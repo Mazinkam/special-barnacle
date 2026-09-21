@@ -586,7 +586,13 @@ async function dispatchParallel(
 		ctx,
 	)) as SubagentDetails;
 
-	return details.results.map((r, i) => ({
+	// HT may return a details object without a `results` array in some
+	// interruption / cancellation paths (e.g. subagent depth exceeded,
+	// parent aborted before any child started). Normalize to an empty
+	// list so the orchestrator's bookkeeping still lands in metrics.jsonl
+	// and the run doesn't crash on `.results.map(...)`.
+	const results = Array.isArray(details?.results) ? details.results : [];
+	return results.map((r, i) => ({
 		taskId: taskInputs[i]._taskId,
 		capability: taskInputs[i]._capability,
 		model: r.model ?? taskInputs[i].model,
