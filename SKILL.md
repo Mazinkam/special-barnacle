@@ -179,6 +179,12 @@ Regenerate `~/.local/state/coding-agent-orchestrator/dashboard.html` after use. 
 - risk observatory metrics
 - cost and calls by coding-agent runtime
 
+### Performance evidence
+
+To evaluate whether the orchestrator is earning its keep, run `scripts/skill_vs_baseline.py`. It reads `metrics.jsonl`, partitions orchestrated work from session-log ingests, reprices orchestrated records at flat single-model baselines (haiku-4-5, sonnet-4-5, opus-4-5), and reports cost, success rate, cost-per-success, retry rate, and waste — for the orchestrator and each bracket. The script is observational: it writes nothing to the stream and does not change the dashboard.
+
+The most recent calibrated numbers live in `policy_overlay.json` under `history.measured_performance` and are refreshed as new orchestrated runs are sampled. The durable finding as of the first measurement: the orchestrator's routing savings come from reviews (routed to haiku / sonnet) paying for `implementation_strong` (routed to opus), with the current mix running materially cheaper per success than a sonnet-4-5 flat baseline at the same token profile. The `policy_overlay.json` `enforcement.measured_roi` block carries the headline ratio.
+
 ## Safe defaults
 
 - adaptive routing: recommend

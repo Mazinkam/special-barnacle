@@ -154,3 +154,14 @@ Append to `outcomes.jsonl` via `record_outcome` / CLI:
 - SLO regression
 
 Recent cohorts must remain labeled immature until the relevant 7/30/90 day window passes.
+
+## Known gaps in the current stream
+
+The metric stream carries production data that is not yet fully separated in the dashboard and not yet fully priced. Three tracking issues limit evaluation quality.
+
+**1. Session-log ingests pollute orchestrator headline metrics.** Codex CLI rollouts at `~/.codex/sessions/*/*/*/rollout-*.jsonl` and HUMAIN Terminal session logs at `~/.humain-terminal/agent/sessions/*/*.jsonl` are ingested with `source: "session_ingest"` and `role: "interactive_session"`. On the current stream the bulk is codex (≈6,600 model calls across ≈92 unique sessions from interactive CLI use) with a thin slice of HT (≈150 calls across ≈22 sessions). These are real model spend, but they are not orchestrated work, and the dashboard's headline tiles and `by_role` / `by_runtime` aggregations merge the two streams. As a result "agent calls", "tokens in/out", and "cost by role" sit dominated by interactive session data. Fix is presentation-side — `scripts/skill_vs_baseline.py` filters them out; the dashboard should treat `interactive_session` as its own panel rather than merging into the orchestrator metrics. See `orchestrator/ingest.py` for the ingest path and `docs/QUARANTINE.md` (historical) for a related attribution bug already fixed.
+
+**2. HT-dispatched work frequently carries `cost_usd: 0`.** On the orchestrated side, ≈33% of orchestrated records have zero or missing cost despite having token counts. These are mostly calls dispatched to `humain-terminal` (roles `worker`, `analysis_mid`, `scout`, `lead`) where the HT runtime emits token usage but does not propagate provider cost the way claude-code does. The orchestrator's actual spend on those calls is missing from totals, cost-per-success ratios, and the route-economics table. Either HT needs to report `cost_usd` directly, or the orchestrator's dispatch layer needs a pricing-table fallback keyed by `model` when `cost_usd` is absent.
+
+**3. Counterfactual emissions are absent on real dispatched work.** The skill has per-call counterfactual fields (`recommended_estimated_verified_cost_usd`, `recommended_estimated_quality_evidence`) intended to record what an alternative route would have cost. On the current stream these fields are populated on only three legacy `adaptive_route_decision` records from a single old claude-code run. None of the ≈110 orchestrated work records carry counterfactuals. `shadow_routing_enabled` is `true` but does not appear to be wired to emit estimates at dispatch time, so the only defensible comparison against a flat baseline is retrospective repricing — which is what `scripts/skill_vs_baseline.py` does. Until counterfactual emission is wired, the retrospective baseline remains valid but coarse.
+
