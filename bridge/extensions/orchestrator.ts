@@ -31,7 +31,11 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+// TypeBox 1.x: `Type` is a namespace (`Type.Object`, `Type.Array`, ...);
+// the validation function moved to a separate `typebox/value` module.
 import { Type } from "typebox";
+import { Check } from "typebox/value";
+
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -250,23 +254,26 @@ async function triageTask(
 	if (!cheapest) return null;
 
 	const tool = createSubagentTool(cwd);
-	const params = Type.Assign(
-		Type.Object({
-			tasks: Type.Array(
-				Type.Object({
-					agent: Type.String(),
-					task: Type.String(),
-					model: Type.Optional(Type.String()),
-					cwd: Type.Optional(Type.String()),
-				}),
-			),
-		}),
-	);
+	// `Type.Assign` is a TS-only type helper in TypeBox 1.x (not a runtime
+	// function), and the original wrapper was passing only one argument
+	// (which Assign never accepted, even in older typebox). Drop it and
+	// use the inner Type.Object literal directly.
+	const params = Type.Object({
+		tasks: Type.Array(
+			Type.Object({
+				agent: Type.String(),
+				task: Type.String(),
+				model: Type.Optional(Type.String()),
+				cwd: Type.Optional(Type.String()),
+			}),
+		),
+	});
+
 	const prompt = TRIAGE_PROMPT + "\n" + goal + "\n\nJSON:\n";
 	try {
 		const details = (await tool.execute(
 			`orchestrator-triage-${Date.now()}`,
-			Type.Check(params, {
+			Check(params, {
 				tasks: [
 					{
 						agent: "orch-implementation-fast",
@@ -558,22 +565,22 @@ async function dispatchParallel(
 		};
 	});
 
-	const params = Type.Assign(
-		Type.Object({
-			tasks: Type.Array(
-				Type.Object({
-					agent: Type.String(),
-					task: Type.String(),
-					model: Type.Optional(Type.String()),
-					cwd: Type.Optional(Type.String()),
-				}),
-			),
-		}),
-	);
+	// `Type.Assign` is a TS-only type helper in TypeBox 1.x — see the note
+	// in triageTask(). The inner Type.Object is the actual runtime schema.
+	const params = Type.Object({
+		tasks: Type.Array(
+			Type.Object({
+				agent: Type.String(),
+				task: Type.String(),
+				model: Type.Optional(Type.String()),
+				cwd: Type.Optional(Type.String()),
+			}),
+		),
+	});
 
 	const details = (await tool.execute(
 		`orchestrator-${runId}-${Date.now()}`,
-		Type.Check(params, { tasks: taskInputs }),
+		Check(params, { tasks: taskInputs }),
 		undefined,
 		undefined,
 		ctx,
