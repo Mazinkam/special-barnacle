@@ -57,7 +57,9 @@ def main():
     if args.cmd=='topology': print(json.dumps(topology_for(args.complexity,args.coupling,args.parallelizable,args.risk),indent=2)); return
     if args.cmd=='resolve-adapter':
         a = resolve_adapter()
-        if args.explain:
+        # --json and --explain are aliases: both emit machine-readable JSON.
+        # The table form is the default when neither is set for human reading.
+        if args.json or args.explain:
             import json as _json
             print(_json.dumps(a, indent=2))
         else:
