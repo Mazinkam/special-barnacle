@@ -10,6 +10,7 @@ from .context import ContextRegistry
 from .features import FeaturePolicy, feature_inventory
 from .engine import OrchestrationEngine
 from .ingest import discover_logs, ingest_paths
+from .dynamic_adapter import resolve_adapter
 
 ROOT=default_state_root()
 def cfg(): return read_json(Path(__file__).with_name('config.json'),{})
@@ -26,6 +27,7 @@ def main():
     sim=sp.add_parser('simulate-policy'); sim.add_argument('--quality-floor',type=float,required=True); sim.add_argument('--cost-aggressiveness',type=float,required=True)
     t=sp.add_parser('topology'); t.add_argument('complexity',type=float); t.add_argument('--coupling',type=float,default=.5); t.add_argument('--parallelizable',type=float,default=.5); t.add_argument('--risk',default='medium')
     ing=sp.add_parser('ingest'); ing.add_argument('paths',nargs='*'); ing.add_argument('--runtime'); ing.add_argument('--repository'); ing.add_argument('--dry-run',action='store_true')
+    ra=sp.add_parser('resolve-adapter'); ra.add_argument('--json',action='store_true',help='emit JSON'); ra.add_argument('--explain',action='store_true',help='include selection reasoning')
     ing.add_argument('--granularity',choices=['call','session'],default='call'); ing.add_argument('--discover',action='store_true'); ing.add_argument('--since-days',type=float); ing.add_argument('--limit',type=int); ing.add_argument('--quiet',action='store_true'); ing.add_argument('--include-scratch',action='store_true')
     q=sp.add_parser('quality'); q.add_argument('payload')
     c=sp.add_parser('context-put'); c.add_argument('id'); c.add_argument('content'); c.add_argument('--source',required=True); c.add_argument('--status',default='observed'); c.add_argument('--revision')
@@ -53,6 +55,21 @@ def main():
     if args.cmd=='simulate-policy':
         print(json.dumps(eng.simulate_policy(candidate_quality_floor=args.quality_floor,candidate_cost_aggressiveness=args.cost_aggressiveness),indent=2)); return
     if args.cmd=='topology': print(json.dumps(topology_for(args.complexity,args.coupling,args.parallelizable,args.risk),indent=2)); return
+    if args.cmd=='resolve-adapter':
+        a = resolve_adapter()
+        if args.explain:
+            import json as _json
+            print(_json.dumps(a, indent=2))
+        else:
+            # Default: print a compact capability -> provider/model table.
+            print(f'{"capability":<24} {"tier":<12} {"provider":<20} {"model":<35} {"in$/M":>8} {"out$/M":>8}')
+            print('-' * 110)
+            for cap, info in sorted(a.items()):
+                if cap.startswith('_'): continue
+                print(f'{cap:<24} {info["tier"]:<12} {info.get("provider","-"):<20} '
+                      f'{info["model"]:<35} {(info.get("input_cost_per_m") or 0):>8.2f} '
+                      f'{(info.get("output_cost_per_m") or 0):>8.2f}')
+        return
     if args.cmd=='ingest':
         import os,sys as _sys
         if args.discover or args.since_days is not None:
