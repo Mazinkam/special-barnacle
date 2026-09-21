@@ -251,7 +251,10 @@ async function triageTask(
 		adapter["worker"] ??
 		adapter["scout"] ??
 		Object.values(adapter)[0];
-	if (!cheapest) return null;
+	if (!cheapest || !cheapest.model) {
+		console.warn("[orchestrator] triage skipped: adapter has no dispatchable model");
+		return null;
+	}
 
 	const tool = createSubagentTool(cwd);
 	// `Type.Assign` is a TS-only type helper in TypeBox 1.x (not a runtime
@@ -323,7 +326,7 @@ async function triageTask(
 			{
 				taskId: `triage-${slugGoal(goal)}`,
 				capability: "implementation_fast",
-				model: r.model ?? cheapest.model,
+				model: r?.model ?? cheapest?.model ?? "unknown",
 				exitCode: r.exitCode,
 				stdout: text,
 				stderr: r.stderr,
@@ -551,11 +554,20 @@ async function dispatchParallel(
 	const tool = createSubagentTool(cwd);
 
 	const taskInputs = tasks.map((t) => {
-		const binding = adapter[t.capability] ?? adapter.worker;
+		// Adapter lookups can return undefined if the dynamic adapter
+		// didn't surface every capability (rare but seen during plan-time
+		// routing handoffs). Fall back to any binding we can find, then to
+		// explicit "unknown" so the dispatch never dereferences undefined.
+		const binding =
+			adapter[t.capability] ??
+			adapter.worker ??
+			adapter.scout ??
+			Object.values(adapter).find((v) => v && typeof v === "object") ??
+			{ model: "unknown" };
 		return {
 			agent: agentNameFor(t.capability),
 			task: formatTaskPrompt(t),
-			model: binding.model,
+			model: binding.model ?? "unknown",
 			cwd,
 			_effort: binding.effort,
 			_capability: t.capability,
@@ -592,19 +604,31 @@ async function dispatchParallel(
 	// list so the orchestrator's bookkeeping still lands in metrics.jsonl
 	// and the run doesn't crash on `.results.map(...)`.
 	const results = Array.isArray(details?.results) ? details.results : [];
-	return results.map((r, i) => ({
-		taskId: taskInputs[i]._taskId,
-		capability: taskInputs[i]._capability,
-		model: r.model ?? taskInputs[i].model,
-		exitCode: r.exitCode,
-		stdout: extractAssistantText(r),
-		stderr: r.stderr,
-		usage: r.usage,
-		durationMs: 0,
-		costUsd: r.usage.cost,
-		stopReason: r.stopReason,
-		filesChanged: parseFilesChanged(extractAssistantText(r)),
-	}));
+
+	// Each `r` may also be sparse/nullish (HT has historically returned
+	// holes in cancellation paths), and the result array may have a
+	// different length than `taskInputs` if the harness reconciles mid-
+	// dispatch. Defend at every field access so the run always lands in
+	// metrics.jsonl instead of crashing the orchestrator.
+	return results.map((r, i, arr) => {
+		const input = taskInputs[i] ?? taskInputs[arr.length - 1] ?? taskInputs[0];
+		const rSafe = r ?? {};
+		const usage = rSafe.usage ?? {};
+		const stdout = extractAssistantText(rSafe);
+		return {
+			taskId: input?._taskId ?? `unknown-${runId}-${i}`,
+			capability: input?._capability ?? "unknown",
+			model: rSafe.model ?? input?.model ?? "unknown",
+			exitCode: rSafe.exitCode ?? -1,
+			stdout,
+			stderr: rSafe.stderr ?? "",
+			usage,
+			durationMs: 0,
+			costUsd: usage.cost ?? 0,
+			stopReason: rSafe.stopReason,
+			filesChanged: parseFilesChanged(stdout),
+		};
+	});
 }
 
 function agentNameFor(capability: string): string {
@@ -636,9 +660,14 @@ function formatTaskPrompt(t: DispatchTask): string {
 	].join("\n");
 }
 
-function extractAssistantText(r: SubagentSingleResult): string {
-	return r.messages
-		.filter((m) => m.role === "assistant")
+function extractAssistantText(r: SubagentSingleResult | null | undefined): string {
+	// HT may return a result with no `messages` array (cancellation,
+	// mid-stream abort, harness-level error before the first delta).
+	// Coerce to empty text so the orchestrator's bookkeeping doesn't
+	// crash on `.messages.filter(...)`.
+	const messages = Array.isArray(r?.messages) ? r.messages : [];
+	return messages
+		.filter((m) => m && m.role === "assistant")
 		.map((m) => (typeof m.content === "string" ? m.content : ""))
 		.join("\n");
 }
@@ -687,7 +716,16 @@ function pickModel(
 	adapter: Adapter,
 	retryCount: number,
 ): string {
-	const base = (adapter[capability] ?? adapter.worker).model;
+	// Defensive: adapter lookups can yield undefined if the dynamic
+	// resolver returned a partial map. Fall back to any binding we can
+	// find before dereferencing .model — otherwise the escalation logic
+	// itself becomes the crash site.
+	const binding =
+		adapter[capability] ??
+		adapter.worker ??
+		adapter.implementation_fast ??
+		Object.values(adapter).find((v) => v && typeof v === "object");
+	const base = binding?.model ?? "unknown";
 	if (retryCount === 0) return base;
 
 	const isReview = capability === "technical_review" || capability === "security_review";
@@ -745,7 +783,7 @@ function cheapestAtTier(adapter: Adapter, tier: string, preferredCapability: str
 	];
 	for (const cap of candidates) {
 		const binding = adapter[cap];
-		if (!binding) continue;
+		if (!binding || !binding.model) continue;
 		const name = binding.model.includes("/") ? binding.model.split("/")[1] : binding.model;
 		if (classifyTier(name) === tier) return binding.model;
 	}
@@ -776,36 +814,42 @@ async function captureDispatchCost(
 	opts: CaptureOpts,
 	result: DispatchResult,
 ): Promise<void> {
-	const model = result.model;
+	// Defensive defaults: every field on `result` may be sparse when HT
+	// returns a partial / cancelled dispatch. Normalize once at the top so
+	// the metric payload below is always well-formed and the split() on
+	// the model id can't throw.
+	const model = result?.model ?? "unknown";
+	const usage = result?.usage ?? {};
+	const provider = model.includes("/") ? model.split("/")[0] : "unknown";
 
 	// 1. The model_call record HT actually produced. `cost_source: "reported"`
 	//    means the harness reported cost directly; if cost is missing, the
 	//    pricing table resolves it to `estimated`.
-	const hasReportedCost = result.costUsd > 0;
+	const hasReportedCost = (result?.costUsd ?? 0) > 0;
 	await recordModelCall({
 		event: "model_call",
 		run_id: opts.runId,
-		task_id: result.taskId,
+		task_id: result?.taskId ?? `unknown-${opts.runId}`,
 		task_class: opts.taskClass,
 		complexity: opts.complexity,
 		risk: opts.risk,
-		role: result.capability,
-		capability_class: result.capability,
+		role: result?.capability ?? "unknown",
+		capability_class: result?.capability ?? "unknown",
 		agent_runtime: "humain-terminal",
-		provider: model.split("/")[0] ?? "unknown",
+		provider,
 		model,
 		effort: "standard",
 		verification_depth: "targeted",
-		input_tokens: result.usage.input,
-		cached_input_tokens: result.usage.cacheRead,
-		cache_write_tokens: result.usage.cacheWrite,
-		output_tokens: result.usage.output,
-		cost_usd: result.costUsd,
+		input_tokens: usage.input ?? 0,
+		cached_input_tokens: usage.cacheRead ?? 0,
+		cache_write_tokens: usage.cacheWrite ?? 0,
+		output_tokens: usage.output ?? 0,
+		cost_usd: result?.costUsd ?? 0,
 		cost_source: hasReportedCost ? "reported" : "estimated-from-reported-tokens",
-		duration_ms: result.durationMs,
-		result: result.exitCode === 0 ? "pass" : "fail",
-		stop_reason: result.stopReason,
-		files_changed: result.filesChanged,
+		duration_ms: result?.durationMs ?? 0,
+		result: result?.exitCode === 0 ? "pass" : "fail",
+		stop_reason: result?.stopReason,
+		files_changed: result?.filesChanged ?? [],
 		plan_id: opts.planId,
 	});
 
@@ -816,19 +860,19 @@ async function captureDispatchCost(
 	await recordModelCall({
 		event: "route_executed",
 		run_id: opts.runId,
-		task_id: result.taskId,
+		task_id: result?.taskId ?? `unknown-${opts.runId}`,
 		plan_id: opts.planId,
 		task_class: opts.taskClass,
 		complexity: opts.complexity,
 		risk: opts.risk,
-		capability_class: result.capability,
+		capability_class: result?.capability ?? "unknown",
 		executed_model: model,
 		executed_effort: "standard",
 		executed_verification_depth: "targeted",
-		executed_cost_usd: result.costUsd,
-		executed_input_tokens: result.usage.input,
-		executed_output_tokens: result.usage.output,
-		executed_passes: result.exitCode === 0,
+		executed_cost_usd: result?.costUsd ?? 0,
+		executed_input_tokens: usage.input ?? 0,
+		executed_output_tokens: usage.output ?? 0,
+		executed_passes: result?.exitCode === 0,
 		recommended_capability: opts.recommended.capability,
 		recommended_effort: opts.recommended.effort,
 		recommended_verification_depth: opts.recommended.verification_depth,
