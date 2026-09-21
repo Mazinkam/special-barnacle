@@ -60,6 +60,7 @@ python -m orchestrator.cli init
 python -m orchestrator.cli features
 python -m orchestrator.cli plan run-001 backend_refactor 6 medium
 python -m orchestrator.cli dashboard
+./install.sh           # optional: wire the HT bridge into ~/.humain-terminal/agent/
 ```
 
 Open:
@@ -67,6 +68,9 @@ Open:
 ```text
 ~/.local/state/coding-agent-orchestrator/dashboard.html
 ```
+
+In HUMAIN Terminal, the bridge exposes `/orchestrate`, `/orchestrator-roi`,
+and `/cross-review-demo` (after `/reload`).
 
 ## Adaptive rollout
 
@@ -126,25 +130,23 @@ subject to hard correctness gates and an effective quality floor.
 ## Files
 
 ```text
-orchestrator/
-  adaptive.py             V3 adaptive route/topology logic
-  features.py             toggle inheritance + validation
-  policy_simulation.py    historical counterfactual estimator
-  engine.py               high-level harness API
-  scheduler.py            compute packages and base topology
-  history.py              empirical cohort aggregation
-  context.py              context registry / packets
-  verification.py         verification cache / flaky signals
-  workspace.py            git worktree + ownership hooks
-  outcomes.py             delayed outcome summaries
-  dashboard.py            self-contained V3 HTML dashboard
-  config.json             default V3 policy
-  feature_schema.json     feature-state reference
-adapters/
-docs/
-tests/
-~/.local/state/coding-agent-orchestrator/
+orchestrator/             Python reference runtime (CLI + EventStore + scheduler)
+bridge/                    HUMAIN Terminal integration (paired with orchestrator/)
+  extensions/              orchestrator.ts + cross-review-demo.ts
+  agents/                  one .md per capability + orchestrator-lead.md
+  README.md                install + adapter notes
+install.sh                 symlinks bridge/ into ~/.humain-terminal/agent/
+adapters/                  example adapter configs (claude-code, codex, generic)
+docs/                      V3 features, adaptive routing, integration, telemetry
+scripts/                   init / rebuild-ledger / regenerate-dashboard / dynamic_adapter
+tests/                     Python tests for the reference runtime
+~/.local/state/coding-agent-orchestrator/   runtime state (events, ledger, dashboard)
 ```
+
+The HT integration lives under `bridge/` and is deployed with `./install.sh`,
+which symlinks the bridge into the user's `~/.humain-terminal/agent/`
+runtime directory. One `git pull && ./install.sh` keeps both the Python
+runtime and the HT bridge in lockstep.
 
 ## Notes
 

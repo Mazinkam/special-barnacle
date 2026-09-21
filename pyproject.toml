@@ -10,3 +10,6 @@ requires-python = ">=3.10"
 
 [tool.setuptools.packages.find]
 include = ["orchestrator*"]
+
+[tool.setuptools.package-data]
+orchestrator = ["../bridge/**/*.ts", "../bridge/**/*.md", "../install.sh"]
