@@ -1,0 +1,32 @@
+{
+  "adapter": "codex-example",
+  "version": 3,
+  "supports_effort": true,
+  "effort_mapping": {
+    "minimal": "instant",
+    "low": "low",
+    "standard": "medium",
+    "high": "high",
+    "maximum": "extra-high"
+  },
+  "capability_mapping": {
+    "architect": "astra",
+    "technical_lead": "astra",
+    "implementation_fast": "luna",
+    "implementation_strong": "terra",
+    "technical_review": "astra",
+    "integration_review": "astra",
+    "security_review": "astra",
+    "migration_review": "astra",
+    "performance_review": "astra",
+    "api_contract_review": "astra"
+  },
+  "family_mapping": {
+    "astra": "codex-example",
+    "luna": "codex-example",
+    "terra": "codex-example"
+  },
+  "supports_parallel_agents": true,
+  "supports_usage_telemetry": true,
+  "supports_worktrees": true
+}

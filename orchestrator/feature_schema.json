@@ -1,0 +1,11 @@
+{
+  "schema_version": 3,
+  "state_types": {
+    "routing_mode": ["off", "observe", "recommend", "enforce"],
+    "adaptive_state": ["off", "on", "adaptive"],
+    "review_mode": ["off", "sampled", "risk_based", "always"],
+    "approval_mode": ["deny", "ask", "allow"],
+    "budget_mode": ["monitor", "warn", "enforce"]
+  },
+  "notes": "Reference inventory for integrations/UI generation; config validation is implemented in orchestrator.features."
+}

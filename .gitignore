@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.orchestrator/events.jsonl
+.orchestrator/metrics.jsonl
+.orchestrator/discoveries.jsonl
+.orchestrator/outcomes.jsonl
+.orchestrator/context_registry.json
+.orchestrator/verification_cache.json
+.orchestrator/locks.json
+.orchestrator/ledger.json
+.orchestrator/dashboard.html

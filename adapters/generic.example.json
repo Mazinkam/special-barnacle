@@ -1,0 +1,27 @@
+{
+  "adapter": "generic-example",
+  "version": 3,
+  "supports_effort": false,
+  "effort_mapping": {},
+  "capability_mapping": {
+    "architect": "MODEL_REASONING_HIGH",
+    "technical_lead": "MODEL_REASONING_HIGH",
+    "implementation_fast": "MODEL_CODING_FAST",
+    "implementation_strong": "MODEL_CODING_HIGH",
+    "technical_review": "MODEL_REVIEW_HIGH",
+    "integration_review": "MODEL_REVIEW_HIGH",
+    "security_review": "MODEL_REVIEW_HIGH",
+    "migration_review": "MODEL_REVIEW_HIGH",
+    "performance_review": "MODEL_REVIEW_HIGH",
+    "api_contract_review": "MODEL_REVIEW_HIGH"
+  },
+  "family_mapping": {
+    "MODEL_REASONING_HIGH": "generic-example",
+    "MODEL_CODING_FAST": "generic-example",
+    "MODEL_CODING_HIGH": "generic-example",
+    "MODEL_REVIEW_HIGH": "generic-example"
+  },
+  "supports_parallel_agents": true,
+  "supports_usage_telemetry": true,
+  "supports_worktrees": true
+}

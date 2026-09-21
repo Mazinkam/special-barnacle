@@ -1,0 +1,31 @@
+{
+  "adapter": "claude-code-example",
+  "version": 3,
+  "supports_effort": true,
+  "effort_mapping": {
+    "minimal": "low",
+    "low": "low",
+    "standard": "medium",
+    "high": "high",
+    "maximum": "high"
+  },
+  "capability_mapping": {
+    "architect": "opus",
+    "technical_lead": "opus",
+    "implementation_fast": "sonnet",
+    "implementation_strong": "opus",
+    "technical_review": "opus",
+    "integration_review": "opus",
+    "security_review": "opus",
+    "migration_review": "opus",
+    "performance_review": "opus",
+    "api_contract_review": "opus"
+  },
+  "family_mapping": {
+    "opus": "claude-code-example",
+    "sonnet": "claude-code-example"
+  },
+  "supports_parallel_agents": true,
+  "supports_usage_telemetry": true,
+  "supports_worktrees": true
+}
