@@ -13,7 +13,7 @@
  *   1. construct engine (Python CLI)         -> implicit via spawn
  *   2. plan_run(...)                         -> /orchestrate command
  *   3. read topology + compute package       -> plan response
- *   4. resolve abstract capability/effort   -> loadAdapter() (dynamic, scripts/dynamic_adapter.py)
+ *   4. resolve abstract capability/effort   -> resolveAdapter() (flags > adapter file > dynamic_adapter.py)
  *   5. spawn subagent via HT subagent tool   -> dispatchHierarchical
  *   6. record every model call              -> captureDispatchCost
  *   7. run deterministic verification       -> runVerification
@@ -27,7 +27,7 @@
  * skill's history has (recommended, executed, observed) triples to learn from.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
 	appendFileSync,
 	existsSync,
@@ -537,7 +537,11 @@ async function resolveAdapter(
 		for (const c of candidates) {
 			const canon = canonicalizeModel(c.binding.model, ctx);
 			if (canon.error) {
-				warnings.push(`${cap} (${c.source}): ${canon.error} — falling back`);
+				// One tier override feeds many capabilities; report the bad spec once.
+				const key = `(${c.source}): ${canon.error} — falling back`;
+				const existing = warnings.findIndex((w) => w.endsWith(key));
+				if (existing === -1) warnings.push(`${cap} ${key}`);
+				else warnings[existing] = `${warnings[existing].slice(0, -key.length).trimEnd()}, ${cap} ${key}`;
 				continue;
 			}
 			adapter[cap] = { model: canon.model, ...(c.binding.effort ? { effort: c.binding.effort } : {}) };
@@ -775,6 +779,9 @@ function shortArgs(toolName: string, args: unknown): string {
  * 20-minute silent dispatch could not be inspected while it ran or after.
  */
 class RunSession {
+	readonly runId: string;
+	readonly ctx: ExtensionContext;
+	readonly goal: string;
 	readonly dir: string;
 	private readonly dispatches = new Map<string, DispatchProgress>();
 	private phase = "starting";
@@ -783,11 +790,10 @@ class RunSession {
 	private tickTimer: ReturnType<typeof setInterval> | undefined;
 	private closed = false;
 
-	constructor(
-		readonly runId: string,
-		readonly ctx: ExtensionContext,
-		readonly goal: string,
-	) {
+	constructor(runId: string, ctx: ExtensionContext, goal: string) {
+		this.runId = runId;
+		this.ctx = ctx;
+		this.goal = goal;
 		this.dir = join(runsDir(), runId);
 		try {
 			mkdirSync(this.dir, { recursive: true });
@@ -1723,6 +1729,29 @@ function formatTaskPrompt(t: DispatchTask, runId: string): string {
 	].join("\n");
 }
 
+/**
+ * Paths that differ from HEAD (modified, added, deleted, renamed, untracked),
+ * repo-relative. `null` when `cwd` is not inside a git work tree, in which case
+ * callers fall back to the scraped list.
+ */
+function gitDirtyFiles(cwd: string): Set<string> | null {
+	const res = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], {
+		cwd,
+		encoding: "utf-8",
+		timeout: 10_000,
+	});
+	if (res.status !== 0) return null;
+	const out = new Set<string>();
+	for (const line of res.stdout.split("\n")) {
+		if (line.length < 4) continue;
+		// "XY path" or "XY old -> new" for renames; take the destination.
+		const p = line.slice(3);
+		const arrow = p.indexOf(" -> ");
+		out.add(arrow === -1 ? p : p.slice(arrow + 4));
+	}
+	return out;
+}
+
 function parseFilesChanged(text: string): string[] {
 	const files: string[] = [];
 	const re = /`([^`]+\.[a-zA-Z0-9]+)`/g;
@@ -2572,6 +2601,7 @@ export default function (pi: ExtensionAPI) {
 					log_dir: session.dir,
 				});
 
+				const dirtyBefore = gitDirtyFiles(cwd);
 				const { leadResults, architectResult, escalationResults } = await dispatchHierarchical(
 					cwd,
 					runId,
@@ -2594,9 +2624,21 @@ export default function (pi: ExtensionAPI) {
 				// Step 3: Verification + escalation. We run QA against whatever files
 				// were touched in the lead phase. If QA fails, escalate per policy
 				// Rule 1. The loop is bounded by maxRetries.
-				const allFiles = Array.from(
-					new Set(leadResults.flatMap((r) => r.filesChanged)),
-				);
+				// `filesChanged` is scraped from the lead's prose, so a report that merely
+				// MENTIONS README.md counted it as changed and sent QA after a phantom.
+				// When the workspace is a git repo, trust the working tree instead: a file
+				// is "changed" if it is dirty now and was either clean before the run or
+				// is also named by the lead.
+				const claimed = new Set(leadResults.flatMap((r) => r.filesChanged));
+				const dirtyAfter = gitDirtyFiles(cwd);
+				const allFiles =
+					dirtyBefore && dirtyAfter
+						? [...dirtyAfter].filter((f) => !dirtyBefore.has(f) || claimed.has(f))
+						: [...claimed];
+				if (dirtyBefore && dirtyAfter) {
+					const phantom = [...claimed].filter((f) => !dirtyAfter.has(f));
+					if (phantom.length > 0) session.log(`lead named ${phantom.length} file(s) that are not modified in git; ignored: ${phantom.join(", ")}`);
+				}
 
 				let retries = 0;
 				let lastVerification: VerificationResult | null = null;

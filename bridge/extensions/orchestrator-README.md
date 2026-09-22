@@ -17,7 +17,8 @@ After install, restart HT (or `/reload`):
 
 ```
 /reload
-/orchestrate <goal> [--task-class T] [--complexity N] [--risk R] [--fan-out] [--max-retries N]
+/orchestrate <goal> [--task-class T] [--complexity N] [--risk R] [--cheap P/M] [--mid P/M] [--premium P/M] [--model cap=P/M] [--max-retries N] [--yes]
+/orchestrator-models
 /orchestrator-roi
 /cross-review-demo
 ```
@@ -71,31 +72,71 @@ Show ROI anytime:
 
 ## Model binding
 
-By default the extension resolves models dynamically through the skill's
-`scripts/dynamic_adapter.py`:
+Precedence, highest first:
 
-```
-cli resolve-adapter --explain
-```
-
-which returns `{capability: {provider, model, tier, ...}}` for all 16
-capabilities it recognizes. The cheapest-mid-premium tiers come from
-`humain_node_catalog.json` (calibrated against model costs dated 2026-09-21).
-The cheapest model the user has configured wins `implementation_fast` /
-`scout` / `worker`; mid wins `implementation_strong` / `technical_lead` /
-`technical_review` / `lead` / `qa_agent`; premium wins `architect` /
-`security_review` / `analysis_strong`.
-
-Override specific capabilities by writing `~/.humain-terminal/agent/orchestrator-adapter.json`:
+1. Per-run flags: `--cheap P/M`, `--mid P/M`, `--premium P/M`, `--model <capability>=P/M`
+2. `~/.humain-terminal/agent/orchestrator-adapter.json` → `capabilities`
+3. `~/.humain-terminal/agent/orchestrator-adapter.json` → `tiers`
+4. Cost-tier resolver (`cli resolve-adapter --explain`, intersects HT's `models-store.json` with `data/humain_node_catalog.json`)
+5. Bundled `FALLBACK_ADAPTER`
 
 ```json
 {
-  "implementation_strong": { "model": "amazon-bedrock/anthropic.claude-opus-4-5" },
-  "technical_review":     { "model": "openai-codex/gpt-5.6-terra" }
+  "tiers": {
+    "premium": "amazon-bedrock/global.anthropic.claude-fable-5-1",
+    "mid":     "amazon-bedrock/global.anthropic.claude-sonnet-5",
+    "cheap":   "amazon-bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
+  },
+  "capabilities": {
+    "technical_review": { "model": "amazon-bedrock/global.anthropic.claude-opus-5", "effort": "high" }
+  }
 }
 ```
 
-The first segment of the model id (`amazon-bedrock`, `openai-codex`, `humain-node`) must match one of HT's configured providers (see `~/.humain-terminal/agent/models-store.json`).
+Tiers: `cheap` = implementation_fast, worker, scout · `mid` = lead, qa_agent,
+implementation_strong, technical_lead, technical_review, analysis_mid,
+integration/migration/performance/api_contract_review · `premium` = architect,
+security_review, analysis_strong.
+
+Every binding is canonicalized against HT's model registry before dispatch, so
+`amazon-bedrock/claude-sonnet-5` becomes the exact id that will run, and an
+unresolvable override aborts the run before any money is spent. Inspect with:
+
+```
+/orchestrator-models
+/orchestrator-models --premium amazon-bedrock/claude-opus-5
+```
+
+The lead's task prompt carries the resolved agent→model table and the lead must
+pass `model:` on every `subagent` call — HT's subagent tool ignores persona
+frontmatter `model:` and otherwise runs children on the parent's model.
+
+## Progress and logs
+
+While a run is live the extension shows a widget above the editor (one row per
+dispatch: model, elapsed, turns, tool calls, last tool, cost) and a footer status
+line, and emits a phase notification at each stage (triage → plan → architect →
+leads → QA → escalation). Each run writes to
+`~/.local/state/coding-agent-orchestrator/runs/<runId>/`:
+
+| file | content |
+|---|---|
+| `run.log` | human-readable timeline: phases, every dispatch start/end, every tool call, verdicts |
+| `<taskId>.prompt.md` | the exact prompt sent to that child |
+| `<taskId>.events.jsonl` | the child's raw `--mode json` stream |
+| `<taskId>.stderr.log` | the child's stderr (only written when non-empty) |
+| `lead-report.md` | the lead(s)' final reports |
+
+The Python EventStore additionally receives `dispatch_plan_confirmed`,
+`dispatch_started`, and `dispatch_finished` events (with model, cost, exit code,
+duration) alongside the existing `model_call` / `route_executed` metrics.
+
+Dispatched agents are non-interactive: they cannot ask you questions mid-run.
+Goals that ask for questions get a warning up front; the lead is instructed to
+put open questions under `## Open items`, which the completion summary surfaces.
+
+Only one `/orchestrate` may be live per session. `--yes` (or
+`HUMAIN_ORCHESTRATOR_ASSUME_YES=1`) skips the two confirmations.
 
 ## What this integration does NOT do
 

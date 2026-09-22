@@ -1,3 +1,29 @@
+## Unreleased
+
+### bridge (HT extension)
+
+- Model overrides are real: `--cheap/--mid/--premium/--model <cap>=P/M` flags and
+  `~/.humain-terminal/agent/orchestrator-adapter.json` (`tiers` / `capabilities`)
+  now bind models, canonicalized against HT's model registry; an unresolvable
+  override aborts before any dispatch. New `/orchestrator-models` command.
+- Leads now receive the resolved agent→model table and must pass `model:` on
+  every `subagent` call (HT's subagent tool ignores persona frontmatter, so
+  workers were silently running on the lead's model).
+- Live progress: per-dispatch widget + footer status (model, elapsed, turns,
+  tool calls, last tool, cost), phase notifications between stages.
+- Per-run logs under `<STATE_ROOT>/runs/<runId>/` (run.log, prompts, raw child
+  event streams, stderr, lead report); `dispatch_started/finished` and
+  `dispatch_plan_confirmed` EventStore events; crashes record `run-failed`.
+- Files-changed now comes from `git status` before/after the lead phase instead
+  of scraping the lead's prose, so mentioned-but-untouched files no longer
+  trigger QA.
+- Orchestrating capabilities (lead/architect/technical_lead) get a longer
+  timeout; timeouts kill the child's whole process group; in-flight dispatches
+  are reaped when HT exits.
+- Warns when the goal asks agents to "ask questions" (children are headless);
+  lead is instructed to record them under `## Open items`, which the summary
+  shows. `--yes` flag; one live run per session.
+
 # Changelog
 
 ## [Unreleased]
