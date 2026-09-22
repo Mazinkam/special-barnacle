@@ -202,3 +202,31 @@ describe("mergeLayers", () => {
 		expect(t).toContain("architect, security_review");
 	});
 });
+
+describe("method.json (canonical orchestration method)", () => {
+	const { METHOD, TIER_CAPABILITIES, ALL_CAPABILITIES, rereviewFloor, reconWorkers, tierOf } = require("./models.ts");
+
+	test("tier table is derived from method.json, not hand-written", () => {
+		for (const [cap, spec] of Object.entries(METHOD.capabilities) as [string, { tier: string }][]) {
+			expect(tierOf(cap)).toBe(spec.tier);
+		}
+		expect(ALL_CAPABILITIES.length).toBe(Object.keys(METHOD.capabilities).length);
+		expect(TIER_CAPABILITIES.cheap).toContain("implementation_fast");
+		expect(TIER_CAPABILITIES.premium).toContain("architect");
+	});
+
+	test("Rule 1 floors come from data", () => {
+		expect(rereviewFloor("low").tier_min).toBe("mid");
+		expect(rereviewFloor("high").tier_min).toBe("premium");
+		expect(rereviewFloor("critical").independent_review).toBe(true);
+		expect(rereviewFloor("garbage")).toEqual(METHOD.rules.review_after_fix.escalation_by_risk.medium);
+	});
+
+	test("Rule 2 recon worker count follows complexity bands", () => {
+		expect(reconWorkers(4)).toBe(0);
+		expect(reconWorkers(5)).toBe(3);
+		expect(reconWorkers(8)).toBe(4);
+		expect(reconWorkers(10)).toBe(5);
+		expect(reconWorkers(9, "investigation")).toBe(0);
+	});
+});

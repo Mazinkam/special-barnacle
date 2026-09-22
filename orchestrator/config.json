@@ -26,27 +26,6 @@
       "no_unresolved_high_risk_findings": true
     }
   },
-  "effort": {
-    "levels": [
-      "minimal",
-      "low",
-      "standard",
-      "high",
-      "maximum"
-    ],
-    "default_by_role": {
-      "architect": "standard",
-      "technical_lead": "standard",
-      "implementation_fast": "low",
-      "implementation_strong": "standard",
-      "technical_review": "standard",
-      "integration_review": "high",
-      "security_review": "high",
-      "performance_review": "standard",
-      "migration_review": "high",
-      "api_contract_review": "standard"
-    }
-  },
   "context": {
     "default_worker_budget_tokens": 18000,
     "lead_budget_tokens": 36000,
@@ -193,18 +172,6 @@
     "default_task_usd": 0.5,
     "high_risk_task_usd": 3.0,
     "critical_task_usd": null
-  },
-  "roles": {
-    "architect": "architect",
-    "technical_lead": "technical_lead",
-    "implementer": "implementation_fast",
-    "complex_implementer": "implementation_strong",
-    "verifier": "technical_review",
-    "integration_verifier": "integration_review",
-    "security_verifier": "security_review",
-    "performance_verifier": "performance_review",
-    "migration_verifier": "migration_review",
-    "api_contract_verifier": "api_contract_review"
   },
   "features": {
     "adaptive_system": {

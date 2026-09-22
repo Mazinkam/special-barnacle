@@ -2,8 +2,9 @@ from __future__ import annotations
 from dataclasses import dataclass,asdict
 from typing import Any
 from .history import bucket_complexity
+from .method import effort_levels
 
-EFFORTS=['minimal','low','standard','high','maximum']
+EFFORTS=effort_levels()
 
 @dataclass
 class ComputePackage:

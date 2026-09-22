@@ -8,27 +8,67 @@
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
+// Canonical orchestration method. `./method.json` is a symlink to
+// `orchestrator/method.json` at the repo root — the same bytes the Python
+// engine reads — so capability tiers and routing rules cannot drift between
+// the two runtimes. Edit the root file, never this one.
+import method from "./method.json";
+
 export type Tier = "cheap" | "mid" | "premium";
 export const TIERS: Tier[] = ["premium", "mid", "cheap"];
 
-/** Which cost tier each abstract capability sits at. Mirrors dynamic_adapter.py. */
-export const TIER_CAPABILITIES: Record<Tier, string[]> = {
-	cheap: ["implementation_fast", "worker", "scout"],
-	mid: [
-		"analysis_mid",
-		"technical_lead",
-		"implementation_strong",
-		"technical_review",
-		"integration_review",
-		"migration_review",
-		"performance_review",
-		"api_contract_review",
-		"qa_agent",
-		"lead",
-	],
-	premium: ["analysis_strong", "architect", "security_review"],
-};
-export const ALL_CAPABILITIES = Object.values(TIER_CAPABILITIES).flat();
+export type RiskLevel = "low" | "medium" | "high" | "critical";
+
+export interface ReReviewFloor {
+	capability: string;
+	tier_min: Tier;
+	verification_depth: string;
+	independent_review?: boolean;
+}
+
+interface MethodFile {
+	schema_version: number;
+	tiers: Tier[];
+	capabilities: Record<string, { tier: Tier; default_effort: string }>;
+	effort_levels: string[];
+	roles: Record<string, string>;
+	rules: {
+		review_after_fix: {
+			prohibit_tiers: Tier[];
+			escalation_by_risk: Record<RiskLevel, ReReviewFloor>;
+		};
+		pre_implementation_recon: {
+			min_complexity: number;
+			workers_by_complexity: { min: number; max: number; workers: number }[];
+			skip_for_task_classes: string[];
+		};
+	};
+}
+
+export const METHOD = method as unknown as MethodFile;
+
+/** Which cost tier each abstract capability sits at. Derived from method.json. */
+export const TIER_CAPABILITIES: Record<Tier, string[]> = { cheap: [], mid: [], premium: [] };
+for (const [cap, spec] of Object.entries(METHOD.capabilities)) TIER_CAPABILITIES[spec.tier].push(cap);
+export const ALL_CAPABILITIES = Object.keys(METHOD.capabilities);
+
+/** Rule 1: the minimum re-review package for a risk level (unknown risk -> medium). */
+export function rereviewFloor(risk: string): ReReviewFloor {
+	const table = METHOD.rules.review_after_fix.escalation_by_risk;
+	return table[risk as RiskLevel] ?? table.medium;
+}
+
+/** Rule 2: how many pre-implementation recon workers a task warrants; 0 = skip recon. */
+export function reconWorkers(complexity: number, taskClass?: string): number {
+	const r = METHOD.rules.pre_implementation_recon;
+	if ((taskClass && r.skip_for_task_classes.includes(taskClass)) || complexity < r.min_complexity) return 0;
+	const band = r.workers_by_complexity.find((b) => complexity >= b.min && complexity <= b.max);
+	return band?.workers ?? r.workers_by_complexity[r.workers_by_complexity.length - 1]?.workers ?? 0;
+}
+
+export function tierIndex(tier: Tier): number {
+	return METHOD.tiers.indexOf(tier);
+}
 
 export function tierOf(capability: string): Tier | undefined {
 	return (Object.keys(TIER_CAPABILITIES) as Tier[]).find((t) => TIER_CAPABILITIES[t].includes(capability));

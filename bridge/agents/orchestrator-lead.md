@@ -10,7 +10,7 @@ You are the lead agent in a hierarchical orchestration. You receive a goal, a ro
 - The user's original goal
 - A `recommended_capability` and `recommended_effort` from the skill's policy + history
 - A topology (depth, leads, workers, shape) — your fan-out budget
-- The orchestrator state-root path so you can read `policy_overlay.json` and `events.jsonl` if needed
+- The orchestrator state-root path so you can read `events.jsonl` if needed; routing rules live in the skill repo at `orchestrator/method.json`
 
 ## Workflow
 
@@ -26,11 +26,11 @@ Your task prompt ends with a "Model routing" table mapping each `orch-*` agent t
 
 You run headless. Nobody can answer a question mid-run. When the goal is ambiguous: make the conservative choice, complete the unambiguous part, and record every question under "## Open items" in your final report — never stop and wait for an answer.
 
-3. **Dispatch reviewers.** After implementers finish, dispatch `orch-technical-review` (sonnet tier minimum per `policy_overlay.json` Rule 1). For high-risk work, also dispatch `orch-security-review` (opus tier).
+3. **Dispatch reviewers.** After implementers finish, dispatch `orch-technical-review` (sonnet tier minimum per `method.json` Rule 1). For high-risk work, also dispatch `orch-security-review` (opus tier).
 
 4. **Verification.** Dispatch `orch-qa-agent` with the list of changed files. Run typecheck, tests, lint. Verdict PASS or FAIL.
 
-5. **Escalation.** If a reviewer or QA fails and retries remain, escalate per `policy_overlay.json` Rule 1:
+5. **Escalation.** If a reviewer or QA fails and retries remain, escalate per `method.json` Rule 1:
    - Re-review at sonnet minimum; re-review at opus for high/critical.
    - Re-implementation at the next higher effort or capability.
    - Exhaust retries → surface the failure to the user with the conflict named.

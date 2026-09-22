@@ -1,5 +1,27 @@
 ## Unreleased
 
+### method (single source of truth)
+
+- The orchestration method now lives in one file, `orchestrator/method.json`:
+  capability vocabulary, cost tiers, default efforts, role aliases and the
+  three routing rules (re-review floor, pre-implementation recon, exploration
+  topology). `orchestrator/method.py` loads and validates it for Python;
+  `bridge/extensions/orchestrator/models.ts` imports the same bytes through a
+  symlink (`bridge/extensions/orchestrator/method.json`) so the HT bridge
+  cannot drift from the engine. Previously the tier table was hand-mirrored
+  between `dynamic_adapter.py` and `models.ts`, Rule 1 was hard-coded in
+  `index.ts`, and the rules themselves sat in a runtime-state file that no
+  code read. `tests/test_method.py` and `models.test.ts` assert parity and
+  check that the thresholds quoted in `SKILL.md` match the data.
+- `config.json` lost `roles` and `effort` (moved to `method.json`); it now
+  holds runtime config only. `~/.local/state/.../policy_overlay.json` lost its
+  rule blocks and holds runtime state only (`enforcement`, `history`); a
+  `.pre-method-bak` copy was left beside it.
+- `pickModel` escalation is risk-aware: the re-review target tier is
+  `max(rules.review_after_fix.escalation_by_risk[risk].tier_min, current+1)`,
+  bumping one tier per additional retry and never landing on a prohibited
+  tier. `complexityNeedsArchitect` reads `pre_implementation_recon.min_complexity`.
+
 ### bridge (HT extension)
 
 - Session usage is now ingested automatically. The extension ingests the

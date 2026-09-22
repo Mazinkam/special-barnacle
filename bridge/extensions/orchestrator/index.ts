@@ -71,17 +71,20 @@ import {
 	type Layer,
 	listShortcuts,
 	mergeLayers,
+	METHOD,
 	migrateAdapterToProfile,
 	parseProfilesFile,
 	PROFILE_NAME_RE,
 	type ProfileSpec,
 	type ProfilesFile,
+	rereviewFloor,
 	resolveAlias,
 	type ResolvedAdapter,
 	shortName,
 	THINKING_LEVELS,
 	type Tier,
 	TIER_CAPABILITIES,
+	tierIndex,
 	TIERS,
 	tiersToBindings,
 	userLayerWarnings,
@@ -1641,7 +1644,7 @@ function agentNameFor(capability: string): string {
 
 function formatTaskPrompt(t: DispatchTask, runId: string): string {
 	const retryNote = t.retryOf
-		? `\n\n[Retry context: this is retry #${(t.retryCount ?? 0) + 1} of a previous failed attempt on task_id=${t.retryOf}. The previous attempt's review/QA feedback is captured in the orchestrator ledger; if you need that context, ask the lead before starting. Per policy_overlay.json Rule 1: minimum sonnet tier for any re-review.]`
+		? `\n\n[Retry context: this is retry #${(t.retryCount ?? 0) + 1} of a previous failed attempt on task_id=${t.retryOf}. The previous attempt's review/QA feedback is captured in the orchestrator ledger; if you need that context, ask the lead before starting. Per method.json rules.review_after_fix: re-review at or above the original reviewer's tier, never the cheap tier.]`
 		: "";
 	return [
 		`[orchestrator:run_id=${runId}]`,
@@ -1714,22 +1717,21 @@ function looksLikeFilePath(s: string): boolean {
 
 /**
  * Pick the model for a dispatch. Honors the recommended capability by default.
- * On retry (escalation), bumps to the next tier per policy_overlay Rule 1:
- * haiku -> sonnet -> opus for re-reviews.
+ * On retry (escalation) of a review capability, applies method.json Rule 1
+ * (`rules.review_after_fix`): the re-review must run at or above the risk's
+ * `tier_min`, and never on a prohibited tier. Each further retry bumps one
+ * more tier so a persistent failure walks up to premium.
  *
- * Tier detection works on the model-id substring. Recognized tokens:
- *   cheap:    haiku, luna, mini, nano, flash, lite
- *   mid:      sonnet, glm, mistral, command, jamba
- *   premium:  opus, kimi-k3, ultra, pro
- * If a model id doesn't match any known token, we leave it unchanged — the
- * adapter's pick already satisfies policy Rule 1 ("at least the original
- * reviewer's tier") because the dynamic adapter routes reviews to sonnet-or-
- * higher by default.
+ * Tier detection works on the model-id substring (see classifyTier). If a
+ * model id doesn't match any known token, we leave it unchanged — the
+ * adapter's pick already satisfies the floor because the dynamic adapter
+ * routes reviews to mid-or-higher by default.
  */
 function pickModel(
 	capability: string,
 	adapter: Adapter,
 	retryCount: number,
+	risk = "medium",
 ): string {
 	// Defensive: adapter lookups can yield undefined if the dynamic
 	// resolver returned a partial map. Fall back to any binding we can
@@ -1747,21 +1749,23 @@ function pickModel(
 	if (!isReview) return base;
 
 	const modelName = base.includes("/") ? base.split("/")[1] : base;
-	const tier = classifyTier(modelName);
-	if (tier === "premium") return base; // already top, no escalation needed
+	const current = classifyTier(modelName);
+	if (current === "unknown") return base;
 
-	// Map: cheap -> mid (retry 1+), mid -> premium (retry 2+).
-	// We can't reliably know the exact "next" model, so we ask the adapter for
-	// the capability that lives one tier above. We do this by inspecting the
-	// adapter's full table: the cheapest mid-tier review model, or the cheapest
-	// premium-tier review model, depending on how far we've escalated.
-	if (tier === "cheap") {
-		const mid = cheapestAtTier(adapter, "mid", capability);
-		if (mid) return mid;
-	}
-	if (tier === "mid" || retryCount >= 2) {
-		const prem = cheapestAtTier(adapter, "premium", capability);
-		if (prem) return prem;
+	// Floor from the method: max(risk tier_min, one tier above current), then
+	// one more tier per additional retry. Prohibited tiers are never allowed.
+	const floor = rereviewFloor(risk);
+	const prohibited = METHOD.rules.review_after_fix.prohibit_tiers;
+	let targetIdx = Math.max(tierIndex(floor.tier_min), tierIndex(current) + 1) + (retryCount - 1);
+	targetIdx = Math.min(targetIdx, METHOD.tiers.length - 1);
+	while (targetIdx < METHOD.tiers.length - 1 && prohibited.includes(METHOD.tiers[targetIdx] as Tier)) targetIdx++;
+	const target = METHOD.tiers[targetIdx] as Tier;
+	if (target === current) return base;
+
+	// Walk upward from the target so a missing tier still escalates.
+	for (let i = targetIdx; i < METHOD.tiers.length; i++) {
+		const m = cheapestAtTier(adapter, METHOD.tiers[i] as Tier, capability);
+		if (m) return m;
 	}
 	return base;
 }
@@ -2005,9 +2009,8 @@ function parseFailedChecks(text: string): string[] {
  * Decide how to escalate a failed verification. Returns a list of new
  * DispatchTask entries to add to the next pass, or empty if we're done.
  *
- * Mirrors `policy_overlay.json` Rule 1:
- *   - Re-review at minimum sonnet; at opus for high/critical.
- *   - Re-implementation at the next-higher capability for high risk.
+ * The model for each retry is chosen by pickModel, which applies method.json
+ * Rule 1 (`rules.review_after_fix`) for the run's risk.
  */
 function planEscalation(
 	failedChecks: string[],
@@ -2162,8 +2165,9 @@ async function dispatchHierarchical(
 	return { leadResults, workerResults: [], architectResult, escalationResults: [] };
 }
 
+/** An architect is worth spawning at the same complexity where method.json Rule 2 mandates recon. */
 function complexityNeedsArchitect(complexity: number): boolean {
-	return complexity >= 5;
+	return complexity >= METHOD.rules.pre_implementation_recon.min_complexity;
 }
 
 function architectPrompt(goal: string, plan: PlanResponse): string {
@@ -2250,7 +2254,7 @@ function leadPrompt(
 		"- Choose the right agent (orch-worker, orch-implementation-strong, orch-implementation-fast, orch-technical-review, orch-security-review, orch-qa-agent).",
 		"- Pass a narrowly-scoped task prompt.",
 		"- Pass the `model` for that agent from the routing table below.",
-		"- After all workers finish, run QA via orch-qa-agent. If verification fails, escalate per policy_overlay.json Rule 1.",
+		"- After all workers finish, run QA via orch-qa-agent. If verification fails, escalate per method.json rules.review_after_fix (Rule 1).",
 		"",
 		...modelTableForLead(adapter),
 	].join("\n");
@@ -2755,6 +2759,7 @@ export default function (pi: ExtensionAPI) {
 							t.capability,
 							adapter,
 							t.retryCount ?? 0,
+							plan.risk,
 						);
 						session.setPhase(
 							`escalation retry ${retries + 1}: ${t.capability} on ${shortName(escalatedModel)} — failed checks: ${lastVerification.failedChecks.slice(0, 3).join(", ")}`,

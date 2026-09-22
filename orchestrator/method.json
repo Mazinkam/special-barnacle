@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "description": "Canonical orchestration method: capability vocabulary, cost tiers, effort levels, role aliases, and the three routing rules. Read by both the Python engine (orchestrator/method.py) and the HT bridge (bridge/extensions/orchestrator/models.ts via a symlink). Editing this file edits the method; SKILL.md summarises it for humans and must not contradict it. Runtime config (pricing, features, budgets, persistence) stays in config.json; runtime state (history, measured ROI) stays in ~/.local/state/coding-agent-orchestrator/.",
+
+  "tiers": ["cheap", "mid", "premium"],
+
+  "capabilities": {
+    "scout":                 { "tier": "cheap",   "default_effort": "low" },
+    "worker":                { "tier": "cheap",   "default_effort": "low" },
+    "implementation_fast":   { "tier": "cheap",   "default_effort": "low" },
+    "analysis_mid":          { "tier": "mid",     "default_effort": "standard" },
+    "technical_lead":        { "tier": "mid",     "default_effort": "standard" },
+    "lead":                  { "tier": "mid",     "default_effort": "standard" },
+    "implementation_strong": { "tier": "mid",     "default_effort": "standard" },
+    "technical_review":      { "tier": "mid",     "default_effort": "standard" },
+    "integration_review":    { "tier": "mid",     "default_effort": "high" },
+    "migration_review":      { "tier": "mid",     "default_effort": "high" },
+    "performance_review":    { "tier": "mid",     "default_effort": "standard" },
+    "api_contract_review":   { "tier": "mid",     "default_effort": "standard" },
+    "qa_agent":              { "tier": "mid",     "default_effort": "standard" },
+    "analysis_strong":       { "tier": "premium", "default_effort": "standard" },
+    "architect":             { "tier": "premium", "default_effort": "standard" },
+    "security_review":       { "tier": "premium", "default_effort": "high" }
+  },
+
+  "effort_levels": ["minimal", "low", "standard", "high", "maximum"],
+
+  "roles": {
+    "architect": "architect",
+    "technical_lead": "technical_lead",
+    "implementer": "implementation_fast",
+    "complex_implementer": "implementation_strong",
+    "verifier": "technical_review",
+    "integration_verifier": "integration_review",
+    "security_verifier": "security_review",
+    "performance_verifier": "performance_review",
+    "migration_verifier": "migration_review",
+    "api_contract_verifier": "api_contract_review"
+  },
+
+  "rules": {
+    "review_after_fix": {
+      "summary": "Re-review after a fix uses at least the original reviewer's tier; never the cheap tier.",
+      "min_capability": "implementation_strong",
+      "min_effort": "standard",
+      "min_verification_depth": "targeted",
+      "prohibit_tiers": ["cheap"],
+      "escalation_by_risk": {
+        "low":      { "capability": "implementation_strong", "tier_min": "mid",     "verification_depth": "targeted" },
+        "medium":   { "capability": "technical_review",      "tier_min": "mid",     "verification_depth": "targeted" },
+        "high":     { "capability": "security_review",       "tier_min": "premium", "verification_depth": "full" },
+        "critical": { "capability": "security_review",       "tier_min": "premium", "verification_depth": "full", "independent_review": true }
+      },
+      "rationale": "After a fix, the code under review has changed. The cheap tier confirmed 4/4 re-reviews in early data, but downstream tasks proceeded without issue only because the fixes were small. A single regression missed by a cheap re-reviewer costs more in rework and escaped defects than the entire cheap re-review savings to date ($0.31)."
+    },
+
+    "pre_implementation_recon": {
+      "summary": "Tasks at complexity >= 5 get a parallel fan-out of cheap recon workers before any implementer touches code.",
+      "min_complexity": 5,
+      "workers_by_complexity": [
+        { "min": 5, "max": 6,  "workers": 3 },
+        { "min": 7, "max": 8,  "workers": 4 },
+        { "min": 9, "max": 10, "workers": 5 }
+      ],
+      "worker_capability": "implementation_fast",
+      "worker_effort": "low",
+      "worker_verification_depth": "targeted",
+      "lead_synthesis_capability": "technical_lead",
+      "evidence_packet_max_tokens": 2000,
+      "skip_for_task_classes": ["investigation", "qa_verification"],
+      "rationale": "implementation_strong-class tasks with 150K-400K input tokens cost $0.55-$2.38 because the implementer reads raw repository context. A $0.05 scout pre-digesting that context into a 2K-token evidence packet saves $1+ on the most expensive implementer calls and improves focus."
+    },
+
+    "exploration_topology": {
+      "summary": "Investigation, recon and digest work uses the cheapest sufficient capability: one capable lead plus 3-5 parallel cheap workers.",
+      "default_shape": "lead_plus_parallel_recon",
+      "recon_workers": 4,
+      "recon_workers_min": 3,
+      "recon_workers_max": 5,
+      "recon_capability": "analysis_mid",
+      "recon_effort": "medium",
+      "recon_verification_depth": "targeted",
+      "synthesis_capability": "technical_lead",
+      "synthesis_effort": "standard",
+      "max_recon_cost_usd": 0.5,
+      "by_task_class": {
+        "issue_triage":   { "worker": "analysis_mid",        "lead": "technical_lead" },
+        "plan_audit":     { "worker": "analysis_mid",        "lead": "technical_lead" },
+        "codebase_recon": { "worker": "implementation_fast", "lead": "technical_lead" },
+        "security_audit": { "worker": "security_review",     "lead": null },
+        "spec_synthesis": { "worker": "analysis_strong",     "lead": "architect" }
+      },
+      "rationale": "The ht-codex-modularization-status run proved this topology: 4 parallel mid-tier scouts produced complete evidence packets at near-zero cost, and a single premium synthesis produced the status report. Sending the premium model to do the investigation itself would have cost 5-10x more."
+    }
+  }
+}

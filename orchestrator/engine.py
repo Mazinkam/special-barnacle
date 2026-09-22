@@ -6,6 +6,7 @@ from typing import Any
 from .runtime import EventStore, Policy, QualityEvidence, default_state_root, read_json, stable_hash
 from .state import rebuild
 from .history import load_stats
+from .method import default_efforts
 from .adaptive import adaptive_route, recommend_topology, should_canary
 from .features import FeaturePolicy, feature_inventory
 from .policy_simulation import compare_policies
@@ -60,7 +61,7 @@ class OrchestrationEngine:
         route = adaptive_route(
             run_id=run_id, task_class=task_class, complexity=complexity, risk=risk,
             quality_floor=qf, cost_aggressiveness=ca, stats=stats, features=features,
-            default_efforts=self.config.get('effort',{}).get('default_by_role',{}),
+            default_efforts=default_efforts(),
             min_samples=int(features.get('historical_learning',{}).get('minimum_samples',history_cfg.get('min_samples_for_empirical_route',12)))
         )
         topo_rec = recommend_topology(

@@ -33,28 +33,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-# These capability tiers match the orchestrator's DEFAULT_PACKAGES
-# (orchestrator/scheduler.py) and the policy_overlay.json routing rules.
-# The bucketing is by (blended_cost, output_cost) percentile — cheapest
-# tier wins for cheap capabilities, priciest for premium.
-CAPABILITY_TIER_TARGET = {
-    "implementation_fast":  "cheapest",
-    "worker":               "cheapest",
-    "scout":                "cheapest",
-    "analysis_mid":         "mid",
-    "technical_lead":       "mid",
-    "implementation_strong":"mid",
-    "technical_review":     "mid",
-    "integration_review":   "mid",
-    "migration_review":     "mid",
-    "performance_review":   "mid",
-    "api_contract_review":  "mid",
-    "analysis_strong":      "expensive",
-    "architect":            "expensive",
-    "security_review":      "expensive",
-    "qa_agent":             "mid",
-    "lead":                 "mid",
-}
+from .method import adapter_tier_targets
+
+# Capability -> cost tier (cheapest|mid|expensive). Derived from the canonical
+# method file (orchestrator/method.json) so the Python resolver and the HT
+# bridge (models.ts) can never disagree on which tier a capability sits at.
+CAPABILITY_TIER_TARGET = adapter_tier_targets()
 
 # Cost-tier thresholds (USD per million output tokens). Models below fall in
 # the cheapest bucket, above into expensive, the rest into mid. Calibrated to

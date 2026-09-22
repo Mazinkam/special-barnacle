@@ -48,9 +48,11 @@ Route work using a package containing:
 
 Do not equate model strength with quality; evaluate the whole implementation + verification route.
 
-## Routing policy overlay
+## Routing policy
 
-The orchestrator maintains a routing policy overlay at `~/.local/state/coding-agent-orchestrator/policy_overlay.json`. The overlay is the source of truth for routing decisions that the orchestrator recommends and (eventually) enforces. Lead agents read the overlay before dispatching review or exploration work. The dashboard generator reads it to track compliance. Three rules govern routing; they were calibrated against the orchestrator's first 13 runs and validated against the metric stream.
+The routing method — capability vocabulary, cost tiers, default efforts, role aliases and the three routing rules below — is defined **once** in `orchestrator/method.json`. The Python engine (`orchestrator/method.py`) and the HT bridge (`bridge/extensions/orchestrator/models.ts`, via a symlink to the same file) both read it, so the two runtimes cannot drift. **Edit `method.json` to change the method; the tables below are a human summary and must match it** (`tests/test_method.py` checks the thresholds quoted here). Lead agents follow these rules when dispatching review or exploration work; the dashboard tracks compliance. The rules were calibrated against the orchestrator's first 13 runs and validated against the metric stream.
+
+Runtime state — measured ROI, enforcement readiness, history — lives in `~/.local/state/coding-agent-orchestrator/policy_overlay.json` and is not part of the method.
 
 ### Rule 1: Review after a fix uses at least the original reviewer's tier
 
@@ -196,6 +198,6 @@ The most recent calibrated numbers live in `policy_overlay.json` under `history.
 - auto merge/deploy: off
 - destructive operations: deny
 - dependency changes: ask
-- re-review minimum tier: sonnet (see Routing policy overlay)
+- re-review minimum tier: mid/sonnet (see Routing policy, `method.json` `rules.review_after_fix`)
 - pre-implementation recon: required at complexity ≥ 5
 - exploration cheapest sufficient: enforce via topology
