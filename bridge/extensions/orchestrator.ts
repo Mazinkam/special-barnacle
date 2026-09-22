@@ -34,7 +34,6 @@ import { join } from "node:path";
 // TypeBox 1.x: `Type` is a namespace (`Type.Object`, `Type.Array`, ...);
 // the validation function moved to a separate `typebox/value` module.
 import { Type } from "typebox";
-import { Check } from "typebox/value";
 
 import type {
 	ExtensionAPI,
@@ -261,22 +260,11 @@ async function triageTask(
 	// function), and the original wrapper was passing only one argument
 	// (which Assign never accepted, even in older typebox). Drop it and
 	// use the inner Type.Object literal directly.
-	const params = Type.Object({
-		tasks: Type.Array(
-			Type.Object({
-				agent: Type.String(),
-				task: Type.String(),
-				model: Type.Optional(Type.String()),
-				cwd: Type.Optional(Type.String()),
-			}),
-		),
-	});
-
 	const prompt = TRIAGE_PROMPT + "\n" + goal + "\n\nJSON:\n";
 	try {
 		const details = (await tool.execute(
 			`orchestrator-triage-${Date.now()}`,
-			Check(params, {
+			{
 				tasks: [
 					{
 						agent: "orch-implementation-fast",
@@ -285,7 +273,7 @@ async function triageTask(
 						cwd,
 					},
 				],
-			}),
+			},
 			undefined,
 			undefined,
 			ctx,
@@ -579,20 +567,9 @@ async function dispatchParallel(
 
 	// `Type.Assign` is a TS-only type helper in TypeBox 1.x — see the note
 	// in triageTask(). The inner Type.Object is the actual runtime schema.
-	const params = Type.Object({
-		tasks: Type.Array(
-			Type.Object({
-				agent: Type.String(),
-				task: Type.String(),
-				model: Type.Optional(Type.String()),
-				cwd: Type.Optional(Type.String()),
-			}),
-		),
-	});
-
 	const details = (await tool.execute(
 		`orchestrator-${runId}-${Date.now()}`,
-		Check(params, { tasks: taskInputs }),
+		{ tasks: taskInputs },
 		undefined,
 		undefined,
 		ctx,
@@ -608,26 +585,33 @@ async function dispatchParallel(
 	// Each `r` may also be sparse/nullish (HT has historically returned
 	// holes in cancellation paths), and the result array may have a
 	// different length than `taskInputs` if the harness reconciles mid-
-	// dispatch. Defend at every field access so the run always lands in
-	// metrics.jsonl instead of crashing the orchestrator.
-	return results.map((r, i, arr) => {
-		const input = taskInputs[i] ?? taskInputs[arr.length - 1] ?? taskInputs[0];
-		const rSafe = r ?? {};
-		const usage = rSafe.usage ?? {};
-		const stdout = extractAssistantText(rSafe);
-		return {
-			taskId: input?._taskId ?? `unknown-${runId}-${i}`,
-			capability: input?._capability ?? "unknown",
-			model: rSafe.model ?? input?.model ?? "unknown",
-			exitCode: rSafe.exitCode ?? -1,
-			stdout,
-			stderr: rSafe.stderr ?? "",
-			usage,
-			durationMs: 0,
-			costUsd: usage.cost ?? 0,
-			stopReason: rSafe.stopReason,
-			filesChanged: parseFilesChanged(stdout),
-		};
+	// dispatch. `.map()` on a sparse array skips the callback for holes
+	// AND returns a sparse array — `for (const r of leadResults)` then
+	// yields `undefined` for each hole, which captureDispatchCost turns
+	// into an all-"unknown" model_call. Use flatMap to drop sparse slots
+	// and out-of-range entries so the consumer only ever sees dense,
+	// index-aligned results.
+	return results.flatMap((r, i) => {
+		if (!r) return [];
+		const input = taskInputs[i];
+		if (!input) return [];
+		const usage = r.usage ?? {};
+		const stdout = extractAssistantText(r);
+		return [
+			{
+				taskId: input._taskId ?? `unknown-${runId}-${i}`,
+				capability: input._capability ?? "unknown",
+				model: r.model ?? input.model ?? "unknown",
+				exitCode: r.exitCode ?? -1,
+				stdout,
+				stderr: r.stderr ?? "",
+				usage,
+				durationMs: 0,
+				costUsd: usage.cost ?? 0,
+				stopReason: r.stopReason,
+				filesChanged: parseFilesChanged(stdout),
+			},
+		];
 	});
 }
 
