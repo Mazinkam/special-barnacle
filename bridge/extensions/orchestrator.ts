@@ -29,7 +29,9 @@
 
 import { spawn } from "node:child_process";
 import {
+	appendFileSync,
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
@@ -65,6 +67,46 @@ const STATE_ROOT =
 	process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT ??
 	"~/.local/state/coding-agent-orchestrator";
 const PYTHON = process.env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3";
+/**
+ * User model overrides. Documented in orchestrator-README.md since the first
+ * release but never actually read — every "use fable" request silently ran on
+ * whatever the cost-tier resolver picked. Shape (all keys optional):
+ *
+ *   {
+ *     "tiers": { "cheap": "provider/model", "mid": "...", "premium": "..." },
+ *     "capabilities": { "architect": { "model": "provider/model", "effort": "high" } }
+ *   }
+ *
+ * The legacy flat form `{ "architect": { "model": "..." } }` is still accepted.
+ * Precedence: CLI flags > capabilities > tiers > dynamic resolver > FALLBACK_ADAPTER.
+ */
+const ADAPTER_OVERRIDE_PATH =
+	process.env.HUMAIN_ORCHESTRATOR_ADAPTER_FILE ??
+	join(homedir(), ".humain-terminal", "agent", "orchestrator-adapter.json");
+
+/** Where per-run logs land: `<STATE_ROOT>/runs/<runId>/`. */
+function runsDir(): string {
+	return join(STATE_ROOT.replace(/^~/, homedir()), "runs");
+}
+
+/** Which cost tier each abstract capability sits at. Mirrors dynamic_adapter.py. */
+const TIER_CAPABILITIES: Record<"cheap" | "mid" | "premium", string[]> = {
+	cheap: ["implementation_fast", "worker", "scout"],
+	mid: [
+		"analysis_mid",
+		"technical_lead",
+		"implementation_strong",
+		"technical_review",
+		"integration_review",
+		"migration_review",
+		"performance_review",
+		"api_contract_review",
+		"qa_agent",
+		"lead",
+	],
+	premium: ["analysis_strong", "architect", "security_review"],
+};
+const ALL_CAPABILITIES = Object.values(TIER_CAPABILITIES).flat();
 
 // Non-interactive runs (`--mode json -p`, CI, smoke tests) get a no-op UI whose
 // `confirm()` always resolves false, so /orchestrate could never dispatch
@@ -81,8 +123,84 @@ function positiveIntEnv(name: string, fallback: number): number {
 const MAX_CONCURRENT_DISPATCHES = positiveIntEnv("HUMAIN_ORCHESTRATOR_MAX_CONCURRENCY", 4);
 /** Hard ceiling on lead fan-out, so a malformed topology can't spawn unbounded leads. */
 const MAX_LEADS = positiveIntEnv("HUMAIN_ORCHESTRATOR_MAX_LEADS", 8);
-/** Per-dispatch wall clock. A hung child fails its own task instead of the run. */
+/** Per-dispatch wall clock for a LEAF dispatch that does its own work directly. */
 const DISPATCH_TIMEOUT_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS", 20 * 60 * 1000);
+
+/**
+ * Capabilities that fan out their own subagents instead of doing the work
+ * themselves. Their wall clock must exceed the sum of the children they wait on,
+ * so they get a separate, larger budget: a lead that dispatches three reviewers
+ * was being killed at the leaf timeout while its children were still running.
+ */
+const ORCHESTRATING_CAPABILITIES = new Set(["lead", "architect", "technical_lead"]);
+const LEAD_DISPATCH_TIMEOUT_MS = positiveIntEnv(
+	"HUMAIN_ORCHESTRATOR_LEAD_TIMEOUT_MS",
+	Math.max(90 * 60 * 1000, DISPATCH_TIMEOUT_MS * 4),
+);
+
+function dispatchTimeoutFor(capability: string | undefined): number {
+	return capability && ORCHESTRATING_CAPABILITIES.has(capability)
+		? LEAD_DISPATCH_TIMEOUT_MS
+		: DISPATCH_TIMEOUT_MS;
+}
+
+/**
+ * PIDs of dispatched children that are still running. Children are spawned
+ * `detached` (own process group) so a timeout can kill their whole subtree; the
+ * flip side is that they would outlive a killed parent, so the parent reaps them
+ * on the way out.
+ */
+const liveDispatchPids = new Set<number>();
+
+/**
+ * Kill a dispatched child AND everything it spawned.
+ *
+ * `kill(-pid)` targets the child's process group, which exists because we spawn
+ * detached. Killing the bare pid instead leaves a dispatched lead's own
+ * subagents running as orphans - unreadable, unbilled, and still burning provider
+ * quota. Falls back to the direct pid when the group is already gone.
+ */
+function killProcessTree(proc: { pid?: number; kill: (signal?: NodeJS.Signals) => boolean }): void {
+	if (typeof proc.pid === "number") {
+		try {
+			process.kill(-proc.pid, "SIGKILL");
+			return;
+		} catch {
+			/* no such group: already reaped, or never became a group leader */
+		}
+	}
+	try {
+		proc.kill("SIGKILL");
+	} catch {
+		/* already gone */
+	}
+}
+
+let dispatchReaperInstalled = false;
+
+/** Kill every in-flight dispatch subtree when this process goes down. */
+function installDispatchReaper(): void {
+	if (dispatchReaperInstalled) return;
+	dispatchReaperInstalled = true;
+	const reap = () => {
+		for (const pid of liveDispatchPids) {
+			try {
+				process.kill(-pid, "SIGKILL");
+			} catch {
+				/* already gone */
+			}
+		}
+		liveDispatchPids.clear();
+	};
+	process.once("exit", reap);
+	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+		// `once` + re-raise keeps HT's own handlers intact: we only add cleanup,
+		// we don't change whether the parent exits.
+		process.once(signal, () => {
+			reap();
+		});
+	}
+}
 
 const PERSONA_TMP_PREFIX = "orch-agent-";
 /**
@@ -147,10 +265,20 @@ async function confirmStep(
 	ctx: ExtensionContext,
 	title: string,
 	message: string,
+	assumeYes = false,
 ): Promise<boolean> {
-	if (ASSUME_YES) {
-		ctx.ui.notify(`${title} — auto-confirmed (HUMAIN_ORCHESTRATOR_ASSUME_YES)`, "warning");
+	if (ASSUME_YES || assumeYes) {
+		ctx.ui.notify(
+			`${title} — auto-confirmed (${assumeYes ? "--yes" : "HUMAIN_ORCHESTRATOR_ASSUME_YES"})`,
+			"warning",
+		);
 		return true;
+	}
+	if (!ctx.hasUI) {
+		// A headless session has no dialog to answer; refuse rather than hang
+		// or silently spend money.
+		ctx.ui.notify(`${title}: no UI to confirm — pass --yes or set HUMAIN_ORCHESTRATOR_ASSUME_YES=1`, "error");
+		return false;
 	}
 	return ctx.ui.confirm(title, message);
 }
@@ -192,7 +320,26 @@ const RULE_REVIEW_AFTER_FIX_MIN_TIER = "sonnet";
 
 type Adapter = Record<string, { model: string; effort?: string }>;
 
-async function loadAdapter(): Promise<Adapter> {
+/** Where each capability's binding came from, for the plan summary + logs. */
+type AdapterSource = "cli" | "file:capability" | "file:tier" | "dynamic" | "fallback";
+
+interface ResolvedAdapter {
+	adapter: Adapter;
+	sources: Record<string, AdapterSource>;
+	warnings: string[];
+}
+
+/** Per-tier / per-capability overrides parsed from the CLI or the override file. */
+interface ModelOverrides {
+	tiers: Partial<Record<"cheap" | "mid" | "premium", string>>;
+	capabilities: Record<string, { model: string; effort?: string }>;
+}
+
+function emptyOverrides(): ModelOverrides {
+	return { tiers: {}, capabilities: {} };
+}
+
+async function loadDynamicAdapter(): Promise<{ adapter: Adapter; source: AdapterSource; warning?: string }> {
 	try {
 		const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
 		const child = spawn(
@@ -215,8 +362,11 @@ async function loadAdapter(): Promise<Adapter> {
 			child.on("close", (code) => resolve(code ?? -1)),
 		);
 		if (exitCode !== 0) {
-			console.warn(`[orchestrator] resolve-adapter failed (exit ${exitCode}): ${stderr}`);
-			return FALLBACK_ADAPTER;
+			return {
+				adapter: FALLBACK_ADAPTER,
+				source: "fallback",
+				warning: `resolve-adapter failed (exit ${exitCode}): ${stderr.trim().slice(0, 300)}`,
+			};
 		}
 		// The CLI emits a single JSON object on stdout (pretty-printed across
 		// many lines). Parse the whole thing, not just the last line.
@@ -227,17 +377,194 @@ async function loadAdapter(): Promise<Adapter> {
 			if (!info.provider || !info.model) continue;
 			out[cap] = { model: `${info.provider}/${info.model}` };
 		}
-		return Object.keys(out).length > 0 ? out : FALLBACK_ADAPTER;
+		if (Object.keys(out).length === 0) {
+			return { adapter: FALLBACK_ADAPTER, source: "fallback", warning: "resolve-adapter returned no bindings" };
+		}
+		return { adapter: out, source: "dynamic" };
 	} catch (err) {
-		console.warn(`[orchestrator] resolve-adapter error: ${(err as Error).message}`);
-		return FALLBACK_ADAPTER;
+		return {
+			adapter: FALLBACK_ADAPTER,
+			source: "fallback",
+			warning: `resolve-adapter error: ${(err as Error).message}`,
+		};
 	}
 }
 
-let ADAPTER: Promise<Adapter> | null = null;
-function adapter(): Promise<Adapter> {
-	if (!ADAPTER) ADAPTER = loadAdapter();
-	return ADAPTER;
+/**
+ * Read `orchestrator-adapter.json`. Returns empty overrides when the file is
+ * absent; malformed content is reported, not swallowed, because a typo here is
+ * exactly the case where the user believes fable is running and it is not.
+ */
+function loadOverrideFile(): { overrides: ModelOverrides; warning?: string } {
+	if (!existsSync(ADAPTER_OVERRIDE_PATH)) return { overrides: emptyOverrides() };
+	try {
+		const raw = JSON.parse(readFileSync(ADAPTER_OVERRIDE_PATH, "utf-8")) as Record<string, unknown>;
+		const out = emptyOverrides();
+		const tiers = raw.tiers;
+		if (tiers && typeof tiers === "object") {
+			for (const tier of ["cheap", "mid", "premium"] as const) {
+				const v = (tiers as Record<string, unknown>)[tier];
+				if (typeof v === "string" && v.trim()) out.tiers[tier] = v.trim();
+			}
+		}
+		const caps =
+			raw.capabilities && typeof raw.capabilities === "object"
+				? (raw.capabilities as Record<string, unknown>)
+				: raw; // legacy flat form
+		const unknown: string[] = [];
+		for (const [cap, v] of Object.entries(caps)) {
+			if (cap === "tiers" || cap === "capabilities" || cap.startsWith("$") || cap.startsWith("_")) continue;
+			if (!v || typeof v !== "object") continue;
+			const model = (v as { model?: unknown }).model;
+			if (typeof model !== "string" || !model.trim()) continue;
+			if (!ALL_CAPABILITIES.includes(cap)) {
+				unknown.push(cap);
+				continue;
+			}
+			const effort = (v as { effort?: unknown }).effort;
+			out.capabilities[cap] = {
+				model: model.trim(),
+				...(typeof effort === "string" && effort.trim() ? { effort: effort.trim() } : {}),
+			};
+		}
+		return {
+			overrides: out,
+			warning:
+				unknown.length > 0
+					? `${ADAPTER_OVERRIDE_PATH}: unknown capabilities ignored: ${unknown.join(", ")} (valid: ${ALL_CAPABILITIES.join(", ")})`
+					: undefined,
+		};
+	} catch (err) {
+		return {
+			overrides: emptyOverrides(),
+			warning: `${ADAPTER_OVERRIDE_PATH} could not be parsed and was ignored: ${(err as Error).message}`,
+		};
+	}
+}
+
+/**
+ * Canonicalize `provider/pattern` to the exact `provider/id` HT will run.
+ *
+ * Children are spawned with `--provider X --model <pattern>`, and HT's CLI
+ * resolver fuzzy-matches the pattern (`claude-sonnet-5` matches both
+ * `eu.anthropic.claude-sonnet-5` and `global.anthropic.claude-sonnet-5`).
+ * Resolving here, once, means the plan summary shows the model that will
+ * actually run and a typo fails before any money is spent. Matching rules
+ * mirror model-resolver.ts: exact `provider/id`, then exact id, then
+ * substring on id/name preferring undated aliases sorted highest.
+ */
+function canonicalizeModel(
+	spec: string,
+	ctx: ExtensionContext,
+): { model: string; error?: string } {
+	let available: { provider: string; id: string; name?: string }[] = [];
+	try {
+		available = ctx.modelRegistry.getAvailable();
+	} catch {
+		return { model: spec }; // registry unavailable (tests) — pass through
+	}
+	if (available.length === 0) return { model: spec };
+
+	const slash = spec.indexOf("/");
+	if (slash === -1) {
+		return {
+			model: spec,
+			error: `"${spec}" must be "provider/model" (providers: ${[...new Set(available.map((m) => m.provider))].join(", ")})`,
+		};
+	}
+	const providerRaw = spec.slice(0, slash);
+	const pattern = spec.slice(slash + 1);
+	const provider = available.find((m) => m.provider.toLowerCase() === providerRaw.toLowerCase())?.provider;
+	if (!provider) {
+		return {
+			model: spec,
+			error: `unknown provider "${providerRaw}" in "${spec}" (providers: ${[...new Set(available.map((m) => m.provider))].join(", ")})`,
+		};
+	}
+	const candidates = available.filter((m) => m.provider === provider);
+	const lower = pattern.toLowerCase();
+	const exact = candidates.find((m) => m.id.toLowerCase() === lower);
+	if (exact) return { model: `${provider}/${exact.id}` };
+	const partial = candidates.filter(
+		(m) => m.id.toLowerCase().includes(lower) || (m.name ?? "").toLowerCase().includes(lower),
+	);
+	if (partial.length === 0) {
+		return { model: spec, error: `no model matching "${pattern}" under provider "${provider}"` };
+	}
+	const isAlias = (id: string) => !/\d{8}/.test(id);
+	const aliases = partial.filter((m) => isAlias(m.id)).sort((a, b) => b.id.localeCompare(a.id));
+	const dated = partial.filter((m) => !isAlias(m.id)).sort((a, b) => b.id.localeCompare(a.id));
+	const pick = aliases[0] ?? dated[0];
+	return { model: `${provider}/${pick.id}` };
+}
+
+/**
+ * Build the capability -> model table for this run. Every binding is
+ * canonicalized; an invalid override is a hard error surfaced to the caller
+ * (via `warnings`) and falls back to the next precedence level instead of
+ * dispatching something the user did not ask for.
+ */
+async function resolveAdapter(
+	ctx: ExtensionContext,
+	cliOverrides: ModelOverrides = emptyOverrides(),
+): Promise<ResolvedAdapter> {
+	const warnings: string[] = [];
+	const dynamic = await loadDynamicAdapter();
+	if (dynamic.warning) warnings.push(dynamic.warning);
+	const file = loadOverrideFile();
+	if (file.warning) warnings.push(file.warning);
+
+	const adapter: Adapter = {};
+	const sources: Record<string, AdapterSource> = {};
+
+	const tierOf = (cap: string): "cheap" | "mid" | "premium" | undefined =>
+		(Object.keys(TIER_CAPABILITIES) as Array<"cheap" | "mid" | "premium">).find((t) =>
+			TIER_CAPABILITIES[t].includes(cap),
+		);
+
+	const caps = new Set<string>([...ALL_CAPABILITIES, ...Object.keys(dynamic.adapter)]);
+	for (const cap of caps) {
+		const tier = tierOf(cap);
+		// Ordered candidates, highest precedence first.
+		const candidates: Array<{ binding: { model: string; effort?: string }; source: AdapterSource }> = [];
+		if (cliOverrides.capabilities[cap]) candidates.push({ binding: cliOverrides.capabilities[cap], source: "cli" });
+		if (tier && cliOverrides.tiers[tier]) candidates.push({ binding: { model: cliOverrides.tiers[tier]! }, source: "cli" });
+		if (file.overrides.capabilities[cap]) candidates.push({ binding: file.overrides.capabilities[cap], source: "file:capability" });
+		if (tier && file.overrides.tiers[tier]) candidates.push({ binding: { model: file.overrides.tiers[tier]! }, source: "file:tier" });
+		if (dynamic.adapter[cap]) candidates.push({ binding: dynamic.adapter[cap], source: dynamic.source });
+		if (FALLBACK_ADAPTER[cap]) candidates.push({ binding: FALLBACK_ADAPTER[cap], source: "fallback" });
+
+		for (const c of candidates) {
+			const canon = canonicalizeModel(c.binding.model, ctx);
+			if (canon.error) {
+				warnings.push(`${cap} (${c.source}): ${canon.error} — falling back`);
+				continue;
+			}
+			adapter[cap] = { model: canon.model, ...(c.binding.effort ? { effort: c.binding.effort } : {}) };
+			sources[cap] = c.source;
+			break;
+		}
+	}
+	return { adapter, sources, warnings };
+}
+
+/** Human-readable capability -> model table grouped by tier. */
+function formatAdapterTable(resolved: ResolvedAdapter): string[] {
+	const lines: string[] = [];
+	for (const tier of ["premium", "mid", "cheap"] as const) {
+		const byModel = new Map<string, string[]>();
+		for (const cap of TIER_CAPABILITIES[tier]) {
+			const b = resolved.adapter[cap];
+			if (!b) continue;
+			const key = `${b.model}${b.effort ? ` @${b.effort}` : ""} [${resolved.sources[cap]}]`;
+			byModel.set(key, [...(byModel.get(key) ?? []), cap]);
+		}
+		for (const [key, caps] of byModel) {
+			lines.push(`${tier.padEnd(7)} ${key}`);
+			lines.push(`        └ ${caps.join(", ")}`);
+		}
+	}
+	return lines;
 }
 
 // -----------------------------------------------------------------------------
@@ -398,6 +725,225 @@ function orchCliInvocation(extraArgs: string[]): { command: string; args: string
 	return { command: "humain-terminal", args: extraArgs };
 }
 
+// -----------------------------------------------------------------------------
+// Run session: live progress board + per-run log files
+// -----------------------------------------------------------------------------
+
+interface DispatchProgress {
+	taskId: string;
+	label: string;
+	model: string;
+	startedAt: number;
+	endedAt?: number;
+	turns: number;
+	toolCalls: number;
+	lastActivity: string;
+	costUsd: number;
+	status: "running" | "done" | "failed";
+}
+
+function fmtElapsed(ms: number): string {
+	const s = Math.max(0, Math.round(ms / 1000));
+	return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+}
+
+function shortArgs(toolName: string, args: unknown): string {
+	if (!args || typeof args !== "object") return "";
+	const a = args as Record<string, unknown>;
+	const pick =
+		(typeof a.command === "string" && a.command) ||
+		(typeof a.path === "string" && a.path) ||
+		(typeof a.pattern === "string" && a.pattern) ||
+		(typeof a.agent === "string" && `agent=${a.agent}`) ||
+		(Array.isArray(a.tasks) && `${a.tasks.length} tasks`) ||
+		(typeof a.task === "string" && a.task) ||
+		"";
+	const s = String(pick).replace(/\s+/g, " ").trim();
+	return s.length > 48 ? `${s.slice(0, 45)}…` : s;
+}
+
+/**
+ * One /orchestrate invocation. Owns the widget/status lines the user sees while
+ * children run, and the on-disk log under `<STATE_ROOT>/runs/<runId>/`:
+ *
+ *   run.log                     human-readable timeline (phases, dispatches, verdicts)
+ *   <taskId>.prompt.md          exact task prompt sent to the child
+ *   <taskId>.events.jsonl       the child's raw --mode json stream
+ *   <taskId>.stderr.log         the child's stderr
+ *
+ * Before this, the only trace of a run was the aggregate metrics row, so a
+ * 20-minute silent dispatch could not be inspected while it ran or after.
+ */
+class RunSession {
+	readonly dir: string;
+	private readonly dispatches = new Map<string, DispatchProgress>();
+	private phase = "starting";
+	private renderTimer: ReturnType<typeof setTimeout> | undefined;
+	private readonly startedAt = Date.now();
+	private tickTimer: ReturnType<typeof setInterval> | undefined;
+	private closed = false;
+
+	constructor(
+		readonly runId: string,
+		readonly ctx: ExtensionContext,
+		readonly goal: string,
+	) {
+		this.dir = join(runsDir(), runId);
+		try {
+			mkdirSync(this.dir, { recursive: true });
+		} catch (err) {
+			console.warn(`[orchestrator] could not create run dir ${this.dir}: ${(err as Error).message}`);
+		}
+		this.log(`run ${runId} started`);
+		this.log(`goal: ${goal}`);
+		// Elapsed counters must tick even when a child is silent — a frozen board
+		// is indistinguishable from a hung run, which is the complaint that led here.
+		this.tickTimer = setInterval(() => this.render(), 1000);
+	}
+
+	file(name: string): string {
+		return join(this.dir, name);
+	}
+
+	log(line: string): void {
+		const stamped = `${new Date().toISOString()} ${line}`;
+		try {
+			appendFileSync(this.file("run.log"), `${stamped}\n`);
+		} catch {
+			/* log dir unavailable; the UI still gets the line */
+		}
+	}
+
+	setPhase(phase: string, notify = true): void {
+		this.phase = phase;
+		this.log(`phase: ${phase}`);
+		if (notify) this.ctx.ui.notify(`[${fmtElapsed(Date.now() - this.startedAt)}] ${phase}`, "info");
+		this.render();
+	}
+
+	startDispatch(taskId: string, label: string, model: string): void {
+		this.dispatches.set(taskId, {
+			taskId,
+			label,
+			model,
+			startedAt: Date.now(),
+			turns: 0,
+			toolCalls: 0,
+			lastActivity: "starting",
+			costUsd: 0,
+			status: "running",
+		});
+		this.log(`dispatch ${taskId} → ${label} on ${model}`);
+		this.render();
+	}
+
+	/** Feed a parsed `--mode json` event from a child. */
+	onChildEvent(taskId: string, event: any): void {
+		const d = this.dispatches.get(taskId);
+		if (!d) return;
+		switch (event?.type) {
+			case "tool_execution_start": {
+				d.toolCalls += 1;
+				const detail = shortArgs(event.toolName, event.args);
+				d.lastActivity = `${event.toolName}${detail ? ` ${detail}` : ""}`;
+				this.log(`  ${taskId} tool#${d.toolCalls} ${d.lastActivity}`);
+				break;
+			}
+			case "tool_execution_end":
+				if (event.isError) {
+					d.lastActivity = `${event.toolName} ✗`;
+					this.log(`  ${taskId} tool ${event.toolName} returned error`);
+				}
+				break;
+			case "message_start":
+				if (event.message?.role === "assistant") d.lastActivity = "thinking";
+				break;
+			case "message_end":
+				if (event.message?.role === "assistant") {
+					d.turns += 1;
+					d.costUsd += event.message?.usage?.cost?.total || 0;
+					d.lastActivity = `turn ${d.turns} done`;
+				}
+				break;
+			default:
+				return;
+		}
+		this.scheduleRender();
+	}
+
+	endDispatch(taskId: string, exitCode: number, costUsd: number, note?: string): void {
+		const d = this.dispatches.get(taskId);
+		if (!d) return;
+		d.endedAt = Date.now();
+		d.status = exitCode === 0 ? "done" : "failed";
+		d.costUsd = costUsd || d.costUsd;
+		d.lastActivity = note ?? (exitCode === 0 ? "finished" : `exit ${exitCode}`);
+		this.log(
+			`dispatch ${taskId} ${d.status} in ${fmtElapsed(d.endedAt - d.startedAt)} — ${d.turns} turns, ${d.toolCalls} tool calls, $${d.costUsd.toFixed(4)}${note ? ` — ${note}` : ""}`,
+		);
+		this.render();
+	}
+
+	totalCost(): number {
+		let c = 0;
+		for (const d of this.dispatches.values()) c += d.costUsd;
+		return c;
+	}
+
+	private scheduleRender(): void {
+		if (this.renderTimer) return;
+		this.renderTimer = setTimeout(() => {
+			this.renderTimer = undefined;
+			this.render();
+		}, 250);
+	}
+
+	render(): void {
+		if (this.closed) return;
+		const running = [...this.dispatches.values()].filter((d) => d.status === "running");
+		const done = [...this.dispatches.values()].filter((d) => d.status !== "running");
+		const elapsed = fmtElapsed(Date.now() - this.startedAt);
+		this.ctx.ui.setStatus(
+			"orchestrator",
+			`orch ${elapsed} · ${this.phase} · ${running.length} running · $${this.totalCost().toFixed(3)}`,
+		);
+		const lines: string[] = [
+			`▶ /orchestrate ${elapsed} — ${this.phase} — $${this.totalCost().toFixed(4)} — log: ${this.file("run.log")}`,
+		];
+		for (const d of running) {
+			lines.push(
+				`  ● ${d.label.padEnd(22)} ${modelShort(d.model).padEnd(28)} ${fmtElapsed(Date.now() - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  ${d.lastActivity}`,
+			);
+		}
+		for (const d of done.slice(-4)) {
+			const mark = d.status === "done" ? "✓" : "✗";
+			lines.push(
+				`  ${mark} ${d.label.padEnd(22)} ${modelShort(d.model).padEnd(28)} ${fmtElapsed((d.endedAt ?? Date.now()) - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  $${d.costUsd.toFixed(4)} ${d.lastActivity}`,
+			);
+		}
+		if (done.length > 4) lines.push(`  … ${done.length - 4} earlier dispatch(es) in run.log`);
+		this.ctx.ui.setWidget("orchestrator", lines);
+	}
+
+	close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		if (this.tickTimer) clearInterval(this.tickTimer);
+		if (this.renderTimer) clearTimeout(this.renderTimer);
+		this.ctx.ui.setWidget("orchestrator", undefined);
+		this.ctx.ui.setStatus("orchestrator", undefined);
+		this.log(`run ${this.runId} closed after ${fmtElapsed(Date.now() - this.startedAt)}`);
+	}
+}
+
+function modelShort(model: string): string {
+	const id = model.includes("/") ? model.slice(model.indexOf("/") + 1) : model;
+	return id.replace(/^(global|eu|us)\.anthropic\./, "").replace(/-\d{8}.*$/, "");
+}
+
+/** The run currently owning the UI. Only one /orchestrate may be live per session. */
+let ACTIVE_RUN: RunSession | null = null;
+
 /**
  * Spawn Pi as a one-shot subagent and parse its JSON event stream for the
  * assistant `message_end`, which carries `model`, `usage`, and `cost.total`.
@@ -413,11 +959,30 @@ async function runSubagentProcess(opts: {
 	effort?: string;
 	tools?: string[];
 	ctx: ExtensionContext;
+	/** Stable id used for the progress board and log file names. */
+	taskId?: string;
+	/** Short human label for the progress board (defaults to agentName). */
+	label?: string;
+	/** Selects the wall clock: orchestrating capabilities wait on their own children. */
+	capability?: string;
 }): Promise<SubagentProcessResult> {
 	const emptyUsage: SubagentUsageStats = {
 		input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
 		cost: 0, contextTokens: 0, turns: 0,
 	};
+	const session = ACTIVE_RUN;
+	const taskId = opts.taskId ?? `${opts.agentName}-${Date.now()}`;
+	const safeTaskId = taskId.replace(/[^a-zA-Z0-9._-]+/g, "_");
+	const eventsLog = session ? session.file(`${safeTaskId}.events.jsonl`) : undefined;
+	const stderrLog = session ? session.file(`${safeTaskId}.stderr.log`) : undefined;
+	if (session) {
+		try {
+			writeFileSync(session.file(`${safeTaskId}.prompt.md`), opts.task);
+		} catch {
+			/* best-effort */
+		}
+		session.startDispatch(taskId, opts.label ?? opts.agentName, opts.model);
+	}
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 
@@ -513,7 +1078,21 @@ async function runSubagentProcess(opts: {
 			if (settled) return;
 			settled = true;
 			if (timeoutTimer) clearTimeout(timeoutTimer);
+			if (typeof proc?.pid === "number") liveDispatchPids.delete(proc.pid);
 			cleanupPrompt();
+			if (stderrLog && stderr.trim()) {
+				try {
+					writeFileSync(stderrLog, stderr);
+				} catch {
+					/* best-effort */
+				}
+			}
+			session?.endDispatch(
+				taskId,
+				exitCode,
+				usage.cost,
+				exitCode === 0 ? undefined : (stderr.trim().split("\n").pop() ?? "").slice(0, 80),
+			);
 			resolve({
 				exitCode,
 				stdout: assistantTexts.join("\n\n"),
@@ -562,6 +1141,7 @@ async function runSubagentProcess(opts: {
 			} catch {
 				return;
 			}
+			session?.onChildEvent(taskId, event);
 			// `message_end` is the authoritative per-turn record. `turn_end` and
 			// `agent_end` repeat the same assistant messages, so ignoring them
 			// keeps usage from being double-counted.
@@ -574,13 +1154,21 @@ async function runSubagentProcess(opts: {
 		// opposed to ENOENT, which arrives as an async 'error' event). Without this
 		// guard the throw escapes before any listener exists, so finish() never
 		// runs and the persona prompt temp dir leaks.
-		let proc: ReturnType<typeof spawn>;
+		// Optional so `finish()` can run from the synchronous-spawn-throw path,
+		// where no child was ever created.
+		let proc: ReturnType<typeof spawn> | undefined;
 		try {
 			proc = spawn(invocation.command, invocation.args, {
 				cwd: opts.cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 				env,
+				// Make the child a process-group leader so a timeout can kill the
+				// whole tree. A dispatched lead spawns its own subagents, and
+				// SIGKILL on the direct pid alone leaves those grandchildren
+				// orphaned, still running, and still billing with nothing reading
+				// their output. We never unref(), so we still await this child.
+				detached: true,
 			});
 		} catch (err) {
 			stderr += `\n[orchestrator] spawn threw: ${(err as Error).message}`;
@@ -588,22 +1176,31 @@ async function runSubagentProcess(opts: {
 			return;
 		}
 
-		// A stalled child would otherwise block its whole Promise.all batch
-		// forever, freezing the run instead of failing just that task.
+		if (typeof proc.pid === "number") liveDispatchPids.add(proc.pid);
+
+		// A stalled child would otherwise block its whole batch forever, freezing
+		// the run instead of failing just that task. Leads that fan out their own
+		// subagents get a larger budget than leaf workers.
+		const timeoutMs = dispatchTimeoutFor(opts.capability);
 		timeoutTimer = setTimeout(() => {
 			if (settled) return;
-			stderr += `\n[orchestrator] dispatch timed out after ${DISPATCH_TIMEOUT_MS}ms; killing child`;
-			try {
-				proc.kill("SIGKILL");
-			} catch {
-				/* already gone */
-			}
+			stderr +=
+				`\n[orchestrator] dispatch timed out after ${Math.round(timeoutMs / 60000)}min ` +
+				`(capability=${opts.capability ?? "unknown"}); killing process group`;
+			if (proc) killProcessTree(proc);
 			finish(124);
-		}, DISPATCH_TIMEOUT_MS);
+		}, timeoutMs);
 
 		proc.stdout?.on("data", (data) => {
 			const chunk = data.toString();
 			rawStdout += chunk;
+			if (eventsLog) {
+				try {
+					appendFileSync(eventsLog, chunk);
+				} catch {
+					/* best-effort */
+				}
+			}
 			buffer += chunk;
 			const lines = buffer.split("\n");
 			buffer = lines.pop() || "";
@@ -638,8 +1235,8 @@ async function triageTask(
 	cwd: string,
 	ctx: ExtensionContext,
 	costSink: { usd: number },
+	adapter: Adapter,
 ): Promise<TriageResult | null> {
-	const adapter = await adapter_();
 	const cheapest =
 		adapter["implementation_fast"] ??
 		adapter["worker"] ??
@@ -658,6 +1255,8 @@ async function triageTask(
 			task: prompt,
 			model: cheapest.model,
 			ctx,
+			taskId: "triage",
+			label: "triage",
 		});
 		costSink.usd += r?.costUsd ?? 0;
 		if (!r || r.exitCode !== 0) {
@@ -762,11 +1361,6 @@ function slugGoal(goal: string): string {
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-+|-+$/g, "")
 		.slice(0, 40) || "untitled";
-}
-
-// Accessor used by triageTask — same singleton as `adapter()`.
-async function adapter_(): Promise<Adapter> {
-	return adapter();
 }
 
 // -----------------------------------------------------------------------------
@@ -894,6 +1488,13 @@ async function planRun(runId: string, opts: PlanOptions): Promise<PlanResponse> 
 	return JSON.parse(res.stdout.trim());
 }
 
+async function recordEvent(event: string, payload: Record<string, unknown>): Promise<void> {
+	const res = await runModule("orchestrator.cli", ["event", event, JSON.stringify(payload)]);
+	if (res.exitCode !== 0) {
+		console.warn(`[orchestrator] event write failed: ${res.stderr}`);
+	}
+}
+
 async function recordModelCall(metric: Record<string, unknown>): Promise<void> {
 	const res = await runModule("orchestrator.cli", ["metric", JSON.stringify(metric)]);
 	if (res.exitCode !== 0) {
@@ -976,7 +1577,7 @@ async function dispatchParallel(
 			{ model: "unknown" };
 		return {
 			agent: agentNameFor(t.capability),
-			task: formatTaskPrompt(t),
+			task: formatTaskPrompt(t, runId),
 			model: binding.model ?? "unknown",
 			effort: binding.effort,
 			cwd,
@@ -994,6 +1595,18 @@ async function dispatchParallel(
 	// subprocess that writes JSON events to stdout; runSubagentProcess
 	// parses the assistant `message_end` for model + usage + cost.
 	const settled = await mapWithConcurrency(taskInputs, MAX_CONCURRENT_DISPATCHES, async (input) => {
+		// `a || b ?? c` is a SyntaxError — mixing || and ?? needs explicit parens.
+		// Left unparenthesised this failed to load the whole extension.
+		const shortId =
+			(input._taskId ?? "").replace(`${runId}-`, "") || input._capability || "task";
+		await recordEvent("dispatch_started", {
+			run_id: runId,
+			task_id: input._taskId,
+			capability: input._capability,
+			agent: input.agent,
+			model: input.model,
+			retry_of: input._retryOf,
+		});
 		try {
 			const r = await runSubagentProcess({
 				cwd: input.cwd,
@@ -1001,11 +1614,26 @@ async function dispatchParallel(
 				task: input.task,
 				model: input.model,
 				effort: input.effort,
+				taskId: input._taskId,
+				label: shortId,
+				capability: input._capability,
 				// Deliberately no `tools` override: each orch-* persona declares its
 				// own allow-list in frontmatter, and those lists encode policy
 				// (reviewers and scouts are read-only). Hardcoding a set here both
 				// granted reviewers write access and dropped tools the personas need.
 				ctx,
+			});
+			await recordEvent("dispatch_finished", {
+				run_id: runId,
+				task_id: input._taskId,
+				capability: input._capability,
+				model: r.model ?? input.model,
+				exit_code: r.exitCode,
+				duration_ms: r.durationMs,
+				cost_usd: r.costUsd,
+				turns: r.usage.turns,
+				stop_reason: r.stopReason,
+				log_dir: ACTIVE_RUN?.dir,
 			});
 			return {
 				taskId: input._taskId ?? `unknown-${runId}`,
@@ -1070,12 +1698,12 @@ function agentNameFor(capability: string): string {
 	return CAPABILITY_AGENT_ALIASES[capability] ?? `orch-${capability.replace(/_/g, "-")}`;
 }
 
-function formatTaskPrompt(t: DispatchTask): string {
+function formatTaskPrompt(t: DispatchTask, runId: string): string {
 	const retryNote = t.retryOf
 		? `\n\n[Retry context: this is retry #${(t.retryCount ?? 0) + 1} of a previous failed attempt on task_id=${t.retryOf}. The previous attempt's review/QA feedback is captured in the orchestrator ledger; if you need that context, ask the lead before starting. Per policy_overlay.json Rule 1: minimum sonnet tier for any re-review.]`
 		: "";
 	return [
-		`[orchestrator:run_id=${t.taskId.split("-")[0]}]`,
+		`[orchestrator:run_id=${runId}]`,
 		`[capability=${t.capability}]`,
 		`[task_id=${t.taskId}]`,
 		"",
@@ -1499,6 +2127,9 @@ async function dispatchHierarchical(
 	let architectResult: DispatchResult | undefined;
 	const needsArchitect = depth >= 2 && complexityNeedsArchitect(plan.complexity);
 	if (needsArchitect) {
+		ACTIVE_RUN?.setPhase(
+			`architect planning on ${modelShort(adapter.architect?.model ?? "?")} (complexity ${plan.complexity} ≥ 5)`,
+		);
 		[architectResult] = await dispatchParallel(
 			cwd,
 			runId,
@@ -1527,6 +2158,10 @@ async function dispatchHierarchical(
 				}\nLeads will run without an architect plan.`,
 				"warning",
 			);
+		} else if (architectResult) {
+			ACTIVE_RUN?.setPhase(
+				`architect done in ${fmtElapsed(architectResult.durationMs)} ($${architectResult.costUsd.toFixed(4)}) — ${architectResult.stdout.split("\n").filter((l) => /^\s*\d+[.)]/.test(l)).length} tasks planned`,
+			);
 		}
 	}
 
@@ -1539,10 +2174,13 @@ async function dispatchHierarchical(
 		: 1;
 	const leadTasks: DispatchTask[] = Array.from({ length: leadCount }, (_, i) => ({
 		capability: "lead",
-		task: leadPrompt(goal, plan, architectResult, i, leadCount),
+		task: leadPrompt(goal, plan, architectResult, i, leadCount, adapter),
 		taskId: `${runId}-lead-${i}`,
 	}));
 
+	ACTIVE_RUN?.setPhase(
+		`${leadCount} lead(s) executing on ${modelShort(adapter.lead?.model ?? "?")} — workers fan out inside each lead`,
+	);
 	const leadResults = await dispatchParallel(cwd, runId, leadTasks, adapter, ctx);
 	for (const r of leadResults) {
 		await captureDispatchCost(
@@ -1588,12 +2226,36 @@ function architectPrompt(goal: string, plan: PlanResponse): string {
 	].join("\n");
 }
 
+/**
+ * The model table the lead must forward to HT's `subagent` tool. The subagent
+ * tool ignores the `model:` frontmatter in the orch-* persona files and runs
+ * every child on the PARENT's model unless the call passes `model` explicitly —
+ * so without this block every "haiku worker" silently ran on the lead's sonnet.
+ */
+function modelTableForLead(adapter: Adapter): string[] {
+	const row = (agent: string, cap: string) =>
+		`- ${agent}: model "${adapter[cap]?.model ?? adapter.worker?.model ?? "unknown"}"`;
+	return [
+		"Model routing (REQUIRED): every `subagent` call MUST pass the `model` field below for the agent it dispatches. The subagent tool does not read the agent's frontmatter; omitting `model` runs the child on your own model and breaks the cost policy.",
+		row("orch-scout", "scout"),
+		row("orch-worker", "worker"),
+		row("orch-implementation-fast", "implementation_fast"),
+		row("orch-implementation-strong", "implementation_strong"),
+		row("orch-technical-lead", "technical_lead"),
+		row("orch-technical-review", "technical_review"),
+		row("orch-security-review", "security_review"),
+		row("orch-qa-agent", "qa_agent"),
+		row("orch-architect", "architect"),
+	];
+}
+
 function leadPrompt(
 	goal: string,
 	plan: PlanResponse,
 	architectResult: DispatchResult | undefined,
 	leadIndex: number,
 	leadCount: number,
+	adapter: Adapter,
 ): string {
 	// Only forward a plan the architect actually produced. A failed architect
 	// dispatch used to be pasted in as an empty "Architect's plan:" section,
@@ -1618,11 +2280,15 @@ function leadPrompt(
 		scopeNote,
 		architectOutput,
 		"",
+		"You are running non-interactively: there is no human to answer questions mid-run. If the goal is ambiguous, make the conservative choice, do the unambiguous part, and list every open question under '## Open items' in your final report instead of stopping to ask.",
+		"",
 		"Use the subagent tool to dispatch workers. For each dispatch:",
-		"- Choose the right capability (worker, implementation_strong, implementation_fast, technical_review, security_review, qa_agent).",
+		"- Choose the right agent (orch-worker, orch-implementation-strong, orch-implementation-fast, orch-technical-review, orch-security-review, orch-qa-agent).",
 		"- Pass a narrowly-scoped task prompt.",
-		"- The orchestrator's runtime adapter will pick the right model per capability.",
-		"- After all workers finish, run QA via qa_agent. If verification fails, escalate per policy_overlay.json Rule 1.",
+		"- Pass the `model` for that agent from the routing table below.",
+		"- After all workers finish, run QA via orch-qa-agent. If verification fails, escalate per policy_overlay.json Rule 1.",
+		"",
+		...modelTableForLead(adapter),
 	].join("\n");
 }
 
@@ -1639,6 +2305,12 @@ interface OrchestrateArgs {
 	costAggressiveness?: number;
 	fanOut: boolean;
 	maxRetries: number;
+	/** Skip both confirmation dialogs (same as HUMAIN_ORCHESTRATOR_ASSUME_YES). */
+	yes: boolean;
+	/** Per-tier / per-capability model overrides from --cheap/--mid/--premium/--model. */
+	models: ModelOverrides;
+	/** Flags we did not recognize — reported instead of silently swallowed. */
+	unknownFlags: string[];
 }
 
 function parseArgs(args: string): OrchestrateArgs {
@@ -1650,6 +2322,9 @@ function parseArgs(args: string): OrchestrateArgs {
 		risk: "medium",
 		fanOut: false,
 		maxRetries: 2,
+		yes: false,
+		models: emptyOverrides(),
+		unknownFlags: [],
 	};
 	const goalTokens: string[] = [];
 	for (let i = 0; i < tokens.length; i++) {
@@ -1663,8 +2338,28 @@ function parseArgs(args: string): OrchestrateArgs {
 			case "--cost-aggressiveness": if (next) { out.costAggressiveness = Number(next); i++; } break;
 			case "--fan-out": out.fanOut = true; break;
 			case "--max-retries": if (next) { out.maxRetries = Number(next) || 2; i++; } break;
+			case "--yes": case "-y": out.yes = true; break;
+			case "--cheap": if (next) { out.models.tiers.cheap = next; i++; } break;
+			case "--mid": if (next) { out.models.tiers.mid = next; i++; } break;
+			case "--premium": if (next) { out.models.tiers.premium = next; i++; } break;
+			case "--model": {
+				// --model <capability>=<provider/model>
+				if (next) {
+					const eq = next.indexOf("=");
+					if (eq > 0) {
+						const cap = next.slice(0, eq);
+						if (ALL_CAPABILITIES.includes(cap)) out.models.capabilities[cap] = { model: next.slice(eq + 1) };
+						else out.unknownFlags.push(`--model ${next} (unknown capability; valid: ${ALL_CAPABILITIES.join(", ")})`);
+					} else {
+						out.unknownFlags.push(`--model ${next} (expected <capability>=<provider/model>)`);
+					}
+					i++;
+				}
+				break;
+			}
 			default:
-				if (!t.startsWith("--")) goalTokens.push(t);
+				if (t.startsWith("--")) out.unknownFlags.push(t);
+				else goalTokens.push(t);
 				break;
 		}
 	}
@@ -1672,273 +2367,377 @@ function parseArgs(args: string): OrchestrateArgs {
 	return out;
 }
 
+/** Goals that ask the agents to come back with questions cannot be honored headlessly. */
+function goalExpectsInteraction(goal: string): boolean {
+	return /\b(ask|raise)\b.*\bquestions?\b|\bclarif(y|ication)|\bcheck (back )?with me\b|\bconfirm with me\b/i.test(goal);
+}
+
+const USAGE =
+	"Usage: /orchestrate <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical]\n" +
+	"       [--cheap provider/model] [--mid provider/model] [--premium provider/model] [--model <capability>=provider/model]\n" +
+	"       [--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--yes]\n" +
+	"Persistent model overrides: " + ADAPTER_OVERRIDE_PATH + "  (see /orchestrator-models)";
+
 // -----------------------------------------------------------------------------
 // Extension entry point
 // -----------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
 	reapOrphanedPersonaDirs();
+	installDispatchReaper();
 
 	pi.registerCommand("orchestrate", {
 		description:
 			"Plan and dispatch a hierarchical agent run. " +
 			"Args: <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical] " +
-			"[--quality-floor F] [--cost-aggressiveness C] [--fan-out] [--max-retries R]\n\n" +
-			"With no flags, an LLM triage call (cheapest available model, ~300 tokens) " +
+			"[--cheap P/M] [--mid P/M] [--premium P/M] [--model <capability>=P/M] " +
+			"[--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--yes]\n\n" +
+			"With no triage flags, an LLM triage call (cheapest configured model) " +
 			"auto-fills task_class, complexity, and risk from the goal text. " +
-			"Pass any flag explicitly to override the triage.",
+			"Model flags override ~/.humain-terminal/agent/orchestrator-adapter.json, which overrides the cost-tier resolver.",
 		handler: async (args, ctx) => {
 			const parsed = parseArgs(args);
 			if (!parsed.goal) {
+				ctx.ui.notify(USAGE, "warning");
+				return;
+			}
+			if (parsed.unknownFlags.length > 0) {
+				ctx.ui.notify(`Unknown flag(s): ${parsed.unknownFlags.join(", ")}\n${USAGE}`, "error");
+				return;
+			}
+			if (ACTIVE_RUN) {
 				ctx.ui.notify(
-					"Usage: /orchestrate <goal> [--task-class T] [--complexity N] [--risk R] [--fan-out] [--max-retries R]",
+					`An orchestration is already running (${ACTIVE_RUN.runId}). Wait for it to finish; its log is ${ACTIVE_RUN.file("run.log")}.`,
 					"warning",
 				);
 				return;
 			}
 
-			const adapter = await loadAdapter();
-
 			// -----------------------------------------------------------------
-			// LLM triage: auto-fill missing task_class / complexity / risk via
-			// the cheapest available model. Skip when the user supplied all
-			// three explicitly; skip silently on any failure and use defaults.
+			// Step 0: resolve models. Done before anything is spent so a typo in
+			// --premium or the override file stops the run here, not after a
+			// 10-minute architect pass on the wrong model.
 			// -----------------------------------------------------------------
-			const missingTriage =
-				parsed.taskClass === "implementation" && parsed.complexity === 5 && parsed.risk === "medium";
-			let effectiveTaskClass = parsed.taskClass;
-			let effectiveComplexity = parsed.complexity;
-			let effectiveRisk = parsed.risk;
-			let triageResult: TriageResult | null = null;
-			const triageCost = { usd: 0 };
-
-			if (missingTriage) {
-				ctx.ui.notify("Triaging goal with cheapest model\u2026", "info");
-				triageResult = await triageTask(parsed.goal, process.cwd(), ctx, triageCost);
-				if (triageResult) {
-					effectiveTaskClass = triageResult.task_class;
-					effectiveComplexity = triageResult.complexity;
-					effectiveRisk = triageResult.risk;
-					const proceed = await confirmStep(
-						ctx,
-						"Triage filled in missing values",
-						`task_class: ${effectiveTaskClass}\n` +
-							`complexity:  ${effectiveComplexity}\n` +
-							`risk:        ${effectiveRisk}\n\n` +
-							`Reasoning: ${triageResult.reasoning}\n\n` +
-							`OK to dispatch with these values? (Cancel to abort)`,
-					);
-					if (!proceed) {
-						ctx.ui.notify("Cancelled.", "info");
-						return;
-					}
-				} else {
-					ctx.ui.notify(
-						"Triage unavailable; using defaults task_class=implementation complexity=5 risk=medium.",
-						"warning",
-					);
-				}
+			const resolved = await resolveAdapter(ctx, parsed.models);
+			const adapter = resolved.adapter;
+			const hasUserOverride = Object.values(resolved.sources).some((s) => s !== "dynamic" && s !== "fallback");
+			const overrideErrors = resolved.warnings.filter((w) => /\((cli|file:[a-z]+)\)/.test(w));
+			if (overrideErrors.length > 0) {
+				ctx.ui.notify(
+					`Model override(s) could not be resolved:\n${overrideErrors.map((w) => `- ${w}`).join("\n")}\n\nRun /orchestrator-models to see what is available. Nothing was dispatched.`,
+					"error",
+				);
+				return;
 			}
-			const runId = `ht-orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			for (const w of resolved.warnings) ctx.ui.notify(w, "warning");
 
-			// Step 1: Plan.
-			ctx.ui.notify(`Planning run ${runId}…`, "info");
-			let plan: PlanResponse;
+			if (goalExpectsInteraction(parsed.goal)) {
+				ctx.ui.notify(
+					"Heads-up: dispatched agents run non-interactively and cannot ask you questions mid-run. " +
+						"They are instructed to make the conservative choice and list open questions in their final report, which is shown when the run completes.",
+					"warning",
+				);
+			}
+
+			const runId = `ht-orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			const session = new RunSession(runId, ctx, parsed.goal);
+			ACTIVE_RUN = session;
+			session.log(`models:\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
+			const cwd = process.cwd();
+
 			try {
-				// Plan from the EFFECTIVE values. Passing `parsed.*` here threw away
-				// the triage verdict the operator had just confirmed, so every
-				// auto-triaged run planned as implementation/5/medium regardless.
-				plan = await planRun(runId, {
-					goal: parsed.goal,
+				// -----------------------------------------------------------------
+				// LLM triage: auto-fill missing task_class / complexity / risk via
+				// the cheapest available model. Skip when the user supplied all
+				// three explicitly; skip silently on any failure and use defaults.
+				// -----------------------------------------------------------------
+				const missingTriage =
+					parsed.taskClass === "implementation" && parsed.complexity === 5 && parsed.risk === "medium";
+				let effectiveTaskClass = parsed.taskClass;
+				let effectiveComplexity = parsed.complexity;
+				let effectiveRisk = parsed.risk;
+				let triageResult: TriageResult | null = null;
+				const triageCost = { usd: 0 };
+
+				if (missingTriage) {
+					session.setPhase(`triage on ${modelShort(adapter.implementation_fast?.model ?? "?")}`);
+					triageResult = await triageTask(parsed.goal, cwd, ctx, triageCost, adapter);
+					if (triageResult) {
+						effectiveTaskClass = triageResult.task_class;
+						effectiveComplexity = triageResult.complexity;
+						effectiveRisk = triageResult.risk;
+						const proceed = await confirmStep(
+							ctx,
+							"Triage filled in missing values",
+							`task_class: ${effectiveTaskClass}\n` +
+								`complexity:  ${effectiveComplexity}\n` +
+								`risk:        ${effectiveRisk}\n\n` +
+								`Reasoning: ${triageResult.reasoning}\n\n` +
+								`OK to plan with these values? (Cancel to abort)`,
+							parsed.yes,
+						);
+						if (!proceed) {
+							session.log("cancelled by user after triage");
+							await failRun(runId, "cancelled after triage");
+							ctx.ui.notify("Cancelled.", "info");
+							return;
+						}
+					} else {
+						ctx.ui.notify(
+							"Triage unavailable; using defaults task_class=implementation complexity=5 risk=medium. " +
+								`Details: ${session.file("triage.stderr.log")}`,
+							"warning",
+						);
+					}
+				}
+
+				// Step 1: Plan.
+				session.setPhase("planning topology + route", false);
+				let plan: PlanResponse;
+				try {
+					// Plan from the EFFECTIVE values. Passing `parsed.*` here threw away
+					// the triage verdict the operator had just confirmed, so every
+					// auto-triaged run planned as implementation/5/medium regardless.
+					plan = await planRun(runId, {
+						goal: parsed.goal,
+						taskClass: effectiveTaskClass,
+						complexity: effectiveComplexity,
+						risk: effectiveRisk,
+						qualityFloor: parsed.qualityFloor,
+						costAggressiveness: parsed.costAggressiveness,
+					});
+				} catch (err) {
+					session.log(`plan failed: ${(err as Error).message}`);
+					await failRun(runId, `plan failed: ${(err as Error).message}`);
+					ctx.ui.notify(`Plan failed: ${(err as Error).message}`, "error");
+					return;
+				}
+
+				const needsArchitect = plan.topology.depth >= 2 && complexityNeedsArchitect(plan.complexity);
+				const leadCount = Number.isFinite(plan.topology.leads)
+					? Math.min(MAX_LEADS, Math.max(1, Math.trunc(plan.topology.leads)))
+					: 1;
+				const pipeline = [
+					...(needsArchitect ? [`architect (${modelShort(adapter.architect?.model ?? "?")})`] : []),
+					`${leadCount} lead${leadCount > 1 ? "s" : ""} (${modelShort(adapter.lead?.model ?? "?")}) → workers (${modelShort(adapter.worker?.model ?? "?")})`,
+					`qa (${modelShort(adapter.qa_agent?.model ?? "?")})`,
+				].join(" → ");
+
+				const planSummary = [
+					`Plan ${plan.plan_id.slice(0, 12)} — "${parsed.goal.slice(0, 60)}${parsed.goal.length > 60 ? "…" : ""}"`,
+					`triage:   ${effectiveTaskClass} / complexity ${effectiveComplexity} / risk ${effectiveRisk}`,
+					`topology: ${plan.topology.shape} depth=${plan.topology.depth} leads=${plan.topology.leads} workers=${plan.topology.workers}`,
+					`route:    ${plan.route.selected.capability} @ ${plan.route.selected.effort} (${plan.route.mode}); quality floor ${plan.effective_quality_floor}`,
+					`pipeline: ${pipeline}`,
+					`models${hasUserOverride ? " (with your overrides)" : " (cost-tier defaults — override with --cheap/--mid/--premium or the adapter file)"}:`,
+					...formatAdapterTable(resolved).map((l) => `  ${l}`),
+					`log:      ${session.file("run.log")}`,
+				];
+				ctx.ui.notify(planSummary.join("\n"), "info");
+				session.log(planSummary.join("\n"));
+
+				const proceed = await confirmStep(
+					ctx,
+					"Dispatch this plan?",
+					`${pipeline}\n\nEach stage runs headless (up to ${Math.round(DISPATCH_TIMEOUT_MS / 60000)} min per dispatch); live progress shows above the editor.`,
+					parsed.yes,
+				);
+				if (!proceed) {
+					session.log("cancelled by user at plan confirmation");
+					await failRun(runId, "cancelled at plan confirmation");
+					ctx.ui.notify("Cancelled.", "info");
+					return;
+				}
+
+				// Step 2: Dispatch.
+				const captureOpts: CaptureOpts = {
+					runId,
+					planId: plan.plan_id,
 					taskClass: effectiveTaskClass,
 					complexity: effectiveComplexity,
 					risk: effectiveRisk,
-					qualityFloor: parsed.qualityFloor,
-					costAggressiveness: parsed.costAggressiveness,
+					recommended: {
+						capability: plan.route.recommended.capability,
+						effort: plan.route.recommended.effort,
+						verification_depth: plan.route.recommended.verification_depth,
+					},
+					mode: plan.route.mode,
+				};
+
+				await recordEvent("dispatch_plan_confirmed", {
+					run_id: runId,
+					plan_id: plan.plan_id,
+					models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
+					model_sources: resolved.sources,
+					log_dir: session.dir,
 				});
-			} catch (err) {
-				ctx.ui.notify(`Plan failed: ${(err as Error).message}`, "error");
-				return;
-			}
 
-			ctx.ui.notify(
-				[
-					`Plan ${plan.plan_id.slice(0, 12)} — "${parsed.goal.slice(0, 50)}"`,
-					`topology: ${plan.topology.shape} depth=${plan.topology.depth} leads=${plan.topology.leads} workers=${plan.topology.workers}`,
-					`route: ${plan.route.selected.capability} @ ${plan.route.selected.effort} (${plan.route.mode})`,
-					`quality floor: ${plan.effective_quality_floor}`,
-				].join("\n"),
-				"info",
-			);
-
-			const proceed = await confirmStep(
-				ctx,
-				"Dispatch this plan?",
-				`Route: ${plan.route.selected.capability}/${plan.route.selected.effort}. ` +
-					`Topology: ${plan.topology.shape} (${plan.topology.leads} leads, ${plan.topology.workers} workers per lead).`,
-			);
-			if (!proceed) {
-				ctx.ui.notify("Cancelled.", "info");
-				return;
-			}
-
-			// Step 2: Dispatch.
-			const cwd = process.cwd();
-			const captureOpts: CaptureOpts = {
-				runId,
-				planId: plan.plan_id,
-				taskClass: effectiveTaskClass,
-				complexity: effectiveComplexity,
-				risk: effectiveRisk,
-				recommended: {
-					capability: plan.route.recommended.capability,
-					effort: plan.route.recommended.effort,
-					verification_depth: plan.route.recommended.verification_depth,
-				},
-				mode: plan.route.mode,
-			};
-
-			ctx.ui.notify("Dispatching…", "info");
-			const { leadResults, architectResult, escalationResults } = await dispatchHierarchical(
-				cwd,
-				runId,
-				plan.plan_id,
-				parsed.goal,
-				plan,
-				adapter,
-				ctx,
-			);
-
-			// Step 3: Verification + escalation. We run QA against whatever files
-			// were touched in the lead phase. If QA fails, escalate per policy
-			// Rule 1. The loop is bounded by maxRetries.
-			const allFiles = Array.from(
-				new Set(leadResults.flatMap((r) => r.filesChanged)),
-			);
-
-			let retries = 0;
-			let lastVerification: VerificationResult | null = null;
-			const verificationResults: DispatchResult[] = [];
-			while (retries <= parsed.maxRetries) {
-				ctx.ui.notify(
-					retries === 0
-						? `Running verification on ${allFiles.length} file(s)…`
-						: `Retrying verification (attempt ${retries + 1})…`,
-					"info",
-				);
-				lastVerification = await runVerification(
+				const { leadResults, architectResult, escalationResults } = await dispatchHierarchical(
 					cwd,
 					runId,
 					plan.plan_id,
-					allFiles,
+					parsed.goal,
+					plan,
 					adapter,
 					ctx,
-					captureOpts,
 				);
-				if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
-				if (lastVerification.passed) break;
 
-				const escalationTasks = planEscalation(
-					lastVerification.failedChecks,
-					leadResults.map((r) => ({
-						capability: r.capability,
-						task: r.stdout,
-						taskId: r.taskId,
-					})),
-					plan.complexity,
-					plan.risk,
-					retries,
-				);
-				if (escalationTasks.length === 0) break;
-
-				// Re-run escalations with bumped models (handled by pickModel when
-				// retryCount > 0 via adapter override).
-				for (const t of escalationTasks) {
-					const binding = adapter[t.capability] ?? adapter.worker;
-					const escalatedModel = pickModel(
-						t.capability,
-						adapter,
-						t.retryCount ?? 0,
-					);
-					const [retryResult] = await dispatchParallel(
-						cwd,
-						runId,
-						[t],
-						{
-							...adapter,
-							[t.capability]: { ...binding, model: escalatedModel },
-						},
-						ctx,
-					);
-					// dispatchParallel returns [] for an empty task list; billing an
-					// absent result wrote an all-"unknown" model_call for a dispatch
-					// that never happened.
-					if (retryResult) {
-						await captureDispatchCost(captureOpts, retryResult);
-						escalationResults.push(retryResult);
+				for (const r of leadResults) {
+					if (r.exitCode !== 0) {
+						ctx.ui.notify(
+							`Lead ${r.taskId.replace(`${runId}-`, "")} failed (exit ${r.exitCode}): ${r.stderr.trim().slice(0, 300) || "(no output)"}\nSee ${session.file(`${r.taskId}.stderr.log`)}`,
+							"warning",
+						);
 					}
 				}
-				retries++;
-			}
 
-			// Step 4: Finalize.
-			// Total cost must cover EVERY dispatch this run paid for — architect and
-			// escalations included. Summing leads alone under-reported spend, which
-			// is the one number the cost-optimisation policy is judged on.
-			const billedResults = [
-				...(architectResult ? [architectResult] : []),
-				...leadResults,
-				...verificationResults,
-				...escalationResults,
-			];
-			const totalCost =
-				triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0);
-			const succeededLeads = leadResults.filter((r) => r.exitCode === 0).length;
-			// A run that dispatched nothing, or whose every lead failed, has not
-			// verified anything — reporting the empty verification suite as PASS is
-			// how phantom runs looked green.
-			const dispatchOk = leadResults.length > 0 && succeededLeads > 0;
-			const verificationSkipped = lastVerification?.skipped ?? false;
-			const passedVerification = dispatchOk && (lastVerification?.passed ?? false);
+				// Step 3: Verification + escalation. We run QA against whatever files
+				// were touched in the lead phase. If QA fails, escalate per policy
+				// Rule 1. The loop is bounded by maxRetries.
+				const allFiles = Array.from(
+					new Set(leadResults.flatMap((r) => r.filesChanged)),
+				);
 
-			await completeRun(runId, {
-				success_rate: succeededLeads / Math.max(1, leadResults.length),
-				verification_passed: passedVerification,
-				total_cost_usd: totalCost,
-				files_changed: allFiles,
-				retries,
-			});
+				let retries = 0;
+				let lastVerification: VerificationResult | null = null;
+				const verificationResults: DispatchResult[] = [];
+				while (retries <= parsed.maxRetries) {
+					if (allFiles.length > 0) {
+						session.setPhase(
+							retries === 0
+								? `QA on ${allFiles.length} changed file(s) via ${modelShort(adapter.qa_agent?.model ?? "?")}`
+								: `QA retry ${retries + 1}/${parsed.maxRetries + 1}`,
+						);
+					}
+					lastVerification = await runVerification(
+						cwd,
+						runId,
+						plan.plan_id,
+						allFiles,
+						adapter,
+						ctx,
+						captureOpts,
+					);
+					if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
+					if (lastVerification.passed) break;
 
-			// For chat/check-in-style goals, the worker produces prose but no file
-			// edits, so the notification block above would otherwise reduce the
-			// run to "$0.0055 cost, 0 files changed" with no signal that anything
-			// actually happened. Surface the lead's reply (truncated) so the user
-			// can see the work; for code tasks that did mutate files, the file
-			// list + verification verdict are the signal that matters.
-			const leadReply =
-				allFiles.length === 0 && leadResults.length > 0
-					? (leadResults[0].stdout ?? "").trim().split("\n").slice(0, 8).join("\n").trim()
-					: "";
+					session.log(`verification failed: ${lastVerification.failedChecks.join(", ") || "(unparsed)"}`);
+					const escalationTasks = planEscalation(
+						lastVerification.failedChecks,
+						leadResults.map((r) => ({
+							capability: r.capability,
+							task: r.stdout,
+							taskId: r.taskId,
+						})),
+						plan.complexity,
+						plan.risk,
+						retries,
+					);
+					if (escalationTasks.length === 0) break;
 
-			ctx.ui.notify(
-				[
-					`Orchestration complete.`,
+					// Re-run escalations with bumped models (handled by pickModel when
+					// retryCount > 0 via adapter override).
+					for (const t of escalationTasks) {
+						const binding = adapter[t.capability] ?? adapter.worker;
+						const escalatedModel = pickModel(
+							t.capability,
+							adapter,
+							t.retryCount ?? 0,
+						);
+						session.setPhase(
+							`escalation retry ${retries + 1}: ${t.capability} on ${modelShort(escalatedModel)} — failed checks: ${lastVerification.failedChecks.slice(0, 3).join(", ")}`,
+						);
+						const [retryResult] = await dispatchParallel(
+							cwd,
+							runId,
+							[t],
+							{
+								...adapter,
+								[t.capability]: { ...binding, model: escalatedModel },
+							},
+							ctx,
+						);
+						// dispatchParallel returns [] for an empty task list; billing an
+						// absent result wrote an all-"unknown" model_call for a dispatch
+						// that never happened.
+						if (retryResult) {
+							await captureDispatchCost(captureOpts, retryResult);
+							escalationResults.push(retryResult);
+						}
+					}
+					retries++;
+				}
+
+				// Step 4: Finalize.
+				// Total cost must cover EVERY dispatch this run paid for — architect and
+				// escalations included. Summing leads alone under-reported spend, which
+				// is the one number the cost-optimisation policy is judged on.
+				const billedResults = [
+					...(architectResult ? [architectResult] : []),
+					...leadResults,
+					...verificationResults,
+					...escalationResults,
+				];
+				const totalCost =
+					triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0);
+				const succeededLeads = leadResults.filter((r) => r.exitCode === 0).length;
+				// A run that dispatched nothing, or whose every lead failed, has not
+				// verified anything — reporting the empty verification suite as PASS is
+				// how phantom runs looked green.
+				const dispatchOk = leadResults.length > 0 && succeededLeads > 0;
+				const verificationSkipped = lastVerification?.skipped ?? false;
+				const passedVerification = dispatchOk && (lastVerification?.passed ?? false);
+
+				await completeRun(runId, {
+					success_rate: succeededLeads / Math.max(1, leadResults.length),
+					verification_passed: passedVerification,
+					total_cost_usd: totalCost,
+					files_changed: allFiles,
+					retries,
+					models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
+					log_dir: session.dir,
+				});
+
+				// The lead's final report is the only place its reasoning, open
+				// questions, and non-file results (audits, package lists, verdicts)
+				// live. Always write it to disk; show it inline when there are no file
+				// edits to speak for the run, or when the lead raised open items.
+				const leadReports = leadResults
+					.filter((r) => r.stdout.trim())
+					.map((r) => `### ${r.taskId.replace(`${runId}-`, "")}\n\n${r.stdout.trim()}`);
+				if (leadReports.length > 0) {
+					try {
+						writeFileSync(session.file("lead-report.md"), leadReports.join("\n\n---\n\n"));
+					} catch {
+						/* best-effort */
+					}
+				}
+				const firstReport = leadResults.find((r) => r.exitCode === 0)?.stdout.trim() ?? "";
+				const openItems = /##\s*Open items\s*\n([\s\S]*?)(?=\n##\s|$)/i.exec(firstReport)?.[1]?.trim();
+				const showFullReport = allFiles.length === 0 && firstReport;
+				const reportLines = showFullReport
+					? firstReport.split("\n").slice(0, 40)
+					: openItems && !/^(none|n\/a|-\s*none)/i.test(openItems)
+						? openItems.split("\n").slice(0, 15)
+						: [];
+				const reportTruncated = showFullReport && firstReport.split("\n").length > 40;
+
+				const verdict = !dispatchOk
+					? "NOT RUN (no lead succeeded)"
+					: verificationSkipped
+						? allFiles.length === 0
+							? "N/A (no files changed — report-only goal)"
+							: "SKIPPED (no files changed)"
+						: passedVerification
+							? "PASS"
+							: "FAIL";
+
+				const summary = [
+					`Orchestration ${dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(Date.now() - Number(runId.split("-")[2]))}.`,
 					`run_id: ${runId}`,
-					`leads: ${succeededLeads}/${leadResults.length} succeeded`,
-					`verification: ${
-						!dispatchOk
-							? "NOT RUN (no lead succeeded)"
-							: verificationSkipped
-								? allFiles.length === 0
-									? "N/A (chat/check-in goal — no files to verify)"
-									: "SKIPPED (no files changed)"
-								: passedVerification
-									? "PASS"
-									: "FAIL"
-					}`,
-					`retries: ${retries}`,
-					`total cost: $${totalCost.toFixed(4)}`,
-					`files: ${allFiles.length} changed`,
+					`leads: ${succeededLeads}/${leadResults.length} succeeded · retries: ${retries} · files: ${allFiles.length} changed`,
+					`verification: ${verdict}`,
+					`total cost: $${totalCost.toFixed(4)} (${billedResults.length + (triageCost.usd > 0 ? 1 : 0)} dispatches)`,
 					...(dispatchOk
 						? []
 						: [
@@ -1948,10 +2747,63 @@ export default function (pi: ExtensionAPI) {
 										.slice(0, 300) || "(no output)"
 								}`,
 							]),
-					...(leadReply ? ["", "lead reply:", leadReply] : []),
+					...(reportLines.length > 0
+						? ["", showFullReport ? "lead report:" : "open items from lead:", ...reportLines, ...(reportTruncated ? [`… full report: ${session.file("lead-report.md")}`] : [])]
+						: leadReports.length > 0
+							? [`lead report: ${session.file("lead-report.md")}`]
+							: []),
+					`run log: ${session.file("run.log")}`,
 					`ledger: ${STATE_ROOT}/metrics.jsonl`,
+				];
+				session.log(summary.join("\n"));
+				ctx.ui.notify(summary.join("\n"), passedVerification || (dispatchOk && verificationSkipped) ? "info" : "warning");
+			} catch (err) {
+				// Any uncaught throw used to leave the run half-recorded (no outcome
+				// row) and the UI stuck on the last notify. Record + surface it.
+				const message = (err as Error).stack ?? String(err);
+				session.log(`run crashed: ${message}`);
+				await failRun(runId, `crashed: ${(err as Error).message}`);
+				ctx.ui.notify(
+					`Orchestration crashed: ${(err as Error).message}\nSee ${session.file("run.log")}`,
+					"error",
+				);
+			} finally {
+				session.close();
+				ACTIVE_RUN = null;
+			}
+		},
+	});
+
+	pi.registerCommand("orchestrator-models", {
+		description:
+			"Show the capability → model table /orchestrate will use, where each binding comes from, and how to override it.",
+		handler: async (args, ctx) => {
+			const parsed = parseArgs(`x ${args}`);
+			const resolved = await resolveAdapter(ctx, parsed.models);
+			let available: string[] = [];
+			try {
+				available = ctx.modelRegistry
+					.getAvailable()
+					.map((m) => `${m.provider}/${m.id}`)
+					.sort();
+			} catch {
+				/* registry unavailable */
+			}
+			ctx.ui.notify(
+				[
+					"Resolved models (precedence: --flags > adapter file capabilities > adapter file tiers > cost-tier resolver > fallback):",
+					...formatAdapterTable(resolved).map((l) => `  ${l}`),
+					...(resolved.warnings.length > 0 ? ["", "warnings:", ...resolved.warnings.map((w) => `  - ${w}`)] : []),
+					"",
+					`override file: ${ADAPTER_OVERRIDE_PATH}${existsSync(ADAPTER_OVERRIDE_PATH) ? "" : " (not present)"}`,
+					'  example: {"tiers":{"premium":"amazon-bedrock/global.anthropic.claude-fable-5-1","mid":"amazon-bedrock/global.anthropic.claude-sonnet-5","cheap":"amazon-bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"}}',
+					"per-run: /orchestrate <goal> --premium P/M --mid P/M --cheap P/M --model architect=P/M",
+					"",
+					`available models (${available.length}):`,
+					...available.slice(0, 40).map((m) => `  ${m}`),
+					...(available.length > 40 ? [`  … ${available.length - 40} more`] : []),
 				].join("\n"),
-				passedVerification ? "info" : "warning",
+				resolved.warnings.length > 0 ? "warning" : "info",
 			);
 		},
 	});
