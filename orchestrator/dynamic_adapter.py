@@ -15,9 +15,13 @@ to the intersection (must be both configured AND in the catalog — and
 `supports_function_calling` must be true, since the orchestrator uses tool
 dispatch).
 
-Usage: python3 dynamic_adapter.py [--json] [--explain]
+Usage: python3 dynamic_adapter.py [--json] [--explain] [--model-family NAME]
   --json    emit the resolved adapter as JSON
   --explain emit the per-capability selection reasoning
+  --model-family NAME  override the model-family preference (default:
+                       "anthropic", via CODING_AGENT_ORCHESTRATOR_MODEL_FAMILY).
+                       Pass "none"/"off"/"cost" to restore pure cost-tier
+                       selection.
 """
 from __future__ import annotations
 
@@ -59,6 +63,33 @@ TIER_BOUNDARIES = {
     "cheapest_output_per_mtok":  2.0,   # <= is cheapest
     "expensive_output_per_mtok": 15.0,  # >= is expensive
 }
+
+# Model-family preference presets. Each preset maps tier -> the catalog id
+# PREFIX of the family member that should fill that tier. Prefix matching
+# lets the same preset survive point releases (`claude-opus-4-7` today,
+# `claude-opus-5` tomorrow) without editing this table.
+#
+# When a preference is active, tier assignment for the matched capability is
+# driven by FAMILY RANK (cheapest=haiku, mid=sonnet, expensive=opus), not by
+# TIER_BOUNDARIES. Cost-boundary bucketing alone would put claude-haiku-4-5
+# (output $5.5/Mtok) in the `mid` tier, so it could never win a `cheapest`
+# capability even when it's the intended cheapest family member.
+MODEL_FAMILY_PRESETS: dict[str, dict[str, str]] = {
+    "anthropic": {
+        "cheapest":  "claude-haiku",
+        "mid":       "claude-sonnet",
+        "expensive": "claude-opus",
+    },
+}
+
+# Env var that overrides the model-family preference. Follows the repo's
+# CODING_AGENT_ORCHESTRATOR_* naming convention (see orchestrator/runtime.py:
+# CODING_AGENT_ORCHESTRATOR_HOME). Accepted values: a key in
+# MODEL_FAMILY_PRESETS (e.g. "anthropic"), or one of the DISABLE_VALUES below
+# to restore pure cost-tier selection.
+MODEL_FAMILY_ENV_VAR = "CODING_AGENT_ORCHESTRATOR_MODEL_FAMILY"
+MODEL_FAMILY_DEFAULT = "anthropic"
+DISABLE_VALUES = {"none", "off", "disabled", "disable", "cost", ""}
 
 
 def _repo_root() -> Path:
@@ -244,6 +275,38 @@ def tier_for(model: dict[str, Any]) -> str:
     return "mid"
 
 
+def resolve_model_family(model_family: str | None = None) -> str | None:
+    """Resolve the active model-family preference key, or None if disabled.
+
+    Precedence: explicit `model_family` argument (e.g. from a CLI flag) wins
+    over the `CODING_AGENT_ORCHESTRATOR_MODEL_FAMILY` env var, which wins
+    over the built-in default (`anthropic`). Any value in DISABLE_VALUES, or
+    any value that doesn't match a known preset, disables the preference and
+    falls back to pure cost-tier selection (today's behaviour).
+    """
+    if model_family is None:
+        model_family = os.environ.get(MODEL_FAMILY_ENV_VAR, MODEL_FAMILY_DEFAULT)
+    normalized = (model_family or "").strip().lower()
+    if normalized in DISABLE_VALUES:
+        return None
+    if normalized not in MODEL_FAMILY_PRESETS:
+        return None
+    return normalized
+
+
+def _pick_family_member(models: dict[str, Any], prefix: str) -> dict[str, Any] | None:
+    """Return the catalog model (from the configured+catalog intersection)
+    whose id starts with `prefix`, preferring the lexicographically-highest
+    match so newer point releases (`claude-opus-5` over `claude-opus-4-7`)
+    are preferred when several are available.
+    """
+    matches = [m for mid, m in models.items() if mid.startswith(prefix)]
+    if not matches:
+        return None
+    matches.sort(key=lambda m: str(m.get("id") or ""), reverse=True)
+    return matches[0]
+
+
 def provider_for_model(model: dict[str, Any]) -> str | None:
     """Return the HT-side provider name (NOT the catalog's provider_ids).
 
@@ -259,13 +322,26 @@ def provider_for_model(model: dict[str, Any]) -> str | None:
     return None
 
 
-def resolve_adapter() -> dict[str, dict[str, Any]]:
-    """Build capability -> {provider, model, output_cost_per_m, tier, source}."""
+def resolve_adapter(model_family: str | None = None) -> dict[str, dict[str, Any]]:
+    """Build capability -> {provider, model, output_cost_per_m, tier, source}.
+
+    `model_family` optionally overrides the model-family preference (see
+    `resolve_model_family`). When a preference is active and a capability's
+    target tier has a preset family member available in the configured+
+    catalog intersection, that member is selected directly and its tier is
+    the target tier itself (family rank), not the cost-boundary bucket.
+    Otherwise selection falls back to the existing cost-tier logic, and the
+    fallback reason is recorded in `_explanations`.
+    """
     models = resolve_models()
     if not models:
         return {}
 
-    # Group models by tier
+    family = resolve_model_family(model_family)
+    family_targets = MODEL_FAMILY_PRESETS.get(family, {}) if family else {}
+
+    # Group models by tier (pure cost-boundary bucketing; used as the
+    # fallback path and for capabilities the family preset doesn't cover).
     by_tier: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for m in models.values():
         by_tier[tier_for(m)].append(m)
@@ -287,17 +363,43 @@ def resolve_adapter() -> dict[str, dict[str, Any]]:
     explanations: dict[str, list[str]] = {}
 
     for cap, target_tier in CAPABILITY_TIER_TARGET.items():
-        # Try target tier first; if empty, fall down to mid, then cheapest.
-        candidates = (
-            by_tier.get(target_tier)
-            or by_tier.get("mid")
-            or by_tier.get("cheapest")
-            or []
-        )
-        if not candidates:
-            explanations[cap] = ["no model available"]
-            continue
-        m = candidates[0]
+        m: dict[str, Any] | None = None
+        effective_tier = target_tier
+        notes: list[str] = []
+
+        preferred_prefix = family_targets.get(target_tier)
+        if preferred_prefix:
+            m = _pick_family_member(models, preferred_prefix)
+            if m is not None:
+                notes.append(f"model_family={family}")
+                notes.append(f"family_rank_tier={target_tier}")
+            else:
+                notes.append(
+                    f"model_family={family} preferred prefix={preferred_prefix!r} "
+                    "not in configured+catalog intersection; falling back to cost tier"
+                )
+
+        if m is None:
+            # Cost-tier fallback: try target tier first; if empty, fall down
+            # to mid, then cheapest.
+            candidates = (
+                by_tier.get(target_tier)
+                or by_tier.get("mid")
+                or by_tier.get("cheapest")
+                or []
+            )
+            if not candidates:
+                notes.append("no model available")
+                explanations[cap] = notes
+                continue
+            m = candidates[0]
+            effective_tier = tier_for(m)
+            others = [c["id"] for c in candidates[1:4]]
+            notes.append(f"tier={effective_tier}")
+            notes.append(f"output_cost_per_m={m.get('output_cost_per_m')}")
+            if others:
+                notes.append(f"alternatives={others}")
+
         provider = provider_for_model(m)
         chosen[cap] = {
             "provider": provider,
@@ -306,13 +408,9 @@ def resolve_adapter() -> dict[str, dict[str, Any]]:
             "input_cost_per_m": m.get("input_cost_per_m"),
             "output_cost_per_m": m.get("output_cost_per_m"),
             "max_context_tokens": m.get("max_context_tokens"),
-            "tier": tier_for(m),
+            "tier": effective_tier,
             "source": "dynamic_intersection",
         }
-        others = [c["id"] for c in candidates[1:4]]
-        notes = [f"tier={tier_for(m)}", f"output_cost_per_m={m.get('output_cost_per_m')}"]
-        if others:
-            notes.append(f"alternatives={others}")
         explanations[cap] = notes
 
     chosen["_explanations"] = explanations  # type: ignore
@@ -323,9 +421,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json", action="store_true", help="emit resolved adapter as JSON")
     ap.add_argument("--explain", action="store_true", help="include selection reasoning")
+    ap.add_argument(
+        "--model-family",
+        default=None,
+        help=(
+            "Model-family preference to route by tier (default: "
+            f"{MODEL_FAMILY_DEFAULT!r} via {MODEL_FAMILY_ENV_VAR}, presets: "
+            f"{sorted(MODEL_FAMILY_PRESETS)}). Pass one of {sorted(DISABLE_VALUES - {''})} "
+            "or 'cost' to restore pure cost-tier selection."
+        ),
+    )
     args = ap.parse_args()
 
-    adapter = resolve_adapter()
+    adapter = resolve_adapter(model_family=args.model_family)
     if args.json or args.explain:
         print(json.dumps(adapter, indent=2))
     else:

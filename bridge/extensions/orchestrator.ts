@@ -28,9 +28,17 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import {
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, join } from "node:path";
 // TypeBox 1.x: `Type` is a namespace (`Type.Object`, `Type.Array`, ...);
 // the validation function moved to a separate `typebox/value` module.
 import { Type } from "typebox";
@@ -40,9 +48,10 @@ import type {
 	ExtensionContext,
 } from "@humain/terminal";
 import {
-	createSubagentTool,
-	type SubagentDetails,
+	discoverAgents,
+	renderTaskWithContext,
 	type SubagentSingleResult,
+	type SubagentUsageStats,
 } from "@core/tools/subagent.ts";
 
 // -----------------------------------------------------------------------------
@@ -56,6 +65,95 @@ const STATE_ROOT =
 	process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT ??
 	"~/.local/state/coding-agent-orchestrator";
 const PYTHON = process.env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3";
+
+// Non-interactive runs (`--mode json -p`, CI, smoke tests) get a no-op UI whose
+// `confirm()` always resolves false, so /orchestrate could never dispatch
+// outside a TTY. Opt in explicitly — default stays "ask", because dispatch
+// spends money and edits files.
+const ASSUME_YES = /^(1|true|yes)$/i.test(process.env.HUMAIN_ORCHESTRATOR_ASSUME_YES ?? "");
+
+function positiveIntEnv(name: string, fallback: number): number {
+	const raw = Number(process.env[name]);
+	return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : fallback;
+}
+
+/** Hard ceiling on concurrent child processes, independent of what a plan asks for. */
+const MAX_CONCURRENT_DISPATCHES = positiveIntEnv("HUMAIN_ORCHESTRATOR_MAX_CONCURRENCY", 4);
+/** Hard ceiling on lead fan-out, so a malformed topology can't spawn unbounded leads. */
+const MAX_LEADS = positiveIntEnv("HUMAIN_ORCHESTRATOR_MAX_LEADS", 8);
+/** Per-dispatch wall clock. A hung child fails its own task instead of the run. */
+const DISPATCH_TIMEOUT_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS", 20 * 60 * 1000);
+
+const PERSONA_TMP_PREFIX = "orch-agent-";
+/**
+ * Age after which an unclaimed persona temp dir is considered orphaned. Must stay
+ * comfortably above DISPATCH_TIMEOUT_MS so a live dispatch is never reaped.
+ */
+const PERSONA_TMP_TTL_MS = Math.max(2 * 60 * 60 * 1000, DISPATCH_TIMEOUT_MS * 6);
+
+/**
+ * Best-effort reap of persona prompt dirs left behind when a parent orchestrator
+ * was killed mid-dispatch (SIGKILL skips every cleanup path we control). Runs
+ * once at activation; age-gated so concurrently running dispatches are safe.
+ */
+function reapOrphanedPersonaDirs(): void {
+	try {
+		const root = tmpdir();
+		const cutoff = Date.now() - PERSONA_TMP_TTL_MS;
+		let reaped = 0;
+		for (const entry of readdirSync(root)) {
+			if (!entry.startsWith(PERSONA_TMP_PREFIX)) continue;
+			const full = join(root, entry);
+			try {
+				if (statSync(full).mtimeMs > cutoff) continue;
+				rmSync(full, { recursive: true, force: true });
+				reaped++;
+			} catch {
+				/* another process may own or have already removed it */
+			}
+		}
+		if (reaped > 0) {
+			console.warn(`[orchestrator] reaped ${reaped} orphaned persona temp dir(s) in ${root}`);
+		}
+	} catch {
+		/* temp dir unreadable — nothing to reap */
+	}
+}
+
+/**
+ * Run `worker` over `items` with at most `limit` in flight, preserving input
+ * order in the results. Replaces a bare `Promise.all` fan-out that spawned one
+ * child process per task with no cap.
+ */
+async function mapWithConcurrency<T, R>(
+	items: T[],
+	limit: number,
+	worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+	const results = new Array<R>(items.length);
+	let next = 0;
+	const runners = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+		while (true) {
+			const index = next++;
+			if (index >= items.length) return;
+			results[index] = await worker(items[index], index);
+		}
+	});
+	await Promise.all(runners);
+	return results;
+}
+
+async function confirmStep(
+	ctx: ExtensionContext,
+	title: string,
+	message: string,
+): Promise<boolean> {
+	if (ASSUME_YES) {
+		ctx.ui.notify(`${title} — auto-confirmed (HUMAIN_ORCHESTRATOR_ASSUME_YES)`, "warning");
+		return true;
+	}
+	return ctx.ui.confirm(title, message);
+}
 
 /**
  * Capability -> concrete model + optional effort override. This IS the runtime
@@ -239,6 +337,295 @@ function clampTriage(raw: Partial<TriageResult>): TriageResult | null {
 	return { task_class, complexity, risk, reasoning };
 }
 
+// -----------------------------------------------------------------------------
+// Direct subagent subprocess
+// -----------------------------------------------------------------------------
+//
+// The orchestrator previously invoked workers via `createSubagentTool(cwd)` from
+// @core/tools/subagent.ts. That tool is wired for LLM-driven tool calls: it
+// expects a fully-populated ExtensionContext with an active EventBus and a
+// parent tool-call context. From inside an extension `registerCommand`
+// handler, the context is partial — `tool.execute` returns a `details` object
+// whose `results` array is empty in production, which silently produces the
+// "leads: 0/0 succeeded, $0 cost" outcome the user observed.
+//
+// Spawning the Pi binary directly — the same binary, the same --mode json
+// protocol, the same event stream that `executeSingleSubagent` parses —
+// bypasses the context-shape mismatch. We already verified that
+// `humain-terminal --mode json -p --no-session <task>` returns real
+// assistant message_end events with model, input/output tokens, and cost.
+// That path is the one we replicate here.
+
+interface SubagentProcessResult {
+	exitCode: number;
+	/** Every assistant text block, in order, joined by blank lines. */
+	stdout: string;
+	/** The LAST assistant text block — the child's final answer. */
+	finalText: string;
+	/** Raw newline-delimited JSON event stream, kept for diagnostics only. */
+	rawStdout: string;
+	/** False when the resolved persona had no write/edit tool, so it cannot have changed files. */
+	personaCanMutate: boolean;
+	stderr: string;
+	model?: string;
+	usage: SubagentUsageStats;
+	costUsd: number;
+	durationMs: number;
+	stopReason?: string;
+}
+
+/**
+ * Pick the right binary + args to invoke Pi in --mode json. Mirrors the
+ * getCliInvocation() helper in @core/tools/subagent.ts, inlined here because
+ * that helper is module-private.
+ */
+function orchCliInvocation(extraArgs: string[]): { command: string; args: string[] } {
+	const currentScript = process.argv[1];
+	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
+	if (currentScript && !isBunVirtualScript && existsSync(currentScript)) {
+		return { command: process.execPath, args: [currentScript, ...extraArgs] };
+	}
+	// HT ships as a compiled bun binary, so argv[1] is a /$bunfs/root/ virtual
+	// path and we fall through to here. `basename` must come from the static
+	// node:path import — an earlier revision referenced a bare `path.basename`
+	// with no `path` binding in scope, which threw ReferenceError on every
+	// dispatch and produced the "0 succeeded / $0.0000" phantom runs.
+	const execName = basename(process.execPath).toLowerCase();
+	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
+	if (!isGenericRuntime) {
+		return { command: process.execPath, args: extraArgs };
+	}
+	return { command: "humain-terminal", args: extraArgs };
+}
+
+/**
+ * Spawn Pi as a one-shot subagent and parse its JSON event stream for the
+ * assistant `message_end`, which carries `model`, `usage`, and `cost.total`.
+ * This is the same on-the-wire protocol the human-facing subagent tool uses
+ * internally — we just launch it from a context (extension handler) where the
+ * human-facing wrapper doesn't have what it needs.
+ */
+async function runSubagentProcess(opts: {
+	cwd: string;
+	agentName: string;
+	task: string;
+	model: string;
+	effort?: string;
+	tools?: string[];
+	ctx: ExtensionContext;
+}): Promise<SubagentProcessResult> {
+	const emptyUsage: SubagentUsageStats = {
+		input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
+		cost: 0, contextTokens: 0, turns: 0,
+	};
+
+	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+
+	// model is "provider/modelId"; split so the CLI resolver can pick the
+	// right provider binding (mirrors executeSingleSubagent).
+	const slashIndex = opts.model.indexOf("/");
+	if (slashIndex !== -1) {
+		args.push("--provider", opts.model.slice(0, slashIndex));
+		args.push("--model", opts.model.slice(slashIndex + 1));
+	} else {
+		args.push("--model", opts.model);
+	}
+
+	if (opts.effort) args.push("--thinking", opts.effort);
+
+	// Resolve the orchestrator agent persona the same way the subagent tool
+	// does: read the agent markdown from the runtime's agents/ directories and
+	// pass its body via --append-system-prompt. There is NO `--agent` CLI flag;
+	// passing one makes HT exit 1 with "Unknown option: --agent" before it ever
+	// contacts a provider, which is what silently zeroed out every dispatch.
+	let persona: { tools?: string[] } | undefined;
+	let promptDir: string | undefined;
+	try {
+		const discovered = discoverAgents(opts.cwd, "both");
+		const agent = discovered.agents.find((a) => a.name === opts.agentName);
+		if (agent) {
+			persona = { tools: agent.tools };
+			if (agent.systemPrompt.trim()) {
+				promptDir = mkdtempSync(join(tmpdir(), PERSONA_TMP_PREFIX));
+				const promptPath = join(promptDir, `${opts.agentName}.md`);
+				writeFileSync(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
+				args.push("--append-system-prompt", promptPath);
+			}
+		} else {
+			console.warn(`[orchestrator] agent persona not found: ${opts.agentName} (using default persona)`);
+		}
+	} catch (err) {
+		console.warn(`[orchestrator] agent persona load failed: ${(err as Error).message}`);
+	}
+
+	const tools = opts.tools && opts.tools.length > 0 ? opts.tools : persona?.tools;
+	if (tools && tools.length > 0) args.push("--tools", tools.join(","));
+	// An allow-list without write/edit means the child physically could not have
+	// touched a file, so anything its prose mentions is a false positive. With no
+	// allow-list at all the child gets the default tool set, which can mutate.
+	const personaCanMutate = !tools || tools.some((t) => t === "write" || t === "edit");
+
+	// Avoid feedback loops: an extension handler inside an interactive
+	// session must not recursively load extensions or the user's skill
+	// commands. Subagent tool does the same.
+	args.push("--no-extensions", "--no-skills", "--no-prompt-templates");
+
+	args.push(renderTaskWithContext(opts.task, undefined));
+
+	const startedAt = Date.now();
+	return new Promise<SubagentProcessResult>((resolve) => {
+		const invocation = orchCliInvocation(args);
+		const env: NodeJS.ProcessEnv = {
+			...process.env,
+			HUMAIN_TERMINAL_RUNTIME: "orchestrator-dispatch",
+			CODING_AGENT_RUNTIME: "humain-terminal",
+			CODING_AGENT_REPOSITORY: opts.cwd,
+			// Supacode/HT injected a few env vars that a nested Pi run would
+			// pick up and try to attach to the parent's supacode session —
+			// that fails fast with an auth error. Clear them.
+			SUPACODE_SESSION: undefined,
+			SUPACODE_TAB_ID: undefined,
+		};
+		let buffer = "";
+		let rawStdout = "";
+		let stderr = "";
+		let model: string | undefined;
+		const usage: SubagentUsageStats = { ...emptyUsage };
+		let stopReason: string | undefined;
+		let settled = false;
+		let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+		// `--mode json` writes newline-delimited events, NOT plain prose. Callers
+		// need the assistant's text, so accumulate it here; handing them the raw
+		// event stream made triage's JSON.parse fail every single time.
+		const assistantTexts: string[] = [];
+
+		const cleanupPrompt = () => {
+			if (!promptDir) return;
+			try {
+				rmSync(promptDir, { recursive: true, force: true });
+			} catch {
+				/* best-effort temp cleanup */
+			}
+			promptDir = undefined;
+		};
+
+		const finish = (exitCode: number) => {
+			if (settled) return;
+			settled = true;
+			if (timeoutTimer) clearTimeout(timeoutTimer);
+			cleanupPrompt();
+			resolve({
+				exitCode,
+				stdout: assistantTexts.join("\n\n"),
+				finalText: assistantTexts.length > 0 ? assistantTexts[assistantTexts.length - 1] : "",
+				rawStdout,
+				personaCanMutate,
+				stderr,
+				model,
+				usage,
+				costUsd: usage.cost,
+				durationMs: Date.now() - startedAt,
+				stopReason,
+			});
+		};
+
+		const absorbAssistantMessage = (msg: any) => {
+			if (msg.model) model = msg.responseModel ?? msg.model;
+			if (msg.usage) {
+				usage.turns += 1;
+				usage.input += msg.usage.input || 0;
+				usage.output += msg.usage.output || 0;
+				usage.cacheRead += msg.usage.cacheRead || 0;
+				usage.cacheWrite += msg.usage.cacheWrite || 0;
+				usage.cost += msg.usage.cost?.total || 0;
+				usage.contextTokens = msg.usage.totalTokens || usage.contextTokens;
+			}
+			if (msg.stopReason) stopReason = msg.stopReason;
+			if (Array.isArray(msg.content)) {
+				const text = msg.content
+					.filter((b: any) => b?.type === "text" && typeof b.text === "string")
+					.map((b: any) => b.text)
+					.join("\n")
+					.trim();
+				if (text) assistantTexts.push(text);
+			} else if (typeof msg.content === "string" && msg.content.trim()) {
+				assistantTexts.push(msg.content.trim());
+			}
+		};
+
+		const processLine = (line: string) => {
+			const trimmed = line.trim();
+			if (!trimmed) return;
+			let event: any;
+			try {
+				event = JSON.parse(trimmed);
+			} catch {
+				return;
+			}
+			// `message_end` is the authoritative per-turn record. `turn_end` and
+			// `agent_end` repeat the same assistant messages, so ignoring them
+			// keeps usage from being double-counted.
+			if (event.type === "message_end" && event.message?.role === "assistant") {
+				absorbAssistantMessage(event.message);
+			}
+		};
+
+		// spawn() itself throws synchronously on argument-validation errors (as
+		// opposed to ENOENT, which arrives as an async 'error' event). Without this
+		// guard the throw escapes before any listener exists, so finish() never
+		// runs and the persona prompt temp dir leaks.
+		let proc: ReturnType<typeof spawn>;
+		try {
+			proc = spawn(invocation.command, invocation.args, {
+				cwd: opts.cwd,
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+				env,
+			});
+		} catch (err) {
+			stderr += `\n[orchestrator] spawn threw: ${(err as Error).message}`;
+			finish(1);
+			return;
+		}
+
+		// A stalled child would otherwise block its whole Promise.all batch
+		// forever, freezing the run instead of failing just that task.
+		timeoutTimer = setTimeout(() => {
+			if (settled) return;
+			stderr += `\n[orchestrator] dispatch timed out after ${DISPATCH_TIMEOUT_MS}ms; killing child`;
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				/* already gone */
+			}
+			finish(124);
+		}, DISPATCH_TIMEOUT_MS);
+
+		proc.stdout?.on("data", (data) => {
+			const chunk = data.toString();
+			rawStdout += chunk;
+			buffer += chunk;
+			const lines = buffer.split("\n");
+			buffer = lines.pop() || "";
+			for (const line of lines) processLine(line);
+		});
+
+		proc.stderr?.on("data", (data) => {
+			stderr += data.toString();
+		});
+
+		proc.on("close", (code) => {
+			if (buffer.trim()) processLine(buffer);
+			finish(code ?? 0);
+		});
+
+		proc.on("error", (err) => {
+			stderr += `\n[orchestrator] spawn error: ${err.message}`;
+			finish(1);
+		});
+	});
+}
+
 async function triageTask(
 	goal: string,
 	cwd: string,
@@ -255,32 +642,60 @@ async function triageTask(
 		return null;
 	}
 
-	const tool = createSubagentTool(cwd);
-	// `Type.Assign` is a TS-only type helper in TypeBox 1.x (not a runtime
-	// function), and the original wrapper was passing only one argument
-	// (which Assign never accepted, even in older typebox). Drop it and
-	// use the inner Type.Object literal directly.
 	const prompt = TRIAGE_PROMPT + "\n" + goal + "\n\nJSON:\n";
 	try {
-		const details = (await tool.execute(
-			`orchestrator-triage-${Date.now()}`,
-			{
-				tasks: [
-					{
-						agent: "orch-implementation-fast",
-						task: prompt,
-						model: cheapest.model,
-						cwd,
-					},
-				],
-			},
-			undefined,
-			undefined,
+		const r = await runSubagentProcess({
+			cwd,
+			agentName: "orch-implementation-fast",
+			task: prompt,
+			model: cheapest.model,
 			ctx,
-		)) as SubagentDetails;
-		const r = details.results[0];
-		if (!r || r.exitCode !== 0) return null;
-		const text = extractAssistantText(r);
+		});
+		if (!r || r.exitCode !== 0) {
+			if (r) {
+				// Surface WHY, instead of the bare "Triage unavailable" the command
+				// used to print. A non-zero exit here is almost always an argv or
+				// provider-auth problem, and stderr names it.
+				console.warn(
+					`[orchestrator] triage exited ${r.exitCode}: ${(r.stderr || r.rawStdout).trim().slice(0, 400) || "(no output)"}`,
+				);
+				await captureDispatchCost(
+					{
+						runId: `triage-${Date.now()}`,
+						planId: "triage",
+						taskClass: "triage",
+						complexity: 5,
+						risk: "medium",
+						recommended: {
+							capability: "implementation_fast",
+							effort: "low",
+							verification_depth: "none",
+						},
+						mode: "triage",
+					},
+					{
+						taskId: `triage-${slugGoal(goal)}`,
+						capability: "implementation_fast",
+						model: r.model ?? cheapest.model,
+						exitCode: r.exitCode,
+						stdout: r.stdout,
+						stderr: r.stderr,
+						usage: r.usage,
+						durationMs: r.durationMs,
+						costUsd: r.costUsd,
+						stopReason: r.stopReason,
+						filesChanged: [],
+					},
+				);
+			}
+			return null;
+		}
+		// The child's final assistant message is the JSON verdict.
+		const text = r.finalText || r.stdout;
+		if (!text.trim()) {
+			console.warn("[orchestrator] triage produced no assistant text");
+			return null;
+		}
 		// Strip markdown fences if the model wrapped anyway.
 		const jsonText = text
 			.replace(/^```(?:json)?\s*/i, "")
@@ -314,13 +729,13 @@ async function triageTask(
 			{
 				taskId: `triage-${slugGoal(goal)}`,
 				capability: "implementation_fast",
-				model: r?.model ?? cheapest?.model ?? "unknown",
+				model: r.model ?? cheapest.model,
 				exitCode: r.exitCode,
 				stdout: text,
 				stderr: r.stderr,
 				usage: r.usage,
-				durationMs: 0,
-				costUsd: r.usage.cost,
+				durationMs: r.durationMs,
+				costUsd: r.costUsd,
 				stopReason: r.stopReason,
 				filesChanged: [],
 			},
@@ -539,8 +954,6 @@ async function dispatchParallel(
 ): Promise<DispatchResult[]> {
 	if (tasks.length === 0) return [];
 
-	const tool = createSubagentTool(cwd);
-
 	const taskInputs = tasks.map((t) => {
 		// Adapter lookups can return undefined if the dynamic adapter
 		// didn't surface every capability (rare but seen during plan-time
@@ -556,8 +969,8 @@ async function dispatchParallel(
 			agent: agentNameFor(t.capability),
 			task: formatTaskPrompt(t),
 			model: binding.model ?? "unknown",
+			effort: binding.effort,
 			cwd,
-			_effort: binding.effort,
 			_capability: t.capability,
 			_taskId: t.taskId,
 			_retryOf: t.retryOf,
@@ -565,58 +978,87 @@ async function dispatchParallel(
 		};
 	});
 
-	// `Type.Assign` is a TS-only type helper in TypeBox 1.x — see the note
-	// in triageTask(). The inner Type.Object is the actual runtime schema.
-	const details = (await tool.execute(
-		`orchestrator-${runId}-${Date.now()}`,
-		{ tasks: taskInputs },
-		undefined,
-		undefined,
-		ctx,
-	)) as SubagentDetails;
-
-	// HT may return a details object without a `results` array in some
-	// interruption / cancellation paths (e.g. subagent depth exceeded,
-	// parent aborted before any child started). Normalize to an empty
-	// list so the orchestrator's bookkeeping still lands in metrics.jsonl
-	// and the run doesn't crash on `.results.map(...)`.
-	const results = Array.isArray(details?.results) ? details.results : [];
-
-	// Each `r` may also be sparse/nullish (HT has historically returned
-	// holes in cancellation paths), and the result array may have a
-	// different length than `taskInputs` if the harness reconciles mid-
-	// dispatch. `.map()` on a sparse array skips the callback for holes
-	// AND returns a sparse array — `for (const r of leadResults)` then
-	// yields `undefined` for each hole, which captureDispatchCost turns
-	// into an all-"unknown" model_call. Use flatMap to drop sparse slots
-	// and out-of-range entries so the consumer only ever sees dense,
-	// index-aligned results.
-	return results.flatMap((r, i) => {
-		if (!r) return [];
-		const input = taskInputs[i];
-		if (!input) return [];
-		const usage = r.usage ?? {};
-		const stdout = extractAssistantText(r);
-		return [
-			{
-				taskId: input._taskId ?? `unknown-${runId}-${i}`,
+	// Direct Pi subprocess fan-out — replaces `createSubagentTool(cwd).execute()`.
+	// See the comment on `runSubagentProcess` above for why we don't use the
+	// human-facing subagent tool from inside an extension handler. Each
+	// worker task becomes its own `humain-terminal --mode json --no-session`
+	// subprocess that writes JSON events to stdout; runSubagentProcess
+	// parses the assistant `message_end` for model + usage + cost.
+	const settled = await mapWithConcurrency(taskInputs, MAX_CONCURRENT_DISPATCHES, async (input) => {
+		try {
+			const r = await runSubagentProcess({
+				cwd: input.cwd,
+				agentName: input.agent,
+				task: input.task,
+				model: input.model,
+				effort: input.effort,
+				// Deliberately no `tools` override: each orch-* persona declares its
+				// own allow-list in frontmatter, and those lists encode policy
+				// (reviewers and scouts are read-only). Hardcoding a set here both
+				// granted reviewers write access and dropped tools the personas need.
+				ctx,
+			});
+			return {
+				taskId: input._taskId ?? `unknown-${runId}`,
 				capability: input._capability ?? "unknown",
-				model: r.model ?? input.model ?? "unknown",
-				exitCode: r.exitCode ?? -1,
-				stdout,
-				stderr: r.stderr ?? "",
-				usage,
-				durationMs: 0,
-				costUsd: usage.cost ?? 0,
+				model: r.model ?? input.model,
+				exitCode: r.exitCode,
+				stdout: r.stdout,
+				// On a non-zero exit HT often fails before emitting any event (bad
+				// argv, provider auth), so stderr is the only diagnostic. When even
+				// that is empty, fall back to the raw event stream so the failure is
+				// explainable in metrics.jsonl instead of a silent zero.
+				stderr:
+					r.exitCode === 0 ? r.stderr : r.stderr || r.rawStdout.slice(0, 2000) || "(no output)",
+				usage: r.usage,
+				durationMs: r.durationMs,
+				costUsd: r.costUsd,
 				stopReason: r.stopReason,
-				filesChanged: parseFilesChanged(stdout),
-			},
-		];
+				// parseFilesChanged scrapes the child's prose, so a read-only reviewer
+				// or QA agent would "report" every path it merely mentioned.
+				filesChanged: r.personaCanMutate ? parseFilesChanged(r.stdout) : [],
+			};
+		} catch (err) {
+			return {
+				taskId: input._taskId ?? `unknown-${runId}`,
+				capability: input._capability ?? "unknown",
+				model: input.model ?? "unknown",
+				exitCode: -1,
+				stdout: "",
+				stderr: (err as Error).message,
+				usage: {
+					input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
+					cost: 0, contextTokens: 0, turns: 0,
+				},
+				durationMs: 0,
+				costUsd: 0,
+				filesChanged: [],
+			};
+		}
 	});
+
+	return settled;
 }
 
+// Capabilities whose persona file is not simply `orch-<capability>`. Without
+// these, the derived name missed the installed persona and the child silently
+// ran with the DEFAULT system prompt and the default (unrestricted) tool set —
+// e.g. capability "lead" looked for "orch-lead" while the shipped persona is
+// "orchestrator-lead", so the lead lost its subagent fan-out instructions.
+// Review capabilities intentionally collapse onto the reviewer personas so the
+// read-only tool allow-list in their frontmatter keeps applying.
+const CAPABILITY_AGENT_ALIASES: Record<string, string> = {
+	lead: "orchestrator-lead",
+	analysis_mid: "orch-technical-lead",
+	analysis_strong: "orch-architect",
+	integration_review: "orch-technical-review",
+	migration_review: "orch-technical-review",
+	performance_review: "orch-technical-review",
+	api_contract_review: "orch-technical-review",
+};
+
 function agentNameFor(capability: string): string {
-	return `orch-${capability.replace(/_/g, "-")}`;
+	return CAPABILITY_AGENT_ALIASES[capability] ?? `orch-${capability.replace(/_/g, "-")}`;
 }
 
 function formatTaskPrompt(t: DispatchTask): string {
@@ -642,18 +1084,6 @@ function formatTaskPrompt(t: DispatchTask): string {
 		"## Notes / Escalation",
 		"Anything the lead should know.",
 	].join("\n");
-}
-
-function extractAssistantText(r: SubagentSingleResult | null | undefined): string {
-	// HT may return a result with no `messages` array (cancellation,
-	// mid-stream abort, harness-level error before the first delta).
-	// Coerce to empty text so the orchestrator's bookkeeping doesn't
-	// crash on `.messages.filter(...)`.
-	const messages = Array.isArray(r?.messages) ? r.messages : [];
-	return messages
-		.filter((m) => m && m.role === "assistant")
-		.map((m) => (typeof m.content === "string" ? m.content : ""))
-		.join("\n");
 }
 
 function parseFilesChanged(text: string): string[] {
@@ -876,6 +1306,10 @@ interface VerificationResult {
 	passed: boolean;
 	summary: string;
 	failedChecks: string[];
+	/** True when no QA agent ran at all (nothing changed) — `passed` is vacuous. */
+	skipped?: boolean;
+	/** The QA dispatch, so the caller can bill it into the run total. */
+	dispatch?: DispatchResult;
 }
 
 /**
@@ -890,10 +1324,12 @@ async function runVerification(
 	filesChanged: string[],
 	adapter: Adapter,
 	ctx: ExtensionContext,
+	captureOpts: CaptureOpts,
 ): Promise<VerificationResult> {
 	if (filesChanged.length === 0) {
 		return {
 			passed: true,
+			skipped: true,
 			summary: "No files changed — verification skipped.",
 			failedChecks: [],
 		};
@@ -916,6 +1352,18 @@ async function runVerification(
 		ctx,
 	);
 
+	if (!qaResult) {
+		return {
+			passed: false,
+			summary: "QA dispatch produced no result.",
+			failedChecks: ["qa-dispatch"],
+		};
+	}
+
+	// The QA agent is a billable dispatch like any other. Recording only its
+	// outcome left its spend out of both metrics.jsonl and the run total.
+	await captureDispatchCost({ ...captureOpts, planId }, qaResult);
+
 	const out = qaResult.stdout;
 	const failedChecks = parseFailedChecks(out);
 	const passed = qaResult.exitCode === 0 && failedChecks.length === 0;
@@ -932,6 +1380,7 @@ async function runVerification(
 		passed,
 		summary: out.slice(0, 500),
 		failedChecks,
+		dispatch: qaResult,
 	};
 }
 
@@ -1023,7 +1472,14 @@ async function dispatchHierarchical(
 	plan: PlanResponse,
 	adapter: Adapter,
 	ctx: ExtensionContext,
-): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[] }> {
+): Promise<{
+	leadResults: DispatchResult[];
+	workerResults: DispatchResult[];
+	/** The architect dispatch, when the topology called for one. Billed by the caller. */
+	architectResult?: DispatchResult;
+	/** Mutable sink the caller appends escalation dispatches to, so they get billed. */
+	escalationResults: DispatchResult[];
+}> {
 	const { depth, leads, workers, shape } = plan.topology;
 	const recCap = plan.route.recommended.capability;
 	const recEffort = plan.route.recommended.effort;
@@ -1052,9 +1508,26 @@ async function dispatchHierarchical(
 			  risk: plan.risk, recommended: plan.route.recommended, mode: plan.route.mode },
 			architectResult,
 		);
+		// The leads proceed without a plan rather than aborting the run, but the
+		// operator must be told the decomposition step was lost — it silently
+		// changes what the leads are working from.
+		if (!architectResult || architectResult.exitCode !== 0) {
+			ctx.ui.notify(
+				`Architect dispatch failed (exit ${architectResult?.exitCode ?? "n/a"}): ${
+					(architectResult?.stderr ?? "no result").trim().slice(0, 300) || "(no output)"
+				}\nLeads will run without an architect plan.`,
+				"warning",
+			);
+		}
 	}
 
-	const leadCount = Math.max(1, leads);
+	// `Math.max(1, leads)` returns NaN when the plan omits `topology.leads` or
+	// sends a non-number, and `Array.from({ length: NaN })` is empty — that is
+	// how a run reported "leads: 0/0 succeeded" with nothing dispatched. Coerce
+	// first, then floor at 1.
+	const leadCount = Number.isFinite(leads)
+		? Math.min(MAX_LEADS, Math.max(1, Math.trunc(leads)))
+		: 1;
 	const leadTasks: DispatchTask[] = Array.from({ length: leadCount }, (_, i) => ({
 		capability: "lead",
 		task: leadPrompt(goal, plan, architectResult, i, leadCount),
@@ -1075,7 +1548,7 @@ async function dispatchHierarchical(
 	// subsequently in our cost capture via the architectResult's reports.
 	// For depth <= 2, the "lead" dispatch IS the orchestrator-lead and it
 	// does its own fan-out inside its own context window.
-	return { leadResults, workerResults: [] };
+	return { leadResults, workerResults: [], architectResult, escalationResults: [] };
 }
 
 function complexityNeedsArchitect(complexity: number): boolean {
@@ -1113,9 +1586,13 @@ function leadPrompt(
 	leadIndex: number,
 	leadCount: number,
 ): string {
-	const architectOutput = architectResult
-		? `\nArchitect's plan:\n\n${architectResult.stdout.slice(0, 3000)}\n`
-		: "";
+	// Only forward a plan the architect actually produced. A failed architect
+	// dispatch used to be pasted in as an empty "Architect's plan:" section,
+	// which reads to the lead as "the architect decided nothing is needed".
+	const architectOutput =
+		architectResult && architectResult.exitCode === 0 && architectResult.stdout.trim()
+			? `\nArchitect's plan:\n\n${architectResult.stdout.slice(0, 3000)}\n`
+			: "";
 	const scopeNote =
 		leadCount > 1
 			? `You are lead ${leadIndex + 1} of ${leadCount}. Focus on your assigned sub-domain; other leads handle parallel sub-domains.`
@@ -1191,6 +1668,8 @@ function parseArgs(args: string): OrchestrateArgs {
 // -----------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	reapOrphanedPersonaDirs();
+
 	pi.registerCommand("orchestrate", {
 		description:
 			"Plan and dispatch a hierarchical agent run. " +
@@ -1230,7 +1709,8 @@ export default function (pi: ExtensionAPI) {
 					effectiveTaskClass = triageResult.task_class;
 					effectiveComplexity = triageResult.complexity;
 					effectiveRisk = triageResult.risk;
-					const proceed = await ctx.ui.confirm(
+					const proceed = await confirmStep(
+						ctx,
 						"Triage filled in missing values",
 						`task_class: ${effectiveTaskClass}\n` +
 							`complexity:  ${effectiveComplexity}\n` +
@@ -1255,11 +1735,14 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`Planning run ${runId}…`, "info");
 			let plan: PlanResponse;
 			try {
+				// Plan from the EFFECTIVE values. Passing `parsed.*` here threw away
+				// the triage verdict the operator had just confirmed, so every
+				// auto-triaged run planned as implementation/5/medium regardless.
 				plan = await planRun(runId, {
 					goal: parsed.goal,
-					taskClass: parsed.taskClass,
-					complexity: parsed.complexity,
-					risk: parsed.risk,
+					taskClass: effectiveTaskClass,
+					complexity: effectiveComplexity,
+					risk: effectiveRisk,
 					qualityFloor: parsed.qualityFloor,
 					costAggressiveness: parsed.costAggressiveness,
 				});
@@ -1278,7 +1761,8 @@ export default function (pi: ExtensionAPI) {
 				"info",
 			);
 
-			const proceed = await ctx.ui.confirm(
+			const proceed = await confirmStep(
+				ctx,
 				"Dispatch this plan?",
 				`Route: ${plan.route.selected.capability}/${plan.route.selected.effort}. ` +
 					`Topology: ${plan.topology.shape} (${plan.topology.leads} leads, ${plan.topology.workers} workers per lead).`,
@@ -1305,7 +1789,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			ctx.ui.notify("Dispatching…", "info");
-			const { leadResults } = await dispatchHierarchical(
+			const { leadResults, architectResult, escalationResults } = await dispatchHierarchical(
 				cwd,
 				runId,
 				plan.plan_id,
@@ -1324,6 +1808,7 @@ export default function (pi: ExtensionAPI) {
 
 			let retries = 0;
 			let lastVerification: VerificationResult | null = null;
+			const verificationResults: DispatchResult[] = [];
 			while (retries <= parsed.maxRetries) {
 				ctx.ui.notify(
 					retries === 0
@@ -1338,7 +1823,9 @@ export default function (pi: ExtensionAPI) {
 					allFiles,
 					adapter,
 					ctx,
+					captureOpts,
 				);
+				if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
 				if (lastVerification.passed) break;
 
 				const escalationTasks = planEscalation(
@@ -1373,15 +1860,35 @@ export default function (pi: ExtensionAPI) {
 						},
 						ctx,
 					);
-					await captureDispatchCost(captureOpts, retryResult);
+					// dispatchParallel returns [] for an empty task list; billing an
+					// absent result wrote an all-"unknown" model_call for a dispatch
+					// that never happened.
+					if (retryResult) {
+						await captureDispatchCost(captureOpts, retryResult);
+						escalationResults.push(retryResult);
+					}
 				}
 				retries++;
 			}
 
 			// Step 4: Finalize.
-			const totalCost = leadResults.reduce((s, r) => s + r.costUsd, 0);
+			// Total cost must cover EVERY dispatch this run paid for — architect and
+			// escalations included. Summing leads alone under-reported spend, which
+			// is the one number the cost-optimisation policy is judged on.
+			const billedResults = [
+				...(architectResult ? [architectResult] : []),
+				...leadResults,
+				...verificationResults,
+				...escalationResults,
+			];
+			const totalCost = billedResults.reduce((s, r) => s + r.costUsd, 0);
 			const succeededLeads = leadResults.filter((r) => r.exitCode === 0).length;
-			const passedVerification = lastVerification?.passed ?? false;
+			// A run that dispatched nothing, or whose every lead failed, has not
+			// verified anything — reporting the empty verification suite as PASS is
+			// how phantom runs looked green.
+			const dispatchOk = leadResults.length > 0 && succeededLeads > 0;
+			const verificationSkipped = lastVerification?.skipped ?? false;
+			const passedVerification = dispatchOk && (lastVerification?.passed ?? false);
 
 			await completeRun(runId, {
 				success_rate: succeededLeads / Math.max(1, leadResults.length),
@@ -1396,10 +1903,27 @@ export default function (pi: ExtensionAPI) {
 					`Orchestration complete.`,
 					`run_id: ${runId}`,
 					`leads: ${succeededLeads}/${leadResults.length} succeeded`,
-					`verification: ${passedVerification ? "PASS" : "FAIL"}`,
+					`verification: ${
+						!dispatchOk
+							? "NOT RUN (no lead succeeded)"
+							: verificationSkipped
+								? "SKIPPED (no files changed)"
+								: passedVerification
+									? "PASS"
+									: "FAIL"
+					}`,
 					`retries: ${retries}`,
 					`total cost: $${totalCost.toFixed(4)}`,
 					`files: ${allFiles.length} changed`,
+					...(dispatchOk
+						? []
+						: [
+								`first failure: ${
+									(billedResults.find((r) => r.exitCode !== 0)?.stderr ?? "(no dispatch attempted)")
+										.trim()
+										.slice(0, 300) || "(no output)"
+								}`,
+							]),
 					`ledger: ${STATE_ROOT}/metrics.jsonl`,
 				].join("\n"),
 				passedVerification ? "info" : "warning",
