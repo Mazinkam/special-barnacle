@@ -2,6 +2,15 @@
 
 ### bridge (HT extension)
 
+- Session usage is now ingested automatically. The extension ingests the
+  current session file on every `agent_settled` (debounced, one in flight) and
+  flushes on `session_shutdown`; `install.sh` additionally installs a launchd
+  agent (`com.humain.orchestrator-ingest`, every 15 min) that sweeps recent
+  HT and Codex session logs as a safety net. Both use session granularity, so
+  they never double count each other or a manual backfill. Previously ingest
+  was manual-only and interactive spend silently stopped being recorded.
+  Scheduler logic lives in `ingest.ts` with a `bun test` suite.
+
 - Model profiles: `orchestrator-profiles.json` with named profiles, short
   aliases derived from the live model registry (no static table), provider
   preference for collisions, per-capability effort (HT thinking levels),

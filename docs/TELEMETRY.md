@@ -63,7 +63,18 @@ A runtime that cannot report cost should still report tokens; that alone moves i
 ## Ingesting usage from session logs
 
 A harness that cannot call the orchestrator per model call still writes usage to disk. Ingest
-it instead of leaving the runtime unmetered:
+it instead of leaving the runtime unmetered.
+
+**This runs automatically; nobody should need to invoke it.** Two mechanisms, both at
+`session` granularity so they never double count each other:
+
+| Mechanism | Trigger | Covers |
+|---|---|---|
+| HT extension hook (`bridge/extensions/orchestrator/ingest.ts`) | `agent_settled` (debounced 3s) and `session_shutdown` | the live HT session, within seconds |
+| launchd sweep `com.humain.orchestrator-ingest` (installed by `install.sh`) | every 15 min + at login | anything the hook missed: crashed sessions, HT without the extension, Codex CLI |
+
+Hook failures are logged to `~/.local/state/coding-agent-orchestrator/ingest-hook.log`, sweep
+output to `ingest-launchd.log`. Manual invocation remains available for backfills:
 
     python3 -m orchestrator.cli ingest <session-log>... [--runtime X] [--repository Y] [--dry-run]
 

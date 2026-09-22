@@ -86,6 +86,7 @@ import {
 	tiersToBindings,
 	userLayerWarnings,
 } from "./models.ts";
+import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -2440,9 +2441,46 @@ const MODELS_USAGE = [
 // Extension entry point
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// Automatic session-usage ingestion (hooks)
+// -----------------------------------------------------------------------------
+
+/**
+ * Ingest this session's usage into the ledger after every settled turn and on
+ * shutdown. Runs `orchestrator.cli ingest <sessionFile> --granularity session`,
+ * whose rows are deltas against what is already recorded, so it is safe to run
+ * as often as we like and alongside the launchd sweep (install.sh).
+ */
+function installSessionIngest(pi: ExtensionAPI): void {
+	const logPath = join(STATE_ROOT.replace(/^~/, homedir()), "ingest-hook.log");
+	const logError = (message: string) => {
+		try {
+			mkdirSync(dirname(logPath), { recursive: true });
+			appendFileSync(logPath, `${new Date().toISOString()} ${message}\n`);
+		} catch {
+			// Telemetry must never break the session.
+		}
+	};
+	const scheduler = new SessionIngestScheduler({
+		onError: logError,
+		run: async (sessionFile) => {
+			const res = await runModule("orchestrator.cli", ingestArgs(sessionFile));
+			if (res.exitCode === 0) return { ok: true };
+			return { ok: false, detail: `exit ${res.exitCode}: ${res.stderr.trim().split("\n").slice(-3).join(" | ")}` };
+		},
+	});
+	pi.on("agent_settled", async (_event, ctx) => {
+		scheduler.schedule(ctx.sessionManager.getSessionFile());
+	});
+	pi.on("session_shutdown", async (_event, ctx) => {
+		await scheduler.flush(ctx.sessionManager.getSessionFile());
+	});
+}
+
 export default function (pi: ExtensionAPI) {
 	reapOrphanedPersonaDirs();
 	installDispatchReaper();
+	installSessionIngest(pi);
 
 	pi.registerCommand("orchestrate", {
 		description:

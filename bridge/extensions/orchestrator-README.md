@@ -23,11 +23,17 @@ After install, restart HT (or `/reload`):
 /cross-review-demo
 ```
 
+`install.sh` also installs a launchd agent (`com.humain.orchestrator-ingest`) that sweeps
+recent HT and Codex session logs into the ledger every 15 minutes. Together with the
+extension's `agent_settled` / `session_shutdown` ingest hooks this keeps interactive
+spend logged without any manual step; see `docs/TELEMETRY.md`.
+
 ## Files this installs
 
 | runtime path (under ` ~/.humain-terminal/agent/`) | source in this repo |
 |---|---|
-| `extensions/orchestrator/` (`index.ts`, `models.ts`) | `bridge/extensions/orchestrator/` |
+| `extensions/orchestrator/` (`index.ts`, `models.ts`, `ingest.ts`) | `bridge/extensions/orchestrator/` |
+| `~/Library/LaunchAgents/com.humain.orchestrator-ingest.plist` (rendered, macOS) | `install.sh` |
 | `extensions/orchestrator-README.md` | `bridge/extensions/orchestrator-README.md` |
 | `extensions/cross-review-demo.ts` | `bridge/extensions/cross-review-demo.ts` |
 | `agents/orchestrator-lead.md` | `bridge/agents/orchestrator-lead.md` |
@@ -64,7 +70,7 @@ Show ROI anytime:
    - `depth ≤ 2`: dispatch one `orchestrator-lead` agent. The lead handles its own worker fan-out via HT's `subagent` tool.
    - `depth ≥ 3`: dispatch the architect first, then `leads` orchestrator-lead agents in parallel. Each lead owns its worker fan-out.
 4. After leads finish, the extension runs `orch-qa-agent` against the union of changed files. Verdict is PASS or FAIL based on parsing `FAIL`/`✗`/`failed` markers from QA output.
-5. On FAIL, escalate per `policy_overlay.json` Rule 1: re-dispatch reviews at bumped tier (mid → premium for re-reviews; never stay at cheap on retry). Bounded by `--max-retries` (default 2).
+5. On FAIL, escalate per `orchestrator/method.json` Rule 1 (`rules.review_after_fix`): re-dispatch reviews at bumped tier (mid → premium for re-reviews; never stay at cheap on retry). Bounded by `--max-retries` (default 2).
 6. Every dispatch writes two records back via `python3 -m orchestrator.cli metric`:
    - `model_call`: the actual model call with tokens + cost. `cost_source: reported` if HT reported a non-zero cost, otherwise `estimated-from-reported-tokens`.
    - `route_executed`: joins the executed model/cost with the plan-time recommendation. Closes the (recommended, executed, observed) triple so the skill's history can learn from real outcomes.
@@ -165,5 +171,5 @@ Only one `/orchestrate` may be live per session. `--yes` (or
 
 - It does not build a real-time HT-side dashboard view. The HTML dashboard at `~/.local/state/coding-agent-orchestrator/dashboard.html` is still canonical.
 - It does not wire shadow routing to emit per-call counterfactuals. The plan-time `adaptive_route_decision` event already carries `recommended_estimated_*`, but per-call comparison still relies on retrospective `skill_vs_baseline.py` repricing — improved now by the `route_executed` events this extension emits.
-- It does not enforce `policy_overlay.json` rules itself — the Python skill's `engine.plan_run()` already does that, and the extension trusts the routing it gets back.
+- It reads the routing rules from `orchestrator/method.json` (symlinked into the extension dir) and does not re-derive them — the Python skill's `engine.plan_run()` already does that, and the extension trusts the routing it gets back.
 - It does not write persistent orchestrator state itself. The Python `EventStore` does that via `cli metric`/`cli outcome` — the extension only bridges.
