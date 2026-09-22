@@ -14,7 +14,14 @@ class V3EngineTests(unittest.TestCase):
             self.assertIn('adaptive_route_decision',metrics)
             out=generate_dashboard(td,config=e.config)
             self.assertTrue(out.exists())
-            self.assertIn('Hierarchical Orchestrator V3',out.read_text())
+            html=out.read_text()
+            self.assertIn('Hierarchical Orchestrator V3',html)
+            # Freshness must be visible: a generated-at stamp plus the latest event time,
+            # and the page must self-reload so a file:// tab does not look frozen.
+            self.assertIn('<meta http-equiv="refresh"',html)
+            self.assertIn('"generated_at"',html)
+            self.assertIn('"last_event_ts"',html)
+            self.assertIn('id="freshness"',html)
 
     def test_master_switch_freezes_route(self):
         with tempfile.TemporaryDirectory() as td:

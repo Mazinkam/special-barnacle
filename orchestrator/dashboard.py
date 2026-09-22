@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime, timezone
 import json
 
 from .runtime import default_state_root, load_jsonl, read_json
@@ -104,7 +105,12 @@ def build_data(root:Path, config:dict|None=None):
         agent_runtime=r.get('agent_runtime') or r.get('runtime') or 'unknown'
         br=interactive_sessions['by_runtime'].setdefault(agent_runtime,{'calls':0,'cost':0.0})
         br['calls']+=1; br['cost']+=row_cost(r)
-    return {'summary':summary,'waste':waste,'by_role':role,'by_runtime':runtime,'policies':policy_rows,'trends':trends,
+    last_event_ts=max((str(e.get('ts','')) for e in events),default=None) or None
+    last_metric_ts=max((str(r.get('ts','')) for r in metrics),default=None) or None
+    return {'generated_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'last_event_ts':last_event_ts,'last_metric_ts':last_metric_ts,
+        'event_count':len(events),'metric_count':len(metrics),
+        'summary':summary,'waste':waste,'by_role':role,'by_runtime':runtime,'policies':policy_rows,'trends':trends,
         'routes':build_route_stats(orchestrated,outcomes),'outcomes':outsum,
         # flaky_stats only matches rows with event=='verification_result'; session-ingest rows
         # are event=='model_call' and never contribute, but we pass `orchestrated` for
@@ -117,10 +123,11 @@ def build_data(root:Path, config:dict|None=None):
 
 def generate_dashboard(state_dir=None, config:dict|None=None):
     root=Path(state_dir) if state_dir is not None else default_state_root(); root.mkdir(parents=True,exist_ok=True); data=build_data(root,config)
-    doc='''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orchestrator V3 Dashboard</title><style>
+    # Auto-refresh so a file:// tab left open does not look frozen between orchestrator dispatches.
+    doc='''<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="30"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orchestrator V3 Dashboard</title><style>
 :root{color-scheme:light dark;--bg:#0e1116;--p:#171b22;--b:#2a313c;--t:#edf2f7;--m:#929bab;--a:#7aa7ff;--g:#61c98c;--w:#e9b65e;--r:#e16e6e}@media(prefers-color-scheme:light){:root{--bg:#f6f7f9;--p:#fff;--b:#e2e6ec;--t:#111827;--m:#667085}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1320px;margin:auto;padding:22px}h1{margin:0;font-size:25px}.sub{color:var(--m);margin:4px 0 18px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.card{background:var(--p);border:1px solid var(--b);border-radius:12px;padding:13px;min-width:0}.k{font-size:12px;color:var(--m)}.v{font-size:22px;font-weight:720;margin-top:3px}.section{margin-top:16px}.section h2{font-size:16px;margin:0 0 10px}table{width:100%;border-collapse:collapse}th,td{padding:7px 8px;border-bottom:1px solid var(--b);text-align:left;white-space:nowrap}th{font-size:12px;color:var(--m)}.scroll{overflow:auto}.bar{height:8px;background:var(--b);border-radius:99px;overflow:hidden}.bar i{display:block;height:100%;background:var(--a)}.small{font-size:12px;color:var(--m)}.risk{display:grid;grid-template-columns:1fr 110px;gap:8px;padding:7px 0;border-bottom:1px solid var(--b)}.timeline{max-height:320px;overflow:auto}.event{padding:7px 0;border-bottom:1px solid var(--b)}.pill{display:inline-block;padding:2px 7px;border:1px solid var(--b);border-radius:999px;font-size:12px}.on{color:var(--g)}.off{color:var(--m)}.warn{color:var(--w)}@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-</style></head><body><main><h1>Hierarchical Orchestrator V3</h1><div class="sub">Adaptive routing, empirical economics, feature state, delayed outcomes, and risk observability. Counterfactuals remain estimates. Spend is split by provenance: provider-reported, estimated from reported tokens, or unmetered — unmetered work is never shown as $0.</div><div id="cards" class="grid"></div>
+</style></head><body><main><h1>Hierarchical Orchestrator V3</h1><div class="sub">Adaptive routing, empirical economics, feature state, delayed outcomes, and risk observability. Counterfactuals remain estimates. Spend is split by provenance: provider-reported, estimated from reported tokens, or unmetered — unmetered work is never shown as $0.</div><div class="sub" id="freshness"></div><div id="cards" class="grid"></div>
 <div class="section grid" style="grid-template-columns:1.1fr .9fr"><div class="card"><h2>Adaptive routing health</h2><div id="adaptiveHealth"></div></div><div class="card"><h2>Risk observatory</h2><div id="risk"></div></div></div>
 <div class="section card"><h2>V3 feature controls</h2><div class="scroll"><table id="features"></table></div></div>
 <div class="section card"><h2>Recent adaptive decisions</h2><div class="scroll"><table id="adaptive"></table></div></div>
@@ -132,6 +139,7 @@ def generate_dashboard(state_dir=None, config:dict|None=None):
 <div class="section card"><h2>Interactive sessions (ingested, not orchestrated)</h2><div id="interactive"></div></div>
 <div class="section card"><h2>Recent events</h2><div class="timeline" id="events"></div></div>
 <script>const D='''+safe(data)+''';const $=s=>document.querySelector(s);const money=x=>x==null?'—':'$'+Number(x).toFixed(4);const pc=x=>x==null?'—':(Number(x)*100).toFixed(1)+'%';const n=x=>Number(x||0).toLocaleString();const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtTs=x=>x?String(x).replace('T',' ').slice(0,19)+' UTC':'—';$('#freshness').textContent=`Rebuilt ${fmtTs(D.generated_at)} · latest event ${fmtTs(D.last_event_ts)} · latest metric ${fmtTs(D.last_metric_ts)} · ${n(D.event_count)} events, ${n(D.metric_count)} metric records · page auto-reloads every 30s`;
 const S=D.summary;const cards=[['Provider-reported spend',money(S.reported_cost)],['Estimated spend',money(S.estimated_cost)],['Unmetered calls',n(S.unmetered_calls)+' of '+n(S.call_rows)],['Cost coverage',pc(S.cost_coverage)],['Verified tasks',n(S.verified_tasks)],['Verified cost/task',money(S.verified_cost)],['Waste rate',pc(S.waste_rate)],['Orchestration overhead',pc(S.orchestration_overhead)],['30d delayed failure',pc(S.stable_30d_failure_rate)],['p99/p50 tail ratio',Number(S.tail_ratio||0).toFixed(1)+'×'],['Adaptive decisions',n(S.adaptive_decisions)]];$('#cards').innerHTML=cards.map(x=>`<div class="card"><div class="k">${x[0]}</div><div class="v">${x[1]}</div></div>`).join('');
 const ah=[['History sufficient',pc(S.history_sufficient_rate)],['Observed exploration',pc(S.exploration_rate_observed)],['Recommend only',n((S.adaptive_actions||{}).recommended_only)],['Empirical enforced',n((S.adaptive_actions||{}).empirical_enforced)],['Static/fallback',n(n0((S.adaptive_actions||{}).static_default)+n0((S.adaptive_actions||{}).fallback_insufficient_history))]];function n0(x){return Number(x||0)}$('#adaptiveHealth').innerHTML=ah.map(x=>`<div class="risk"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
 const risks=[['Fan-out rework multiplier',Number(S.fanout_rework||0).toFixed(2)],['Context packet miss rate',pc(S.context_miss_rate)],['Merge/conflict events',n(S.conflicts)],['Shadow false-pass rate',pc(S.shadow_false_pass_rate)],['Shadow over-rejection',pc(S.shadow_over_reject_rate)],['Review wait p90',Number(S.review_wait_p90_s||0).toFixed(1)+'s'],['p99 call cost',money(S.p99_cost)]];$('#risk').innerHTML=risks.map(x=>`<div class="risk"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
