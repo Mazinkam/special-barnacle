@@ -46,16 +46,14 @@ import { basename, dirname, join } from "node:path";
 // the validation function moved to a separate `typebox/value` module.
 import { Type } from "typebox";
 
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-} from "@humain/terminal";
 import {
 	discoverAgents,
+	type ExtensionAPI,
+	type ExtensionContext,
 	renderTaskWithContext,
 	type SubagentSingleResult,
 	type SubagentUsageStats,
-} from "@core/tools/subagent.ts";
+} from "@humain/terminal";
 
 import {
 	ALL_CAPABILITIES,
@@ -610,7 +608,7 @@ function clampTriage(raw: Partial<TriageResult>): TriageResult | null {
 // -----------------------------------------------------------------------------
 //
 // The orchestrator previously invoked workers via `createSubagentTool(cwd)` from
-// @core/tools/subagent.ts. That tool is wired for LLM-driven tool calls: it
+// the subagent tool exported by @humain/terminal. That tool is wired for LLM-driven tool calls: it
 // expects a fully-populated ExtensionContext with an active EventBus and a
 // parent tool-call context. From inside an extension `registerCommand`
 // handler, the context is partial — `tool.execute` returns a `details` object
@@ -644,7 +642,7 @@ interface SubagentProcessResult {
 
 /**
  * Pick the right binary + args to invoke Pi in --mode json. Mirrors the
- * getCliInvocation() helper in @core/tools/subagent.ts, inlined here because
+ * getCliInvocation() helper in the coding-agent subagent tool, inlined here because
  * that helper is module-private.
  */
 function orchCliInvocation(extraArgs: string[]): { command: string; args: string[] } {

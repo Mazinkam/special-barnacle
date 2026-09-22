@@ -14,8 +14,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { createSubagentTool, type SubagentDetails } from "@core/tools/subagent.ts";
-import type { ExtensionAPI, ExtensionContext } from "@humain/terminal";
+import { createSubagentTool, type ExtensionAPI, type ExtensionContext, type SubagentDetails } from "@humain/terminal";
 
 // Three-way cross-review using the human-node models the user asked for.
 // Each implementer is reviewed by a model from a DIFFERENT family than theirs.
