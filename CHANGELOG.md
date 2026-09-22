@@ -2,6 +2,17 @@
 
 ### bridge (HT extension)
 
+- Model profiles: `orchestrator-profiles.json` with named profiles, short
+  aliases derived from the live model registry (no static table), provider
+  preference for collisions, per-capability effort (HT thinking levels),
+  `--profile` / `--effort` flags. `orchestrator-adapter.json` is migrated into
+  profile `default` once and then ignored.
+- `/orchestrator-models` subcommands: show, list, validate [--live], check,
+  set, effort, use, new, pick (tiers first). `check` probes every distinct
+  model through the real dispatch path and reports the model that answered.
+- Extension moved to `bridge/extensions/orchestrator/{index.ts,models.ts}`;
+  the pure resolution module has a `bun test` suite (16 tests).
+
 - Model overrides are real: `--cheap/--mid/--premium/--model <cap>=P/M` flags and
   `~/.humain-terminal/agent/orchestrator-adapter.json` (`tiers` / `capabilities`)
   now bind models, canonicalized against HT's model registry; an unresolvable

@@ -37,10 +37,11 @@ import {
 	readFileSync,
 	rmSync,
 	statSync,
+	renameSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 // TypeBox 1.x: `Type` is a namespace (`Type.Object`, `Type.Array`, ...);
 // the validation function moved to a separate `typebox/value` module.
 import { Type } from "typebox";
@@ -56,6 +57,36 @@ import {
 	type SubagentUsageStats,
 } from "@core/tools/subagent.ts";
 
+import {
+	ALL_CAPABILITIES,
+	type AliasTable,
+	type AvailableModel,
+	type Binding,
+	buildAliasTable,
+	DEFAULT_PROVIDER_PREFERENCE,
+	emptyProfilesFile,
+	formatAdapterTable,
+	isThinkingLevel,
+	isTier,
+	type Layer,
+	listShortcuts,
+	mergeLayers,
+	migrateAdapterToProfile,
+	parseProfilesFile,
+	PROFILE_NAME_RE,
+	type ProfileSpec,
+	type ProfilesFile,
+	resolveAlias,
+	type ResolvedAdapter,
+	shortName,
+	THINKING_LEVELS,
+	type Tier,
+	TIER_CAPABILITIES,
+	TIERS,
+	tiersToBindings,
+	userLayerWarnings,
+} from "./models.ts";
+
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
@@ -68,19 +99,15 @@ const STATE_ROOT =
 	"~/.local/state/coding-agent-orchestrator";
 const PYTHON = process.env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3";
 /**
- * User model overrides. Documented in orchestrator-README.md since the first
- * release but never actually read — every "use fable" request silently ran on
- * whatever the cost-tier resolver picked. Shape (all keys optional):
- *
- *   {
- *     "tiers": { "cheap": "provider/model", "mid": "...", "premium": "..." },
- *     "capabilities": { "architect": { "model": "provider/model", "effort": "high" } }
- *   }
- *
- * The legacy flat form `{ "architect": { "model": "..." } }` is still accepted.
- * Precedence: CLI flags > capabilities > tiers > dynamic resolver > FALLBACK_ADAPTER.
+ * Model configuration lives in one file: `orchestrator-profiles.json`
+ * (named profiles of alias -> capability/tier bindings; see models.ts). The
+ * older `orchestrator-adapter.json` is migrated into profile "default" on first
+ * load and then ignored.
  */
-const ADAPTER_OVERRIDE_PATH =
+const PROFILES_PATH =
+	process.env.HUMAIN_ORCHESTRATOR_PROFILES_FILE ??
+	join(homedir(), ".humain-terminal", "agent", "orchestrator-profiles.json");
+const LEGACY_ADAPTER_PATH =
 	process.env.HUMAIN_ORCHESTRATOR_ADAPTER_FILE ??
 	join(homedir(), ".humain-terminal", "agent", "orchestrator-adapter.json");
 
@@ -88,25 +115,6 @@ const ADAPTER_OVERRIDE_PATH =
 function runsDir(): string {
 	return join(STATE_ROOT.replace(/^~/, homedir()), "runs");
 }
-
-/** Which cost tier each abstract capability sits at. Mirrors dynamic_adapter.py. */
-const TIER_CAPABILITIES: Record<"cheap" | "mid" | "premium", string[]> = {
-	cheap: ["implementation_fast", "worker", "scout"],
-	mid: [
-		"analysis_mid",
-		"technical_lead",
-		"implementation_strong",
-		"technical_review",
-		"integration_review",
-		"migration_review",
-		"performance_review",
-		"api_contract_review",
-		"qa_agent",
-		"lead",
-	],
-	premium: ["analysis_strong", "architect", "security_review"],
-};
-const ALL_CAPABILITIES = Object.values(TIER_CAPABILITIES).flat();
 
 // Non-interactive runs (`--mode json -p`, CI, smoke tests) get a no-op UI whose
 // `confirm()` always resolves false, so /orchestrate could never dispatch
@@ -306,7 +314,7 @@ const FALLBACK_ADAPTER: Record<string, { model: string; effort?: string }> = {
 	scout:                { model: "amazon-bedrock/anthropic.claude-haiku-4-5" },
 	analysis_mid:         { model: "amazon-bedrock/anthropic.claude-sonnet-4-5" },
 	analysis_strong:      { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
-	technical_review:     { model: "amazon-bedrock/anthropic.claude-sonnet-4-5", effort: "standard" },
+	technical_review:     { model: "amazon-bedrock/anthropic.claude-sonnet-4-5" },
 	integration_review:   { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
 	security_review:      { model: "amazon-bedrock/anthropic.claude-opus-4-5" },
 	migration_review:     { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
@@ -318,28 +326,23 @@ const FALLBACK_ADAPTER: Record<string, { model: string; effort?: string }> = {
 
 const RULE_REVIEW_AFTER_FIX_MIN_TIER = "sonnet";
 
-type Adapter = Record<string, { model: string; effort?: string }>;
+type Adapter = Record<string, Binding>;
 
-/** Where each capability's binding came from, for the plan summary + logs. */
-type AdapterSource = "cli" | "file:capability" | "file:tier" | "dynamic" | "fallback";
-
-interface ResolvedAdapter {
-	adapter: Adapter;
-	sources: Record<string, AdapterSource>;
-	warnings: string[];
-}
-
-/** Per-tier / per-capability overrides parsed from the CLI or the override file. */
+/** Per-run overrides parsed from /orchestrate flags. */
 interface ModelOverrides {
-	tiers: Partial<Record<"cheap" | "mid" | "premium", string>>;
-	capabilities: Record<string, { model: string; effort?: string }>;
+	tiers: Partial<Record<Tier, string>>;
+	capabilities: Record<string, Binding>;
+	/** Run-wide `--effort`; wins over every per-capability effort. */
+	effort?: string;
+	/** `--profile <name>`; defaults to the file's active_profile. */
+	profile?: string;
 }
 
 function emptyOverrides(): ModelOverrides {
 	return { tiers: {}, capabilities: {} };
 }
 
-async function loadDynamicAdapter(): Promise<{ adapter: Adapter; source: AdapterSource; warning?: string }> {
+async function loadDynamicAdapter(): Promise<{ adapter: Adapter; warning?: string }> {
 	try {
 		const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
 		const child = spawn(
@@ -362,14 +365,8 @@ async function loadDynamicAdapter(): Promise<{ adapter: Adapter; source: Adapter
 			child.on("close", (code) => resolve(code ?? -1)),
 		);
 		if (exitCode !== 0) {
-			return {
-				adapter: FALLBACK_ADAPTER,
-				source: "fallback",
-				warning: `resolve-adapter failed (exit ${exitCode}): ${stderr.trim().slice(0, 300)}`,
-			};
+			return { adapter: {}, warning: `resolve-adapter failed (exit ${exitCode}): ${stderr.trim().slice(0, 300)}` };
 		}
-		// The CLI emits a single JSON object on stdout (pretty-printed across
-		// many lines). Parse the whole thing, not just the last line.
 		const resolved = JSON.parse(stdout.trim()) as Record<string, any>;
 		const out: Adapter = {};
 		for (const [cap, info] of Object.entries(resolved)) {
@@ -377,198 +374,134 @@ async function loadDynamicAdapter(): Promise<{ adapter: Adapter; source: Adapter
 			if (!info.provider || !info.model) continue;
 			out[cap] = { model: `${info.provider}/${info.model}` };
 		}
-		if (Object.keys(out).length === 0) {
-			return { adapter: FALLBACK_ADAPTER, source: "fallback", warning: "resolve-adapter returned no bindings" };
-		}
-		return { adapter: out, source: "dynamic" };
+		return { adapter: out, warning: Object.keys(out).length === 0 ? "resolve-adapter returned no bindings" : undefined };
 	} catch (err) {
-		return {
-			adapter: FALLBACK_ADAPTER,
-			source: "fallback",
-			warning: `resolve-adapter error: ${(err as Error).message}`,
-		};
+		return { adapter: {}, warning: `resolve-adapter error: ${(err as Error).message}` };
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Profiles file I/O
+// -----------------------------------------------------------------------------
+
+interface LoadedProfiles {
+	file: ProfilesFile;
+	/** true when the file exists on disk (vs. synthesized defaults). */
+	present: boolean;
+	problems: string[];
+	notes: string[];
+}
+
+function writeProfilesFile(file: ProfilesFile): void {
+	// Atomic: a crash mid-write must not leave a truncated config behind.
+	mkdirSync(dirname(PROFILES_PATH), { recursive: true });
+	const tmp = `${PROFILES_PATH}.${process.pid}.tmp`;
+	writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+	renameSync(tmp, PROFILES_PATH);
+}
+
 /**
- * Read `orchestrator-adapter.json`. Returns empty overrides when the file is
- * absent; malformed content is reported, not swallowed, because a typo here is
- * exactly the case where the user believes fable is running and it is not.
+ * Load profiles. When the file does not exist but the legacy adapter file
+ * does, migrate it into profile "default" once and write the new file, so the
+ * user's existing bindings keep working under the new scheme.
  */
-function loadOverrideFile(): { overrides: ModelOverrides; warning?: string } {
-	if (!existsSync(ADAPTER_OVERRIDE_PATH)) return { overrides: emptyOverrides() };
-	try {
-		const raw = JSON.parse(readFileSync(ADAPTER_OVERRIDE_PATH, "utf-8")) as Record<string, unknown>;
-		const out = emptyOverrides();
-		const tiers = raw.tiers;
-		if (tiers && typeof tiers === "object") {
-			for (const tier of ["cheap", "mid", "premium"] as const) {
-				const v = (tiers as Record<string, unknown>)[tier];
-				if (typeof v === "string" && v.trim()) out.tiers[tier] = v.trim();
+function loadProfiles(): LoadedProfiles {
+	const notes: string[] = [];
+	if (existsSync(PROFILES_PATH)) {
+		try {
+			const { file, problems } = parseProfilesFile(JSON.parse(readFileSync(PROFILES_PATH, "utf-8")));
+			if (existsSync(LEGACY_ADAPTER_PATH)) {
+				notes.push(`${LEGACY_ADAPTER_PATH} is ignored now that ${PROFILES_PATH} exists; delete it to silence this note.`);
 			}
-		}
-		const caps =
-			raw.capabilities && typeof raw.capabilities === "object"
-				? (raw.capabilities as Record<string, unknown>)
-				: raw; // legacy flat form
-		const unknown: string[] = [];
-		for (const [cap, v] of Object.entries(caps)) {
-			if (cap === "tiers" || cap === "capabilities" || cap.startsWith("$") || cap.startsWith("_")) continue;
-			if (!v || typeof v !== "object") continue;
-			const model = (v as { model?: unknown }).model;
-			if (typeof model !== "string" || !model.trim()) continue;
-			if (!ALL_CAPABILITIES.includes(cap)) {
-				unknown.push(cap);
-				continue;
-			}
-			const effort = (v as { effort?: unknown }).effort;
-			out.capabilities[cap] = {
-				model: model.trim(),
-				...(typeof effort === "string" && effort.trim() ? { effort: effort.trim() } : {}),
+			return { file, present: true, problems, notes };
+		} catch (err) {
+			return {
+				file: emptyProfilesFile(),
+				present: true,
+				problems: [`${PROFILES_PATH} could not be parsed: ${(err as Error).message}`],
+				notes,
 			};
 		}
-		return {
-			overrides: out,
-			warning:
-				unknown.length > 0
-					? `${ADAPTER_OVERRIDE_PATH}: unknown capabilities ignored: ${unknown.join(", ")} (valid: ${ALL_CAPABILITIES.join(", ")})`
-					: undefined,
-		};
-	} catch (err) {
-		return {
-			overrides: emptyOverrides(),
-			warning: `${ADAPTER_OVERRIDE_PATH} could not be parsed and was ignored: ${(err as Error).message}`,
-		};
 	}
+	if (existsSync(LEGACY_ADAPTER_PATH)) {
+		try {
+			const { spec, notes: migrationNotes } = migrateAdapterToProfile(JSON.parse(readFileSync(LEGACY_ADAPTER_PATH, "utf-8")));
+			const file: ProfilesFile = { version: 1, active_profile: "default", profiles: { default: spec } };
+			writeProfilesFile(file);
+			notes.push(`migrated ${LEGACY_ADAPTER_PATH} → ${PROFILES_PATH} (profile "default")${migrationNotes.length ? `: ${migrationNotes.join("; ")}` : ""}`);
+			return { file, present: true, problems: [], notes };
+		} catch (err) {
+			return {
+				file: emptyProfilesFile(),
+				present: false,
+				problems: [`${LEGACY_ADAPTER_PATH} could not be migrated: ${(err as Error).message}`],
+				notes,
+			};
+		}
+	}
+	return { file: emptyProfilesFile(), present: false, problems: [], notes };
 }
 
-/**
- * Canonicalize `provider/pattern` to the exact `provider/id` HT will run.
- *
- * Children are spawned with `--provider X --model <pattern>`, and HT's CLI
- * resolver fuzzy-matches the pattern (`claude-sonnet-5` matches both
- * `eu.anthropic.claude-sonnet-5` and `global.anthropic.claude-sonnet-5`).
- * Resolving here, once, means the plan summary shows the model that will
- * actually run and a typo fails before any money is spent. Matching rules
- * mirror model-resolver.ts: exact `provider/id`, then exact id, then
- * substring on id/name preferring undated aliases sorted highest.
- */
-function canonicalizeModel(
-	spec: string,
-	ctx: ExtensionContext,
-): { model: string; error?: string } {
-	let available: { provider: string; id: string; name?: string }[] = [];
+function availableModels(ctx: ExtensionContext): AvailableModel[] {
 	try {
-		available = ctx.modelRegistry.getAvailable();
+		return ctx.modelRegistry.getAvailable().map((m) => ({ provider: m.provider, id: m.id, name: m.name }));
 	} catch {
-		return { model: spec }; // registry unavailable (tests) — pass through
+		return [];
 	}
-	if (available.length === 0) return { model: spec };
+}
 
-	const slash = spec.indexOf("/");
-	if (slash === -1) {
-		return {
-			model: spec,
-			error: `"${spec}" must be "provider/model" (providers: ${[...new Set(available.map((m) => m.provider))].join(", ")})`,
-		};
-	}
-	const providerRaw = spec.slice(0, slash);
-	const pattern = spec.slice(slash + 1);
-	const provider = available.find((m) => m.provider.toLowerCase() === providerRaw.toLowerCase())?.provider;
-	if (!provider) {
-		return {
-			model: spec,
-			error: `unknown provider "${providerRaw}" in "${spec}" (providers: ${[...new Set(available.map((m) => m.provider))].join(", ")})`,
-		};
-	}
-	const candidates = available.filter((m) => m.provider === provider);
-	const lower = pattern.toLowerCase();
-	const exact = candidates.find((m) => m.id.toLowerCase() === lower);
-	if (exact) return { model: `${provider}/${exact.id}` };
-	const partial = candidates.filter(
-		(m) => m.id.toLowerCase().includes(lower) || (m.name ?? "").toLowerCase().includes(lower),
-	);
-	if (partial.length === 0) {
-		return { model: spec, error: `no model matching "${pattern}" under provider "${provider}"` };
-	}
-	const isAlias = (id: string) => !/\d{8}/.test(id);
-	const aliases = partial.filter((m) => isAlias(m.id)).sort((a, b) => b.id.localeCompare(a.id));
-	const dated = partial.filter((m) => !isAlias(m.id)).sort((a, b) => b.id.localeCompare(a.id));
-	const pick = aliases[0] ?? dated[0];
-	return { model: `${provider}/${pick.id}` };
+interface FullResolution extends ResolvedAdapter {
+	profileName: string;
+	profiles: LoadedProfiles;
+	table: AliasTable;
+	preference: string[];
 }
 
 /**
- * Build the capability -> model table for this run. Every binding is
- * canonicalized; an invalid override is a hard error surfaced to the caller
- * (via `warnings`) and falls back to the next precedence level instead of
- * dispatching something the user did not ask for.
+ * Build the capability -> model table for a run. Precedence, highest first:
+ * flags > profile capabilities > profile tiers > dynamic resolver > fallback.
+ * Problems in the profiles file are surfaced as warnings; an unresolvable spec
+ * at a user layer is a warning the /orchestrate handler treats as fatal.
  */
 async function resolveAdapter(
 	ctx: ExtensionContext,
-	cliOverrides: ModelOverrides = emptyOverrides(),
-): Promise<ResolvedAdapter> {
-	const warnings: string[] = [];
+	overrides: ModelOverrides = emptyOverrides(),
+): Promise<FullResolution> {
+	const profiles = loadProfiles();
+	const table = buildAliasTable(availableModels(ctx));
+	const preference = profiles.file.provider_preference ?? DEFAULT_PROVIDER_PREFERENCE;
+	const profileName = overrides.profile ?? profiles.file.active_profile;
+	const profile = profiles.file.profiles[profileName];
+	const warnings: string[] = [...profiles.problems];
+	if (!profile) {
+		warnings.push(
+			`(profile:${profileName}) profile "${profileName}" is not defined in ${PROFILES_PATH} (have: ${Object.keys(profiles.file.profiles).join(", ") || "none"})`,
+		);
+	}
 	const dynamic = await loadDynamicAdapter();
 	if (dynamic.warning) warnings.push(dynamic.warning);
-	const file = loadOverrideFile();
-	if (file.warning) warnings.push(file.warning);
 
-	const adapter: Adapter = {};
-	const sources: Record<string, AdapterSource> = {};
-
-	const tierOf = (cap: string): "cheap" | "mid" | "premium" | undefined =>
-		(Object.keys(TIER_CAPABILITIES) as Array<"cheap" | "mid" | "premium">).find((t) =>
-			TIER_CAPABILITIES[t].includes(cap),
-		);
-
-	const caps = new Set<string>([...ALL_CAPABILITIES, ...Object.keys(dynamic.adapter)]);
-	for (const cap of caps) {
-		const tier = tierOf(cap);
-		// Ordered candidates, highest precedence first.
-		const candidates: Array<{ binding: { model: string; effort?: string }; source: AdapterSource }> = [];
-		if (cliOverrides.capabilities[cap]) candidates.push({ binding: cliOverrides.capabilities[cap], source: "cli" });
-		if (tier && cliOverrides.tiers[tier]) candidates.push({ binding: { model: cliOverrides.tiers[tier]! }, source: "cli" });
-		if (file.overrides.capabilities[cap]) candidates.push({ binding: file.overrides.capabilities[cap], source: "file:capability" });
-		if (tier && file.overrides.tiers[tier]) candidates.push({ binding: { model: file.overrides.tiers[tier]! }, source: "file:tier" });
-		if (dynamic.adapter[cap]) candidates.push({ binding: dynamic.adapter[cap], source: dynamic.source });
-		if (FALLBACK_ADAPTER[cap]) candidates.push({ binding: FALLBACK_ADAPTER[cap], source: "fallback" });
-
-		for (const c of candidates) {
-			const canon = canonicalizeModel(c.binding.model, ctx);
-			if (canon.error) {
-				// One tier override feeds many capabilities; report the bad spec once.
-				const key = `(${c.source}): ${canon.error} — falling back`;
-				const existing = warnings.findIndex((w) => w.endsWith(key));
-				if (existing === -1) warnings.push(`${cap} ${key}`);
-				else warnings[existing] = `${warnings[existing].slice(0, -key.length).trimEnd()}, ${cap} ${key}`;
-				continue;
-			}
-			adapter[cap] = { model: canon.model, ...(c.binding.effort ? { effort: c.binding.effort } : {}) };
-			sources[cap] = c.source;
-			break;
-		}
-	}
-	return { adapter, sources, warnings };
-}
-
-/** Human-readable capability -> model table grouped by tier. */
-function formatAdapterTable(resolved: ResolvedAdapter): string[] {
-	const lines: string[] = [];
-	for (const tier of ["premium", "mid", "cheap"] as const) {
-		const byModel = new Map<string, string[]>();
-		for (const cap of TIER_CAPABILITIES[tier]) {
-			const b = resolved.adapter[cap];
-			if (!b) continue;
-			const key = `${b.model}${b.effort ? ` @${b.effort}` : ""} [${resolved.sources[cap]}]`;
-			byModel.set(key, [...(byModel.get(key) ?? []), cap]);
-		}
-		for (const [key, caps] of byModel) {
-			lines.push(`${tier.padEnd(7)} ${key}`);
-			lines.push(`        └ ${caps.join(", ")}`);
-		}
-	}
-	return lines;
+	const layers: Layer[] = [
+		{ source: "flag", bindings: { ...tiersToBindings(overrides.tiers), ...overrides.capabilities } },
+		{
+			source: `profile:${profileName}`,
+			bindings: Object.fromEntries(Object.entries(profile?.capabilities ?? {}).map(([c, m]) => [c, { model: m }])),
+		},
+		{ source: `profile:${profileName}`, bindings: tiersToBindings(profile?.tiers) },
+		{ source: "dynamic", bindings: dynamic.adapter },
+		{ source: "fallback", bindings: FALLBACK_ADAPTER },
+	];
+	const merged = mergeLayers(layers, table, preference, profile?.effort ?? {}, overrides.effort);
+	// Fallback/dynamic specs are canonical already but may name models the user
+	// has not configured; those show up as non-user warnings and are informational.
+	return {
+		...merged,
+		warnings: [...warnings, ...merged.warnings],
+		profileName,
+		profiles,
+		table,
+		preference,
+	};
 }
 
 // -----------------------------------------------------------------------------
@@ -918,13 +851,13 @@ class RunSession {
 		];
 		for (const d of running) {
 			lines.push(
-				`  ● ${d.label.padEnd(22)} ${modelShort(d.model).padEnd(28)} ${fmtElapsed(Date.now() - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  ${d.lastActivity}`,
+				`  ● ${d.label.padEnd(22)} ${shortName(d.model).padEnd(28)} ${fmtElapsed(Date.now() - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  ${d.lastActivity}`,
 			);
 		}
 		for (const d of done.slice(-4)) {
 			const mark = d.status === "done" ? "✓" : "✗";
 			lines.push(
-				`  ${mark} ${d.label.padEnd(22)} ${modelShort(d.model).padEnd(28)} ${fmtElapsed((d.endedAt ?? Date.now()) - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  $${d.costUsd.toFixed(4)} ${d.lastActivity}`,
+				`  ${mark} ${d.label.padEnd(22)} ${shortName(d.model).padEnd(28)} ${fmtElapsed((d.endedAt ?? Date.now()) - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  $${d.costUsd.toFixed(4)} ${d.lastActivity}`,
 			);
 		}
 		if (done.length > 4) lines.push(`  … ${done.length - 4} earlier dispatch(es) in run.log`);
@@ -942,10 +875,9 @@ class RunSession {
 	}
 }
 
-function modelShort(model: string): string {
-	const id = model.includes("/") ? model.slice(model.indexOf("/") + 1) : model;
-	return id.replace(/^(global|eu|us)\.anthropic\./, "").replace(/-\d{8}.*$/, "");
-}
+
+/** Sentinel agent name: spawn with HT's default system prompt, no persona file. */
+const NO_PERSONA = "__no_persona__";
 
 /** The run currently owning the UI. Only one /orchestrate may be live per session. */
 let ACTIVE_RUN: RunSession | null = null;
@@ -1011,7 +943,9 @@ async function runSubagentProcess(opts: {
 	// contacts a provider, which is what silently zeroed out every dispatch.
 	let persona: { tools?: string[] } | undefined;
 	let promptDir: string | undefined;
-	try {
+	if (opts.agentName === NO_PERSONA) {
+		/* probes run on the default system prompt on purpose */
+	} else try {
 		const discovered = discoverAgents(opts.cwd, "both");
 		const agent = discovered.agents.find((a) => a.name === opts.agentName);
 		if (agent) {
@@ -2157,7 +2091,7 @@ async function dispatchHierarchical(
 	const needsArchitect = depth >= 2 && complexityNeedsArchitect(plan.complexity);
 	if (needsArchitect) {
 		ACTIVE_RUN?.setPhase(
-			`architect planning on ${modelShort(adapter.architect?.model ?? "?")} (complexity ${plan.complexity} ≥ 5)`,
+			`architect planning on ${shortName(adapter.architect?.model ?? "?")} (complexity ${plan.complexity} ≥ 5)`,
 		);
 		[architectResult] = await dispatchParallel(
 			cwd,
@@ -2208,7 +2142,7 @@ async function dispatchHierarchical(
 	}));
 
 	ACTIVE_RUN?.setPhase(
-		`${leadCount} lead(s) executing on ${modelShort(adapter.lead?.model ?? "?")} — workers fan out inside each lead`,
+		`${leadCount} lead(s) executing on ${shortName(adapter.lead?.model ?? "?")} — workers fan out inside each lead`,
 	);
 	const leadResults = await dispatchParallel(cwd, runId, leadTasks, adapter, ctx);
 	for (const r of leadResults) {
@@ -2336,6 +2270,8 @@ interface OrchestrateArgs {
 	maxRetries: number;
 	/** Skip both confirmation dialogs (same as HUMAIN_ORCHESTRATOR_ASSUME_YES). */
 	yes: boolean;
+	/** /orchestrator-models only: dispatch a one-turn probe on every distinct model. */
+	check: boolean;
 	/** Per-tier / per-capability model overrides from --cheap/--mid/--premium/--model. */
 	models: ModelOverrides;
 	/** Flags we did not recognize — reported instead of silently swallowed. */
@@ -2352,6 +2288,7 @@ function parseArgs(args: string): OrchestrateArgs {
 		fanOut: false,
 		maxRetries: 2,
 		yes: false,
+		check: false,
 		models: emptyOverrides(),
 		unknownFlags: [],
 	};
@@ -2368,11 +2305,21 @@ function parseArgs(args: string): OrchestrateArgs {
 			case "--fan-out": out.fanOut = true; break;
 			case "--max-retries": if (next) { out.maxRetries = Number(next) || 2; i++; } break;
 			case "--yes": case "-y": out.yes = true; break;
+			case "--check": case "--live": out.check = true; break;
+			case "--profile": if (next) { out.models.profile = next; i++; } break;
+			case "--effort": {
+				if (next) {
+					if (isThinkingLevel(next)) out.models.effort = next;
+					else out.unknownFlags.push(`--effort ${next} (expected one of ${THINKING_LEVELS.join("|")})`);
+					i++;
+				}
+				break;
+			}
 			case "--cheap": if (next) { out.models.tiers.cheap = next; i++; } break;
 			case "--mid": if (next) { out.models.tiers.mid = next; i++; } break;
 			case "--premium": if (next) { out.models.tiers.premium = next; i++; } break;
 			case "--model": {
-				// --model <capability>=<provider/model>
+				// --model <capability>=<alias|provider/model>
 				if (next) {
 					const eq = next.indexOf("=");
 					if (eq > 0) {
@@ -2401,11 +2348,93 @@ function goalExpectsInteraction(goal: string): boolean {
 	return /\b(ask|raise)\b.*\bquestions?\b|\bclarif(y|ication)|\bcheck (back )?with me\b|\bconfirm with me\b/i.test(goal);
 }
 
+/**
+ * Live check: one cheap probe per distinct configured model, through the exact
+ * spawn path /orchestrate uses (same --provider/--model split, same env). Proves
+ * auth + routing and that the model that answered is the one the table names —
+ * an unauthenticated provider or wrong-region alias fails here for cents
+ * instead of mid-run for dollars. Judged on "the model answered as itself", not
+ * on reply text: personas rewrite replies into report formats.
+ */
+async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Promise<boolean> {
+	if (ACTIVE_RUN) {
+		ctx.ui.notify(`An orchestration is already running (${ACTIVE_RUN.runId}); try again when it finishes.`, "warning");
+		return false;
+	}
+	const byModel = new Map<string, string[]>();
+	for (const [cap, b] of Object.entries(resolved.adapter)) {
+		byModel.set(b.model, [...(byModel.get(b.model) ?? []), cap]);
+	}
+	const session = new RunSession(`model-check-${Date.now()}`, ctx, "model check");
+	ACTIVE_RUN = session;
+	session.setPhase(`probing ${byModel.size} distinct model(s)`);
+	try {
+		const probes = await mapWithConcurrency([...byModel.entries()], MAX_CONCURRENT_DISPATCHES, async ([model, caps]) => {
+			const r = await runSubagentProcess({
+				cwd: process.cwd(),
+				agentName: NO_PERSONA,
+				task: "Connectivity check. Reply with the single word OK.",
+				model,
+				tools: ["read"],
+				ctx,
+				taskId: `probe-${shortName(model)}`,
+				label: shortName(model),
+			});
+			const replied = (r.finalText || r.stdout).trim();
+			const expectedId = model.slice(model.indexOf("/") + 1);
+			const servedBy = r.model;
+			const idMatches =
+				!servedBy || servedBy === expectedId || expectedId.endsWith(servedBy) || servedBy.endsWith(expectedId) || shortName(servedBy) === shortName(model);
+			const ok = r.exitCode === 0 && replied.length > 0;
+			return { model, caps, ok, idMatches, servedBy, replied, r };
+		});
+
+		const lines = probes.map((p) => {
+			const mark = p.ok && p.idMatches ? "✓" : p.ok ? "⚠" : "✗";
+			const detail = p.ok
+				? p.idMatches
+					? `${fmtElapsed(p.r.durationMs)}, $${p.r.costUsd.toFixed(4)}, served by ${p.servedBy ?? "(unreported)"}`
+					: `answered, but served by ${p.servedBy} (expected ${p.model.slice(p.model.indexOf("/") + 1)})`
+				: `exit ${p.r.exitCode}: ${(p.r.stderr.trim().split("\n").filter(Boolean).pop() ?? "(no output)").slice(0, 160)}`;
+			return [`${mark} ${p.model}`, `    ${detail}`, `    used by: ${p.caps.join(", ")}`].join("\n");
+		});
+		const failed = probes.filter((p) => !p.ok).length;
+		const total = probes.reduce((s, p) => s + p.r.costUsd, 0);
+		const summary = [
+			`Live model check: ${probes.length - failed}/${probes.length} model(s) answered · $${total.toFixed(4)}`,
+			...lines,
+			...(failed > 0 ? ["", `Fix the failing binding(s) with /orchestrator-models set <capability|tier> <alias>, or pass --premium/--mid/--cheap/--model; /orchestrate would abort on these.`] : []),
+			`log: ${session.file("run.log")}`,
+		];
+		session.log(summary.join("\n"));
+		ctx.ui.notify(summary.join("\n"), failed > 0 ? "error" : "info");
+		return failed === 0;
+	} finally {
+		session.close();
+		ACTIVE_RUN = null;
+	}
+}
+
 const USAGE =
 	"Usage: /orchestrate <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical]\n" +
-	"       [--cheap provider/model] [--mid provider/model] [--premium provider/model] [--model <capability>=provider/model]\n" +
+	"       [--profile NAME] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--model <capability>=ALIAS] [--effort LEVEL]\n" +
 	"       [--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--yes]\n" +
-	"Persistent model overrides: " + ADAPTER_OVERRIDE_PATH + "  (see /orchestrator-models)";
+	"ALIAS is a short name (fable-5-1, sonnet, haiku, astra, terra) or provider/model. Profiles: " + PROFILES_PATH + "  (see /orchestrator-models)";
+
+const MODELS_USAGE = [
+	"Usage:",
+	"  /orchestrator-models                       resolved table for the active profile",
+	"  /orchestrator-models show [PROFILE]        resolved table for a profile",
+	"  /orchestrator-models list                  aliases you can use + full catalog",
+	"  /orchestrator-models validate [PROFILE] [--live]   offline check; --live probes every model",
+	"  /orchestrator-models check                 = validate --live",
+	"  /orchestrator-models set <capability|tier> <ALIAS> [--profile P]",
+	"  /orchestrator-models effort <capability> <level|none> [--profile P]",
+	"  /orchestrator-models use <PROFILE>         switch active profile",
+	"  /orchestrator-models new <PROFILE> [--from P]",
+	"  /orchestrator-models pick [PROFILE]        interactive: tiers first, then capability overrides",
+	`file: ${PROFILES_PATH}`,
+].join("\n");
 
 // -----------------------------------------------------------------------------
 // Extension entry point
@@ -2419,11 +2448,11 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Plan and dispatch a hierarchical agent run. " +
 			"Args: <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical] " +
-			"[--cheap P/M] [--mid P/M] [--premium P/M] [--model <capability>=P/M] " +
+			"[--profile NAME] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--model <capability>=ALIAS] [--effort LEVEL] " +
 			"[--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--yes]\n\n" +
 			"With no triage flags, an LLM triage call (cheapest configured model) " +
 			"auto-fills task_class, complexity, and risk from the goal text. " +
-			"Model flags override ~/.humain-terminal/agent/orchestrator-adapter.json, which overrides the cost-tier resolver.",
+			"Models: flags > profile (orchestrator-profiles.json) > cost-tier resolver. See /orchestrator-models.",
 		handler: async (args, ctx) => {
 			const parsed = parseArgs(args);
 			if (!parsed.goal) {
@@ -2450,15 +2479,16 @@ export default function (pi: ExtensionAPI) {
 			const resolved = await resolveAdapter(ctx, parsed.models);
 			const adapter = resolved.adapter;
 			const hasUserOverride = Object.values(resolved.sources).some((s) => s !== "dynamic" && s !== "fallback");
-			const overrideErrors = resolved.warnings.filter((w) => /\((cli|file:[a-z]+)\)/.test(w));
-			if (overrideErrors.length > 0) {
+			const overrideErrors = userLayerWarnings(resolved);
+			if (overrideErrors.length > 0 || resolved.profiles.problems.length > 0) {
 				ctx.ui.notify(
-					`Model override(s) could not be resolved:\n${overrideErrors.map((w) => `- ${w}`).join("\n")}\n\nRun /orchestrator-models to see what is available. Nothing was dispatched.`,
+					`Model configuration is invalid — nothing was dispatched:\n${[...resolved.profiles.problems, ...overrideErrors].map((w) => `- ${w}`).join("\n")}\n\nFix with /orchestrator-models set <capability|tier> <alias>, or /orchestrator-models list to see aliases.`,
 					"error",
 				);
 				return;
 			}
 			for (const w of resolved.warnings) ctx.ui.notify(w, "warning");
+			for (const n of resolved.profiles.notes) ctx.ui.notify(n, "info");
 
 			if (goalExpectsInteraction(parsed.goal)) {
 				ctx.ui.notify(
@@ -2471,7 +2501,8 @@ export default function (pi: ExtensionAPI) {
 			const runId = `ht-orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 			const session = new RunSession(runId, ctx, parsed.goal);
 			ACTIVE_RUN = session;
-			session.log(`models:\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
+			session.log(`models (profile "${resolved.profileName}"):\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
+			for (const n of resolved.notes) session.log(`note: ${n}`);
 			const cwd = process.cwd();
 
 			try {
@@ -2489,7 +2520,7 @@ export default function (pi: ExtensionAPI) {
 				const triageCost = { usd: 0 };
 
 				if (missingTriage) {
-					session.setPhase(`triage on ${modelShort(adapter.implementation_fast?.model ?? "?")}`);
+					session.setPhase(`triage on ${shortName(adapter.implementation_fast?.model ?? "?")}`);
 					triageResult = await triageTask(parsed.goal, cwd, ctx, triageCost, adapter);
 					if (triageResult) {
 						effectiveTaskClass = triageResult.task_class;
@@ -2547,9 +2578,9 @@ export default function (pi: ExtensionAPI) {
 					? Math.min(MAX_LEADS, Math.max(1, Math.trunc(plan.topology.leads)))
 					: 1;
 				const pipeline = [
-					...(needsArchitect ? [`architect (${modelShort(adapter.architect?.model ?? "?")})`] : []),
-					`${leadCount} lead${leadCount > 1 ? "s" : ""} (${modelShort(adapter.lead?.model ?? "?")}) → workers (${modelShort(adapter.worker?.model ?? "?")})`,
-					`qa (${modelShort(adapter.qa_agent?.model ?? "?")})`,
+					...(needsArchitect ? [`architect (${shortName(adapter.architect?.model ?? "?")})`] : []),
+					`${leadCount} lead${leadCount > 1 ? "s" : ""} (${shortName(adapter.lead?.model ?? "?")}) → workers (${shortName(adapter.worker?.model ?? "?")})`,
+					`qa (${shortName(adapter.qa_agent?.model ?? "?")})`,
 				].join(" → ");
 
 				const planSummary = [
@@ -2558,7 +2589,7 @@ export default function (pi: ExtensionAPI) {
 					`topology: ${plan.topology.shape} depth=${plan.topology.depth} leads=${plan.topology.leads} workers=${plan.topology.workers}`,
 					`route:    ${plan.route.selected.capability} @ ${plan.route.selected.effort} (${plan.route.mode}); quality floor ${plan.effective_quality_floor}`,
 					`pipeline: ${pipeline}`,
-					`models${hasUserOverride ? " (with your overrides)" : " (cost-tier defaults — override with --cheap/--mid/--premium or the adapter file)"}:`,
+					`models (profile "${resolved.profileName}"${hasUserOverride ? "" : " is empty — cost-tier defaults; set with /orchestrator-models set"}):`,
 					...formatAdapterTable(resolved).map((l) => `  ${l}`),
 					`log:      ${session.file("run.log")}`,
 				];
@@ -2598,6 +2629,7 @@ export default function (pi: ExtensionAPI) {
 					plan_id: plan.plan_id,
 					models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
 					model_sources: resolved.sources,
+					profile: resolved.profileName,
 					log_dir: session.dir,
 				});
 
@@ -2647,7 +2679,7 @@ export default function (pi: ExtensionAPI) {
 					if (allFiles.length > 0) {
 						session.setPhase(
 							retries === 0
-								? `QA on ${allFiles.length} changed file(s) via ${modelShort(adapter.qa_agent?.model ?? "?")}`
+								? `QA on ${allFiles.length} changed file(s) via ${shortName(adapter.qa_agent?.model ?? "?")}`
 								: `QA retry ${retries + 1}/${parsed.maxRetries + 1}`,
 						);
 					}
@@ -2687,7 +2719,7 @@ export default function (pi: ExtensionAPI) {
 							t.retryCount ?? 0,
 						);
 						session.setPhase(
-							`escalation retry ${retries + 1}: ${t.capability} on ${modelShort(escalatedModel)} — failed checks: ${lastVerification.failedChecks.slice(0, 3).join(", ")}`,
+							`escalation retry ${retries + 1}: ${t.capability} on ${shortName(escalatedModel)} — failed checks: ${lastVerification.failedChecks.slice(0, 3).join(", ")}`,
 						);
 						const [retryResult] = await dispatchParallel(
 							cwd,
@@ -2818,35 +2850,209 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("orchestrator-models", {
 		description:
-			"Show the capability → model table /orchestrate will use, where each binding comes from, and how to override it.",
+			"Manage which models /orchestrate uses. Subcommands: show|list|validate [--live]|check|set|effort|use|new|pick. " +
+			"Aliases like fable-5-1, sonnet, haiku, astra, terra resolve against your configured models.",
 		handler: async (args, ctx) => {
-			const parsed = parseArgs(`x ${args}`);
-			const resolved = await resolveAdapter(ctx, parsed.models);
-			let available: string[] = [];
-			try {
-				available = ctx.modelRegistry
-					.getAvailable()
-					.map((m) => `${m.provider}/${m.id}`)
-					.sort();
-			} catch {
-				/* registry unavailable */
-			}
-			ctx.ui.notify(
-				[
-					"Resolved models (precedence: --flags > adapter file capabilities > adapter file tiers > cost-tier resolver > fallback):",
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			const sub = tokens[0] && !tokens[0].startsWith("--") ? tokens[0] : "show";
+			const rest = tokens[0] && !tokens[0].startsWith("--") ? tokens.slice(1) : tokens;
+			const VALUE_FLAGS = new Set(["--profile", "--from", "--effort", "--cheap", "--mid", "--premium", "--model"]);
+			const positional = rest.filter((t, i) => !t.startsWith("--") && !VALUE_FLAGS.has(rest[i - 1] ?? ""));
+			// Flags (--profile, --live, ...) come from the same parser as /orchestrate;
+			// bare words land in `goal`, which we ignore here in favour of `positional`.
+			const parsed = parseArgs(`x ${rest.join(" ")}`);
+
+			const showResolved = async (profile?: string) => {
+				const resolved = await resolveAdapter(ctx, { ...emptyOverrides(), profile });
+				const p = resolved.profiles;
+				const lines = [
+					`Profile "${resolved.profileName}"${resolved.profileName === p.file.active_profile ? " (active)" : ""}${p.file.profiles[resolved.profileName]?.description ? ` — ${p.file.profiles[resolved.profileName].description}` : ""}`,
+					"precedence: --flags > profile capabilities > profile tiers > cost-tier resolver > fallback",
 					...formatAdapterTable(resolved).map((l) => `  ${l}`),
+					...(resolved.notes.length > 0 ? ["", ...resolved.notes.map((n) => `  note: ${n}`)] : []),
 					...(resolved.warnings.length > 0 ? ["", "warnings:", ...resolved.warnings.map((w) => `  - ${w}`)] : []),
+					...(p.notes.length > 0 ? ["", ...p.notes.map((n) => `  ${n}`)] : []),
 					"",
-					`override file: ${ADAPTER_OVERRIDE_PATH}${existsSync(ADAPTER_OVERRIDE_PATH) ? "" : " (not present)"}`,
-					'  example: {"tiers":{"premium":"amazon-bedrock/global.anthropic.claude-fable-5-1","mid":"amazon-bedrock/global.anthropic.claude-sonnet-5","cheap":"amazon-bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"}}',
-					"per-run: /orchestrate <goal> --premium P/M --mid P/M --cheap P/M --model architect=P/M",
-					"",
-					`available models (${available.length}):`,
-					...available.slice(0, 40).map((m) => `  ${m}`),
-					...(available.length > 40 ? [`  … ${available.length - 40} more`] : []),
-				].join("\n"),
-				resolved.warnings.length > 0 ? "warning" : "info",
-			);
+					`profiles: ${Object.keys(p.file.profiles).map((n) => (n === p.file.active_profile ? `*${n}` : n)).join(", ")}  file: ${PROFILES_PATH}${p.present ? "" : " (not created yet)"}`,
+					"commands: /orchestrator-models list | set <cap|tier> <alias> | use <profile> | pick | validate --live",
+				];
+				ctx.ui.notify(lines.join("\n"), resolved.warnings.length > 0 ? "warning" : "info");
+				return resolved;
+			};
+
+			switch (sub) {
+				case "show": {
+					await showResolved(positional[0] ?? parsed.models.profile);
+					return;
+				}
+				case "list": {
+					const models = availableModels(ctx);
+					const table = buildAliasTable(models);
+					const profiles = loadProfiles();
+					const preference = profiles.file.provider_preference ?? DEFAULT_PROVIDER_PREFERENCE;
+					const shortcuts = listShortcuts(table, preference);
+					const byProvider = new Map<string, string[]>();
+					for (const m of models) byProvider.set(m.provider, [...(byProvider.get(m.provider) ?? []), m.id]);
+					const width = Math.min(20, Math.max(...shortcuts.map((s) => s.alias.length), 5));
+					ctx.ui.notify(
+						[
+							`Aliases (provider preference: ${preference.join(" > ")}; write provider/alias to force one):`,
+							...shortcuts.map((s) => `  ${s.alias.padEnd(width)} → ${s.model}${s.alsoOn.length ? `  (also on ${s.alsoOn.join(", ")})` : ""}`),
+							"",
+							`Full catalog (${models.length} models configured):`,
+							...[...byProvider.entries()].flatMap(([prov, ids]) => [`  ${prov} (${ids.length}):`, ...ids.sort().map((id) => `    ${id}`)]),
+						].join("\n"),
+						"info",
+					);
+					return;
+				}
+				case "validate":
+				case "check": {
+					const resolved = await showResolved(positional[0] ?? parsed.models.profile);
+					const problems = [...resolved.profiles.problems, ...userLayerWarnings(resolved)];
+					if (problems.length > 0) {
+						ctx.ui.notify(`Offline validation: FAIL (${problems.length} problem(s)) — /orchestrate would refuse to dispatch.`, "error");
+						return;
+					}
+					ctx.ui.notify("Offline validation: OK — every binding resolves to a configured model.", "info");
+					if (sub === "check" || parsed.check) await checkModels(ctx, resolved);
+					return;
+				}
+				case "use": {
+					const name = positional[0];
+					const profiles = loadProfiles();
+					if (!name || !profiles.file.profiles[name]) {
+						ctx.ui.notify(`Unknown profile "${name ?? ""}". Have: ${Object.keys(profiles.file.profiles).join(", ")}`, "error");
+						return;
+					}
+					profiles.file.active_profile = name;
+					writeProfilesFile(profiles.file);
+					ctx.ui.notify(`Active profile → "${name}"`, "info");
+					await showResolved(name);
+					return;
+				}
+				case "new": {
+					const name = positional[0];
+					if (!name || !PROFILE_NAME_RE.test(name)) {
+						ctx.ui.notify(`Profile name must match ${PROFILE_NAME_RE}`, "error");
+						return;
+					}
+					const profiles = loadProfiles();
+					if (profiles.file.profiles[name]) {
+						ctx.ui.notify(`Profile "${name}" already exists.`, "error");
+						return;
+					}
+					const fromIdx = rest.indexOf("--from");
+					const from = fromIdx !== -1 ? rest[fromIdx + 1] : undefined;
+					const base: ProfileSpec = from ? structuredClone(profiles.file.profiles[from] ?? {}) : {};
+					if (from && !profiles.file.profiles[from]) {
+						ctx.ui.notify(`--from profile "${from}" does not exist.`, "error");
+						return;
+					}
+					profiles.file.profiles[name] = { ...base, description: from ? `copied from ${from}` : undefined };
+					writeProfilesFile(profiles.file);
+					ctx.ui.notify(`Created profile "${name}"${from ? ` from "${from}"` : ""}. Activate with: /orchestrator-models use ${name}`, "info");
+					return;
+				}
+				case "set": {
+					const [target, spec] = positional;
+					if (!target || !spec) {
+						ctx.ui.notify(`Usage: /orchestrator-models set <capability|cheap|mid|premium> <alias|provider/model> [--profile P]\n${MODELS_USAGE}`, "error");
+						return;
+					}
+					if (!isTier(target) && !ALL_CAPABILITIES.includes(target)) {
+						ctx.ui.notify(`"${target}" is not a tier (cheap|mid|premium) or capability (${ALL_CAPABILITIES.join(", ")})`, "error");
+						return;
+					}
+					const profiles = loadProfiles();
+					const name = parsed.models.profile ?? profiles.file.active_profile;
+					const profile = (profiles.file.profiles[name] ??= {});
+					const table = buildAliasTable(availableModels(ctx));
+					const res = resolveAlias(spec, table, profiles.file.provider_preference ?? DEFAULT_PROVIDER_PREFERENCE);
+					if (!res.model) {
+						ctx.ui.notify(`${res.error}\nNothing written. /orchestrator-models list shows valid aliases.`, "error");
+						return;
+					}
+					if (isTier(target)) (profile.tiers ??= {})[target] = spec;
+					else (profile.capabilities ??= {})[target] = spec;
+					writeProfilesFile(profiles.file);
+					ctx.ui.notify(`${name}.${target} = ${spec} → ${res.model}${res.note ? `\nnote: ${res.note}` : ""}`, "info");
+					await showResolved(name);
+					return;
+				}
+				case "effort": {
+					const [cap, level] = positional;
+					if (!cap || !level || !ALL_CAPABILITIES.includes(cap) || (level !== "none" && !isThinkingLevel(level))) {
+						ctx.ui.notify(`Usage: /orchestrator-models effort <capability> <${THINKING_LEVELS.join("|")}|none> [--profile P]`, "error");
+						return;
+					}
+					const profiles = loadProfiles();
+					const name = parsed.models.profile ?? profiles.file.active_profile;
+					const profile = (profiles.file.profiles[name] ??= {});
+					if (level === "none") delete profile.effort?.[cap];
+					else (profile.effort ??= {})[cap] = level;
+					writeProfilesFile(profiles.file);
+					ctx.ui.notify(`${name}.effort.${cap} = ${level}`, "info");
+					return;
+				}
+				case "pick": {
+					if (!ctx.hasUI) {
+						ctx.ui.notify("pick needs an interactive session; use `set` instead.", "error");
+						return;
+					}
+					const profiles = loadProfiles();
+					const name = positional[0] ?? profiles.file.active_profile;
+					if (positional[0] && !PROFILE_NAME_RE.test(positional[0])) {
+						ctx.ui.notify(`Profile name must match ${PROFILE_NAME_RE}`, "error");
+						return;
+					}
+					const profile = (profiles.file.profiles[name] ??= {});
+					const table = buildAliasTable(availableModels(ctx));
+					const preference = profiles.file.provider_preference ?? DEFAULT_PROVIDER_PREFERENCE;
+					const shortcuts = listShortcuts(table, preference);
+					// Options: short aliases first (what people think in), then every raw provider/id.
+					const options = [
+						...shortcuts.map((s) => `${s.alias}  →  ${s.model}`),
+						...[...new Set(table.models.map((m) => `${m.provider}/${m.id}`))].sort(),
+					];
+					const KEEP = "(keep current)";
+					const CLEAR = "(clear — fall through to next layer)";
+					const pickOne = async (title: string, current: string | undefined) => {
+						const choice = await ctx.ui.select(`${title}${current ? `  [current: ${current}]` : ""}`, [KEEP, CLEAR, ...options]);
+						if (choice === undefined || choice === KEEP) return "keep" as const;
+						if (choice === CLEAR) return "clear" as const;
+						return choice.includes("  →  ") ? choice.split("  →  ")[0].trim() : choice;
+					};
+					// Tiers first — three picks cover every capability.
+					for (const tier of TIERS) {
+						const r = await pickOne(`${tier} tier (${TIER_CAPABILITIES[tier].join(", ")})`, profile.tiers?.[tier]);
+						if (r === "clear") delete profile.tiers?.[tier];
+						else if (r !== "keep") (profile.tiers ??= {})[tier] = r;
+					}
+					// Then optional per-capability overrides until Done.
+					const DONE = "(done)";
+					while (true) {
+						const cap = await ctx.ui.select(
+							"Override a single capability? (tiers already cover all of them)",
+							[DONE, ...ALL_CAPABILITIES.map((c) => `${c}${profile.capabilities?.[c] ? `  = ${profile.capabilities[c]}` : ""}`)],
+						);
+						if (cap === undefined || cap === DONE) break;
+						const capName = cap.split("  =")[0].trim();
+						const r = await pickOne(`model for ${capName}`, profile.capabilities?.[capName]);
+						if (r === "clear") delete profile.capabilities?.[capName];
+						else if (r !== "keep") (profile.capabilities ??= {})[capName] = r;
+					}
+					writeProfilesFile(profiles.file);
+					ctx.ui.notify(`Saved profile "${name}".`, "info");
+					const resolved = await showResolved(name);
+					const problems = [...resolved.profiles.problems, ...userLayerWarnings(resolved)];
+					if (problems.length > 0) ctx.ui.notify(`Validation: FAIL (${problems.length}) — see warnings above.`, "error");
+					else if (await ctx.ui.confirm("Validation OK", "Run a live probe on each configured model now? (a few cents)")) await checkModels(ctx, resolved);
+					return;
+				}
+				default:
+					ctx.ui.notify(`Unknown subcommand "${sub}".\n${MODELS_USAGE}`, "error");
+			}
 		},
 	});
 

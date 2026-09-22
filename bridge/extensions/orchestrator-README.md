@@ -18,7 +18,7 @@ After install, restart HT (or `/reload`):
 ```
 /reload
 /orchestrate <goal> [--task-class T] [--complexity N] [--risk R] [--cheap P/M] [--mid P/M] [--premium P/M] [--model cap=P/M] [--max-retries N] [--yes]
-/orchestrator-models
+/orchestrator-models [list|set|use|pick|validate --live]
 /orchestrator-roi
 /cross-review-demo
 ```
@@ -27,7 +27,7 @@ After install, restart HT (or `/reload`):
 
 | runtime path (under ` ~/.humain-terminal/agent/`) | source in this repo |
 |---|---|
-| `extensions/orchestrator.ts` | `bridge/extensions/orchestrator.ts` |
+| `extensions/orchestrator/` (`index.ts`, `models.ts`) | `bridge/extensions/orchestrator/` |
 | `extensions/orchestrator-README.md` | `bridge/extensions/orchestrator-README.md` |
 | `extensions/cross-review-demo.ts` | `bridge/extensions/cross-review-demo.ts` |
 | `agents/orchestrator-lead.md` | `bridge/agents/orchestrator-lead.md` |
@@ -72,39 +72,62 @@ Show ROI anytime:
 
 ## Model binding
 
-Precedence, highest first:
-
-1. Per-run flags: `--cheap P/M`, `--mid P/M`, `--premium P/M`, `--model <capability>=P/M`
-2. `~/.humain-terminal/agent/orchestrator-adapter.json` → `capabilities`
-3. `~/.humain-terminal/agent/orchestrator-adapter.json` → `tiers`
-4. Cost-tier resolver (`cli resolve-adapter --explain`, intersects HT's `models-store.json` with `data/humain_node_catalog.json`)
-5. Bundled `FALLBACK_ADAPTER`
+Models are configured in **one file**, `~/.humain-terminal/agent/orchestrator-profiles.json`,
+as named profiles. Values are short **aliases** (`fable-5-1`, `sonnet`, `haiku`,
+`astra`, `terra`) or explicit `provider/model`. Aliases are derived at runtime from
+the models you actually have configured (`models-store.json`) — there is no static
+table to go stale.
 
 ```json
 {
-  "tiers": {
-    "premium": "amazon-bedrock/global.anthropic.claude-fable-5-1",
-    "mid":     "amazon-bedrock/global.anthropic.claude-sonnet-5",
-    "cheap":   "amazon-bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
-  },
-  "capabilities": {
-    "technical_review": { "model": "amazon-bedrock/global.anthropic.claude-opus-5", "effort": "high" }
+  "version": 1,
+  "active_profile": "default",
+  "provider_preference": ["openai-codex", "amazon-bedrock"],
+  "profiles": {
+    "default": {
+      "tiers":        { "premium": "fable-5-1", "mid": "sonnet", "cheap": "haiku" },
+      "capabilities": { "technical_review": "astra", "security_review": "astra" },
+      "effort":       { "technical_review": "high" }
+    }
   }
 }
 ```
 
+Precedence, highest first — merged capability by capability:
+
+1. `/orchestrate` flags: `--model <capability>=ALIAS`, `--cheap/--mid/--premium ALIAS`, `--effort LEVEL`
+2. profile `capabilities` (active profile, or `--profile NAME`)
+3. profile `tiers`
+4. cost-tier resolver (`cli resolve-adapter`, intersects `models-store.json` with `data/humain_node_catalog.json`)
+5. bundled `FALLBACK_ADAPTER`
+
 Tiers: `cheap` = implementation_fast, worker, scout · `mid` = lead, qa_agent,
 implementation_strong, technical_lead, technical_review, analysis_mid,
 integration/migration/performance/api_contract_review · `premium` = architect,
-security_review, analysis_strong.
+security_review, analysis_strong. `effort` values are HT thinking levels
+(`off|minimal|low|medium|high|xhigh|max`) and are passed as `--thinking`.
 
-Every binding is canonicalized against HT's model registry before dispatch, so
-`amazon-bedrock/claude-sonnet-5` becomes the exact id that will run, and an
-unresolvable override aborts the run before any money is spent. Inspect with:
+Alias rules: a bare alias that exists on several providers is picked by
+`provider_preference` (default codex first) and the choice is reported; write
+`provider/alias` (e.g. `amazon-bedrock/astra`) to force one. Family names
+(`fable`, `sonnet`) resolve to the newest undated, `global.` variant. Unknown
+aliases fail with suggestions, **before** anything is dispatched.
+
+The old `orchestrator-adapter.json` is migrated into profile `default` the first
+time it is seen and then ignored.
 
 ```
-/orchestrator-models
-/orchestrator-models --premium amazon-bedrock/claude-opus-5
+/orchestrator-models                       resolved table for the active profile, with sources
+/orchestrator-models list                  every alias you can use + the full catalog
+/orchestrator-models set premium fable-5-1 [--profile P]
+/orchestrator-models set technical_review astra
+/orchestrator-models effort technical_review high
+/orchestrator-models new work --from default
+/orchestrator-models use work
+/orchestrator-models pick                  interactive: three tier picks, then optional per-capability overrides
+/orchestrator-models validate [P]          offline: every binding resolves to a configured model
+/orchestrator-models check                 validate + live one-turn probe of every distinct model (a few cents)
+/orchestrate <goal> --profile work --effort high
 ```
 
 The lead's task prompt carries the resolved agent→model table and the lead must

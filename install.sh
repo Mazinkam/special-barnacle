@@ -111,6 +111,12 @@ main() {
     fi
 
     log "mode: install"
+    # The extension moved from a single file to a directory (orchestrator/index.ts).
+    # A stale file symlink would load a second, dead copy; drop it.
+    if [ -L "$EXTENSIONS_DST/orchestrator.ts" ]; then
+        rm "$EXTENSIONS_DST/orchestrator.ts"
+        log "remove    orchestrator.ts (superseded by orchestrator/ directory)"
+    fi
     while IFS='|' read -r src dst; do
         [ -n "${src:-}" ] || continue
         install_one "$src" "$dst"
@@ -119,6 +125,7 @@ main() {
     log "install done. run /reload in HT (or restart) to pick up the new commands:"
     log "  /reload"
     log "  /orchestrate <goal> [--task-class T] [--complexity N] [--risk R]"
+    log "  /orchestrator-models [list|set|use|pick|validate --live]"
     log "  /orchestrator-roi"
 }
 
