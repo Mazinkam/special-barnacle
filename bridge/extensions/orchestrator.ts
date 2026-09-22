@@ -626,10 +626,18 @@ async function runSubagentProcess(opts: {
 	});
 }
 
+/**
+ * Classify the goal with the cheapest capability.
+ *
+ * `costSink` accumulates what triage spent. Triage is logged under its own
+ * synthetic run id (it happens before the real run exists), so without this the
+ * command's reported total silently excluded it.
+ */
 async function triageTask(
 	goal: string,
 	cwd: string,
 	ctx: ExtensionContext,
+	costSink: { usd: number },
 ): Promise<TriageResult | null> {
 	const adapter = await adapter_();
 	const cheapest =
@@ -651,6 +659,7 @@ async function triageTask(
 			model: cheapest.model,
 			ctx,
 		});
+		costSink.usd += r?.costUsd ?? 0;
 		if (!r || r.exitCode !== 0) {
 			if (r) {
 				// Surface WHY, instead of the bare "Triage unavailable" the command
@@ -1701,10 +1710,11 @@ export default function (pi: ExtensionAPI) {
 			let effectiveComplexity = parsed.complexity;
 			let effectiveRisk = parsed.risk;
 			let triageResult: TriageResult | null = null;
+			const triageCost = { usd: 0 };
 
 			if (missingTriage) {
 				ctx.ui.notify("Triaging goal with cheapest model\u2026", "info");
-				triageResult = await triageTask(parsed.goal, process.cwd(), ctx);
+				triageResult = await triageTask(parsed.goal, process.cwd(), ctx, triageCost);
 				if (triageResult) {
 					effectiveTaskClass = triageResult.task_class;
 					effectiveComplexity = triageResult.complexity;
@@ -1881,7 +1891,8 @@ export default function (pi: ExtensionAPI) {
 				...verificationResults,
 				...escalationResults,
 			];
-			const totalCost = billedResults.reduce((s, r) => s + r.costUsd, 0);
+			const totalCost =
+				triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0);
 			const succeededLeads = leadResults.filter((r) => r.exitCode === 0).length;
 			// A run that dispatched nothing, or whose every lead failed, has not
 			// verified anything — reporting the empty verification suite as PASS is
@@ -1898,6 +1909,17 @@ export default function (pi: ExtensionAPI) {
 				retries,
 			});
 
+			// For chat/check-in-style goals, the worker produces prose but no file
+			// edits, so the notification block above would otherwise reduce the
+			// run to "$0.0055 cost, 0 files changed" with no signal that anything
+			// actually happened. Surface the lead's reply (truncated) so the user
+			// can see the work; for code tasks that did mutate files, the file
+			// list + verification verdict are the signal that matters.
+			const leadReply =
+				allFiles.length === 0 && leadResults.length > 0
+					? (leadResults[0].stdout ?? "").trim().split("\n").slice(0, 8).join("\n").trim()
+					: "";
+
 			ctx.ui.notify(
 				[
 					`Orchestration complete.`,
@@ -1907,7 +1929,9 @@ export default function (pi: ExtensionAPI) {
 						!dispatchOk
 							? "NOT RUN (no lead succeeded)"
 							: verificationSkipped
-								? "SKIPPED (no files changed)"
+								? allFiles.length === 0
+									? "N/A (chat/check-in goal — no files to verify)"
+									: "SKIPPED (no files changed)"
 								: passedVerification
 									? "PASS"
 									: "FAIL"
@@ -1924,6 +1948,7 @@ export default function (pi: ExtensionAPI) {
 										.slice(0, 300) || "(no output)"
 								}`,
 							]),
+					...(leadReply ? ["", "lead reply:", leadReply] : []),
 					`ledger: ${STATE_ROOT}/metrics.jsonl`,
 				].join("\n"),
 				passedVerification ? "info" : "warning",
