@@ -143,6 +143,27 @@ class DashboardAttributionTests(unittest.TestCase):
             self.assertNotIn('unknown', data['by_runtime'])
             self.assertEqual(data['by_runtime']['humain-terminal']['calls'], 2)
 
+    def test_session_ingest_rows_are_isolated_from_orchestrated_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'metrics.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in [
+                {'event': 'model_call', 'source': 'session_ingest', 'role': 'interactive_session',
+                 'agent_runtime': 'claude-code', 'cost_usd': 3.0, 'cost_source': 'reported'},
+                {'event': 'model_call', 'role': 'interactive_session', 'agent_runtime': 'codex',
+                 'cost_usd': 4.0, 'cost_source': 'reported'},
+                {'event': 'model_call', 'role': 'implementer', 'agent_runtime': 'humain-terminal',
+                 'cost_usd': 1.0, 'cost_source': 'reported'},
+                {'event': 'model_call', 'role': 'technical_review', 'agent_runtime': 'humain-terminal',
+                 'cost_usd': 2.0, 'cost_source': 'reported'},
+            ]), encoding='utf-8')
+            data = build_data(root, config={})
+            self.assertNotIn('interactive_session', data['by_role'])
+            self.assertNotIn('claude-code', data['by_runtime'])
+            self.assertNotIn('codex', data['by_runtime'])
+            self.assertAlmostEqual(data['summary']['total_cost'], 3.0)
+            self.assertEqual(data['interactive_sessions']['calls'], 2)
+            self.assertAlmostEqual(data['interactive_sessions']['cost'], 7.0)
+
 
 if __name__ == '__main__':
     unittest.main()

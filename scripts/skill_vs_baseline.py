@@ -22,6 +22,7 @@ from typing import Any, Iterable
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # .../hierarchical-agent-orchestrator/
 
+from orchestrator.economics import is_session_ingest  # noqa: E402
 from orchestrator.pricing import estimate_cost_usd, load_pricing  # noqa: E402
 
 STATE = Path('~/.local/state/coding-agent-orchestrator').expanduser()
@@ -64,7 +65,7 @@ def partition(records: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
     """Return (orchestrated, interactive_session)."""
     orchestrated, interactive = [], []
     for r in records:
-        if r.get('source') == 'session_ingest' or r.get('role') == 'interactive_session':
+        if is_session_ingest(r):
             interactive.append(r)
         else:
             orchestrated.append(r)

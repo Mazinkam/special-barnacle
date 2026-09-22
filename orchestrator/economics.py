@@ -37,6 +37,10 @@ def is_call_row(row:dict)->bool:
     if row.get('event')=='model_call': return True
     return any(row.get(k) is not None for k in ('cost_usd','input_tokens','output_tokens','model','cost_source'))
 
+def is_session_ingest(row:dict)->bool:
+    """Rows ingested from interactive sessions (not orchestrated runs)."""
+    return row.get('source')=='session_ingest' or row.get('role')=='interactive_session'
+
 def cost_attribution(rows:list[dict])->dict[str,Any]:
     """Split spend by provenance so an unmetered runtime never renders as $0 spend."""
     buckets={k:{'cost':0.0,'calls':0} for k in (REPORTED,ESTIMATED,UNMETERED)}
