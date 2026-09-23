@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Iterable, Iterator, Optional
 from contextlib import contextmanager
 import fcntl, hashlib, json, os, secrets
 
@@ -58,17 +58,19 @@ def fsync_directory_ancestry(path: Path) -> list[Path]:
         directory = parent
 
 
-def write_json(path: Path, value: Any, *, compact: bool=False, durable: bool=False):
+def _create_exclusive_tmp(path: Path) -> tuple[int, Path]:
+    """Open a fresh same-directory temporary file for an atomic replacement of `path`."""
     for _ in range(100):
         tmp = path.with_name(f'.{path.name}.{secrets.token_hex(8)}.tmp')
         try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-            break
+            return os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666), tmp
         except FileExistsError:
             continue
-    else:
-        raise FileExistsError(f'Could not create a unique temporary file for {path}')
+    raise FileExistsError(f'Could not create a unique temporary file for {path}')
 
+
+def write_json(path: Path, value: Any, *, compact: bool=False, durable: bool=False):
+    fd, tmp = _create_exclusive_tmp(path)
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             # json.dumps uses the C encoder; json.dump(fp) always falls back to the pure-Python one.
@@ -76,8 +78,25 @@ def write_json(path: Path, value: Any, *, compact: bool=False, durable: bool=Fal
             if durable:
                 f.flush()
                 os.fsync(f.fileno())
-        tmp.replace(path)
+        os.replace(tmp, path)
         if durable: fsync_directory(path.parent)
+    finally:
+        try: tmp.unlink()
+        except FileNotFoundError: pass
+
+def write_text_atomic(path: Path, chunks: Iterable[str], *, encoding: str='utf-8'):
+    """Publish a text document by same-directory temporary file + rename.
+
+    Readers (a browser tab on `file://dashboard.html`, another process) see either the previous
+    complete document or the new complete one, never a truncated page. A failure while rendering
+    or writing leaves the previous document untouched and removes the temporary file. Nothing is
+    fsynced: derived views are rebuildable, and the next refresh republishes them.
+    """
+    fd, tmp = _create_exclusive_tmp(path)
+    try:
+        with os.fdopen(fd, 'w', encoding=encoding) as f:
+            for chunk in chunks: f.write(chunk)
+        os.replace(tmp, path)
     finally:
         try: tmp.unlink()
         except FileNotFoundError: pass
@@ -125,6 +144,18 @@ def iter_jsonl_from(path: Path, offset: int=0):
             if not stripped: yield None,pos; continue
             try: yield json.loads(stripped),pos
             except (json.JSONDecodeError,UnicodeDecodeError): yield None,pos
+
+def iter_jsonl(path: Path) -> Iterator[dict[str,Any]]:
+    """Stream the complete, well-formed JSON objects of a JSONL file in order, one at a time.
+
+    Never holds the whole file: lines are read through the buffered binary reader and parsed one
+    by one. Blank lines, malformed lines, invalid UTF-8 and non-object JSON values are skipped, and a
+    trailing line without its newline (torn or in-progress write) is not yielded — the same
+    replayable-prefix rule the ledger uses, so the dashboard and the ledger agree on what exists.
+    `load_jsonl` remains the eager whole-file reader for callers that need a list.
+    """
+    for record,_ in iter_jsonl_from(path):
+        if isinstance(record,dict): yield record
 
 TAIL_FINGERPRINT_BYTES=4096
 

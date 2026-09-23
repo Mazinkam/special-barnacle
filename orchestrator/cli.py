@@ -4,7 +4,7 @@ import re as _re_path
 from pathlib import Path
 from typing import Any, Callable
 from .runtime import EventStore,QualityEvidence,default_state_root,read_json,utc_now,write_json
-from .state import rebuild,load_or_rebuild
+from .state import rebuild,refresh_ledger,load_or_rebuild
 from .dashboard import generate_dashboard
 from .record_batch import write_batch,single_record,BatchValidationError,BatchAppendError,STREAMS,RETRY_SAME_IDS
 from .history import load_stats
@@ -22,8 +22,9 @@ def _redact_paths(text):
 ROOT=default_state_root()
 def cfg(): return read_json(Path(__file__).with_name('config.json'),{})
 def refresh(state_root: Path = ROOT) -> Path:
+    """Incrementally catch up the durable ledger and atomically republish the dashboard."""
     root = Path(state_root)
-    rebuild(root)
+    refresh_ledger(root)
     return generate_dashboard(root, config=cfg())
 
 

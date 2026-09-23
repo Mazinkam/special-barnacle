@@ -37,18 +37,21 @@ from .records import (
     verification_state,
 )
 
+TOKEN_KEYS = ('input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_write_tokens')
+
 REPORTED = 'reported'
 ESTIMATED = 'estimated'
 UNMETERED = 'unmetered'
-TOKEN_KEYS = ('input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_write_tokens')
 
-
+#: `row_cost` is deliberately *the same function object* as `records.row_cost`. Imported above and
+#: re-exported here so existing callers (`dashboard`, `scripts/`) keep working while the definition
+#: of a row's cost exists once, in the classification seam.
 __all__ = [
-    'REPORTED', 'ESTIMATED', 'UNMETERED', 'TOKEN_KEYS', 'row_cost', 'has_reported_tokens',
-    'cost_class', 'is_call_row', 'is_session_ingest', 'cost_attribution', 'verified_cost',
-    'quantile', 'per_call_costs', 'cost_distribution', 'is_unsuccessful_attempt',
-    'waste_cost', 'coordination_roles', 'verification_roles', 'orchestration_overhead',
-    'fanout_rework', 'topology_regret',
+    'REPORTED', 'ESTIMATED', 'UNMETERED', 'row_cost', 'cost_class', 'is_call_row',
+    'is_session_ingest', 'cost_attribution', 'verified_cost', 'quantile', 'per_call_costs',
+    'cost_distribution', 'is_unsuccessful_attempt', 'waste_cost', 'coordination_roles',
+    'verification_roles', 'orchestration_overhead', 'fanout_rework', 'topology_regret',
+    'has_reported_tokens', 'unique_records', 'verification_passed',
 ]
 
 
@@ -58,14 +61,11 @@ def has_reported_tokens(row: dict) -> bool:
     All-zero usage measured nothing: HT writes `*_tokens=0` when a child crashes before
     reporting usage, and that must not read as 'this call was free'.
     """
-    for key in TOKEN_KEYS:
+    for k in TOKEN_KEYS:
         try:
-            if int(float(row.get(key) or 0)) > 0:
-                return True
-        except (TypeError, ValueError):
-            continue
+            if int(float(row.get(k) or 0))>0: return True
+        except (TypeError,ValueError): continue
     return False
-
 
 def cost_class(row: dict) -> str:
     """Classify a record's cost provenance: provider-reported, estimated, or absent.
@@ -80,11 +80,10 @@ def cost_class(row: dict) -> str:
     (HT's shape for a child that crashed before reporting usage) is a coverage gap, not spend.
     This is the single classifier for summary cards, per-runtime cards, and run evidence.
     """
-    source = str(row.get('cost_source') or '').strip().lower()
-    measured = row_cost(row) > 0 or has_reported_tokens(row)
-    if 'estimat' in source or 'blended' in source or 'derived' in source:
-        return ESTIMATED if measured else UNMETERED
-    if source in {'reported', 'provider', 'provider_reported', 'provider-reported', 'metered', 'measured', 'actual'}:
+    source=str(row.get('cost_source') or '').strip().lower()
+    measured=row_cost(row)>0 or has_reported_tokens(row)
+    if 'estimat' in source or 'blended' in source or 'derived' in source: return ESTIMATED if measured else UNMETERED
+    if source in {'reported','provider','provider_reported','provider-reported','metered','measured','actual'}:
         return REPORTED if measured else UNMETERED
     if 'not_metered' in source or 'not-metered' in source or 'unmetered' in source or 'unknown' in source:
         return ESTIMATED if row_cost(row)>0 else UNMETERED
@@ -111,6 +110,21 @@ def is_call_row(row: dict) -> bool:
         return True
     return any(row.get(k) is not None for k in ('cost_usd', 'input_tokens', 'output_tokens', 'model', 'cost_source'))
 
+def verification_passed(row:dict)->bool:
+    """The event names an attempt, not its result (engine also emits failures there)."""
+    return row.get('result') == 'verified' or (row.get('event') == 'task_verified' and row.get('result') in {'pass', 'success'})
+
+
+def unique_records(rows):
+    """First stable ID wins within one stream; ID-less historical rows remain distinct."""
+    seen = set()
+    for row in rows:
+        rid = row.get('record_id')
+        if isinstance(rid, str) and rid:
+            if rid in seen: continue
+            seen.add(rid)
+        yield row
+
 
 def is_session_ingest(row: dict) -> bool:
     """Rows ingested from interactive sessions (not orchestrated runs)."""
@@ -130,7 +144,7 @@ def cost_attribution(rows: list[dict]) -> dict[str, Any]:
     buckets = {k: {'cost': 0.0, 'calls': 0} for k in (REPORTED, ESTIMATED, UNMETERED)}
     calls = 0
     covered = 0
-    for row in rows:
+    for row in unique_records(rows):
         if not is_call_row(row):
             continue
         calls += 1
@@ -154,7 +168,7 @@ def verified_cost(rows: list[dict]) -> float:
 
 # --- per-call cost distribution ---------------------------------------------------------------
 
-def quantile(values: list[float], p: float) -> Any:
+def quantile(values: list[float], p: float, *, presorted: bool = False) -> Any:
     """Linear-interpolated quantile, or `NO_DATA` for an empty population.
 
     Returning `NO_DATA` rather than `0.0` is what lets a tail ratio refuse to exist instead of
@@ -162,7 +176,7 @@ def quantile(values: list[float], p: float) -> Any:
     """
     if not values:
         return NO_DATA
-    xs = sorted(values)
+    xs = values if presorted else sorted(values)
     k = (len(xs) - 1) * p
     lo = int(k)
     hi = min(len(xs) - 1, lo + 1)
@@ -188,15 +202,17 @@ def cost_distribution(rows: list[dict]) -> dict[str, Any]:
     should use `verified_cost`, not the sum of these percentiles.
     """
     costs = per_call_costs(rows)
+    call_cost = sum(costs)
+    costs.sort()
     samples = len(costs)
     sessions = [r for r in rows if classify(r) == SESSION]
     return {
         'samples': samples,
-        'call_cost': sum(costs),
-        'mean_cost': metric(sum(costs) / samples if samples else None, samples),
-        'p50_cost': metric(quantile(costs, .5), samples),
-        'p90_cost': metric(quantile(costs, .9), samples),
-        'p99_cost': metric(quantile(costs, .99), samples),
+        'call_cost': call_cost,
+        'mean_cost': metric(call_cost / samples if samples else None, samples),
+        'p50_cost': metric(quantile(costs, .5, presorted=True), samples),
+        'p90_cost': metric(quantile(costs, .9, presorted=True), samples),
+        'p99_cost': metric(quantile(costs, .99, presorted=True), samples),
         'max_cost': metric(max(costs) if costs else None, samples),
         'session_rows': len(sessions),
         'session_cost': sum(row_cost(r) for r in sessions),

@@ -3,7 +3,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
-from .runtime import default_state_root, load_jsonl
+from typing import Iterable
+from .runtime import default_state_root, iter_jsonl
 
 def _dt(s):
     try: return datetime.fromisoformat(s.replace('Z','+00:00'))
@@ -66,8 +67,11 @@ def bad_signal(row: dict) -> bool:
     return False
 
 
-def outcome_summary(root=None):
-    root=Path(root) if root is not None else default_state_root(); rows=load_jsonl(root/'outcomes.jsonl'); by=defaultdict(list)
+def outcome_summary(root=None, rows:Iterable[dict]|None=None):
+    """Per-task delayed-outcome maturity. Pass `rows` to reuse outcomes a caller already streamed."""
+    if rows is None:
+        root=Path(root) if root is not None else default_state_root(); rows=iter_jsonl(root/'outcomes.jsonl')
+    by=defaultdict(list)
     for r in rows:
         if r.get('task_id'): by[r['task_id']].append(r)
     now=datetime.now(timezone.utc); result=[]
