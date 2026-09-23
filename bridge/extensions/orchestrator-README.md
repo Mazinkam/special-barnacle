@@ -17,7 +17,7 @@ After install, restart HT (or `/reload`):
 
 ```
 /reload
-/orchestrate <goal> [--task-class T] [--complexity N] [--risk R] [--cheap P/M] [--mid P/M] [--premium P/M] [--model cap=P/M] [--max-retries N] [--yes]
+/orchestrate <goal> [--task-class T] [--complexity N] [--risk R] [--cheap P/M] [--mid P/M] [--premium P/M] [--model cap=P/M] [--max-retries N] [--interactive]
 /orchestrator-models [list|set|use|pick|validate --live]
 /orchestrator-roi
 /cross-review-demo
@@ -164,8 +164,7 @@ Dispatched agents are non-interactive: they cannot ask you questions mid-run.
 Goals that ask for questions get a warning up front; the lead is instructed to
 put open questions under `## Open items`, which the completion summary surfaces.
 
-Only one `/orchestrate` may be live per session. `--yes` (or
-`HUMAIN_ORCHESTRATOR_ASSUME_YES=1`) skips the two confirmations.
+Only one `/orchestrate` may be live per session. Runs automatically approve the triage result and dispatch plan by default. Pass `--interactive` to require confirmation after triage and again before dispatch. `--yes` / `-y` remain accepted as no-op compatibility aliases for the new default.
 
 ## What this integration does NOT do
 

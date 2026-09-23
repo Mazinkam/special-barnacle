@@ -119,10 +119,8 @@ function runsDir(): string {
 }
 
 // Non-interactive runs (`--mode json -p`, CI, smoke tests) get a no-op UI whose
-// `confirm()` always resolves false, so /orchestrate could never dispatch
-// outside a TTY. Opt in explicitly — default stays "ask", because dispatch
-// spends money and edits files.
-const ASSUME_YES = /^(1|true|yes)$/i.test(process.env.HUMAIN_ORCHESTRATOR_ASSUME_YES ?? "");
+// `confirm()` always resolves false. Runs therefore auto-approve by default;
+// `--interactive` explicitly opts in to the confirmation gates.
 
 function positiveIntEnv(name: string, fallback: number): number {
 	const raw = Number(process.env[name]);
@@ -271,23 +269,19 @@ async function mapWithConcurrency<T, R>(
 	return results;
 }
 
-async function confirmStep(
+export async function confirmStep(
 	ctx: ExtensionContext,
 	title: string,
 	message: string,
-	assumeYes = false,
+	requireConfirmation = false,
 ): Promise<boolean> {
-	if (ASSUME_YES || assumeYes) {
-		ctx.ui.notify(
-			`${title} — auto-confirmed (${assumeYes ? "--yes" : "HUMAIN_ORCHESTRATOR_ASSUME_YES"})`,
-			"warning",
-		);
+	if (!requireConfirmation) {
+		ctx.ui.notify(`${title} — auto-confirmed (default mode)`, "info");
 		return true;
 	}
 	if (!ctx.hasUI) {
-		// A headless session has no dialog to answer; refuse rather than hang
-		// or silently spend money.
-		ctx.ui.notify(`${title}: no UI to confirm — pass --yes or set HUMAIN_ORCHESTRATOR_ASSUME_YES=1`, "error");
+		// An interactive request cannot be answered in a headless session.
+		ctx.ui.notify(`${title}: no UI to confirm — remove --interactive to run automatically`, "error");
 		return false;
 	}
 	return ctx.ui.confirm(title, message);
@@ -2271,8 +2265,8 @@ interface OrchestrateArgs {
 	costAggressiveness?: number;
 	fanOut: boolean;
 	maxRetries: number;
-	/** Skip both confirmation dialogs (same as HUMAIN_ORCHESTRATOR_ASSUME_YES). */
-	yes: boolean;
+	/** Opt in to confirmation dialogs after triage and before dispatch. */
+	interactive: boolean;
 	/** /orchestrator-models only: dispatch a one-turn probe on every distinct model. */
 	check: boolean;
 	/** Per-tier / per-capability model overrides from --cheap/--mid/--premium/--model. */
@@ -2281,7 +2275,7 @@ interface OrchestrateArgs {
 	unknownFlags: string[];
 }
 
-function parseArgs(args: string): OrchestrateArgs {
+export function parseArgs(args: string): OrchestrateArgs {
 	const tokens = args.trim().split(/\s+/);
 	const out: OrchestrateArgs = {
 		goal: "",
@@ -2290,7 +2284,7 @@ function parseArgs(args: string): OrchestrateArgs {
 		risk: "medium",
 		fanOut: false,
 		maxRetries: 2,
-		yes: false,
+		interactive: false,
 		check: false,
 		models: emptyOverrides(),
 		unknownFlags: [],
@@ -2307,7 +2301,9 @@ function parseArgs(args: string): OrchestrateArgs {
 			case "--cost-aggressiveness": if (next) { out.costAggressiveness = Number(next); i++; } break;
 			case "--fan-out": out.fanOut = true; break;
 			case "--max-retries": if (next) { out.maxRetries = Number(next) || 2; i++; } break;
-			case "--yes": case "-y": out.yes = true; break;
+			case "--interactive": out.interactive = true; break;
+			// Kept as a no-op for existing scripts: auto-approval is now the default.
+			case "--yes": case "-y": break;
 			case "--check": case "--live": out.check = true; break;
 			case "--profile": if (next) { out.models.profile = next; i++; } break;
 			case "--effort": {
@@ -2421,7 +2417,7 @@ async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Pr
 const USAGE =
 	"Usage: /orchestrate <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical]\n" +
 	"       [--profile NAME] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--model <capability>=ALIAS] [--effort LEVEL]\n" +
-	"       [--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--yes]\n" +
+	"       [--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--interactive]\n" +
 	"ALIAS is a short name (fable-5-1, sonnet, haiku, astra, terra) or provider/model. Profiles: " + PROFILES_PATH + "  (see /orchestrator-models)";
 
 const MODELS_USAGE = [
@@ -2489,7 +2485,7 @@ export default function (pi: ExtensionAPI) {
 			"Plan and dispatch a hierarchical agent run. " +
 			"Args: <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical] " +
 			"[--profile NAME] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--model <capability>=ALIAS] [--effort LEVEL] " +
-			"[--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--yes]\n\n" +
+			"[--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--interactive]\n\n" +
 			"With no triage flags, an LLM triage call (cheapest configured model) " +
 			"auto-fills task_class, complexity, and risk from the goal text. " +
 			"Models: flags > profile (orchestrator-profiles.json) > cost-tier resolver. See /orchestrator-models.",
@@ -2574,11 +2570,14 @@ export default function (pi: ExtensionAPI) {
 								`risk:        ${effectiveRisk}\n\n` +
 								`Reasoning: ${triageResult.reasoning}\n\n` +
 								`OK to plan with these values? (Cancel to abort)`,
-							parsed.yes,
+							parsed.interactive,
 						);
 						if (!proceed) {
-							session.log("cancelled by user after triage");
-							await failRun(runId, "cancelled after triage");
+							const reason = parsed.interactive && !ctx.hasUI
+								? "interactive confirmation unavailable after triage"
+								: "cancelled by user after triage";
+							session.log(reason);
+							await failRun(runId, reason);
 							ctx.ui.notify("Cancelled.", "info");
 							return;
 						}
@@ -2640,11 +2639,14 @@ export default function (pi: ExtensionAPI) {
 					ctx,
 					"Dispatch this plan?",
 					`${pipeline}\n\nEach stage runs headless (up to ${Math.round(DISPATCH_TIMEOUT_MS / 60000)} min per dispatch); live progress shows above the editor.`,
-					parsed.yes,
+					parsed.interactive,
 				);
 				if (!proceed) {
-					session.log("cancelled by user at plan confirmation");
-					await failRun(runId, "cancelled at plan confirmation");
+					const reason = parsed.interactive && !ctx.hasUI
+						? "interactive confirmation unavailable before dispatch"
+						: "cancelled by user at plan confirmation";
+					session.log(reason);
+					await failRun(runId, reason);
 					ctx.ui.notify("Cancelled.", "info");
 					return;
 				}
