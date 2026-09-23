@@ -8,6 +8,8 @@ full-history aggregates and UI fields, only the recent-row retention is bounded.
 """
 from __future__ import annotations
 
+import argparse
+import importlib.util
 import io
 import json
 import os
@@ -16,13 +18,15 @@ import re
 import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
 import unittest
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from orchestrator import dashboard, runtime
+from orchestrator import dashboard, records, runtime
 from orchestrator.economics import (ESTIMATED, REPORTED, UNMETERED, cost_attribution, cost_class, fanout_rework,
                                     is_call_row, is_session_ingest, orchestration_overhead, row_cost, waste_cost)
 from orchestrator.features import feature_inventory
@@ -141,6 +145,51 @@ def synthetic_history(runs: int, seed: int = 7, *, run_prefix: str = 'R') -> dic
     for rows in (events, metrics, outcomes):
         rows.sort(key=lambda r: r['ts'])
     return {'events.jsonl': events, 'metrics.jsonl': metrics, 'outcomes.jsonl': outcomes}
+
+
+def edge_case_rows() -> dict[str, list[dict]]:
+    """Representative shapes the synthetic generator never emits, appended after the sorted history.
+
+    Each one exercises a branch the streaming pass and the whole-file oracle must agree on: costs
+    carried only by `ci_cost_usd`/`human_cost_usd`, `null` cost and usage (unmetered, not free),
+    the legacy `runtime` key instead of `agent_runtime` (orchestrated and ingested rows), a verified
+    row without a task id, a row without any timestamp, and events with no `run_id`.
+    """
+    run = {'run_id': 'R-edge', 'repository': '/work/forge'}
+    ts = lambda s: f'2025-08-15T10:{s:02d}:00+00:00'  # noqa: E731 - later than every generated row
+    metrics = [
+        {'ts': ts(0), 'record_id': 'edge-ci', 'event': 'ci_run', 'task_id': 'R-edge-T0', 'ci_cost_usd': .42, 'cost_source': 'reported',
+         'role': 'ci', 'agent_runtime': 'humain-terminal', **run},
+        {'ts': ts(1), 'record_id': 'edge-human', 'event': 'human_review', 'task_id': 'R-edge-T0', 'human_cost_usd': 3.0,
+         'role': 'human', 'agent_runtime': 'humain-terminal', **run},
+        {'ts': ts(2), 'record_id': 'edge-null-cost', 'event': 'model_call', 'task_id': 'R-edge-T1', 'role': 'worker',
+         'capability_class': 'implementation_fast', 'model': 'openai/gpt-5', 'cost_usd': None, 'input_tokens': None, 'output_tokens': None,
+         'cost_source': 'estimated-from-reported-tokens', 'policy_id': 'pol-0', 'agent_runtime': 'codex', **run},
+        {'ts': ts(3), 'record_id': 'edge-legacy-runtime', 'event': 'model_call', 'task_id': 'R-edge-T1', 'role': 'worker',
+         'model': 'anthropic/claude-haiku-4-5', 'cost_usd': .25, 'cost_source': 'reported', 'input_tokens': 100, 'output_tokens': 10,
+         'runtime': 'claude-code', 'review_wait_ms': 2500, **run},
+        {'ts': ts(4), 'record_id': 'edge-legacy-session', 'event': 'model_call', 'source': 'session_ingest', 'role': 'interactive_session',
+         'session_id': 42, 'runtime': 'claude-code', 'model': 'openai/gpt-5', 'cost_usd': None, 'input_tokens': None, 'output_tokens': 500,
+         'repository': '/work/other'},
+        {'ts': ts(5), 'record_id': 'edge-verified-no-task', 'event': 'task_verified', 'role': 'qa', 'result': 'verified',
+         'quality_evidence_score': .9, 'agent_runtime': 'humain-terminal', **run},
+        {'record_id': 'edge-bare', 'event': 'model_call', 'cost_usd': .01, **run},
+    ]
+    events = [
+        {'ts': ts(0), 'record_id': 'edge-ev-start', 'event': 'run_started', 'started_at': ts(0), 'runtime': 'claude-code', **run},
+        {'ts': ts(1), 'record_id': 'edge-ev-no-run', 'event': 'orchestrator_initialized', 'schema_version': 3},
+        {'ts': ts(2), 'record_id': 'edge-ev-conflict-no-run', 'event': 'merge_conflict_resolution'},
+        {'ts': ts(6), 'record_id': 'edge-ev-end', 'event': 'run_completed', 'started_at': ts(0), 'finished_at': ts(6),
+         'elapsed_ms': 360000, 'elapsed_source': 'monotonic', **run},
+    ]
+    outcomes = [{'ts': ts(6), 'record_id': 'edge-outcome', 'task_id': 'run-complete', 'note': 'not json', 'completed_at': None, **run}]
+    return {'events.jsonl': events, 'metrics.jsonl': metrics, 'outcomes.jsonl': outcomes}
+
+
+def append_rows(root: Path, rows_by_stream: dict[str, list[dict]]) -> None:
+    for name, rows in rows_by_stream.items():
+        with (root / name).open('ab') as f:
+            for row in rows: f.write((json.dumps(row, sort_keys=True) + '\n').encode('utf-8'))
 
 
 def write_synthetic_history(root: Path, runs: int, seed: int = 7) -> dict[str, int]:
@@ -312,6 +361,7 @@ class DashboardAggregateTests(SyntheticRootTestCase):
     def test_streaming_build_matches_the_whole_file_reference_on_a_large_history(self):
         counts = write_synthetic_history(self.root, runs=450)
         self.assertGreater(counts['metrics.jsonl'], 2000); self.assertGreater(counts['events.jsonl'], 500)
+        append_rows(self.root, edge_case_rows())
         expected = normalized(reference_build_data(self.root, config={}))
         actual = normalized(dashboard.build_data(self.root, config={}))
         # Compare the streaming reducer to the whole-file oracle for fields whose semantics did
@@ -322,47 +372,75 @@ class DashboardAggregateTests(SyntheticRootTestCase):
                        'run_evidence', 'runs', 'waste')
         for key in stable_keys:
             self.assertEqual(actual[key], expected[key], f'dashboard field {key!r} diverged from the reference')
+        # Recompute row-oriented aggregates from a fully materialized input. The reference oracle
+        # predates CI/human cost components and the rows-vs-calls distinction, so use current shared
+        # record classifiers with the whole-file population as an independent streaming oracle.
+        all_metrics = load_jsonl(self.root / 'metrics.jsonl')
+        orchestrated = [row for row in all_metrics if not is_session_ingest(row)]
+        ingested = [row for row in all_metrics if is_session_ingest(row)]
+        attribution = cost_attribution(orchestrated)
         for key in ('total_cost', 'reported_cost', 'estimated_cost', 'unmetered_calls',
-                    'call_rows', 'cost_coverage', 'runs', 'runs_fully_priced', 'runs_with_elapsed'):
-            self.assertEqual(actual['summary'][key], expected['summary'][key],
-                             f'dashboard summary field {key!r} diverged from the reference')
-        for role, old in expected['by_role'].items():
-            current = actual['by_role'][role]
-            self.assertEqual(current['rows'], old['calls'], role)
-            self.assertEqual(current['cost'], old['cost'], role)
-            self.assertEqual(current['tokens'], old['tokens'], role)
-        for runtime, old in expected['by_runtime'].items():
-            current = actual['by_runtime'][runtime]
-            self.assertEqual(current['rows'], old['calls'], runtime)
-            for key in ('cost', 'reported_cost', 'estimated_cost', 'metered_calls', 'unmetered_calls'):
-                self.assertEqual(current[key], old[key], f'runtime {runtime}: {key}')
-        self.assertEqual(actual['interactive_sessions']['rows'], expected['interactive_sessions']['calls'])
-        for key in ('cost', 'tokens', 'sessions'):
-            self.assertEqual(actual['interactive_sessions'][key], expected['interactive_sessions'][key])
-        for runtime, old in expected['interactive_sessions']['by_runtime'].items():
-            current = actual['interactive_sessions']['by_runtime'][runtime]
-            self.assertEqual(current['rows'], old['calls'], runtime)
-            self.assertEqual(current['cost'], old['cost'], runtime)
-        old_policies = {row['policy_id']: row for row in expected['policies']}
-        for current in actual['policies']:
-            old = old_policies[current['policy_id']]
-            self.assertEqual(current['rows'], old['calls'], current['policy_id'])
-            for key in ('cost', 'quality', 'cost_aggressiveness'):
-                actual_value, expected_value = current[key], old[key]
-                # The newer NO_DATA sentinel preserves its distinction from a measured zero;
-                # the legacy whole-file oracle used None for an absent sample.
-                if actual_value == 'NO_DATA' and expected_value is None:
-                    continue
-                self.assertEqual(actual_value, expected_value, f"policy {current['policy_id']}: {key}")
-        old_trends = {row['day']: row for row in expected['trends']}
-        for current in actual['trends']:
-            old = old_trends[current['day']]
-            self.assertEqual(current['rows'], old['calls'], current['day'])
-            for key in ('cost', 'quality', 'cost_aggressiveness', 'retries', 'adaptive'):
-                actual_value, expected_value = current[key], old[key]
-                if actual_value == 'NO_DATA' and expected_value is None:
-                    continue
-                self.assertEqual(actual_value, expected_value, f"trend {current['day']}: {key}")
+                    'call_rows', 'cost_coverage'):
+            if key == 'total_cost':
+                expected_value = sum(row_cost(row) for row in orchestrated)
+            elif key == 'reported_cost':
+                expected_value = attribution[REPORTED]['cost']
+            elif key == 'estimated_cost':
+                expected_value = attribution[ESTIMATED]['cost']
+            elif key == 'unmetered_calls':
+                expected_value = attribution[UNMETERED]['calls']
+            elif key == 'cost_coverage':
+                expected_value = attribution['coverage']
+            else:
+                expected_value = attribution[key]
+            self.assertEqual(actual['summary'][key], expected_value, f'summary {key}')
+        for key in ('runs', 'runs_fully_priced', 'runs_with_elapsed'):
+            self.assertEqual(actual['summary'][key], expected['summary'][key], f'summary {key}')
+
+        roles = defaultdict(lambda: {'rows': 0, 'cost': 0.0, 'tokens': 0})
+        runtimes = defaultdict(lambda: {'rows': 0, 'cost': 0.0, 'reported_cost': 0.0,
+                                        'estimated_cost': 0.0, 'metered_calls': 0, 'unmetered_calls': 0})
+        policies = defaultdict(lambda: {'rows': 0, 'cost': 0.0})
+        trends = defaultdict(lambda: {'rows': 0, 'cost': 0.0})
+        for row in orchestrated:
+            role = row.get('role') or row.get('capability_class') or 'unknown'
+            runtime = row.get('agent_runtime') or row.get('runtime') or 'unknown'
+            cost = row_cost(row)
+            roles[role]['rows'] += 1; roles[role]['cost'] += cost
+            roles[role]['tokens'] += int(row.get('input_tokens', 0) or 0) + int(row.get('output_tokens', 0) or 0)
+            runtimes[runtime]['rows'] += 1; runtimes[runtime]['cost'] += cost
+            if is_call_row(row):
+                kind = cost_class(row)
+                if kind == REPORTED:
+                    runtimes[runtime]['reported_cost'] += cost; runtimes[runtime]['metered_calls'] += 1
+                elif kind == ESTIMATED:
+                    runtimes[runtime]['estimated_cost'] += cost; runtimes[runtime]['metered_calls'] += 1
+                else:
+                    runtimes[runtime]['unmetered_calls'] += 1
+            policy = row.get('policy_id') or 'unknown'
+            policies[policy]['rows'] += 1; policies[policy]['cost'] += cost
+            day = str(row.get('ts', ''))[:10] or 'unknown'
+            trends[day]['rows'] += 1; trends[day]['cost'] += cost
+        for role, expected_row in roles.items():
+            for key, value in expected_row.items():
+                self.assertEqual(actual['by_role'][role][key], value, f'role {role}: {key}')
+        for runtime, expected_row in runtimes.items():
+            for key, value in expected_row.items():
+                self.assertEqual(actual['by_runtime'][runtime][key], value, f'runtime {runtime}: {key}')
+        for policy, expected_row in policies.items():
+            for key, value in expected_row.items():
+                self.assertEqual(next(row for row in actual['policies'] if row['policy_id'] == policy)[key],
+                                 value, f'policy {policy}: {key}')
+        for day, expected_row in trends.items():
+            current = next(row for row in actual['trends'] if row['day'] == day)
+            for key, value in expected_row.items():
+                self.assertEqual(current[key], value, f'trend {day}: {key}')
+        interactive = actual['interactive_sessions']
+        self.assertEqual(interactive['rows'], len(ingested))
+        self.assertEqual(interactive['calls'], sum(records.covered_calls(row) for row in ingested))
+        self.assertEqual(interactive['cost'], sum(row_cost(row) for row in ingested))
+        self.assertEqual(interactive['tokens'], sum(int(row.get('input_tokens', 0) or 0) + int(row.get('output_tokens', 0) or 0) for row in ingested))
+        self.assertEqual(interactive['sessions'], len({str(row.get('session_id')) for row in ingested if row.get('session_id') is not None}) or 'NO_DATA')
 
     def test_recent_rows_are_bounded_to_the_stream_tail(self):
         write_synthetic_history(self.root, runs=450)
@@ -496,10 +574,12 @@ class SurrogateTests(SyntheticRootTestCase):
 
 
 class CliRefreshPathTests(SyntheticRootTestCase):
+    def _env(self) -> dict[str, str]:
+        return {**os.environ, 'CODING_AGENT_ORCHESTRATOR_HOME': str(self.root), 'CODING_AGENT_RUNTIME': 'dashboard-test',
+                'CODING_AGENT_REPOSITORY': '/work/forge', 'PYTHONPATH': str(REPO), 'PYTHONDONTWRITEBYTECODE': '1'}
+
     def _cli(self, *args: str) -> subprocess.CompletedProcess:
-        env = {**os.environ, 'CODING_AGENT_ORCHESTRATOR_HOME': str(self.root), 'CODING_AGENT_RUNTIME': 'dashboard-test',
-               'CODING_AGENT_REPOSITORY': '/work/forge', 'PYTHONPATH': str(REPO), 'PYTHONDONTWRITEBYTECODE': '1'}
-        return subprocess.run([sys.executable, '-B', '-m', 'orchestrator.cli', *args], capture_output=True, text=True, env=env, cwd=str(REPO), timeout=120)
+        return subprocess.run([sys.executable, '-B', '-m', 'orchestrator.cli', *args], capture_output=True, text=True, env=self._env(), cwd=str(REPO), timeout=120)
 
     def test_init_uses_the_batch_refresh_path_without_discarding_the_record_index(self):
         write_synthetic_history(self.root, runs=5)
@@ -519,6 +599,128 @@ class CliRefreshPathTests(SyntheticRootTestCase):
         # The exact-id cache is still the same trusted database (init is not a recovery `rebuild`).
         self.assertEqual(index.stat().st_ino, before[0]); self.assertNotEqual(read_json(receipt, None), before[1])
         self.assertTrue((self.root / 'records.index.sqlite3').exists())
+
+    def test_init_reports_an_append_failure_as_structured_json_with_same_id_retry(self):
+        write_synthetic_history(self.root, runs=2)
+        before = (self.root / 'events.jsonl').read_bytes()
+        script = textwrap.dedent(
+            """
+            import sys
+            from unittest.mock import patch
+            from orchestrator import record_batch, cli
+            def fail(path, lines, **kwargs): raise OSError(28, 'No space left on device')
+            sys.argv = ['orchestrator', 'init']
+            with patch.object(record_batch, '_append_stream', fail):
+                cli.main()
+            """
+        )
+        result = subprocess.run([sys.executable, '-B', '-c', script], capture_output=True, text=True, env=self._env(), cwd=str(REPO), timeout=120)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)  # EXIT_APPEND_FAILED, like `batch`/`event`
+        self.assertNotIn('Traceback', result.stderr)
+        body = json.loads(result.stdout)
+        self.assertEqual((body['ok'], body['status'], body['retry']), (False, 'append_failed', 'same_ids'))
+        self.assertEqual(body['persisted'], {'event': 0, 'metric': 0, 'outcome': 0})
+        self.assertIn('No space left', body['error'])
+        self.assertFalse(body['ledger_updated']); self.assertFalse(body['dashboard_updated'])
+        self.assertEqual((self.root / 'events.jsonl').read_bytes(), before, 'nothing may be appended by a failed init')
+        # Same-id retry: the next init finishes the work exactly once.
+        retry = self._cli('init')
+        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+        self.assertIn('Initialized V3 state', retry.stdout)
+        self.assertEqual([e['event'] for e in load_jsonl(self.root / 'events.jsonl')].count('orchestrator_initialized'), 1)
+
+
+def load_benchmark_module():
+    spec = importlib.util.spec_from_file_location('benchmark_refresh', REPO / 'scripts' / 'benchmark_refresh.py')
+    module = importlib.util.module_from_spec(spec); sys.modules[spec.name] = module; spec.loader.exec_module(module)
+    return module
+
+
+class BenchmarkHarnessTests(SyntheticRootTestCase):
+    """scripts/benchmark_refresh.py must measure children without deadlocking and report measured bytes."""
+
+    def setUp(self):
+        super().setUp(); self.bench = load_benchmark_module()
+
+    def _run_child_bounded(self, *args, timeout=60, **kwargs):
+        """Run the harness in a thread so a reap-before-drain deadlock fails the test instead of hanging it."""
+        result = []
+        thread = threading.Thread(target=lambda: result.append(self.bench.run_child(*args, **kwargs)), daemon=True)
+        thread.start(); thread.join(timeout)
+        self.assertTrue(result, f'harness did not return within {timeout}s (child output larger than a pipe buffer)')
+        return result[0]
+
+    def test_run_child_drains_output_larger_than_a_pipe_buffer(self):
+        out_bytes, err_bytes, in_bytes = 2 * 1024 * 1024, 1024 * 1024, 512 * 1024
+        code = (f'import sys; data = sys.stdin.read(); sys.stdout.write("o" * {out_bytes}); sys.stderr.write("e" * {err_bytes}); '
+                f'sys.stdout.flush(); sys.exit(0 if len(data) == {in_bytes} else 9)')
+        run = self._run_child_bounded([sys.executable, '-c', code], env=dict(os.environ), stdin='i' * in_bytes)
+        self.assertEqual(run.returncode, 0, run.stderr[-200:])
+        self.assertEqual(len(run.stdout), out_bytes); self.assertEqual(len(run.stderr), err_bytes)
+        self.assertGreater(run.ru_maxrss, 0, 'rusage must be the child\'s own (os.wait4)')
+        self.assertGreater(run.elapsed_s, 0)
+        self.assertIsNone(run.io, 'an uninstrumented child has no I/O report')
+
+    def test_run_child_reports_a_non_zero_exit_code(self):
+        run = self._run_child_bounded([sys.executable, '-c', 'import sys; sys.exit(7)'], env=dict(os.environ))
+        self.assertEqual(run.returncode, 7)
+
+    def test_instrumented_child_reports_logical_bytes_exactly_and_physical_bytes_separately(self):
+        self.root.mkdir(); source = self.root / 'in.bin'; source.write_bytes(os.urandom(300 * 1024 + 17))
+        code = textwrap.dedent(f"""
+            import os
+            from pathlib import Path
+            p = Path({str(source)!r}); root = p.parent
+            whole = p.read_bytes()                                   # BufferedReader.read(-1) -> readall
+            lines = sum(len(l) for l in open(p, 'rb'))               # iteration -> readinto
+            with open(root / 'out.bin', 'wb') as f: f.write(b'x' * 123456)   # BufferedWriter -> raw write
+            with open(root / 'out.txt', 'w', encoding='utf-8') as f: f.write('\\u00e9' * 1000)   # 2000 UTF-8 bytes
+            fd = os.open(root / 'raw.bin', os.O_WRONLY | os.O_CREAT); os.write(fd, b'y' * 1000); os.close(fd)
+            fd = os.open(p, os.O_RDONLY); n = len(os.read(fd, 4096)); os.close(fd)
+            assert len(whole) == lines == {source.stat().st_size} and n == 4096
+        """)
+        run = self._run_child_bounded(self.bench.instrumented_argv(code), env=dict(os.environ))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIsNotNone(run.io)
+        logical = run.io['python_file_io']
+        self.assertEqual(logical['read_bytes'], 2 * source.stat().st_size + 4096)
+        self.assertEqual(logical['write_bytes'], 123456 + 2000 + 1000)
+        summary = self.bench.io_summary([[run]])
+        self.assertEqual((summary['logical']['read_bytes'], summary['logical']['write_bytes']), (logical['read_bytes'], logical['write_bytes']))
+        self.assertIn('source', summary['logical'])
+        # Physical I/O is the kernel's/OS's count of bytes that actually reached the disk: reported
+        # separately from the logical count, never substituted for it, and null only when this
+        # platform offers no per-process source for it.
+        self.assertIn('physical', summary)
+        if summary['physical'] is not None:
+            self.assertTrue(all(isinstance(summary['physical'][k], int) and summary['physical'][k] >= 0 for k in ('read_bytes', 'write_bytes')))
+            self.assertIn('source', summary['physical'])
+        if sys.platform.startswith('linux') or sys.platform == 'darwin':
+            self.assertIsNotNone(summary['physical'], f'{sys.platform} has a per-process physical I/O source')
+
+    def test_cli_children_are_instrumented_and_bytes_exceed_the_streams_read(self):
+        write_synthetic_history(self.root, runs=3)
+        stream_bytes = sum((self.root / n).stat().st_size for n in STREAMS)
+        run = self._run_child_bounded(self.bench.cli_argv('dashboard'), env=self.bench.cli_env(self.root), cwd=str(REPO))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.strip(), str(self.root / 'dashboard.html'))
+        self.assertGreaterEqual(run.io['python_file_io']['read_bytes'], stream_bytes, 'a dashboard render reads every stream once')
+        self.assertGreaterEqual(run.io['python_file_io']['write_bytes'], (self.root / 'dashboard.html').stat().st_size)
+        self.assertFalse([p for p in self.root.iterdir() if p.name == 'io.json'],
+                         'the benchmark I/O report never lands in the state root')
+
+    def test_measure_reports_measured_bytes_not_only_fixture_sizes(self):
+        write_synthetic_history(self.root, runs=3)
+        args = argparse.Namespace(batch_size=2, repeat=1)
+        result = self.bench.measure(self.root, 1, args, tag='t')
+        self.assertIn('fixture_bytes', result); self.assertNotIn('bytes', result)
+        for op in ('batch', 'dashboard', 'per_record_legacy', 'cold_first_batch'):
+            io = result[op]['io']
+            self.assertGreater(io['logical']['read_bytes'], 0, op); self.assertGreater(io['logical']['write_bytes'], 0, op)
+            self.assertIn('physical', io, op)
+        self.assertGreater(result['batch']['io']['logical']['write_bytes'], 0)
+        self.assertEqual(result['per_record_legacy']['subprocesses'], 2)
+        self.assertEqual(result['total_subprocesses'], 1 + 2 + 2)
 
 
 if __name__ == '__main__':

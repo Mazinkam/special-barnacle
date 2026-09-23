@@ -8,16 +8,30 @@ streams of an existing root into the temp directory instead and replicates them 
 re-suffixed identifiers). For each scale the script:
 
 1. warms the fixture with one CLI `batch` call (cold record-index derivation + full ledger
-   replay; reported as `cold_s`, not included in the medians);
+   replay; reported as `cold_first_batch`, not included in the medians);
 2. measures `--repeat` CLI `batch` invocations of a `--batch-size`-record batch (durable append +
    incremental ledger + dashboard) and `--repeat` CLI `dashboard` invocations;
 3. for comparison, measures writing the same records through the legacy one-record commands
    (`event`/`metric`/`outcome`), i.e. one subprocess per record.
 
-Per measured operation it prints the subprocess count, median elapsed seconds, peak child RSS
-(from `os.wait4` rusage, so it is the child's own high-water mark) and throughput in records per
-second (records durably written *and* published per second of wall time). Peak RSS is reported in
-MiB on both macOS (bytes) and Linux (KiB). Run before and after a change with the same arguments.
+Per measured operation it prints the subprocess count, median elapsed seconds (spawn to reap),
+peak child RSS, throughput, and the bytes the child actually read and wrote:
+
+* **logical** bytes are counted inside the child by `instrumented_argv`: every file object the
+  program opens (`io.open`/`open`/`Path.open`/`os.fdopen`) gets a counting raw layer, and
+  `os.read`/`os.write`/`os.pread`/`os.pwrite` are wrapped. That is the program's own data I/O —
+  streams, ledger, checkpoint, dashboard — and excludes interpreter start-up (module loading goes
+  through `_io.open_code`), the child's stdout/stderr, and sqlite3's own file I/O (C library).
+* **physical** bytes are what the OS says reached the disk for the process: Linux `/proc/self/io`
+  `read_bytes`/`write_bytes` (which also yields kernel-counted logical `rchar`/`wchar` over *all*
+  descriptors, reported as `kernel_logical`), macOS `proc_pid_rusage` `ri_diskio_bytesread/
+  byteswritten`. Page-cache hits make physical reads much smaller than logical reads; that gap is
+  the point of reporting both. `null` means the platform offers no per-process source.
+
+Each child is reaped with `os.wait4`, so `peak_rss_mib` is that child's own `ru_maxrss` (MiB on
+macOS bytes / Linux KiB), and its stdout/stderr go to temporary files, never pipes: a chatty child
+cannot block on a full pipe while the parent waits. Run before and after a change with the same
+arguments; fixture sizes are reported separately (`fixture_bytes`) and are not a measurement.
 """
 from __future__ import annotations
 
@@ -30,15 +44,138 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from tests.test_dashboard_refresh import write_synthetic_history  # noqa: E402
-
 STREAMS = ('events.jsonl', 'metrics.jsonl', 'outcomes.jsonl')
 ID_FIELDS = ('record_id', 'run_id', 'task_id', 'session_id', 'decision_id')
+IO_REPORT_ENV = 'ORCHESTRATOR_BENCH_IO_REPORT'
+LOGICAL_SOURCE = 'python file objects + os.read/os.write in the child (excludes interpreter start-up, stdio and sqlite3)'
+
+# Prepended to every instrumented child's `-c` program. Pure standard library, runs before the
+# program under test, writes its report at exit to the path in $ORCHESTRATOR_BENCH_IO_REPORT.
+_INSTRUMENT = r'''
+import atexit, builtins, io, json, os, sys
+_counts = {'read': 0, 'write': 0}
+_real_open = io.open
+
+class _CountingFileIO(io.FileIO):
+    """The raw layer io.open would have built, counting bytes as the buffered layers pull/push them."""
+    def readinto(self, b):
+        n = super().readinto(b)
+        if n: _counts['read'] += n
+        return n
+    def read(self, size=-1):
+        data = super().read(size)
+        if data: _counts['read'] += len(data)
+        return data
+    def readall(self):
+        data = super().readall()
+        if data: _counts['read'] += len(data)
+        return data
+    def write(self, b):
+        n = super().write(b)
+        if n: _counts['write'] += n
+        return n
+
+def _open(file, mode='r', buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
+    # io.open's raw -> buffered -> text layering, with the counting raw layer underneath.
+    modes = set(mode)
+    binary = 'b' in modes
+    if binary and 't' in modes: raise ValueError("can't have text and binary mode at once")
+    creating, reading, writing, appending, updating = ('x' in modes), ('r' in modes), ('w' in modes), ('a' in modes), ('+' in modes)
+    raw_mode = ('x' if creating else '') + ('r' if reading else '') + ('w' if writing else '') + ('a' if appending else '') + ('+' if updating else '')
+    raw = _CountingFileIO(file, raw_mode, closefd, opener=opener)
+    try:
+        line_buffering = False
+        if buffering == 1 or (buffering < 0 and raw.isatty()): buffering = -1; line_buffering = True
+        if buffering < 0:
+            buffering = io.DEFAULT_BUFFER_SIZE
+            try: block = os.fstat(raw.fileno()).st_blksize
+            except (OSError, AttributeError): pass
+            else:
+                if block > 1: buffering = block
+        if buffering == 0:
+            if binary: return raw
+            raise ValueError("can't have unbuffered text I/O")
+        if updating: buffer = io.BufferedRandom(raw, buffering)
+        elif creating or writing or appending: buffer = io.BufferedWriter(raw, buffering)
+        else: buffer = io.BufferedReader(raw, buffering)
+        if binary: return buffer
+        text = io.TextIOWrapper(buffer, encoding, errors, newline, line_buffering); text.mode = mode
+        return text
+    except Exception:
+        raw.close(); raise
+
+def _counted(fn, key):
+    def wrapper(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        n = result if isinstance(result, int) else len(result)
+        if n > 0: _counts[key] += n
+        return result
+    return wrapper
+
+io.open = builtins.open = _open
+for _name, _key in (('read', 'read'), ('pread', 'read'), ('readv', 'read'), ('write', 'write'), ('pwrite', 'write'), ('writev', 'write')):
+    if hasattr(os, _name): setattr(os, _name, _counted(getattr(os, _name), _key))
+
+def _kernel_view():
+    """The OS's own per-process counters: physical bytes everywhere it exists, kernel logical bytes on Linux."""
+    if sys.platform.startswith('linux'):
+        try:
+            with _real_open('/proc/self/io') as f:
+                fields = {k.strip(): int(v) for k, v in (line.split(':', 1) for line in f if ':' in line)}
+            return {'physical': {'read_bytes': fields['read_bytes'], 'write_bytes': fields['write_bytes'], 'source': '/proc/self/io read_bytes/write_bytes'},
+                    'kernel_logical': {'read_bytes': fields['rchar'], 'write_bytes': fields['wchar'], 'source': '/proc/self/io rchar/wchar (all descriptors, incl. stdio and start-up)'}}
+        except (OSError, KeyError, ValueError): return {}
+    if sys.platform == 'darwin':
+        try:
+            import ctypes
+            class RusageInfoV2(ctypes.Structure):
+                _fields_ = [('ri_uuid', ctypes.c_uint8 * 16)] + [(name, ctypes.c_uint64) for name in (
+                    'ri_user_time', 'ri_system_time', 'ri_pkg_idle_wkups', 'ri_interrupt_wkups', 'ri_pageins', 'ri_wired_size',
+                    'ri_resident_size', 'ri_phys_footprint', 'ri_proc_start_abstime', 'ri_proc_exit_abstime', 'ri_child_user_time',
+                    'ri_child_system_time', 'ri_child_pkg_idle_wkups', 'ri_child_interrupt_wkups', 'ri_child_pageins',
+                    'ri_child_elapsed_abstime', 'ri_diskio_bytesread', 'ri_diskio_byteswritten')]
+            info = RusageInfoV2()
+            if ctypes.CDLL('/usr/lib/libproc.dylib').proc_pid_rusage(os.getpid(), 2, ctypes.byref(info)) != 0: return {}
+            return {'physical': {'read_bytes': int(info.ri_diskio_bytesread), 'write_bytes': int(info.ri_diskio_byteswritten),
+                                 'source': 'proc_pid_rusage(RUSAGE_INFO_V2) ri_diskio_bytesread/byteswritten'}}
+        except (OSError, AttributeError): return {}
+    return {}
+
+def _report():
+    path = os.environ.get('ORCHESTRATOR_BENCH_IO_REPORT')
+    if not path: return
+    report = {'python_file_io': {'read_bytes': _counts['read'], 'write_bytes': _counts['write']}, **_kernel_view()}
+    try:
+        with _real_open(path, 'w') as f: json.dump(report, f)
+    except OSError: pass
+atexit.register(_report)
+'''
+
+_RUN_CLI = r'''
+import sys
+sys.argv = ['orchestrator', *sys.argv[1:]]
+from orchestrator import cli
+cli.main()
+'''
+
+
+@dataclass
+class ChildRun:
+    argv: list
+    returncode: int
+    elapsed_s: float          # spawn to reap, i.e. what one more subprocess costs the caller
+    ru_maxrss: int            # the child's own high-water mark (os.wait4)
+    ru_inblock: int           # rusage block counts: populated on Linux, always 0 on macOS
+    ru_oublock: int
+    stdout: str
+    stderr: str
+    io: dict | None           # the child's I/O report, None when the child was not instrumented
 
 
 def rss_mib(ru_maxrss: int) -> float:
@@ -50,21 +187,67 @@ def cli_env(root: Path) -> dict[str, str]:
             'CODING_AGENT_REPOSITORY': '/work/forge', 'PYTHONPATH': str(REPO), 'PYTHONDONTWRITEBYTECODE': '1'}
 
 
-def run_cli(root: Path, *args: str, stdin: str | None = None) -> tuple[float, int, subprocess.CompletedProcess]:
-    """Run one CLI subprocess; return (elapsed seconds, child ru_maxrss, completed process)."""
-    proc = subprocess.Popen([sys.executable, '-B', '-m', 'orchestrator.cli', *args], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=cli_env(root), cwd=str(REPO))
-    start = time.perf_counter()
-    if stdin is not None: proc.stdin.write(stdin)
-    proc.stdin.close()
-    _, status, usage = os.wait4(proc.pid, 0)  # reap ourselves so the child's own rusage is available
-    elapsed = time.perf_counter() - start
-    out, err = proc.stdout.read(), proc.stderr.read(); proc.stdout.close(); proc.stderr.close()
-    proc.returncode = code = os.waitstatus_to_exitcode(status) if hasattr(os, 'waitstatus_to_exitcode') else (status >> 8)
-    completed = subprocess.CompletedProcess(proc.args, code, out, err)
-    if code != 0:
-        raise SystemExit(f'CLI {args[0]} failed ({code}):\n{out}\n{err}')
-    return elapsed, usage.ru_maxrss, completed
+def instrumented_argv(program: str, *args: str) -> list[str]:
+    """argv for a child that runs `program` (Python source) with I/O counting installed first."""
+    return [sys.executable, '-B', '-c', _INSTRUMENT + program, *args]
+
+
+def cli_argv(*args: str) -> list[str]:
+    return instrumented_argv(_RUN_CLI, *args)
+
+
+def run_child(argv: list[str], *, env: dict[str, str], cwd: str | None = None, stdin: str | None = None) -> ChildRun:
+    """Spawn `argv`, reap it with os.wait4 and collect its output and I/O report.
+
+    stdin/stdout/stderr are temporary files rather than pipes, so the child can never block on a
+    full pipe while this process is blocked in wait4 (and the parent never has to read while
+    waiting). The I/O report path is handed to the child through $ORCHESTRATOR_BENCH_IO_REPORT and
+    lives in the same private temporary directory, never in the state root under test.
+    """
+    with tempfile.TemporaryDirectory(prefix='orchestrator-bench-child-') as tmp:
+        report = Path(tmp, 'io.json')
+        with open(Path(tmp, 'stdin'), 'w+b') as inp, open(Path(tmp, 'stdout'), 'w+b') as out, open(Path(tmp, 'stderr'), 'w+b') as err:
+            if stdin is not None: inp.write(stdin.encode('utf-8')); inp.flush(); inp.seek(0)
+            start = time.perf_counter()
+            proc = subprocess.Popen(argv, stdin=inp if stdin is not None else subprocess.DEVNULL, stdout=out, stderr=err,
+                                    env={**env, IO_REPORT_ENV: str(report)}, cwd=cwd)
+            _, status, usage = os.wait4(proc.pid, 0)
+            elapsed = time.perf_counter() - start
+            proc.returncode = code = os.waitstatus_to_exitcode(status)  # tell Popen it is reaped; no second waitpid
+            out.seek(0); err.seek(0)
+            stdout = out.read().decode('utf-8', 'replace'); stderr = err.read().decode('utf-8', 'replace')
+        io_report = json.loads(report.read_text(encoding='utf-8')) if report.exists() else None
+    return ChildRun(list(argv), code, elapsed, usage.ru_maxrss, usage.ru_inblock, usage.ru_oublock, stdout, stderr, io_report)
+
+
+def run_cli(root: Path, *args: str, stdin: str | None = None) -> ChildRun:
+    """Run one instrumented CLI subprocess against `root`; a non-zero exit aborts the benchmark."""
+    run = run_child(cli_argv(*args), env=cli_env(root), cwd=str(REPO), stdin=stdin)
+    if run.returncode != 0:
+        raise SystemExit(f'CLI {args[0]} failed ({run.returncode}):\n{run.stdout}\n{run.stderr}')
+    return run
+
+
+def io_summary(groups: list[list[ChildRun]]) -> dict:
+    """Median over `groups` of the bytes each group of children moved (a group is one operation).
+
+    Logical and physical are reported side by side and never substituted for one another; each
+    carries the name of its source. A section is None when no child in the groups reported it.
+    """
+    def total(group: list[ChildRun], section: str, key: str) -> int | None:
+        values = [run.io[section][key] for run in group if run.io and run.io.get(section)]
+        return sum(values) if values else None
+
+    def section(name: str, default_source: str | None = None) -> dict | None:
+        reads = [total(g, name, 'read_bytes') for g in groups]; writes = [total(g, name, 'write_bytes') for g in groups]
+        reads = [r for r in reads if r is not None]; writes = [w for w in writes if w is not None]
+        if not reads or not writes: return None
+        source = default_source or next((run.io[name]['source'] for g in groups for run in g if run.io and run.io.get(name)), None)
+        return {'read_bytes': int(statistics.median(reads)), 'write_bytes': int(statistics.median(writes)), 'source': source}
+
+    return {'logical': section('python_file_io', LOGICAL_SOURCE), 'kernel_logical': section('kernel_logical'), 'physical': section('physical'),
+            'rusage_blocks': {'in': max((run.ru_inblock for g in groups for run in g), default=0),
+                              'out': max((run.ru_oublock for g in groups for run in g), default=0), 'source': 'os.wait4 ru_inblock/ru_oublock (0 on macOS)'}}
 
 
 def batch_records(tag: str, size: int) -> list[dict]:
@@ -104,41 +287,48 @@ def copy_fixture(source: Path, root: Path, scale: int) -> dict[str, int]:
 
 def measure(root: Path, scale: int, args: argparse.Namespace, tag: str) -> dict:
     size = args.batch_size
-    cold_s, cold_rss, _ = run_cli(root, 'batch', json.dumps(batch_records(f'{tag}-warm', size)))
-    batch_t = []; batch_rss = []
+    cold = run_cli(root, 'batch', json.dumps(batch_records(f'{tag}-warm', size)))
+    batch = [run_cli(root, 'batch', json.dumps(batch_records(f'{tag}-{i}', size))) for i in range(args.repeat)]
+    dash = [run_cli(root, 'dashboard') for _ in range(args.repeat)]
+    single: list[list[ChildRun]] = []
     for i in range(args.repeat):
-        elapsed, rss, _ = run_cli(root, 'batch', json.dumps(batch_records(f'{tag}-{i}', size)))
-        batch_t.append(elapsed); batch_rss.append(rss)
-    dash_t = []; dash_rss = []
-    for _ in range(args.repeat):
-        elapsed, rss, _ = run_cli(root, 'dashboard'); dash_t.append(elapsed); dash_rss.append(rss)
-    single_t = []; single_rss = []; single_spawns = 0
-    for i in range(args.repeat):
-        total = 0.0
+        group = []
         for record in batch_records(f'{tag}-single-{i}', size):
             stream = record.pop('stream')
-            if stream == 'event':
-                elapsed, rss, _ = run_cli(root, 'event', record.pop('event'), json.dumps(record))
-            else:
-                elapsed, rss, _ = run_cli(root, stream, json.dumps(record))
-            total += elapsed; single_rss.append(rss); single_spawns += 1
-        single_t.append(total)
-    med_batch = statistics.median(batch_t); med_dash = statistics.median(dash_t); med_single = statistics.median(single_t)
+            if stream == 'event': group.append(run_cli(root, 'event', record.pop('event'), json.dumps(record)))
+            else: group.append(run_cli(root, stream, json.dumps(record)))
+        single.append(group)
+    med_batch = statistics.median(r.elapsed_s for r in batch); med_dash = statistics.median(r.elapsed_s for r in dash)
+    med_single = statistics.median(sum(r.elapsed_s for r in group) for group in single)
+    peak = lambda runs: round(rss_mib(max(r.ru_maxrss for r in runs)), 1)  # noqa: E731
     return {
         'scale': f'{scale}x', 'rows': {n: sum(1 for _ in (root / n).open('rb')) for n in STREAMS},
-        'bytes': {n: (root / n).stat().st_size for n in STREAMS},
-        'cold_first_batch': {'elapsed_s': round(cold_s, 3), 'peak_rss_mib': round(rss_mib(cold_rss), 1)},
-        'batch': {'subprocesses': 1, 'records': size, 'median_s': round(med_batch, 4), 'peak_rss_mib': round(rss_mib(max(batch_rss)), 1),
-                  'records_per_s': round(size / med_batch, 2)},
-        'dashboard': {'subprocesses': 1, 'median_s': round(med_dash, 4), 'peak_rss_mib': round(rss_mib(max(dash_rss)), 1),
-                      'refreshes_per_s': round(1 / med_dash, 2)},
+        'fixture_bytes': {n: (root / n).stat().st_size for n in STREAMS},  # size on disk, not a measurement of I/O
+        'cold_first_batch': {'elapsed_s': round(cold.elapsed_s, 3), 'peak_rss_mib': peak([cold]), 'io': io_summary([[cold]])},
+        'batch': {'subprocesses': 1, 'records': size, 'median_s': round(med_batch, 4), 'peak_rss_mib': peak(batch),
+                  'records_per_s': round(size / med_batch, 2), 'io': io_summary([[r] for r in batch])},
+        'dashboard': {'subprocesses': 1, 'median_s': round(med_dash, 4), 'peak_rss_mib': peak(dash),
+                      'refreshes_per_s': round(1 / med_dash, 2), 'io': io_summary([[r] for r in dash])},
         'per_record_legacy': {'subprocesses': size, 'records': size, 'median_s': round(med_single, 4),
-                              'peak_rss_mib': round(rss_mib(max(single_rss)), 1), 'records_per_s': round(size / med_single, 2)},
-        'total_subprocesses': 1 + 2 * args.repeat + single_spawns,
+                              'peak_rss_mib': peak([r for group in single for r in group]), 'records_per_s': round(size / med_single, 2),
+                              'io': io_summary(single)},
+        'total_subprocesses': 1 + 2 * args.repeat + sum(len(group) for group in single),
     }
 
 
+def _mib(n: int | None) -> str:
+    return '—' if n is None else f'{n / 2 ** 20:.2f}'
+
+
+def _io_cells(io: dict) -> str:
+    logical, physical = io['logical'], io['physical']
+    return (f"{_mib(logical['read_bytes'] if logical else None)} / {_mib(logical['write_bytes'] if logical else None)} | "
+            f"{_mib(physical['read_bytes'] if physical else None)} / {_mib(physical['write_bytes'] if physical else None)}")
+
+
 def main() -> None:
+    from tests.test_dashboard_refresh import write_synthetic_history  # lazy: children and tests must not pay for it
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--runs', type=int, default=500, help='synthetic runs at 1x (~12 events, ~12 metrics, ~5 outcomes each)')
     ap.add_argument('--scales', default='1,2,4'); ap.add_argument('--repeat', type=int, default=5)
@@ -156,19 +346,21 @@ def main() -> None:
             results.append(measure(root, scale, args, tag=f'{scale}x'))
             shutil.rmtree(root, ignore_errors=True)
     meta = {'python': sys.version.split()[0], 'platform': sys.platform, 'repeat': args.repeat, 'batch_size': args.batch_size,
-            'fixture': 'copy of ' + str(args.source) if args.source else f'synthetic runs={args.runs} seed={args.seed}'}
+            'fixture': 'copy of ' + str(args.source) if args.source else f'synthetic runs={args.runs} seed={args.seed}',
+            'io': {'logical': LOGICAL_SOURCE, 'physical': next((r['batch']['io']['physical']['source'] for r in results if r['batch']['io']['physical']), None)}}
     if args.json:
         print(json.dumps({'meta': meta, 'results': results}, indent=2)); return
     print(f"# refresh benchmark — {meta['fixture']} — python {meta['python']} {meta['platform']} — repeat={args.repeat} batch={args.batch_size}")
-    print('| scale | metrics rows / MB | op | subprocesses | median s | peak child RSS MiB | throughput |')
-    print('|---|---:|---|---:|---:|---:|---:|')
+    print(f"# logical bytes: {meta['io']['logical']}; physical bytes: {meta['io']['physical'] or 'unavailable on this platform'}")
+    print('| scale | metrics rows / fixture MB | op | subprocesses | median s | peak child RSS MiB | throughput | logical MiB read / written | physical MiB read / written |')
+    print('|---|---:|---|---:|---:|---:|---:|---:|---:|')
     for r in results:
-        rows = f"{r['rows']['metrics.jsonl']} / {r['bytes']['metrics.jsonl'] / 1e6:.1f}"
-        b, d, s = r['batch'], r['dashboard'], r['per_record_legacy']
-        print(f"| {r['scale']} | {rows} | batch ({b['records']} rec) | {b['subprocesses']} | {b['median_s']:.3f} | {b['peak_rss_mib']:.1f} | {b['records_per_s']:.1f} rec/s |")
-        print(f"| {r['scale']} | {rows} | dashboard | {d['subprocesses']} | {d['median_s']:.3f} | {d['peak_rss_mib']:.1f} | {d['refreshes_per_s']:.2f} refresh/s |")
-        print(f"| {r['scale']} | {rows} | per-record legacy ({s['records']} rec) | {s['subprocesses']} | {s['median_s']:.3f} | {s['peak_rss_mib']:.1f} | {s['records_per_s']:.1f} rec/s |")
-        print(f"| {r['scale']} | {rows} | cold first batch | 1 | {r['cold_first_batch']['elapsed_s']:.3f} | {r['cold_first_batch']['peak_rss_mib']:.1f} | — |")
+        rows = f"{r['rows']['metrics.jsonl']} / {r['fixture_bytes']['metrics.jsonl'] / 1e6:.1f}"
+        b, d, s, c = r['batch'], r['dashboard'], r['per_record_legacy'], r['cold_first_batch']
+        print(f"| {r['scale']} | {rows} | batch ({b['records']} rec) | {b['subprocesses']} | {b['median_s']:.3f} | {b['peak_rss_mib']:.1f} | {b['records_per_s']:.1f} rec/s | {_io_cells(b['io'])} |")
+        print(f"| {r['scale']} | {rows} | dashboard | {d['subprocesses']} | {d['median_s']:.3f} | {d['peak_rss_mib']:.1f} | {d['refreshes_per_s']:.2f} refresh/s | {_io_cells(d['io'])} |")
+        print(f"| {r['scale']} | {rows} | per-record legacy ({s['records']} rec) | {s['subprocesses']} | {s['median_s']:.3f} | {s['peak_rss_mib']:.1f} | {s['records_per_s']:.1f} rec/s | {_io_cells(s['io'])} |")
+        print(f"| {r['scale']} | {rows} | cold first batch | 1 | {c['elapsed_s']:.3f} | {c['peak_rss_mib']:.1f} | — | {_io_cells(c['io'])} |")
 
 
 if __name__ == '__main__':

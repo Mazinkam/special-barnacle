@@ -100,22 +100,30 @@ def _parse_json(text:str,what:str):
 def _batch_payload(raw:str|None):
     return _parse_json(raw if raw not in (None,'-') else sys.stdin.read(),'batch payload')
 
-def _failure(status:str,error:str,persisted:dict|None=None,retry:str|None=None)->str:
+def _failure(status:str,error:str,persisted:dict|None=None,retry:str|None=None)->dict:
     empty={s:0 for s in STREAMS}
-    return json.dumps({'ok':False,'status':status,'error':error,'persisted':persisted or empty,'duplicates':empty,'ledger_updated':False,'dashboard_updated':False,'retry':retry})
+    return {'ok':False,'status':status,'error':error,'persisted':persisted or empty,'duplicates':empty,'ledger_updated':False,'dashboard_updated':False,'retry':retry}
+
+def _write(records)->tuple[int,dict]:
+    """Run the coordinated writer; return (exit code, JSON body) without printing.
+
+    Every CLI path that appends (`batch`, `event`, `metric`, `outcome`, `init`) reports the writer's
+    outcome through this one function, so a rejected batch or an interrupted append is always a
+    structured body with `persisted`/`retry` and never an uncaught traceback.
+    """
+    try: result=write_batch(ROOT,records,config=cfg())
+    except BatchValidationError as exc: return EXIT_INVALID,_failure('invalid',str(exc))
+    except BatchAppendError as exc: return EXIT_APPEND_FAILED,_failure('append_failed',str(exc),exc.persisted,RETRY_SAME_IDS)
+    return (EXIT_OK if result['ok'] else EXIT_REFRESH_FAILED),{k:v for k,v in result.items() if k!='records'}
 
 def write_records(records)->int:
     """Run the coordinated writer for the CLI and print its JSON result; return the exit code."""
-    try: result=write_batch(ROOT,records,config=cfg())
-    except BatchValidationError as exc: print(_failure('invalid',str(exc))); return EXIT_INVALID
-    except BatchAppendError as exc: print(_failure('append_failed',str(exc),exc.persisted,RETRY_SAME_IDS)); return EXIT_APPEND_FAILED
-    print(json.dumps({k:v for k,v in result.items() if k!='records'}))
-    return EXIT_OK if result['ok'] else EXIT_REFRESH_FAILED
+    code,body=_write(records); print(json.dumps(body)); return code
 
 def _single(stream:str,payload_text:str,event:str|None=None)->int:
     """One-record form of `write_records`: the command names the stream (and event); the payload cannot override them."""
     try: record=single_record(stream,_parse_json(payload_text,'payload'),event=event)
-    except BatchValidationError as exc: print(_failure('invalid',str(exc))); return EXIT_INVALID
+    except BatchValidationError as exc: print(json.dumps(_failure('invalid',str(exc)))); return EXIT_INVALID
     return write_records([record])
 
 def main():
@@ -138,7 +146,16 @@ def main():
     cp=sp.add_parser('context-packet'); cp.add_argument('ids'); cp.add_argument('--budget',type=int,default=18000)
     args=ap.parse_args(); store=EventStore(ROOT); C=cfg(); eng=OrchestrationEngine(ROOT)
     if args.cmd=='init':
-        store.emit('orchestrator_initialized',schema_version=3); refresh(); print('Initialized V3 state'); return
+        # One coordinated write: durable append -> incremental ledger -> atomic dashboard, instead of
+        # an append followed by a full history replay that also discards the record-id cache. A
+        # rejected or interrupted write is reported exactly like `batch` (JSON body, exit 1/2/3,
+        # `retry == 'same_ids'`), so callers can resubmit `init` safely instead of parsing a traceback.
+        code, body = _write([single_record('event', {'schema_version': 3}, event='orchestrator_initialized')])
+        if code != EXIT_OK:
+            print(json.dumps(body))
+            raise SystemExit(code)
+        print('Initialized V3 state')
+        return
     if args.cmd=='status': print(json.dumps(load_or_rebuild(ROOT),indent=2)); return
     if args.cmd=='dashboard': print(generate_dashboard(ROOT,config=C)); return
     if args.cmd=='rebuild': print(json.dumps(rebuild(ROOT),indent=2)); generate_dashboard(ROOT,config=C); return
@@ -150,7 +167,7 @@ def main():
     if args.cmd=='outcome': raise SystemExit(_single('outcome',args.payload))
     if args.cmd=='batch':
         try: records=_batch_payload(args.payload)
-        except BatchValidationError as exc: print(_failure('invalid',str(exc))); raise SystemExit(EXIT_INVALID)
+        except BatchValidationError as exc: print(json.dumps(_failure('invalid',str(exc)))); raise SystemExit(EXIT_INVALID)
         raise SystemExit(write_records(records))
     if args.cmd=='route':
         overrides={}
