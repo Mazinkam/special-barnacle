@@ -15,12 +15,15 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
 
+from .records import CALL, SESSION
 from .runtime import EventStore, default_state_root, load_jsonl, stable_hash
 
 HUMAIN_TERMINAL = 'humain-terminal'
 CODEX = 'codex'
-CALL = 'call'
-SESSION = 'session'
+# CALL/SESSION re-exported from `orchestrator.records` (verified byte-identical to the values
+# this module used before that seam existed: 'call' and 'session') so there is exactly one
+# definition of granularity vocabulary. Re-exported, not just imported privately, because
+# callers outside this module (tests, cli.py) import CALL/SESSION from `orchestrator.ingest`.
 
 TOKEN_FIELDS = ('input_tokens', 'cached_input_tokens', 'cache_write_tokens', 'output_tokens',
                 'reasoning_output_tokens', 'total_tokens')
@@ -251,6 +254,10 @@ def recorded_session_totals(state_root: Path) -> dict[tuple[str, str, str], dict
     Session aggregates are emitted as deltas against this, so a session that was partly ingested
     per call, already aggregated, or has since grown contributes each token exactly once. Nothing
     is ever rewritten or removed to achieve that.
+
+    This is one of two independent reconciliation keys; see `recorded_source_totals` for the
+    other and `_merge_prior` for why both are needed and why they are combined with `max`, not
+    summed.
     """
     totals: dict[tuple[str, str, str], dict[str, int]] = {}
     for row in load_jsonl(state_root / 'metrics.jsonl'):
@@ -266,6 +273,59 @@ def recorded_session_totals(state_root: Path) -> dict[tuple[str, str, str], dict
                 pass
         bucket['calls'] += int(row.get('covers_calls') or 1)
     return totals
+
+
+def recorded_source_totals(state_root: Path) -> dict[tuple[str, str, str], dict[str, int]]:
+    """Tokens already recorded per (runtime, ingest_source, model), at any granularity.
+
+    `recorded_session_totals` keys by `session_id`, and `session_id` is not stable: it comes from
+    `read_humain_terminal`'s filename fallback (`path.stem.split('_')[-1]`) until a later
+    `type=='session'` record overrides it, and that override may or may not be present on any
+    given pass over a log that is still being written. When it drifts between passes, a
+    session-granularity re-ingest looks up prior totals under the *new* session_id, finds
+    nothing, and re-emits tokens that were already recorded under the *old* one. Live evidence:
+    one `ingest_source` carries both 2 session-aggregate rows ($9.18) and 113 per-call rows
+    ($11.32) for what should have been a single reconciled total.
+
+    `ingest_source` (the file path passed to `ingest_file`) does not drift, so keying on it too
+    gives a second, independent way to find "has this already been counted" that survives
+    session_id drift within one file. It cannot, by itself, handle one logical session spanning
+    multiple files (each has a different `ingest_source`) — that is what the session_id key is
+    for. Both keys are kept; see `_merge_prior`.
+    """
+    totals: dict[tuple[str, str, str], dict[str, int]] = {}
+    for row in load_jsonl(state_root / 'metrics.jsonl'):
+        source = row.get('ingest_source')
+        if not source or row.get('source') != 'session_ingest':
+            continue
+        key = (str(row.get('agent_runtime') or row.get('runtime') or ''), str(source), str(row.get('model') or ''))
+        bucket = totals.setdefault(key, {field: 0 for field in TOKEN_FIELDS} | {'calls': 0})
+        for field in TOKEN_FIELDS:
+            try:
+                bucket[field] += int(row.get(field) or 0)
+            except (TypeError, ValueError):
+                pass
+        bucket['calls'] += int(row.get('covers_calls') or 1)
+    return totals
+
+
+def _merge_prior(*buckets: dict[str, int] | None) -> dict[str, int]:
+    """Field-wise maximum across the two reconciliation buckets, never their sum.
+
+    When `session_id` has not drifted, the session-keyed and source-keyed buckets describe the
+    exact same prior rows and agree, so the max is that shared value. When it has drifted, one
+    bucket is empty (no prior row was ever recorded under the new session_id, or this is the
+    first file seen under this ingest_source) and the other holds the real prior total; the max
+    picks the real one. Summing instead of taking the max would double-subtract in the common,
+    non-drifted case, because both buckets would be counting the same underlying rows.
+    """
+    merged = {field: 0 for field in TOKEN_FIELDS} | {'calls': 0}
+    for bucket in buckets:
+        if not bucket:
+            continue
+        for field in merged:
+            merged[field] = max(merged[field], int(bucket.get(field) or 0))
+    return merged
 
 
 def call_id_for(runtime: str, session_id: str, native_id: str) -> str:
@@ -302,12 +362,16 @@ def _base_metric(call: dict[str, Any], *, runtime: str, path: Path, repository: 
     return metric
 
 
-def _session_aggregates(calls: list[dict[str, Any]], *, runtime: str, root: Path,
-                        recorded: dict[tuple[str, str, str], dict[str, int]]) -> list[dict[str, Any]]:
+def _session_aggregates(calls: list[dict[str, Any]], *, runtime: str, root: Path, ingest_source: str,
+                        recorded: dict[tuple[str, str, str], dict[str, int]],
+                        recorded_by_source: dict[tuple[str, str, str], dict[str, int]]) -> list[dict[str, Any]]:
     """Collapse a session into one row per (session, model), minus what is already recorded.
 
     Grouping by model rather than by session alone keeps pricing exact when a session switches
-    models mid-stream.
+    models mid-stream. The amount already recorded is the merge of two independent reconciliation
+    keys — `recorded` (by session_id) and `recorded_by_source` (by this file's `ingest_source`) —
+    so that neither a drifted session_id nor a session spanning multiple files can cause the same
+    tokens to be counted twice. See `_merge_prior`.
     """
     groups: dict[tuple[str, str], dict[str, Any]] = {}
     for call in calls:
@@ -323,11 +387,11 @@ def _session_aggregates(calls: list[dict[str, Any]], *, runtime: str, root: Path
             group['ts'] = call['ts']
     rows: list[dict[str, Any]] = []
     for (session_id, model), group in groups.items():
-        prior = recorded.get((runtime, session_id, model))
-        if prior:
-            for field in TOKEN_FIELDS:
-                group[field] = max(0, group[field] - prior.get(field, 0))
-            group['calls'] = max(0, group['calls'] - prior.get('calls', 0))
+        prior = _merge_prior(recorded.get((runtime, session_id, model)),
+                             recorded_by_source.get((runtime, ingest_source, model)))
+        for field in TOKEN_FIELDS:
+            group[field] = max(0, group[field] - prior.get(field, 0))
+        group['calls'] = max(0, group['calls'] - prior.get('calls', 0))
         # Emit whenever unrecorded calls remain, even with zero tokens: that row carries
         # covers_calls and lands in the unmetered bucket.
         if group['calls'] <= 0 and all(group[field] <= 0 for field in TOKEN_FIELDS):
@@ -339,7 +403,8 @@ def _session_aggregates(calls: list[dict[str, Any]], *, runtime: str, root: Path
 def ingest_file(path: str | Path, *, runtime: str | None = None, repository: str | None = None,
                 state_root: str | Path | None = None, dry_run: bool = False, granularity: str = CALL,
                 store: EventStore | None = None, seen: set[str] | None = None,
-                recorded: dict[tuple[str, str, str], dict[str, int]] | None = None) -> dict[str, Any]:
+                recorded: dict[tuple[str, str, str], dict[str, int]] | None = None,
+                recorded_by_source: dict[tuple[str, str, str], dict[str, int]] | None = None) -> dict[str, Any]:
     path = Path(path).expanduser()
     if not path.is_file():
         raise FileNotFoundError(f'No session log at {path}')
@@ -363,7 +428,9 @@ def ingest_file(path: str | Path, *, runtime: str | None = None, repository: str
                'estimated_cost_usd': 0.0, 'unpriced_models': {}, 'dry_run': bool(dry_run)}
     if granularity == SESSION:
         prior = recorded_session_totals(root) if recorded is None else recorded
-        rows = _session_aggregates(calls, runtime=resolved, root=root, recorded=prior)
+        prior_by_source = recorded_source_totals(root) if recorded_by_source is None else recorded_by_source
+        rows = _session_aggregates(calls, runtime=resolved, root=root, ingest_source=str(path),
+                                   recorded=prior, recorded_by_source=prior_by_source)
         if not rows:
             summary['duplicates'] = 1 if calls else 0
             return summary
@@ -374,12 +441,18 @@ def ingest_file(path: str | Path, *, runtime: str | None = None, repository: str
                            'call_id': call_id_for(resolved, str(row['session_id']), row['native_id'])})
             metric.pop('calls', None)
             record = writer.preview_metric(**metric) if dry_run else writer.metric(**metric)
-            # Keep the in-memory view consistent for the next file in the same batch.
-            key = (resolved, str(row['session_id']), str(row.get('model') or ''))
-            bucket = prior.setdefault(key, {field: 0 for field in TOKEN_FIELDS} | {'calls': 0})
+            # Keep the in-memory view consistent for the next file in the same batch, for both
+            # reconciliation keys: a later file in the same batch may share this session_id (the
+            # multi-file case) or, in principle, be re-processed under this same ingest_source.
+            session_key = (resolved, str(row['session_id']), str(row.get('model') or ''))
+            session_bucket = prior.setdefault(session_key, {field: 0 for field in TOKEN_FIELDS} | {'calls': 0})
+            source_key = (resolved, str(path), str(row.get('model') or ''))
+            source_bucket = prior_by_source.setdefault(source_key, {field: 0 for field in TOKEN_FIELDS} | {'calls': 0})
             for field in TOKEN_FIELDS:
-                bucket[field] += int(row.get(field) or 0)
-            bucket['calls'] += covered
+                session_bucket[field] += int(row.get(field) or 0)
+                source_bucket[field] += int(row.get(field) or 0)
+            session_bucket['calls'] += covered
+            source_bucket['calls'] += covered
             summary['emitted'] += 1
             _tally(summary, record)
         return summary
@@ -407,6 +480,7 @@ def ingest_paths(paths: Iterable[str | Path], *, runtime: str | None = None, rep
     store = EventStore(root)
     seen = existing_call_ids(root)
     recorded = recorded_session_totals(root) if granularity == SESSION else None
+    recorded_by_source = recorded_source_totals(root) if granularity == SESSION else None
     files: list[dict[str, Any]] = []
     totals = {'emitted': 0, 'duplicates': 0, 'zero_usage': 0, 'usage_rows': 0, 'estimated_cost_usd': 0.0}
     unpriced: dict[str, int] = {}
@@ -416,7 +490,7 @@ def ingest_paths(paths: Iterable[str | Path], *, runtime: str | None = None, rep
         try:
             summary = ingest_file(path, runtime=runtime, repository=repository, state_root=root,
                                   dry_run=dry_run, granularity=granularity, store=store, seen=seen,
-                                  recorded=recorded)
+                                  recorded=recorded, recorded_by_source=recorded_by_source)
         except (FileNotFoundError, ValueError, OSError) as error:
             # One unreadable log must not abandon a bulk backfill part-way through.
             failures.append({'file': str(path), 'error': f'{type(error).__name__}: {error}'})
