@@ -74,6 +74,25 @@ class ReaderTests(unittest.TestCase):
         self.assertTrue(all(call['output_tokens'] >= 0 for call in calls))
         self.assertNotIn('user-1', [call['native_id'] for call in calls])
 
+    def test_truncated_trailing_json_does_not_erase_valid_usage(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            log = humain_terminal_log(Path(d, 'session.jsonl'))
+            fixture_records = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines()]
+            valid_usage = next(row for row in fixture_records
+                               if isinstance(row.get('message'), dict)
+                               and row['message'].get('role') == 'assistant')
+            log.write_text(json.dumps({'type': 'session', 'id': 'sess-1'}) + '\n'
+                           + json.dumps(valid_usage) + '\n'
+                           + '{"type":"message","id":"truncated","message":',
+                           encoding='utf-8')
+
+            result = ingest_paths([log], state_root=root, runtime=HUMAIN_TERMINAL)
+
+            self.assertEqual(result['emitted'], 1)
+            self.assertEqual(result['failures'], [])
+            self.assertEqual(len(load_jsonl(root / 'metrics.jsonl')), 1)
+
     def test_codex_uses_per_response_usage_not_cumulative_totals(self):
         with tempfile.TemporaryDirectory() as d:
             calls = read_codex(codex_log(Path(d, 'rollout.jsonl')))
