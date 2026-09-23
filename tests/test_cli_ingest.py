@@ -72,7 +72,18 @@ def test_make_ingest_status_bounds_failure_details():
 
     assert result['status'] == 'partial'
     assert result['error'].startswith('2 file(s) failed; first: first detail ')
-    assert len(result['error']) == 500
+    assert len(result['error']) == 240
+
+
+def test_make_ingest_status_redacts_absolute_paths_in_error():
+    result = make_ingest_status({}, {
+        'failures': [{'error': 'failed to parse /Users/alice/.humain-terminal/sessions/p/s.jsonl: bad'}],
+        'files_scanned': 1,
+        'emitted': 0,
+    })
+    assert '/Users/alice' not in result['error']
+    assert '<path>' in result['error']
+    assert result['status'] == 'partial'
 
 
 def test_ingest_reports_per_file_progress_to_stderr_when_not_quiet(tmp_path, monkeypatch, capsys):

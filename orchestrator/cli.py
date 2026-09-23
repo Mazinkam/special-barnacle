@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse,json,os,sys
+import re as _re_path
 from pathlib import Path
 from typing import Any, Callable
 from .runtime import EventStore,QualityEvidence,default_state_root,read_json,utc_now,write_json
@@ -13,6 +14,10 @@ from .engine import OrchestrationEngine
 from .ingest import discover_logs, ingest_paths
 from .dynamic_adapter import resolve_adapter
 
+_PATH_RE = _re_path.compile(r"(/Users/[^ \t\n|]+|/home/[^ \t\n|]+|~/[^ \t\n|]+)")
+def _redact_paths(text):
+    return _PATH_RE.sub("<path>", text)
+
 ROOT=default_state_root()
 def cfg(): return read_json(Path(__file__).with_name('config.json'),{})
 def refresh(state_root: Path = ROOT) -> Path:
@@ -25,10 +30,10 @@ def make_ingest_status(previous: dict[str, Any], result: dict[str, Any], *,
                        materialization_error: Exception | None = None) -> dict[str, Any]:
     failures = result.get('failures') or []
     status = 'error' if materialization_error is not None else ('partial' if failures else 'ok')
-    error = str(materialization_error)[:500] if materialization_error is not None else None
+    error = _redact_paths(str(materialization_error))[:240] if materialization_error is not None else None
     if error is None and failures:
         first_detail = str(failures[0].get('error') or 'ingest failed')
-        error = f"{len(failures)} file(s) failed; first: {first_detail}"[:500]
+        error = _redact_paths(f"{len(failures)} file(s) failed; first: {first_detail}")[:240]
 
     interval = os.environ.get('HUMAIN_ORCHESTRATOR_INGEST_INTERVAL')
     try:
@@ -157,7 +162,7 @@ def main():
         print(json.dumps(result,indent=2))
         if result.get('failures') and not args.dry_run:
             first_detail = ' '.join(str(result['failures'][0].get('error') or 'ingest failed').split())
-            print(f"{len(result['failures'])} file(s) failed; first: {first_detail}"[:500], file=sys.stderr, flush=True)
+            print(_redact_paths(f"{len(result['failures'])} file(s) failed; first: {first_detail}")[:240], file=sys.stderr, flush=True)
             raise SystemExit(1)
         return
     if args.cmd=='quality':
