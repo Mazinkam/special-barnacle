@@ -15,6 +15,7 @@ import json
 import os
 import random
 import re
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -664,6 +665,52 @@ class BenchmarkHarnessTests(SyntheticRootTestCase):
     def test_run_child_reports_a_non_zero_exit_code(self):
         run = self._run_child_bounded([sys.executable, '-c', 'import sys; sys.exit(7)'], env=dict(os.environ))
         self.assertEqual(run.returncode, 7)
+
+    def test_run_child_keeps_the_exit_code_when_the_io_report_is_truncated(self):
+        # A child that dies mid-report leaves a syntactically incomplete file: the harness must report
+        # the child's exit code and `io=None`, never raise a decode error that masks the failure.
+        code = ('import os, sys; open(os.environ["ORCHESTRATOR_BENCH_IO_REPORT"], "w").write(\'{"python_file_io": {"read_\'); sys.exit(3)')
+        run = self._run_child_bounded([sys.executable, '-c', code], env=dict(os.environ))
+        self.assertEqual(run.returncode, 3)
+        self.assertIsNone(run.io, 'a truncated report is no report')
+        # A report that parses but is not the expected object is also discarded, not mistaken for data.
+        code = 'import os, sys; open(os.environ["ORCHESTRATOR_BENCH_IO_REPORT"], "w").write("[1, 2]"); sys.exit(0)'
+        run = self._run_child_bounded([sys.executable, '-c', code], env=dict(os.environ))
+        self.assertEqual(run.returncode, 0); self.assertIsNone(run.io)
+
+    def test_run_cli_surfaces_the_exit_code_of_a_child_that_crashed_mid_report(self):
+        code = ('import os, sys; open(os.environ["ORCHESTRATOR_BENCH_IO_REPORT"], "w").write(\'{"python_file_io\'); sys.exit(5)')
+        self.bench.cli_argv = lambda *args: [sys.executable, '-c', code]
+        with self.assertRaises(SystemExit) as ctx:
+            self.bench.run_cli(self.root, 'dashboard')
+        self.assertIn('failed (5)', str(ctx.exception))
+
+    def _child(self, io):
+        return self.bench.ChildRun(argv=[], returncode=0, elapsed_s=.1, ru_maxrss=1, ru_inblock=0, ru_oublock=0, stdout='', stderr='', io=io)
+
+    def test_io_summary_never_labels_a_partially_reported_group_as_a_whole(self):
+        full = lambda r, w: {'python_file_io': {'read_bytes': r, 'write_bytes': w}, 'physical': {'read_bytes': r, 'write_bytes': w, 'source': 'os'}}  # noqa: E731
+        logical_only = lambda r, w: {'python_file_io': {'read_bytes': r, 'write_bytes': w}}  # noqa: E731
+        complete = [self._child(full(100, 10)), self._child(full(200, 20))]
+        unreported = [self._child(full(1000, 100)), self._child(None)]                # a child without any report
+        no_physical = [self._child(full(5000, 500)), self._child(logical_only(1, 1))]  # a child that reported only logical bytes
+        summary = self.bench.io_summary([complete, unreported, no_physical])
+        # Groups with a silent child contribute nothing to that section; the median is over the fully reported groups only,
+        # and the section says so instead of presenting 1000/100 as if it were the whole two-child operation.
+        self.assertEqual((summary['logical']['read_bytes'], summary['logical']['write_bytes']), (int(statistics.median([300, 5001])), int(statistics.median([30, 501]))))
+        self.assertEqual((summary['logical']['groups'], summary['logical']['complete_groups']), (3, 2))
+        self.assertTrue(summary['logical']['partial'])
+        self.assertEqual((summary['physical']['read_bytes'], summary['physical']['write_bytes']), (300, 30))
+        self.assertEqual((summary['physical']['groups'], summary['physical']['complete_groups']), (3, 1))
+        self.assertTrue(summary['physical']['partial'])
+        # Fully reported groups are not flagged.
+        clean = self.bench.io_summary([complete, [self._child(full(7, 7))]])
+        self.assertFalse(clean['logical']['partial']); self.assertEqual((clean['logical']['groups'], clean['logical']['complete_groups']), (2, 2))
+        self.assertEqual(clean['logical']['read_bytes'], int(statistics.median([300, 7])))
+        # A section no complete group reported is None, never a number.
+        self.assertIsNone(self.bench.io_summary([unreported, no_physical])['physical'])
+        self.assertIsNone(self.bench.io_summary([unreported])['logical'])
+        self.assertIsNone(self.bench.io_summary([[self._child(None)]])['logical'])
 
     def test_instrumented_child_reports_logical_bytes_exactly_and_physical_bytes_separately(self):
         self.root.mkdir(); source = self.root / 'in.bin'; source.write_bytes(os.urandom(300 * 1024 + 17))

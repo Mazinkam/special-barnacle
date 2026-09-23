@@ -175,7 +175,7 @@ class ChildRun:
     ru_oublock: int
     stdout: str
     stderr: str
-    io: dict | None           # the child's I/O report, None when the child was not instrumented
+    io: dict | None           # the child's I/O report; None when the child was not instrumented or died before completing it
 
 
 def rss_mib(ru_maxrss: int) -> float:
@@ -216,8 +216,21 @@ def run_child(argv: list[str], *, env: dict[str, str], cwd: str | None = None, s
             proc.returncode = code = os.waitstatus_to_exitcode(status)  # tell Popen it is reaped; no second waitpid
             out.seek(0); err.seek(0)
             stdout = out.read().decode('utf-8', 'replace'); stderr = err.read().decode('utf-8', 'replace')
-        io_report = json.loads(report.read_text(encoding='utf-8')) if report.exists() else None
+        io_report = _load_io_report(report)
     return ChildRun(list(argv), code, elapsed, usage.ru_maxrss, usage.ru_inblock, usage.ru_oublock, stdout, stderr, io_report)
+
+
+def _load_io_report(path: Path) -> dict | None:
+    """The child's report, or None when it is missing, truncated (child died mid-write) or not an object.
+
+    A child that crashes while `_report` is writing leaves an unparseable file; that must not turn
+    into a decode error in the parent, which would hide the child's non-zero exit code.
+    """
+    try:
+        loaded = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def run_cli(root: Path, *args: str, stdin: str | None = None) -> ChildRun:
@@ -232,18 +245,23 @@ def io_summary(groups: list[list[ChildRun]]) -> dict:
     """Median over `groups` of the bytes each group of children moved (a group is one operation).
 
     Logical and physical are reported side by side and never substituted for one another; each
-    carries the name of its source. A section is None when no child in the groups reported it.
+    carries the name of its source. A group's total for a section exists only when *every* child in
+    the group reported that section: a group with a silent child (no report, truncated report, or a
+    platform without that source) is incomplete and contributes nothing, so a two-child operation is
+    never presented as the bytes of its one reporting child. The median is over the complete groups;
+    `groups`/`complete_groups` give the count and `partial` is True when any group was dropped. A
+    section is None when no group reported it completely.
     """
-    def total(group: list[ChildRun], section: str, key: str) -> int | None:
-        values = [run.io[section][key] for run in group if run.io and run.io.get(section)]
-        return sum(values) if values else None
+    def total(group: list[ChildRun], section: str) -> tuple[int, int] | None:
+        if not group or any(not run.io or not isinstance(run.io.get(section), dict) for run in group): return None
+        return sum(run.io[section]['read_bytes'] for run in group), sum(run.io[section]['write_bytes'] for run in group)
 
     def section(name: str, default_source: str | None = None) -> dict | None:
-        reads = [total(g, name, 'read_bytes') for g in groups]; writes = [total(g, name, 'write_bytes') for g in groups]
-        reads = [r for r in reads if r is not None]; writes = [w for w in writes if w is not None]
-        if not reads or not writes: return None
-        source = default_source or next((run.io[name]['source'] for g in groups for run in g if run.io and run.io.get(name)), None)
-        return {'read_bytes': int(statistics.median(reads)), 'write_bytes': int(statistics.median(writes)), 'source': source}
+        totals = [t for t in (total(g, name) for g in groups) if t is not None]
+        if not totals: return None
+        source = default_source or next((run.io[name].get('source') for g in groups for run in g if run.io and isinstance(run.io.get(name), dict)), None)
+        return {'read_bytes': int(statistics.median(r for r, _ in totals)), 'write_bytes': int(statistics.median(w for _, w in totals)),
+                'source': source, 'groups': len(groups), 'complete_groups': len(totals), 'partial': len(totals) < len(groups)}
 
     return {'logical': section('python_file_io', LOGICAL_SOURCE), 'kernel_logical': section('kernel_logical'), 'physical': section('physical'),
             'rusage_blocks': {'in': max((run.ru_inblock for g in groups for run in g), default=0),
@@ -321,9 +339,13 @@ def _mib(n: int | None) -> str:
 
 
 def _io_cells(io: dict) -> str:
+    def cell(section: dict | None, key: str) -> str:
+        if section is None: return '—'
+        return _mib(section[key]) + ('*' if section.get('partial') else '')
+
     logical, physical = io['logical'], io['physical']
-    return (f"{_mib(logical['read_bytes'] if logical else None)} / {_mib(logical['write_bytes'] if logical else None)} | "
-            f"{_mib(physical['read_bytes'] if physical else None)} / {_mib(physical['write_bytes'] if physical else None)}")
+    return (f"{cell(logical, 'read_bytes')} / {cell(logical, 'write_bytes')} | "
+            f"{cell(physical, 'read_bytes')} / {cell(physical, 'write_bytes')}")
 
 
 def main() -> None:
@@ -352,6 +374,7 @@ def main() -> None:
         print(json.dumps({'meta': meta, 'results': results}, indent=2)); return
     print(f"# refresh benchmark — {meta['fixture']} — python {meta['python']} {meta['platform']} — repeat={args.repeat} batch={args.batch_size}")
     print(f"# logical bytes: {meta['io']['logical']}; physical bytes: {meta['io']['physical'] or 'unavailable on this platform'}")
+    print('# * = partial: some repetitions had a child without a complete I/O report and were excluded from that median')
     print('| scale | metrics rows / fixture MB | op | subprocesses | median s | peak child RSS MiB | throughput | logical MiB read / written | physical MiB read / written |')
     print('|---|---:|---|---:|---:|---:|---:|---:|---:|')
     for r in results:
