@@ -2722,7 +2722,7 @@ export default function (pi: ExtensionAPI) {
 
 				const proceed = await Promise.race([session.cancellation.wait(), confirmStep(
 					ctx,
-					"Dispatch this plan?"
+					"Dispatch this plan?",
 					`${pipeline}\n\nEach stage runs headless (up to ${Math.round(DISPATCH_TIMEOUT_MS / 60000)} min per dispatch); live progress shows above the editor.`,
 					parsed.interactive,
 				)]);

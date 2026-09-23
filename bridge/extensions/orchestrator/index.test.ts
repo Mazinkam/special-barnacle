@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -63,6 +63,37 @@ describe("RunSession cancellation presentation", () => {
 });
 
 describe("confirmation gates", () => {
+	test.each([false, true])("dispatch call passes separate confirmation arguments (interactive=%s)", async (interactive) => {
+		// Execute the actual call expression after the plan summary, not a copy of it.
+		// This isolates argument construction without planning or dispatching agents.
+		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+		const afterSummary = source.slice(source.indexOf("session.log(planSummary.join"));
+		const call = afterSummary.match(/confirmStep\([\s\S]*?\n\s*\)/)?.[0];
+		if (!call) throw new Error("Dispatch confirmation call not found after plan summary");
+		const invoke = new Function("ctx", "pipeline", "parsed", "DISPATCH_TIMEOUT_MS", "confirmStep", `return ${call};`);
+		const confirm = mock(() => Promise.resolve(false));
+		const ctx = { hasUI: true, ui: { confirm, notify: mock() } };
+		const confirmStep = mock(orchestrator.confirmStep);
+
+		const result = await invoke(ctx, "lead → workers → qa", { interactive }, 120000, confirmStep);
+
+		expect(confirmStep).toHaveBeenCalledWith(
+			ctx,
+			"Dispatch this plan?",
+			"lead → workers → qa\n\nEach stage runs headless (up to 2 min per dispatch); live progress shows above the editor.",
+			interactive,
+		);
+		expect(result).toBe(!interactive);
+		if (interactive) {
+			expect(confirm).toHaveBeenCalledWith(
+				"Dispatch this plan?",
+				"lead → workers → qa\n\nEach stage runs headless (up to 2 min per dispatch); live progress shows above the editor.",
+			);
+		} else {
+			expect(confirm).not.toHaveBeenCalled();
+		}
+	});
+
 	test("auto-confirms when interactive confirmation is not requested", async () => {
 		expect(orchestrator.confirmStep).toBeFunction();
 		const confirm = mock(() => false);
