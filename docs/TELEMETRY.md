@@ -65,13 +65,16 @@ A runtime that cannot report cost should still report tokens; that alone moves i
 A harness that cannot call the orchestrator per model call still writes usage to disk. Ingest
 it instead of leaving the runtime unmetered.
 
-**This runs automatically; nobody should need to invoke it.** Two mechanisms, both at
-`session` granularity so they never double count each other:
+**This runs automatically; nobody should need to invoke it.** A settled HT turn is ingested after a 3-second debounce; transient failures get up to three attempts total, with 250 ms then 500 ms backoff. `session_shutdown` awaits a flush. Both mechanisms use `session` granularity so they never double count:
 
 | Mechanism | Trigger | Covers |
 |---|---|---|
-| HT extension hook (`bridge/extensions/orchestrator/ingest.ts`) | `agent_settled` (debounced 3s) and `session_shutdown` | the live HT session, within seconds |
-| launchd sweep `com.humain.orchestrator-ingest` (installed by `install.sh`) | every 15 min + at login | anything the hook missed: crashed sessions, HT without the extension, Codex CLI |
+| HT extension hook (`bridge/extensions/orchestrator/ingest.ts`) | `agent_settled` (3-second debounce, bounded retry) and `session_shutdown` | the live HT session, normally within seconds |
+| launchd sweep `com.humain.orchestrator-ingest` (installed by `install.sh`) | at login and every 15 min | anything the hook missed: crashed sessions, HT without the extension, Codex CLI |
+
+`ingest_status.json` in the shared state directory drives the dashboard's session-ingest health panel. Version 1 fields are `version`, `last_attempt_at`, `last_success_at`, `status`, `files_scanned`, `emitted`, `failure_count`, `error`, and `sweep_interval_seconds`. The panel reports `ok` for a successful check (including a duplicate-only check), `partial` when some files failed, `error` when ingestion or materialization failed, `stale` when the last success is older than twice `HUMAIN_ORCHESTRATOR_INGEST_INTERVAL`, and `unknown` when status is missing/malformed or required timestamps are invalid (a null `last_success_at` is valid for a first partial/error attempt). The sweep interval defaults to 900 seconds (15 minutes), so the default stale threshold is 1,800 seconds. A stale state is based on the last successful check, not the age of the last model call.
+
+Only saved assistant usage records are ingested; user and assistant message text is never copied into metrics, status, or dashboard output. The startup/15-minute discovery sweep is the catch-up path if a hook, extension, or process misses a turn. An already-open dashboard refreshes every five seconds while visible; its pause control disables refresh and its scroll position is restored after reload. A running HUMAIN Terminal must receive `/reload` or be restarted to load changed extension hooks. Ephemeral `--no-session` work has no saved session log and is excluded from this ingestion path.
 
 Hook failures are logged to `~/.local/state/coding-agent-orchestrator/ingest-hook.log`, sweep
 output to `ingest-launchd.log`. Manual invocation remains available for backfills:

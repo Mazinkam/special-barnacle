@@ -1,9 +1,10 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { SessionIngestScheduler } from "./ingest.ts";
 
 mock.module("@humain/terminal", () => ({
 	BorderedLoader: class {
@@ -16,6 +17,7 @@ mock.module("@humain/terminal", () => ({
 
 const testStateRoot = mkdtempSync(join(tmpdir(), "orch-run-session-test-"));
 process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = testStateRoot;
+process.env.CODING_AGENT_ORCHESTRATOR_HOME = testStateRoot;
 const orchestrator = await import("./index.ts");
 afterAll(() => {
 	rmSync(testStateRoot, { recursive: true, force: true });
@@ -39,6 +41,125 @@ describe("session ingest hook wiring", () => {
 		await handlers.session_shutdown({}, ctxFor("/sessions/current-shutdown.jsonl"));
 		expect(scheduled).toEqual(["/sessions/current-settled.jsonl"]);
 		expect(flushed).toEqual(["/sessions/current-shutdown.jsonl"]);
+	});
+
+	test("registered settled hook runs real debounced CLI ingestion and replay refreshes without duplicates", async () => {
+		const sessionRoot = mkdtempSync(join(tmpdir(), "orch-hook-session-"));
+		try {
+			const sessionDir = join(sessionRoot, "sessions", "--Users-test-Projects-app--");
+			mkdirSync(sessionDir, { recursive: true });
+			const sessionFile = join(sessionDir, "turn.jsonl");
+			const marker = "MARKER_DO_NOT_LEAK_7f3a";
+			writeFileSync(sessionFile, [
+				{ type: "session", id: "event-session" },
+				{
+					type: "message", id: "assistant-1", timestamp: "2026-09-23T10:00:00Z",
+					message: {
+						role: "assistant", model: "claude-sonnet-5", content: [{ type: "text", text: marker }],
+						usage: { input: 40, output: 8, totalTokens: 48 },
+					},
+				},
+			].map((row) => JSON.stringify(row)).join("\n") + "\n");
+
+			const handlers: Record<string, (...args: any[]) => unknown> = {};
+			const api = new Proxy({
+				on: (event: string, handler: (...args: any[]) => unknown) => { handlers[event] = handler; },
+			}, {
+				get(target, property: string) {
+					return property in target ? target[property as "on"] : () => {};
+				},
+			});
+			orchestrator.default!(api as never);
+			expect(handlers.agent_settled).toBeFunction();
+			const context = { sessionManager: { getSessionFile: () => sessionFile } };
+			const waitForMaterialization = async (previousAttempt?: string) => {
+				const deadline = Date.now() + 10_000;
+				while (Date.now() < deadline) {
+					try {
+						const status = JSON.parse(readFileSync(join(testStateRoot, "ingest_status.json"), "utf8"));
+						if (status.status === "ok" && status.last_attempt_at !== previousAttempt &&
+							statSync(join(testStateRoot, "dashboard.html")).size > 0) return status;
+					} catch {
+						// Wait for the debounced CLI to create its materialized files.
+					}
+					await new Promise((resolve) => setTimeout(resolve, 100));
+				}
+				throw new Error("settled-session ingest did not materialize within 10 seconds");
+			};
+
+			await handlers.agent_settled({}, context);
+			const firstStatus = await waitForMaterialization();
+			const metricsPath = join(testStateRoot, "metrics.jsonl");
+			const metricRows = readFileSync(metricsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+			expect(metricRows).toHaveLength(1);
+			expect(metricRows[0].covers_calls).toBe(1);
+			expect(firstStatus.emitted).toBe(1);
+			expect(readFileSync(join(testStateRoot, "ledger.json"), "utf8")).toBeTruthy();
+			expect(readFileSync(join(testStateRoot, "dashboard.html"), "utf8")).toContain("Session ingest health");
+
+			const beforeReplayDashboard = statSync(join(testStateRoot, "dashboard.html")).mtimeMs;
+			await handlers.agent_settled({}, context);
+			const replayStatus = await waitForMaterialization(firstStatus.last_attempt_at);
+			const dashboardText = readFileSync(join(testStateRoot, "dashboard.html"), "utf8");
+			expect(replayStatus.emitted).toBe(0);
+			expect(replayStatus.status).toBe("ok");
+			expect(statSync(join(testStateRoot, "dashboard.html")).mtimeMs).toBeGreaterThan(beforeReplayDashboard);
+			expect(readFileSync(metricsPath, "utf8").trim().split("\n")).toHaveLength(1);
+			for (const output of [readFileSync(metricsPath, "utf8"),
+				readFileSync(join(testStateRoot, "ingest_status.json"), "utf8"), dashboardText]) {
+				expect(output).not.toContain(marker);
+			}
+		} finally {
+			rmSync(sessionRoot, { recursive: true, force: true });
+		}
+	}, 25_000);
+
+	test("same-session append during an in-flight run is consumed by the queued rerun", async () => {
+		const root = mkdtempSync(join(tmpdir(), "orch-queued-ingest-test-"));
+		const sessionFile = join(root, "session.jsonl");
+		writeFileSync(sessionFile, "initial\n");
+		let releaseFirst!: () => void;
+		let markFirstStarted!: () => void;
+		let markSecondFinished!: () => void;
+		const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+		const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+		const secondFinished = new Promise<void>((resolve) => { markSecondFinished = resolve; });
+		const snapshots: string[] = [];
+		const scheduler = new SessionIngestScheduler({
+			debounceMs: 0,
+			run: async (file) => {
+				snapshots.push(readFileSync(file, "utf8"));
+				if (snapshots.length === 1) {
+					markFirstStarted();
+					await firstGate;
+				} else {
+					markSecondFinished();
+				}
+				return { ok: true };
+			},
+		});
+		const handlers: Record<string, (...args: any[]) => unknown> = {};
+		orchestrator.registerSessionIngestHooks!({
+			on: (event: string, handler: (...args: any[]) => unknown) => { handlers[event] = handler; },
+		} as never, scheduler);
+		const context = { sessionManager: { getSessionFile: () => sessionFile } };
+		try {
+			await handlers.agent_settled({}, context);
+			await firstStarted;
+			writeFileSync(sessionFile, "initial\nappended-during-ingest\n");
+			await handlers.agent_settled({}, context);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(snapshots).toHaveLength(1);
+			releaseFirst();
+			await secondFinished;
+			await scheduler.flush(null);
+			expect(snapshots).toHaveLength(2);
+			expect(snapshots[0]).toBe("initial\n");
+			expect(snapshots[1]).toContain("appended-during-ingest");
+		} finally {
+			releaseFirst();
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	test("final hook failure atomically records bounded status and preserves last success", () => {

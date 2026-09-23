@@ -3,6 +3,9 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -96,6 +99,89 @@ def test_dry_run_does_not_write_status_or_refresh(tmp_path):
     assert result['emitted'] == 1
     assert not (root / 'ingest_status.json').exists()
     refresh.assert_not_called()
+
+
+def test_discovery_sweep_catches_up_idempotently_after_a_missed_hook(tmp_path):
+    home = tmp_path / 'home'
+    session = home / '.humain-terminal/agent/sessions/--Users-test-Projects-app--/session.jsonl'
+    session.parent.mkdir(parents=True)
+    marker = 'MARKER_DO_NOT_LEAK_7f3a'
+
+    def assistant_call(call_id, output):
+        return {
+            'type': 'message', 'id': call_id, 'timestamp': '2026-09-23T10:00:00Z',
+            'message': {'role': 'assistant', 'model': 'claude-sonnet-5',
+                        'content': [{'type': 'text', 'text': marker}],
+                        'usage': {'input': 20, 'output': output, 'totalTokens': 20 + output}},
+        }
+
+    session.write_text(''.join(json.dumps(row) + '\n' for row in (
+        {'type': 'session', 'id': 'sweep-session'},
+        assistant_call('call-1', 5), assistant_call('call-2', 7),
+    )), encoding='utf-8')
+    state = tmp_path / 'state'
+    repo_root = Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        'HOME': str(home),
+        'CODING_AGENT_ORCHESTRATOR_HOME': str(state),
+        'PYTHONPATH': str(repo_root),
+    }
+    command = [sys.executable, '-m', 'orchestrator.cli', 'ingest', '--discover',
+               '--since-days', '2', '--granularity', 'session', '--quiet']
+
+    def sweep():
+        return subprocess.run(command, env=env, capture_output=True, text=True, check=False)
+
+    first = sweep()
+    assert first.returncode == 0, first.stderr
+    rows = load_jsonl(state / 'metrics.jsonl')
+    assert sum(row['covers_calls'] for row in rows) == 2
+    assert len(rows) == 1
+    initial_status = read_json(state / 'ingest_status.json', {})
+    assert set(initial_status) == STATUS_FIELDS
+    assert initial_status['status'] == 'ok'
+    assert (state / 'ledger.json').exists()
+    assert (state / 'dashboard.html').exists()
+
+    second = sweep()
+    assert second.returncode == 0, second.stderr
+    assert json.loads(second.stdout)['emitted'] == 0
+    assert sum(row['covers_calls'] for row in load_jsonl(state / 'metrics.jsonl')) == 2
+
+    with session.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(assistant_call('call-3', 9)) + '\n')
+    caught_up = sweep()
+    assert caught_up.returncode == 0, caught_up.stderr
+    assert json.loads(caught_up.stdout)['emitted'] == 1
+    final_rows = load_jsonl(state / 'metrics.jsonl')
+    assert sum(row['covers_calls'] for row in final_rows) == 3
+    assert len(final_rows) == 2
+
+    status_text = (state / 'ingest_status.json').read_text(encoding='utf-8')
+    dashboard_text = (state / 'dashboard.html').read_text(encoding='utf-8')
+    metrics_text = (state / 'metrics.jsonl').read_text(encoding='utf-8')
+    assert marker not in metrics_text
+    assert marker not in status_text
+    assert marker not in dashboard_text
+    final_status = read_json(state / 'ingest_status.json', {})
+    assert set(final_status) == STATUS_FIELDS
+    assert final_status['status'] == 'ok'
+    assert final_status['files_scanned'] == 1
+    assert final_status['emitted'] == 1
+
+
+def test_refresh_with_corrupt_ingest_status_renders_unknown(tmp_path):
+    root = tmp_path / 'state'
+    root.mkdir()
+    (root / 'ingest_status.json').write_text('{corrupt json', encoding='utf-8')
+
+    dashboard = cli.refresh(root)
+
+    assert dashboard == root / 'dashboard.html'
+    rendered = dashboard.read_text(encoding='utf-8')
+    assert '"status": "unknown"' in rendered
+    assert 'Traceback' not in rendered
 
 
 def test_failed_render_is_recovered_by_duplicate_only_retry(tmp_path):

@@ -31,6 +31,12 @@ A real adapter should advertise:
 
 Do not assume effort names are portable. Translate the orchestrator's abstract effort levels into the harness/provider's supported controls.
 
+## HUMAIN Terminal session usage
+
+The installed bridge ingests saved assistant usage from `~/.humain-terminal/agent/sessions/<project>/*.jsonl` after `agent_settled` (3-second debounce, up to three attempts with 250 ms exponential backoff) and flushes on `session_shutdown`. The login/15-minute discovery sweep catches missed events. Message text is not ingested; ephemeral `--no-session` work is outside this path.
+
+The generated dashboard refreshes every five seconds while visible, preserves scroll position, and has a pause/resume control. To load updated extension hooks into a running HUMAIN Terminal, run `/reload` or restart the session.
+
 ## Workspaces
 
 `WorkspaceManager` provides Git worktree hooks and ownership locks. A production adapter may substitute native sandbox/branch isolation, but it should retain the same provenance fields: base revision, result revision, owner, and merge result.

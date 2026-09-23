@@ -70,7 +70,12 @@ Open:
 ```
 
 In HUMAIN Terminal, the bridge exposes `/orchestrate`, `/orchestrator-roi`,
-and `/cross-review-demo` (after `/reload`).
+and `/cross-review-demo` (after `/reload`). Saved interactive usage is ingested from
+`~/.humain-terminal/agent/sessions/<project>/*.jsonl` after settled turns; the login/15-minute
+sweep catches missed hooks. Message text and ephemeral `--no-session` work are excluded from
+this session-log path. The dashboard refreshes every five seconds while visible, restores scroll,
+and offers a pause/resume control. Run `/reload` or restart an already-running HUMAIN Terminal
+to load changed extension hooks.
 
 ## Adaptive rollout
 
