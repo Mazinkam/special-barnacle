@@ -28,7 +28,14 @@ def read_json(path: Path, default):
     try: return json.loads(path.read_text(encoding='utf-8'))
     except Exception: return default
 
-def write_json(path: Path, value: Any, *, compact: bool=False):
+def fsync_directory(path: Path):
+    """Make newly created/replaced directory entries durable on local POSIX filesystems."""
+    fd = os.open(path, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+
+def write_json(path: Path, value: Any, *, compact: bool=False, durable: bool=False):
     for _ in range(100):
         tmp = path.with_name(f'.{path.name}.{secrets.token_hex(8)}.tmp')
         try:
@@ -43,7 +50,11 @@ def write_json(path: Path, value: Any, *, compact: bool=False):
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             # json.dumps uses the C encoder; json.dump(fp) always falls back to the pure-Python one.
             f.write(json.dumps(value, separators=(',',':') if compact else None, indent=None if compact else 2, sort_keys=True, default=str))
+            if durable:
+                f.flush()
+                os.fsync(f.fileno())
         tmp.replace(path)
+        if durable: fsync_directory(path.parent)
     finally:
         try: tmp.unlink()
         except FileNotFoundError: pass
@@ -57,7 +68,7 @@ def exclusive_file_lock(path: Path):
         finally: fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 WRITER_LOCK_FILE='ledger.lock'
-RECORD_INDEX_FILE='records.checkpoint.json'  # derived record-id index owned by record_batch; rebuild() discards it
+RECORD_INDEX_FILE='records.checkpoint.json'  # independent receipt for the rebuildable SQLite record-id cache
 
 def writer_lock(root: Path):
     """The single process-wide lock that serializes check/append/checkpoint/ledger writes.
@@ -180,7 +191,8 @@ class EventStore:
     def __init__(self, root: str|Path|None=None):
         self.root=Path(root) if root is not None else default_state_root(); self.root.mkdir(parents=True,exist_ok=True)
         self.events=self.root/'events.jsonl'; self.metrics=self.root/'metrics.jsonl'; self.discoveries=self.root/'discoveries.jsonl'; self.outcomes=self.root/'outcomes.jsonl'
-        for p in [self.events,self.metrics,self.discoveries,self.outcomes]: p.touch(exist_ok=True)
+        for p in [self.events,self.metrics,self.discoveries,self.outcomes]:
+            if not p.exists(): p.touch(exist_ok=True)
     def _write(self,stream:str,payload:dict[str,Any],*,event:str|None=None):
         """Route a single record through the coordinated writer (lock + dedup + checkpoint).
 

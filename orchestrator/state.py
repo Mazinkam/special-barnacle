@@ -1,7 +1,8 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Any
-from .runtime import EventStore, write_json, read_json, utc_now, writer_lock, iter_jsonl_from, tail_fingerprint, RECORD_INDEX_FILE
+from .runtime import EventStore, write_json, read_json, utc_now, writer_lock, iter_jsonl_from, tail_fingerprint
+from .record_index import discard as discard_record_index
 
 LEDGER_FILE='ledger.json'
 LEDGER_CHECKPOINT_VERSION=1
@@ -124,7 +125,7 @@ def rebuild(root: str|Path|None=None)->dict[str,Any]:
     """
     root=EventStore(root).root
     with writer_lock(root):
-        (root/RECORD_INDEX_FILE).unlink(missing_ok=True)
+        discard_record_index(root)
         return replay_ledger(root,full=True)
 
 def refresh_ledger(root: str|Path|None=None)->dict[str,Any]:

@@ -1,0 +1,248 @@
+"""Round-4 regressions: cache tampering never changes canonical membership."""
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+from orchestrator import record_batch
+from orchestrator.record_index import DATABASE_FILE, RecordIndex
+from orchestrator.runtime import read_json
+from tests.record_io_probe import measure_io
+from tests.test_record_batch import (TemporaryRootTestCase, _completed_run, _fill_streams,
+    _forge_index_with_stream_access, run_batch, sample_batch, cli_env, stream_ids)
+
+
+class ExactIndexTests(TemporaryRootTestCase):
+    def test_io_meter_counts_fdopen_writes_once(self):
+        self.root.mkdir()
+        with measure_io() as counts:
+            (self.root / 'path').write_bytes(b'a' * 128)
+            fd = os.open(self.root / 'descriptor', os.O_CREAT | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(b'b' * 128)
+        self.assertEqual(counts['write'], 256)
+
+    def test_missing_truncated_and_replaced_cache_never_changes_rows(self):
+        _completed_run(self)
+        cache = self.root / DATABASE_FILE
+        original = cache.read_bytes()
+        before = {s: (self.root / name).read_bytes() for s, name in record_batch.STREAMS.items()}
+        for fault in ('empty', 'partial', 'garbage', 'missing', 'old-copy', 'old-copy-and-receipt'):
+            with self.subTest(fault):
+                receipt = (self.root / record_batch.CHECKPOINT_FILE).read_bytes()
+                if fault == 'missing':
+                    cache.unlink()
+                elif fault == 'old-copy':
+                    replacement = self.root / 'replacement'
+                    replacement.write_bytes(original)
+                    replacement.replace(cache)
+                elif fault == 'old-copy-and-receipt':
+                    cache.write_bytes(original)
+                    (self.root / record_batch.CHECKPOINT_FILE).write_bytes(receipt)
+                else:
+                    cache.write_bytes({'empty': b'', 'partial': original[:7000], 'garbage': b'not sqlite'}[fault])
+                retry = run_batch(self.root, sample_batch())
+                self.assertEqual(retry.returncode, 0, retry.stderr)
+                self.assertEqual(json.loads(retry.stdout)['duplicates'], {'event': 3, 'metric': 1, 'outcome': 1})
+                for stream, name in record_batch.STREAMS.items():
+                    self.assertEqual((self.root / name).read_bytes(), before[stream])
+                self.assertEqual(read_json(self.root / 'ledger.json', {})['runs']['R1']['status'], 'completed')
+
+    def test_forged_metric_presence_cannot_drop_cost(self):
+        _completed_run(self)
+        db = sqlite3.connect(self.root / DATABASE_FILE)
+        db.execute('INSERT INTO ids VALUES (?, ?)', ('metric', 'ghost'))
+        db.commit(); db.close()
+        result = record_batch.write_batch(self.root, [{'stream': 'metric', 'record_id': 'ghost', 'cost_usd': 7}], refresh=False)
+        self.assertEqual(result['persisted']['metric'], 1)
+        self.assertEqual(stream_ids(self.root, 'metric'), ['m-1', 'ghost'])
+
+    def test_unique_index_and_receipt_loss_recover_from_jsonl(self):
+        _completed_run(self)
+        db = sqlite3.connect(self.root / DATABASE_FILE)
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute('INSERT INTO ids VALUES (?, ?)', ('metric', 'm-1'))
+        finally:
+            db.close()
+        (self.root / record_batch.CHECKPOINT_FILE).unlink()
+        retry = run_batch(self.root, sample_batch())
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)['duplicates'], {'event': 3, 'metric': 1, 'outcome': 1})
+
+    def test_legacy_v4_predictable_tail_membership_is_never_imported(self):
+        _completed_run(self)
+        from orchestrator.runtime import tail_fingerprint
+        # Old-shaped metadata can accurately describe every boundary yet omit all IDs.
+        streams = {s: {'size': (self.root / name).stat().st_size, 'ids': [],
+                       'audited_size': (self.root / name).stat().st_size,
+                       'binding': tail_fingerprint(self.root / name, (self.root / name).stat().st_size)}
+                   for s, name in record_batch.STREAMS.items()}
+        (self.root / record_batch.CHECKPOINT_FILE).write_text(json.dumps({'format_version': 4, 'streams': streams}))
+        (self.root / DATABASE_FILE).unlink()
+        retry = run_batch(self.root, sample_batch())
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)['duplicates'], {'event': 3, 'metric': 1, 'outcome': 1})
+        self.assertEqual(stream_ids(self.root, 'metric'), ['m-1'])
+
+    def test_crashes_during_index_transaction_and_after_commit_are_idempotent(self):
+        for stage in ('transaction', 'committed', 'receipt'):
+            with self.subTest(stage), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.assertTrue(record_batch.write_batch(root, sample_batch())['ok'])
+                records = [{'stream': 'event', 'record_id': 'done', 'event': 'run_completed', 'run_id': 'R1'},
+                           {'stream': 'metric', 'record_id': 'cost', 'cost_usd': 3}]
+                script = '''
+import json, os, sys
+from orchestrator import record_batch
+from orchestrator.record_index import RecordIndex
+stage = sys.argv[2]
+original = RecordIndex.commit
+def crash_commit(self):
+    if stage == 'committed': original(self)
+    os._exit(9)
+if stage in ('transaction', 'committed'):
+    RecordIndex.commit = crash_commit
+else:
+    original_checkpoint = record_batch._write_checkpoint
+    def crash_receipt(*args):
+        original_checkpoint(*args)
+        os._exit(9)
+    record_batch._write_checkpoint = crash_receipt
+record_batch.write_batch(sys.argv[1], json.loads(sys.stdin.read()))
+'''
+                crashed = subprocess.run([sys.executable, '-B', '-c', script, str(root), stage],
+                    input=json.dumps(records), text=True, capture_output=True, env=cli_env(root), timeout=60)
+                self.assertEqual(crashed.returncode, 9, crashed.stderr)
+                before = {s: (root / name).read_bytes() for s, name in record_batch.STREAMS.items()}
+                retry = run_batch(root, records)
+                self.assertEqual(retry.returncode, 0, retry.stderr)
+                self.assertEqual(json.loads(retry.stdout)['duplicates'], {'event': 1, 'metric': 1, 'outcome': 0})
+                for stream, name in record_batch.STREAMS.items():
+                    self.assertEqual((root / name).read_bytes(), before[stream])
+                self.assertEqual(read_json(root / 'ledger.json', {})['runs']['R1']['status'], 'completed')
+
+    def test_process_dies_mid_canonical_write_then_same_id_retry_repairs_tail(self):
+        self.assertTrue(record_batch.write_batch(self.root, sample_batch())['ok'])
+        record = [{'stream': 'event', 'record_id': 'torn', 'event': 'run_completed', 'run_id': 'R1'}]
+        script = '''
+import json, os, sys
+from orchestrator import record_batch
+original = os.write
+def torn(fd, data):
+    original(fd, data[:len(data)//2])
+    os._exit(9)
+record_batch.os.write = torn
+record_batch.write_batch(sys.argv[1], json.loads(sys.stdin.read()))
+'''
+        crashed = subprocess.run([sys.executable, '-B', '-c', script, str(self.root)], input=json.dumps(record),
+            text=True, capture_output=True, env=cli_env(self.root), timeout=60)
+        self.assertEqual(crashed.returncode, 9, crashed.stderr)
+        torn = (self.root / 'events.jsonl').read_bytes()
+        retry = run_batch(self.root, record)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)['persisted']['event'], 1)
+        self.assertTrue((self.root / 'events.jsonl').read_bytes().startswith(torn))
+        self.assertEqual(stream_ids(self.root, 'event'), ['e-1', 'e-2', 'e-3', 'torn'])
+        again = run_batch(self.root, record)
+        self.assertEqual(json.loads(again.stdout)['duplicates']['event'], 1)
+        self.assertEqual(read_json(self.root / 'ledger.json', {})['runs']['R1']['status'], 'completed')
+
+    def test_directory_sync_failure_stops_before_the_next_stream(self):
+        import stat
+        real_fsync = os.fsync
+        # The JSONL bytes alone are not durable until their directory entry is synced.
+        def fail_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode) and (self.root / 'events.jsonl').exists():
+                raise OSError('directory sync failed')
+            return real_fsync(fd)
+        with patch('os.fsync', fail_directory):
+            with self.assertRaises(record_batch.BatchAppendError) as caught:
+                record_batch.write_batch(self.root, sample_batch())
+        self.assertEqual(caught.exception.persisted, {'event': 0, 'metric': 0, 'outcome': 0})
+        self.assertEqual(stream_ids(self.root, 'metric'), [], 'no later stream before event durability')
+        retry = run_batch(self.root, sample_batch())
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(stream_ids(self.root, 'event'), ['e-1', 'e-2', 'e-3'])
+        self.assertEqual(stream_ids(self.root, 'metric'), ['m-1'])
+
+    def test_sqlite_commit_failure_reports_durable_counts_and_retry(self):
+        with patch.object(RecordIndex, 'commit', side_effect=sqlite3.OperationalError('disk full')):
+            result = record_batch.write_batch(self.root, sample_batch())
+        self.assertEqual(result['status'], 'checkpoint_failed')
+        self.assertEqual(result['persisted'], {'event': 3, 'metric': 1, 'outcome': 1})
+        self.assertEqual(result['retry'], 'same_ids')
+        retry = run_batch(self.root, sample_batch())
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)['duplicates'], {'event': 3, 'metric': 1, 'outcome': 1})
+
+    def test_fragment_completion_is_seen_after_unrelated_cached_writes(self):
+        _completed_run(self)
+        events = self.root / 'events.jsonl'
+        with events.open('ab') as f:
+            f.write(b'{"record_id":"later","event":"run_started","run_id":"R2"')
+        for i in range(3):
+            record_batch.write_batch(self.root, [{'stream': 'metric', 'record_id': f'more-{i}'}], refresh=False)
+        with events.open('ab') as f:
+            f.write(b'}')  # complete object, still no newline
+        retry = run_batch(self.root, [{'stream': 'event', 'record_id': 'later', 'event': 'run_started', 'run_id': 'R2'}])
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)['duplicates']['event'], 1)
+        self.assertTrue(events.read_bytes().endswith(b'\n'))
+        self.assertEqual(stream_ids(self.root, 'event').count('later'), 1)
+
+    def test_forged_absence_cannot_replay_stale_run_started(self):
+        _completed_run(self)
+        before = (self.root / 'events.jsonl').read_bytes()
+        _forge_index_with_stream_access(self.root, {'event': ['e-1']})
+        retry = run_batch(self.root, [sample_batch()[0]])
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)['duplicates']['event'], 1)
+        self.assertEqual((self.root / 'events.jsonl').read_bytes(), before)
+        self.assertEqual(read_json(self.root / 'ledger.json', {})['runs']['R1']['status'], 'completed')
+
+    def test_forged_absence_cannot_duplicate_metric_cost(self):
+        _completed_run(self)
+        before = (self.root / 'metrics.jsonl').read_bytes()
+        _forge_index_with_stream_access(self.root, {'metric': ['m-1']})
+        retry = run_batch(self.root, [sample_batch()[1]])
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)['duplicates']['metric'], 1)
+        self.assertEqual((self.root / 'metrics.jsonl').read_bytes(), before)
+
+    def test_malformed_tail_is_not_rescanned_by_unrelated_writes(self):
+        _fill_streams(self.root, 500)
+        with (self.root / 'events.jsonl').open('ab') as f:
+            f.write(b'{"fragment":"' + b'x' * 2_000_000)
+        def probe(i):
+            return record_batch.write_batch(self.root, [{'stream': 'metric', 'record_id': f'probe-{i}'}], refresh=False)
+        probe(0)  # reconcile the new fragment once
+        before = (self.root / 'events.jsonl').read_bytes()
+        with measure_io() as counts:
+            for i in range(1, 4):
+                self.assertTrue(probe(i)['ok'])
+        self.assertLess(counts['read'], 150_000, counts)
+        self.assertEqual((self.root / 'events.jsonl').read_bytes(), before)
+
+    def test_total_io_per_write_does_not_scale_with_all_ids(self):
+        measurements = {}
+        for multiplier in (1, 2, 4):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                _fill_streams(root, 4000 * multiplier)
+                def probe(i):
+                    return record_batch.write_batch(root, [{'stream': 'metric', 'record_id': f'probe-{i}'}], refresh=False)
+                probe(0); probe(1)
+                with measure_io() as counts:
+                    for i in range(2, 7):
+                        self.assertTrue(probe(i)['ok'])
+                measurements[multiplier] = dict(counts)
+        print('TOTAL_IO', measurements)
+        for direction in ('read', 'write'):
+            self.assertLessEqual(measurements[4][direction], measurements[1][direction] + 100_000, measurements)
+        self.assertGreater(measurements[4]['sqlite_read'], 0, 'meter must include SQLite C-level I/O')
+        self.assertGreater(measurements[4]['sqlite_write'], 0)
