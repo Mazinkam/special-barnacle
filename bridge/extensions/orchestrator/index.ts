@@ -88,6 +88,7 @@ import {
 	userLayerWarnings,
 } from "./models.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
+import { BoundedCapture, classifyDispatchOutcome, summarizeStderr } from "./dispatch-outcome.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -632,6 +633,12 @@ interface SubagentProcessResult {
 	costUsd: number;
 	durationMs: number;
 	stopReason?: string;
+	/** Process disposition after considering terminal JSON events. */
+	outcome: "completed" | "completed_after_process_error" | "failed" | "timed_out";
+	/** Raw child exit code before terminal-result recovery. */
+	processExitCode: number;
+	/** Teardown error retained alongside a valid settled result. */
+	postCompletionError?: string;
 }
 
 /**
@@ -989,10 +996,16 @@ async function runSubagentProcess(opts: {
 		};
 		let buffer = "";
 		let rawStdout = "";
-		let stderr = "";
+		// Node can truncate a chatty child's async pipe at 64 KiB, so retain both
+		// the runtime header and the diagnostic tail without unbounded memory use.
+		const stderrCapture = new BoundedCapture();
 		let model: string | undefined;
 		const usage: SubagentUsageStats = { ...emptyUsage };
 		let stopReason: string | undefined;
+		let sawAgentSettled = false;
+		let sawAgentEnd = false;
+		let timedOut = false;
+		let spawnFailed = false;
 		let settled = false;
 		let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 		// `--mode json` writes newline-delimited events, NOT plain prose. Callers
@@ -1010,29 +1023,42 @@ async function runSubagentProcess(opts: {
 			promptDir = undefined;
 		};
 
-		const finish = (exitCode: number) => {
+		const finish = (processExitCode: number) => {
 			if (settled) return;
 			settled = true;
 			if (timeoutTimer) clearTimeout(timeoutTimer);
 			if (typeof proc?.pid === "number") liveDispatchPids.delete(proc.pid);
 			cleanupPrompt();
-			if (stderrLog && stderr.trim()) {
+			const stderr = stderrCapture.text();
+			const stderrSummary = summarizeStderr(stderr);
+			const finalText = assistantTexts.length > 0 ? assistantTexts[assistantTexts.length - 1] : "";
+			// Only recover a process error after the JSON protocol proved the child
+			// completed normally; failures before settlement still fail the dispatch.
+			const outcome = classifyDispatchOutcome({
+				exitCode: processExitCode,
+				sawAgentSettled,
+				sawAgentEnd,
+				hasFinalText: Boolean(finalText),
+				lastStopReason: stopReason,
+				timedOut,
+				spawnFailed,
+				stderrSummary,
+			});
+			if (stderrLog) {
 				try {
-					writeFileSync(stderrLog, stderr);
+					const logText = outcome.status === "completed_after_process_error"
+						? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n${stderr}`
+						: stderr;
+					writeFileSync(stderrLog, logText);
 				} catch {
 					/* best-effort */
 				}
 			}
-			session?.endDispatch(
-				taskId,
-				exitCode,
-				usage.cost,
-				exitCode === 0 ? undefined : (stderr.trim().split("\n").pop() ?? "").slice(0, 80),
-			);
+			session?.endDispatch(taskId, outcome.effectiveExitCode, usage.cost, outcome.note);
 			resolve({
-				exitCode,
+				exitCode: outcome.effectiveExitCode,
 				stdout: assistantTexts.join("\n\n"),
-				finalText: assistantTexts.length > 0 ? assistantTexts[assistantTexts.length - 1] : "",
+				finalText,
 				rawStdout,
 				personaCanMutate,
 				stderr,
@@ -1041,6 +1067,9 @@ async function runSubagentProcess(opts: {
 				costUsd: usage.cost,
 				durationMs: Date.now() - startedAt,
 				stopReason,
+				outcome: outcome.status,
+				processExitCode,
+				postCompletionError: outcome.status === "completed_after_process_error" ? outcome.note : undefined,
 			});
 		};
 
@@ -1078,6 +1107,9 @@ async function runSubagentProcess(opts: {
 				return;
 			}
 			session?.onChildEvent(taskId, event);
+			if (event.type === "agent_settled") sawAgentSettled = true;
+			if (event.type === "agent_end") sawAgentEnd = true;
+			if (typeof event.stopReason === "string") stopReason = event.stopReason;
 			// `message_end` is the authoritative per-turn record. `turn_end` and
 			// `agent_end` repeat the same assistant messages, so ignoring them
 			// keeps usage from being double-counted.
@@ -1107,7 +1139,8 @@ async function runSubagentProcess(opts: {
 				detached: true,
 			});
 		} catch (err) {
-			stderr += `\n[orchestrator] spawn threw: ${(err as Error).message}`;
+			spawnFailed = true;
+			stderrCapture.append(`\n[orchestrator] spawn threw: ${(err as Error).message}`);
 			finish(1);
 			return;
 		}
@@ -1120,9 +1153,11 @@ async function runSubagentProcess(opts: {
 		const timeoutMs = dispatchTimeoutFor(opts.capability);
 		timeoutTimer = setTimeout(() => {
 			if (settled) return;
-			stderr +=
+			timedOut = true;
+			stderrCapture.append(
 				`\n[orchestrator] dispatch timed out after ${Math.round(timeoutMs / 60000)}min ` +
-				`(capability=${opts.capability ?? "unknown"}); killing process group`;
+					`(capability=${opts.capability ?? "unknown"}); killing process group`,
+			);
 			if (proc) killProcessTree(proc);
 			finish(124);
 		}, timeoutMs);
@@ -1144,7 +1179,7 @@ async function runSubagentProcess(opts: {
 		});
 
 		proc.stderr?.on("data", (data) => {
-			stderr += data.toString();
+			stderrCapture.append(data.toString());
 		});
 
 		proc.on("close", (code) => {
@@ -1153,7 +1188,8 @@ async function runSubagentProcess(opts: {
 		});
 
 		proc.on("error", (err) => {
-			stderr += `\n[orchestrator] spawn error: ${err.message}`;
+			spawnFailed = true;
+			stderrCapture.append(`\n[orchestrator] spawn error: ${err.message}`);
 			finish(1);
 		});
 	});
@@ -1201,7 +1237,7 @@ async function triageTask(
 				// used to print. A non-zero exit here is almost always an argv or
 				// provider-auth problem, and stderr names it.
 				console.warn(
-					`[orchestrator] triage exited ${r.exitCode}: ${(r.stderr || r.rawStdout).trim().slice(0, 400) || "(no output)"}`,
+					`[orchestrator] triage exited ${r.exitCode}: ${summarizeStderr(r.stderr || r.rawStdout, 400) || "(no output)"}`,
 				);
 				await captureDispatchCost(
 					{
@@ -1582,7 +1618,7 @@ async function dispatchParallel(
 				// that is empty, fall back to the raw event stream so the failure is
 				// explainable in metrics.jsonl instead of a silent zero.
 				stderr:
-					r.exitCode === 0 ? r.stderr : r.stderr || r.rawStdout.slice(0, 2000) || "(no output)",
+					r.exitCode === 0 ? r.stderr : summarizeStderr(r.stderr || r.rawStdout, 2_000) || "(no output)",
 				usage: r.usage,
 				durationMs: r.durationMs,
 				costUsd: r.costUsd,
@@ -2113,7 +2149,7 @@ async function dispatchHierarchical(
 		if (!architectResult || architectResult.exitCode !== 0) {
 			ctx.ui.notify(
 				`Architect dispatch failed (exit ${architectResult?.exitCode ?? "n/a"}): ${
-					(architectResult?.stderr ?? "no result").trim().slice(0, 300) || "(no output)"
+					summarizeStderr(architectResult?.stderr ?? "no result", 300) || "(no output)"
 				}\nLeads will run without an architect plan.`,
 				"warning",
 			);
@@ -2394,7 +2430,7 @@ async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Pr
 				? p.idMatches
 					? `${fmtElapsed(p.r.durationMs)}, $${p.r.costUsd.toFixed(4)}, served by ${p.servedBy ?? "(unreported)"}`
 					: `answered, but served by ${p.servedBy} (expected ${p.model.slice(p.model.indexOf("/") + 1)})`
-				: `exit ${p.r.exitCode}: ${(p.r.stderr.trim().split("\n").filter(Boolean).pop() ?? "(no output)").slice(0, 160)}`;
+				: `exit ${p.r.exitCode}: ${summarizeStderr(p.r.stderr, 160) || "(no output)"}`;
 			return [`${mark} ${p.model}`, `    ${detail}`, `    used by: ${p.caps.join(", ")}`].join("\n");
 		});
 		const failed = probes.filter((p) => !p.ok).length;
@@ -2689,7 +2725,7 @@ export default function (pi: ExtensionAPI) {
 				for (const r of leadResults) {
 					if (r.exitCode !== 0) {
 						ctx.ui.notify(
-							`Lead ${r.taskId.replace(`${runId}-`, "")} failed (exit ${r.exitCode}): ${r.stderr.trim().slice(0, 300) || "(no output)"}\nSee ${session.file(`${r.taskId}.stderr.log`)}`,
+							`Lead ${r.taskId.replace(`${runId}-`, "")} failed (exit ${r.exitCode}): ${summarizeStderr(r.stderr, 300) || "(no output)"}\nSee ${session.file(`${r.taskId}.stderr.log`)}`,
 							"warning",
 						);
 					}
