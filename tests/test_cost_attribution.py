@@ -141,7 +141,17 @@ class DashboardAttributionTests(unittest.TestCase):
             self.assertAlmostEqual(data['by_runtime']['claude-code']['estimated_cost'], 1.0)
             # a row using the legacy `runtime` key must not pool into 'unknown'
             self.assertNotIn('unknown', data['by_runtime'])
-            self.assertEqual(data['by_runtime']['humain-terminal']['calls'], 2)
+            # `rows` counts every orchestrated record for the runtime (the `tasks_accepted` metric row
+            # included); `call_rows` counts only those accountable for cost. The old single `calls`
+            # key conflated the two and rendered '309 calls · 110 metered · 16 unmetered'.
+            ht = data['by_runtime']['humain-terminal']
+            self.assertEqual(ht['rows'], 2)
+            self.assertEqual(ht['call_rows'], 1)
+            # the ambiguous `calls` key is gone: it used to mean rows
+            self.assertNotIn('calls', ht)
+            for name, rt in data['by_runtime'].items():
+                self.assertEqual(rt['metered_calls'] + rt['unmetered_calls'], rt['call_rows'],
+                                 f'{name} does not reconcile')
 
     def test_session_ingest_rows_are_isolated_from_orchestrated_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -161,6 +171,9 @@ class DashboardAttributionTests(unittest.TestCase):
             self.assertNotIn('claude-code', data['by_runtime'])
             self.assertNotIn('codex', data['by_runtime'])
             self.assertAlmostEqual(data['summary']['total_cost'], 3.0)
+            # no row carries `covers_calls`, so rows and calls agree here; they are still reported
+            # as separate fields because session aggregates make them differ 13-fold on live data.
+            self.assertEqual(data['interactive_sessions']['rows'], 2)
             self.assertEqual(data['interactive_sessions']['calls'], 2)
             self.assertAlmostEqual(data['interactive_sessions']['cost'], 7.0)
 

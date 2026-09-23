@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import tempfile
@@ -8,6 +9,8 @@ from unittest.mock import patch
 
 from orchestrator.ingest import (CODEX, HUMAIN_TERMINAL, _resolve_encoded_path, detect_runtime, discover_logs,
                                  ingest_file, ingest_paths, is_scratch_log, read_codex, read_humain_terminal)
+from orchestrator.pricing import estimate_cost_usd
+from orchestrator.records import CALL, SESSION, covered_calls
 from orchestrator.runtime import load_jsonl
 
 
@@ -316,3 +319,340 @@ class RepositoryDecodingTests(unittest.TestCase):
             self.assertFalse(is_scratch_log(real))
             self.assertEqual([p for p in discover_logs(home=home)], [real])
             self.assertEqual(len(discover_logs(home=home, include_scratch=True)), 2)
+
+
+class DedupeHardeningTests(unittest.TestCase):
+    """T5: session-granularity reconciliation must not double count, by either key."""
+
+    def _env(self, root):
+        return patch.dict(os.environ, {'CODING_AGENT_ORCHESTRATOR_HOME': str(root),
+                                       'CODING_AGENT_RUNTIME': 'humain-terminal',
+                                       'CODING_AGENT_REPOSITORY': '/work/forge'})
+
+    def test_call_then_session_ingestion_of_the_same_file_does_not_double_count(self):
+        # Re-ingesting one file at CALL granularity, then again at SESSION granularity, must
+        # cost and cover exactly what the file actually contains — once, not twice.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            log = codex_log(Path(d, 'rollout.jsonl'))
+            with self._env(root):
+                per_call = ingest_paths([log], state_root=root)
+                session = ingest_paths([log], state_root=root, granularity=SESSION)
+            rows = load_jsonl(root / 'metrics.jsonl')
+            self.assertEqual(per_call['emitted'], 2)
+            self.assertEqual(session['emitted'], 0)
+            self.assertEqual(session['duplicates'], 1)
+            total_cost = round(sum(float(r.get('cost_usd') or 0) for r in rows), 6)
+            self.assertAlmostEqual(total_cost, per_call['estimated_cost_usd'], places=6)
+            self.assertEqual(sum(covered_calls(r) for r in rows), 2)
+
+    def test_session_id_drift_does_not_double_count_because_ingest_source_reconciles(self):
+        # `read_humain_terminal` derives `session_id` from a filename fallback until a later
+        # `type=='session'` record overrides it. Simulate that drift: ingest the file once before
+        # the override exists (CALL granularity, session_id falls back to 'sessA'), then again
+        # after the file has gained a leading `session` record with a *different* id ('sess-B'),
+        # this time at SESSION granularity. Without the `ingest_source` reconciliation key, the
+        # second pass would look for prior totals under 'sess-B', find none, and re-emit the same
+        # tokens the first pass already recorded under 'sessA'.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            log = Path(d, 'log_sessA.jsonl')
+
+            def write(with_session_override):
+                rows = []
+                if with_session_override:
+                    rows.append({'type': 'session', 'id': 'sess-B'})
+                rows += [
+                    {'type': 'message', 'id': 'asst-1', 'timestamp': '2026-09-21T10:00:00.000Z',
+                     'message': {'role': 'assistant', 'model': 'claude-sonnet-5', 'provider': 'humain-node',
+                                 'usage': {'input': 100, 'output': 50, 'cacheRead': 0, 'cacheWrite': 0,
+                                           'totalTokens': 150}}},
+                    {'type': 'message', 'id': 'asst-2', 'timestamp': '2026-09-21T10:00:05.000Z',
+                     'message': {'role': 'assistant', 'model': 'claude-sonnet-5', 'provider': 'humain-node',
+                                 'usage': {'input': 100, 'output': 50, 'cacheRead': 0, 'cacheWrite': 0,
+                                           'totalTokens': 150}}},
+                ]
+                log.write_text(''.join(json.dumps(r) + '\n' for r in rows), encoding='utf-8')
+
+            write(with_session_override=False)
+            with self._env(root):
+                first = ingest_file(log, state_root=root, runtime=HUMAIN_TERMINAL)
+            self.assertEqual(first['emitted'], 2)
+            self.assertEqual({r['session_id'] for r in load_jsonl(root / 'metrics.jsonl')}, {'sessA'})
+
+            write(with_session_override=True)
+            with self._env(root):
+                second = ingest_file(log, state_root=root, runtime=HUMAIN_TERMINAL, granularity=SESSION)
+            self.assertEqual(second['emitted'], 0)
+            self.assertEqual(second['duplicates'], 1)
+            rows = load_jsonl(root / 'metrics.jsonl')
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(sum(r['input_tokens'] for r in rows), 200)
+            self.assertEqual(sum(r['output_tokens'] for r in rows), 100)
+
+    def test_two_distinct_sessions_in_one_file_each_emit_their_full_totals(self):
+        # The reviewer's regression. `read_humain_terminal` assigns `session_id` from the filename
+        # fallback until a `type=='session'` record overrides it, so ONE physical log can carry two
+        # distinct session_ids: calls before the override belong to 'sessA', calls after it to
+        # 'sess-B'. A source-level reconciliation bucket that is not session-aware accumulates
+        # across both and silently subtracts session A's already-recorded totals from session B.
+        #
+        # Expected: A = 1000/500, B = 1200/400. Regression produced B = 200/0, losing 1000 input
+        # and ALL 400 output tokens with emitted:1 and no duplicate flag and no error.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            log = Path(d, 'log_sessA.jsonl')
+
+            def call(native_id, ts, input_tokens, output_tokens):
+                return {'type': 'message', 'id': native_id, 'timestamp': ts,
+                        'message': {'role': 'assistant', 'model': 'claude-sonnet-5',
+                                    'provider': 'humain-node',
+                                    'usage': {'input': input_tokens, 'output': output_tokens,
+                                              'cacheRead': 0, 'cacheWrite': 0,
+                                              'totalTokens': input_tokens + output_tokens}}}
+
+            session_a = [call('asst-a1', '2026-09-21T10:00:00.000Z', 1000, 500)]
+            session_b = [{'type': 'session', 'id': 'sess-B'},
+                         call('asst-b1', '2026-09-21T11:00:00.000Z', 1200, 400)]
+
+            def write(rows):
+                log.write_text(''.join(json.dumps(r) + '\n' for r in rows), encoding='utf-8')
+
+            # Pass 1: the file so far holds only session A.
+            write(session_a)
+            with self._env(root):
+                first = ingest_file(log, state_root=root, runtime=HUMAIN_TERMINAL, granularity=SESSION)
+            self.assertEqual(first['emitted'], 1)
+
+            # Pass 2: the same file has grown a second, distinct session.
+            write(session_a + session_b)
+            with self._env(root):
+                second = ingest_file(log, state_root=root, runtime=HUMAIN_TERMINAL, granularity=SESSION)
+            self.assertEqual(second['emitted'], 1)
+
+            rows = load_jsonl(root / 'metrics.jsonl')
+            by_session = {}
+            for row in rows:
+                bucket = by_session.setdefault(row['session_id'], {'input': 0, 'output': 0})
+                bucket['input'] += int(row.get('input_tokens') or 0)
+                bucket['output'] += int(row.get('output_tokens') or 0)
+            self.assertEqual(sorted(by_session), sorted(['sessA', 'sess-B']))
+            self.assertEqual(by_session['sessA'], {'input': 1000, 'output': 500})
+            # Session B's full, unreduced totals -- not 200/0.
+            self.assertEqual(by_session['sess-B'], {'input': 1200, 'output': 400})
+            # Nothing lost in aggregate either.
+            self.assertEqual(sum(r['input_tokens'] for r in rows), 2200)
+            self.assertEqual(sum(r['output_tokens'] for r in rows), 900)
+
+    def test_session_id_drift_between_two_session_passes_does_not_double_count(self):
+        # Property (a) at SESSION->SESSION granularity: the file's single logical session is
+        # recorded under 'sessA', then the `type=='session'` override appears and the very same
+        # calls now read as 'sess-B'. The prior total was recorded for THIS file under a session_id
+        # that is no longer present, so it must still be reconciled -- not re-emitted.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            log = Path(d, 'log_sessA.jsonl')
+            call = {'type': 'message', 'id': 'asst-1', 'timestamp': '2026-09-21T10:00:00.000Z',
+                    'message': {'role': 'assistant', 'model': 'claude-sonnet-5', 'provider': 'humain-node',
+                                'usage': {'input': 700, 'output': 300, 'cacheRead': 0, 'cacheWrite': 0,
+                                          'totalTokens': 1000}}}
+
+            def write(rows):
+                log.write_text(''.join(json.dumps(r) + '\n' for r in rows), encoding='utf-8')
+
+            write([call])
+            with self._env(root):
+                first = ingest_file(log, state_root=root, runtime=HUMAIN_TERMINAL, granularity=SESSION)
+            self.assertEqual(first['emitted'], 1)
+            self.assertEqual({r['session_id'] for r in load_jsonl(root / 'metrics.jsonl')}, {'sessA'})
+
+            write([{'type': 'session', 'id': 'sess-B'}, call])
+            with self._env(root):
+                second = ingest_file(log, state_root=root, runtime=HUMAIN_TERMINAL, granularity=SESSION)
+            self.assertEqual(second['emitted'], 0)
+            self.assertEqual(second['duplicates'], 1)
+            rows = load_jsonl(root / 'metrics.jsonl')
+            self.assertEqual(sum(r['input_tokens'] for r in rows), 700)
+            self.assertEqual(sum(r['output_tokens'] for r in rows), 300)
+
+    def test_a_session_spanning_multiple_files_still_reconciles_by_session_id(self):
+        # The multi-file case the session_id key exists for. Two different ingest_sources
+        # (different files) sharing the same logical session_id must still be reconciled purely
+        # by session_id, unaffected by the new ingest_source key: an empty ingest_source bucket
+        # for the second (never-before-seen) file must not override a real session_id total.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            log1 = humain_terminal_log(Path(d, 'part1.jsonl'))
+            log2 = humain_terminal_log(Path(d, 'part2.jsonl'))
+            with self._env(root):
+                first = ingest_file(log1, state_root=root, granularity=SESSION)
+                second = ingest_file(log2, state_root=root, granularity=SESSION)
+            self.assertGreater(first['emitted'], 0)
+            self.assertEqual(second['emitted'], 0)
+            self.assertEqual(second['duplicates'], 1)
+
+
+class GranularityStampingTests(unittest.TestCase):
+    def _env(self, root):
+        return patch.dict(os.environ, {'CODING_AGENT_ORCHESTRATOR_HOME': str(root),
+                                       'CODING_AGENT_RUNTIME': 'humain-terminal',
+                                       'CODING_AGENT_REPOSITORY': '/work/forge'})
+
+    def test_every_emitted_row_carries_an_explicit_granularity(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            with self._env(root):
+                ingest_file(humain_terminal_log(Path(d, 'a.jsonl')), state_root=root, granularity=CALL)
+                ingest_file(codex_log(Path(d, 'b.jsonl')), state_root=root, granularity=SESSION)
+            rows = load_jsonl(root / 'metrics.jsonl')
+            self.assertTrue(rows)
+            for row in rows:
+                self.assertIn('granularity', row)
+                self.assertIn(row['granularity'], (CALL, SESSION))
+            # Session aggregates (the ones carrying covers_calls) must be stamped SESSION, never CALL.
+            self.assertEqual({r['granularity'] for r in rows if r.get('covers_calls')}, {SESSION})
+            self.assertEqual({r['granularity'] for r in rows if not r.get('covers_calls')}, {CALL})
+
+
+class PricingProvenanceTests(unittest.TestCase):
+    def test_estimate_surfaces_configured_rate_provenance(self):
+        result = estimate_cost_usd(model='claude-sonnet-5', input_tokens=1000, output_tokens=100)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['cost_rate_source'], 'unverified-local-catalog')
+        self.assertIsNone(result['cost_rate_verified_on'])
+
+    def test_absent_provenance_on_a_rate_entry_does_not_break_estimation(self):
+        # Most of the live config predates `source`/`verified_on`; an entry missing them must
+        # keep pricing correctly rather than raising.
+        pricing = {'enabled': True, 'models': {'x-model': {'input_per_mtok': 1.0, 'output_per_mtok': 2.0}}}
+        result = estimate_cost_usd(model='x-model', input_tokens=1000, output_tokens=1000, pricing=pricing)
+        self.assertIsNotNone(result)
+        self.assertGreater(result['cost_usd'], 0)
+        self.assertIsNone(result['cost_rate_source'])
+        self.assertIsNone(result['cost_rate_verified_on'])
+
+    def test_ingested_rows_carry_rate_provenance(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            with patch.dict(os.environ, {'CODING_AGENT_ORCHESTRATOR_HOME': str(root),
+                                         'CODING_AGENT_RUNTIME': 'humain-terminal',
+                                         'CODING_AGENT_REPOSITORY': '/work/forge'}):
+                ingest_file(humain_terminal_log(Path(d, 's.jsonl')), state_root=root)
+            rows = load_jsonl(root / 'metrics.jsonl')
+            estimated = [r for r in rows if r.get('cost_source') == 'estimated-from-reported-tokens']
+            self.assertTrue(estimated)
+            self.assertEqual(estimated[0]['cost_rate_source'], 'unverified-local-catalog')
+            self.assertIn('cost_rate_verified_on', estimated[0])
+
+
+class StampGranularityTests(unittest.TestCase):
+    @staticmethod
+    def _load_module():
+        script_path = Path(__file__).resolve().parents[1] / 'scripts' / 'stamp_granularity.py'
+        spec = importlib.util.spec_from_file_location('stamp_granularity_under_test', script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _sample_rows():
+        return [
+            {'event': 'model_call', 'model': 'claude-sonnet-5', 'cost_usd': 0.01},
+            {'event': 'model_call', 'covers_calls': 5, 'cost_usd': 0.5, 'legacy_source': 'old'},
+            {'event': 'route_executed', 'executed_cost_usd': 0.2},
+            {'event': 'model_call', 'granularity': 'call', 'cost_usd': 0.02},
+        ]
+
+    def test_dry_run_writes_nothing(self):
+        stamp = self._load_module()
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d)
+            metrics = state / 'metrics.jsonl'
+            metrics.write_text(''.join(json.dumps(r) + '\n' for r in self._sample_rows()), encoding='utf-8')
+            before = metrics.read_text(encoding='utf-8')
+            code = stamp.main([str(state)])
+            self.assertEqual(code, 0)
+            self.assertEqual(metrics.read_text(encoding='utf-8'), before)
+            self.assertEqual(list(state.glob('metrics.pre-stamp-granularity-*.jsonl')), [])
+
+    def test_write_path_is_idempotent_and_backs_up_first(self):
+        stamp = self._load_module()
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d)
+            metrics = state / 'metrics.jsonl'
+            metrics.write_text(''.join(json.dumps(r) + '\n' for r in self._sample_rows()), encoding='utf-8')
+
+            code1 = stamp.main([str(state), '--write'])
+            self.assertEqual(code1, 0)
+            backups_after_first = list(state.glob('metrics.pre-stamp-granularity-*.jsonl'))
+            self.assertEqual(len(backups_after_first), 1)
+
+            first_rows = load_jsonl(metrics)
+            self.assertEqual(len(first_rows), 4)
+            for row in first_rows:
+                self.assertIn('granularity', row)
+            by_legacy = [r['granularity'] for r in first_rows if r.get('legacy_source')]
+            self.assertEqual(by_legacy, [SESSION])
+            by_route = [r['granularity'] for r in first_rows if r.get('event') == 'route_executed']
+            self.assertEqual(by_route, ['event'])
+            # Already-stamped row is untouched.
+            already_stamped = [r for r in first_rows if r.get('cost_usd') == 0.02]
+            self.assertEqual(already_stamped[0]['granularity'], CALL)
+
+            after_first_write = metrics.read_text(encoding='utf-8')
+
+            code2 = stamp.main([str(state), '--write'])
+            self.assertEqual(code2, 0)
+            self.assertEqual(metrics.read_text(encoding='utf-8'), after_first_write)
+            # A backup is taken on every write, including a no-op second pass.
+            self.assertGreaterEqual(len(list(state.glob('metrics.pre-stamp-granularity-*.jsonl'))), 1)
+
+    def test_a_crash_mid_write_leaves_the_original_stream_intact(self):
+        # Non-atomic rewrites truncate metrics.jsonl the moment they open it, so an interruption
+        # part-way through destroys every row that had not been re-written yet. The rewrite must
+        # land via a temp file + os.replace, so a failure leaves the original fully readable.
+        stamp = self._load_module()
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d)
+            metrics = state / 'metrics.jsonl'
+            metrics.write_text(''.join(json.dumps(r) + '\n' for r in self._sample_rows()), encoding='utf-8')
+            before = metrics.read_text(encoding='utf-8')
+
+            with patch.object(stamp.os, 'fsync', side_effect=OSError('No space left on device')):
+                with self.assertRaises(OSError):
+                    stamp.main([str(state), '--write'])
+
+            # The shared stream is byte-identical and still parses to every original row.
+            self.assertEqual(metrics.read_text(encoding='utf-8'), before)
+            self.assertEqual(len(load_jsonl(metrics)), len(self._sample_rows()))
+            # No temp debris left behind next to it.
+            self.assertEqual([p.name for p in state.glob('.metrics.jsonl.*')], [])
+
+    def test_write_replaces_the_target_rather_than_truncating_it_in_place(self):
+        # Pin the mechanism, not just the outcome: the new content must arrive via os.replace onto
+        # metrics.jsonl, from a staged sibling file.
+        stamp = self._load_module()
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d)
+            metrics = state / 'metrics.jsonl'
+            metrics.write_text(''.join(json.dumps(r) + '\n' for r in self._sample_rows()), encoding='utf-8')
+            replaced: list[tuple[str, str]] = []
+            real_replace = os.replace
+
+            def spy(src, dst):
+                replaced.append((str(src), str(dst)))
+                return real_replace(src, dst)
+
+            with patch.object(stamp.os, 'replace', side_effect=spy):
+                self.assertEqual(stamp.main([str(state), '--write']), 0)
+            self.assertEqual([dst for _, dst in replaced], [str(metrics)])
+            # The staged file was a sibling, so the rename stays on one filesystem.
+            self.assertEqual(Path(replaced[0][0]).parent, state)
+            for row in load_jsonl(metrics):
+                self.assertIn('granularity', row)
+
+    def test_missing_state_dir_is_reported_not_raised(self):
+        stamp = self._load_module()
+        with tempfile.TemporaryDirectory() as d:
+            code = stamp.main([str(Path(d, 'nope'))])
+            self.assertEqual(code, 1)
