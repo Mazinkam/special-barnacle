@@ -139,12 +139,13 @@ export interface DispatchOutcomeInput {
 	hasFinalText: boolean;
 	lastStopReason?: string;
 	timedOut: boolean;
+	cancelled?: boolean;
 	spawnFailed: boolean;
 	stderrSummary: string;
 }
 
 export interface DispatchOutcome {
-	status: "completed" | "completed_after_process_error" | "failed" | "timed_out";
+	status: "completed" | "completed_after_process_error" | "failed" | "timed_out" | "cancelled";
 	effectiveExitCode: number;
 	note?: string;
 }
@@ -154,6 +155,9 @@ export interface DispatchOutcome {
  * usually extension teardown, so preserve the answer rather than failing it.
  */
 export function classifyDispatchOutcome(input: DispatchOutcomeInput): DispatchOutcome {
+	if (input.cancelled) {
+		return { status: "cancelled", effectiveExitCode: 137, note: input.stderrSummary || undefined };
+	}
 	if (input.timedOut || input.exitCode === 124) {
 		return { status: "timed_out", effectiveExitCode: input.exitCode, note: input.stderrSummary || undefined };
 	}

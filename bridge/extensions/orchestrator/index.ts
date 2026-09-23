@@ -91,8 +91,21 @@ import {
 } from "./models.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
 import { BoundedCapture, classifyDispatchOutcome, summarizeStderr, trimEventForLog } from "./dispatch-outcome.ts";
+import {
+	DispatchProgressTracker,
+	ORCHESTRATING_CAPABILITIES,
+	buildInterruptionReport,
+	renderInterruptionReport,
+	summarizeInterruption,
+	resolveDispatchTimeoutPolicy,
+	applyLeadTimeoutOverride,
+	type DispatchTimeoutPolicy,
+	type InterruptionReport,
+} from "./dispatch-progress.ts";
 import { RunCancellation } from "./cancellation.ts";
-import { connectCancellationLoader } from "./run-ui.ts";
+import { connectCancellationLoader, applyObservation, applyWarnings, createProgressView, formatNestedWorkerRows, formatProgressLine, formatWarningLine } from "./run-ui.ts";
+import type { DispatchProgressView } from "./run-ui.ts";
+import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -139,23 +152,6 @@ const MAX_LEADS = positiveIntEnv("HUMAIN_ORCHESTRATOR_MAX_LEADS", 8);
 /** Per-dispatch wall clock for a LEAF dispatch that does its own work directly. */
 const DISPATCH_TIMEOUT_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS", 20 * 60 * 1000);
 
-/**
- * Capabilities that fan out their own subagents instead of doing the work
- * themselves. Their wall clock must exceed the sum of the children they wait on,
- * so they get a separate, larger budget: a lead that dispatches three reviewers
- * was being killed at the leaf timeout while its children were still running.
- */
-const ORCHESTRATING_CAPABILITIES = new Set(["lead", "architect", "technical_lead"]);
-const LEAD_DISPATCH_TIMEOUT_MS = positiveIntEnv(
-	"HUMAIN_ORCHESTRATOR_LEAD_TIMEOUT_MS",
-	Math.max(90 * 60 * 1000, DISPATCH_TIMEOUT_MS * 4),
-);
-
-function dispatchTimeoutFor(capability: string | undefined): number {
-	return capability && ORCHESTRATING_CAPABILITIES.has(capability)
-		? LEAD_DISPATCH_TIMEOUT_MS
-		: DISPATCH_TIMEOUT_MS;
-}
 
 /**
  * PIDs of dispatched children that are still running. Children are spawned
@@ -265,8 +261,9 @@ function installDispatchReaper(): void {
 
 const PERSONA_TMP_PREFIX = "orch-agent-";
 /**
- * Age after which an unclaimed persona temp dir is considered orphaned. Must stay
- * comfortably above DISPATCH_TIMEOUT_MS so a live dispatch is never reaped.
+ * Age after which an unclaimed persona temp dir is considered orphaned. Leads may
+ * run up to the absolute ceiling (6h by default), but each prompt file is read
+ * once when its child starts, so the TTL only needs to cover spawn.
  */
 const PERSONA_TMP_TTL_MS = Math.max(2 * 60 * 60 * 1000, DISPATCH_TIMEOUT_MS * 6);
 
@@ -686,7 +683,9 @@ interface SubagentProcessResult {
 	durationMs: number;
 	stopReason?: string;
 	/** Process disposition after considering terminal JSON events. */
-	outcome: "completed" | "completed_after_process_error" | "failed" | "timed_out";
+	outcome: "completed" | "completed_after_process_error" | "failed" | "timed_out" | "cancelled";
+	timeoutReason?: "inactivity" | "absolute";
+	interruption?: InterruptionReport;
 	/** Raw child exit code before terminal-result recovery. */
 	processExitCode: number;
 	/** Teardown error retained alongside a valid settled result. */
@@ -736,6 +735,9 @@ interface DispatchProgress {
 	status: "running" | "done" | "failed" | "cancelled";
 	/** Nesting depth (0 = top-level dispatch, 1 = child of a lead, …). */
 	depth: number;
+	progress: DispatchProgressView;
+	lastLoggedProgressDetail?: string;
+	lastLoggedProgressAt?: number;
 }
 
 const MAX_ACTIVITY_TAIL = 4;
@@ -933,11 +935,12 @@ export class RunSession {
 	}
 
 	startDispatch(taskId: string, label: string, model: string, depth: number = 0): void {
+		const now = Date.now();
 		this.dispatches.set(taskId, {
 			taskId,
 			label,
 			model,
-			startedAt: Date.now(),
+			startedAt: now,
 			turns: 0,
 			toolCalls: 0,
 			lastActivity: "starting",
@@ -945,15 +948,37 @@ export class RunSession {
 			costUsd: 0,
 			status: "running",
 			depth,
+			progress: createProgressView(now),
 		});
 		this.log(`dispatch ${taskId} → ${label} on ${model} (depth=${depth})`);
 		this.render();
+	}
+
+	recordProgress(taskId: string, observation: ProgressObservation, check: TimeoutCheck, now = Date.now()): void {
+		const dispatch = this.dispatches.get(taskId);
+		if (!dispatch) return;
+		applyObservation(dispatch.progress, observation, now);
+		applyWarnings(dispatch.progress, check.warnings, now, (warning) => this.log(`  ${taskId} ${warning}`));
+		const detail = observation.detail.replace(/\s+/g, " ").trim();
+		if (
+			observation.kind === "progress" &&
+			detail !== "tool execution completed" &&
+			dispatch.lastLoggedProgressDetail !== detail &&
+			(detail.startsWith("nested worker progress") || dispatch.lastLoggedProgressAt === undefined || now - dispatch.lastLoggedProgressAt >= 60_000)
+		) {
+			dispatch.lastLoggedProgressDetail = detail;
+			dispatch.lastLoggedProgressAt = now;
+			this.log(`  ${taskId} progress: ${detail}`);
+		}
+		this.scheduleRender();
 	}
 
 	/** Feed a parsed `--mode json` event from a child. */
 	onChildEvent(taskId: string, event: any): void {
 		const d = this.dispatches.get(taskId);
 		if (!d) return;
+		// Nested worker counts/turns are derived by render() from the single
+		// de-duplicated progress view, never from raw event snapshots.
 		let changed: string | null = null;
 		switch (event?.type) {
 			case "tool_execution_start": {
@@ -1069,6 +1094,12 @@ export class RunSession {
 			for (const d of running) {
 				lines.push(this.formatRunningRow(d, now));
 				this.appendActivityTail(lines, d);
+				const indent = "  ".repeat(2 + d.depth);
+				const progressLine = formatProgressLine(d.progress, now, indent);
+				if (progressLine) lines.push(progressLine);
+				const warningLine = formatWarningLine(d.progress, now, indent);
+				if (warningLine) lines.push(warningLine);
+				lines.push(...formatNestedWorkerRows(d.progress, now, d.depth));
 			}
 		}
 
@@ -1113,17 +1144,20 @@ export class RunSession {
 		const turns = `t${d.turns}`.padStart(4);
 		const tools = `⚙${d.toolCalls}`.padStart(5);
 		const cost = `$${d.costUsd.toFixed(4)}`.padStart(9);
-		return `${indent}${spin} ${d.label.padEnd(20)}  ${model}  ${elapsed}  ${turns} ${tools}  ${cost}`;
+		const idleMs = now - d.progress.lastProgressAt;
+		const idle = idleMs > 60_000 ? `  idle ${fmtElapsed(idleMs)}` : "";
+		return `${indent}${spin} ${d.label.padEnd(20)}  ${model}  ${elapsed}  ${turns} ${tools}  ${cost}${idle}`;
 	}
 
 	private appendActivityTail(lines: string[], d: DispatchProgress): void {
-		if (d.activityTail.length <= 1) return;
-		// Show second-most-recent through the oldest kept; the latest is already
-		// implied by the row being alive.
-		const tail = d.activityTail.slice(0, -1);
-		if (tail.length === 0) return;
 		const indent = "  ".repeat(2 + d.depth);
-		lines.push(`${indent}↳ ${tail.join(" · ")}`);
+		const tail = d.activityTail.slice(0, -1);
+		if (tail.length > 0) lines.push(`${indent}↳ ${tail.join(" · ")}`.slice(0, 120));
+		const nestedWorkers = d.progress.nested.size;
+		const nestedTurns = [...d.progress.nested.values()].reduce((total, worker) => total + worker.turns, 0);
+		if (nestedWorkers > 0) {
+			lines.push(`${indent}${nestedWorkers} worker${nestedWorkers === 1 ? "" : "s"} (${nestedTurns} turns)`);
+		}
 	}
 
 	private formatDoneRow(d: DispatchProgress, now: number): string {
@@ -1205,6 +1239,10 @@ export async function runSubagentProcess(opts: {
 	capability?: string;
 	/** Nesting depth for the widget (0 = top-level, 1 = child of a lead, etc.). */
 	depth?: number;
+	/** Test seam for deterministic progress/absolute timeout coverage. */
+	leadTimeouts?: { inactivityMs: number; maxMs: number };
+	/** Optional owning session; production callers use the active run. */
+	session?: RunSession;
 	/**
 	 * Test seam only: replaces the real child launcher. Defaults to node's
 	 * `spawn`; production callers never set this. Lets tests exercise the real
@@ -1217,7 +1255,7 @@ export async function runSubagentProcess(opts: {
 		input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
 		cost: 0, contextTokens: 0, turns: 0,
 	};
-	const session = ACTIVE_RUN;
+	const session = opts.session ?? ACTIVE_RUN;
 	session?.cancellation.throwIfCancelled();
 	const taskId = opts.taskId ?? `${opts.agentName}-${Date.now()}`;
 	const safeTaskId = taskId.replace(/[^a-zA-Z0-9._-]+/g, "_");
@@ -1314,10 +1352,21 @@ export async function runSubagentProcess(opts: {
 		let sawAgentSettled = false;
 		let sawAgentEnd = false;
 		let timedOut = false;
+		let cancelledByListener = false;
+		let timeoutReason: "inactivity" | "absolute" | undefined;
+		let interruption: InterruptionReport | undefined;
 		let spawnFailed = false;
 		let settled = false;
 		let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 		let removeCancellationListener: (() => void) | undefined;
+		let progressTracker: DispatchProgressTracker | undefined;
+		let isLead = false;
+		let dispatchStartedAt = startedAt;
+		let toolCalls = 0;
+		let assistantTurns = 0;
+		let interruptionNote: string | undefined;
+		let armTimer: () => void = () => {};
+		let handleExpiry: (reason: "inactivity" | "absolute") => void = () => {};
 		// `--mode json` writes newline-delimited events, NOT plain prose. Callers
 		// need the assistant's text, so accumulate it here; handing them the raw
 		// event stream made triage's JSON.parse fail every single time.
@@ -1333,10 +1382,39 @@ export async function runSubagentProcess(opts: {
 			promptDir = undefined;
 		};
 
+		const recordInterruption = (reason: InterruptionReport["reason"]): string => {
+			if (interruptionNote) return interruptionNote;
+			const now = Date.now();
+			// The tracker is created only after a successful spawn; a cancellation
+			// racing a synchronous spawn failure still needs an honest note.
+			if (!progressTracker) {
+				progressTracker = new DispatchProgressTracker(resolveDispatchTimeoutPolicy(opts.capability, process.env), dispatchStartedAt);
+			}
+			interruption = buildInterruptionReport({
+				taskId,
+				reason,
+				startedAt: dispatchStartedAt,
+				now,
+				turns: assistantTurns,
+				toolCalls,
+				partialText: assistantTexts[assistantTexts.length - 1] ?? "",
+				tracker: progressTracker,
+			});
+			interruptionNote = renderInterruptionReport(interruption);
+			stderrCapture.append(`\n${interruptionNote}`);
+			return interruptionNote;
+		};
+
 		const finish = (processExitCode: number) => {
 			if (settled) return;
+			const cancelled = cancelledByListener || session?.cancellation.isCancelled === true;
+			cancelledByListener = cancelled;
+			if (cancelled) session?.log(recordInterruption("cancelled"));
 			settled = true;
-			if (timeoutTimer) clearTimeout(timeoutTimer);
+			if (timeoutTimer !== undefined) {
+				clearTimeout(timeoutTimer);
+				timeoutTimer = undefined;
+			}
 			removeCancellationListener?.();
 			if (typeof proc?.pid === "number") liveDispatchPids.delete(proc.pid);
 			cleanupPrompt();
@@ -1352,6 +1430,7 @@ export async function runSubagentProcess(opts: {
 				hasFinalText: Boolean(finalText),
 				lastStopReason: stopReason,
 				timedOut,
+				cancelled,
 				spawnFailed,
 				stderrSummary,
 			});
@@ -1365,7 +1444,7 @@ export async function runSubagentProcess(opts: {
 					/* best-effort */
 				}
 			}
-			session?.endDispatch(taskId, outcome.effectiveExitCode, usage.cost, outcome.note);
+			session?.endDispatch(taskId, outcome.effectiveExitCode, usage.cost, interruptionNote ? summarizeInterruption(interruption!) : outcome.note);
 			resolve({
 				exitCode: outcome.effectiveExitCode,
 				stdout: assistantTexts.join("\n\n"),
@@ -1380,6 +1459,8 @@ export async function runSubagentProcess(opts: {
 				stopReason,
 				outcome: outcome.status,
 				processExitCode,
+				timeoutReason,
+				interruption,
 				postCompletionError: outcome.status === "completed_after_process_error" ? outcome.note : undefined,
 			});
 		};
@@ -1409,6 +1490,7 @@ export async function runSubagentProcess(opts: {
 		};
 
 		const processLine = (line: string) => {
+			if (settled) return;
 			const trimmed = line.trim();
 			if (!trimmed) return;
 			let event: any;
@@ -1419,6 +1501,8 @@ export async function runSubagentProcess(opts: {
 				return;
 			}
 			appendTrimmedEventLog(eventsLog, event);
+			const now = Date.now();
+			const observation = progressTracker?.observe(event, now);
 			session?.onChildEvent(taskId, event);
 			if (event.type === "agent_settled") sawAgentSettled = true;
 			if (event.type === "agent_end") sawAgentEnd = true;
@@ -1427,7 +1511,25 @@ export async function runSubagentProcess(opts: {
 			// `agent_end` repeat the same assistant messages, so ignoring them
 			// keeps usage from being double-counted.
 			if (event.type === "message_end" && event.message?.role === "assistant") {
+				assistantTurns += 1;
 				absorbAssistantMessage(event.message);
+			}
+			if (progressTracker && observation) {
+				if (event.type === "tool_execution_start") toolCalls += 1;
+				const check = progressTracker.check(now);
+				session?.recordProgress(taskId, observation, {
+					...check,
+					warnings: isLead ? check.warnings : [],
+				}, now);
+				if (isLead) {
+					for (const warning of check.warnings) stderrCapture.append(`\n${warning.text}`);
+					if (check.expired) handleExpiry(check.expired);
+					else if (observation.kind === "progress") {
+						if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+						timeoutTimer = undefined;
+						armTimer();
+					}
+				}
 			}
 		};
 
@@ -1460,24 +1562,88 @@ export async function runSubagentProcess(opts: {
 		}
 
 		if (typeof proc.pid === "number") liveDispatchPids.add(proc.pid);
-		removeCancellationListener = session?.cancellation.onCancel(() => {
-			if (proc && !settled) killProcessTree(proc);
-		});
+		dispatchStartedAt = Date.now();
+		// Policy is resolved per dispatch (env read now, not at module load) so
+		// operators and tests can change limits without reloading the extension.
+		// `leadTimeouts` is a test seam that only applies to orchestrating capabilities.
+		const timeoutOverride = ORCHESTRATING_CAPABILITIES.has(opts.capability ?? "") ? opts.leadTimeouts : undefined;
+		const policy: DispatchTimeoutPolicy = applyLeadTimeoutOverride(
+			resolveDispatchTimeoutPolicy(opts.capability, process.env),
+			timeoutOverride,
+		);
+		isLead = policy.mode === "lead";
+		progressTracker = new DispatchProgressTracker(policy, dispatchStartedAt);
+		for (const note of policy.notes) {
+			stderrCapture.append(`\n[orchestrator] timeout configuration: ${note}`);
+			session?.log(`dispatch ${taskId} timeout configuration: ${note}`);
+		}
 
-		// A stalled child would otherwise block its whole batch forever, freezing
-		// the run instead of failing just that task. Leads that fan out their own
-		// subagents get a larger budget than leaf workers.
-		const timeoutMs = dispatchTimeoutFor(opts.capability);
-		timeoutTimer = setTimeout(() => {
+		handleExpiry = (reason) => {
 			if (settled) return;
 			timedOut = true;
-			stderrCapture.append(
-				`\n[orchestrator] dispatch timed out after ${Math.round(timeoutMs / 60000)}min ` +
-					`(capability=${opts.capability ?? "unknown"}); killing process group`,
-			);
+			timeoutReason = reason;
+			const explanation = progressTracker?.describeExpiry(reason, opts.capability, Date.now()) ?? reason;
+			stderrCapture.append(`\n[orchestrator] ${reason} timeout: ${explanation}`);
+			const report = recordInterruption(reason === "inactivity" ? "inactivity_timeout" : "absolute_timeout");
+			session?.log(report);
 			if (proc) killProcessTree(proc);
 			finish(124);
-		}, timeoutMs);
+		};
+
+		removeCancellationListener = session?.cancellation.onCancel(() => {
+			if (proc && !settled) {
+				cancelledByListener = true;
+				recordInterruption("cancelled");
+				killProcessTree(proc);
+				finish(137);
+			}
+		});
+
+		armTimer = () => {
+			if (settled || !progressTracker) return;
+			if (timeoutTimer !== undefined) {
+				clearTimeout(timeoutTimer);
+				timeoutTimer = undefined;
+			}
+			const now = Date.now();
+			const check = progressTracker.peek(now);
+			if (check.expired) {
+				handleExpiry(check.expired);
+				return;
+			}
+			const delay = Math.max(50, Math.min(30_000, check.nextCheckMs));
+			timeoutTimer = setTimeout(() => {
+				timeoutTimer = undefined;
+				if (settled || !progressTracker) return;
+				const tickNow = Date.now();
+				const tickCheck = progressTracker.check(tickNow);
+				session?.recordProgress(taskId, { kind: "heartbeat", detail: "timer" }, tickCheck, tickNow);
+				for (const warning of tickCheck.warnings) stderrCapture.append(`\n${warning.text}`);
+				if (tickCheck.expired) handleExpiry(tickCheck.expired);
+				else armTimer();
+			}, delay);
+		};
+		// A cancellation that fired synchronously above has already settled the
+		// dispatch; never arm a timer after settle. Do NOT return early here: the
+		// stream/error handlers below must still attach so a late 'error' emit on
+		// the child cannot become an uncaught exception.
+		if (isLead) {
+			armTimer();
+		} else if (!settled) {
+			// Leaf dispatches retain their fixed wall-clock timeout
+			// (HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS); no inactivity rule applies.
+			const leafTimeoutMs = policy.absoluteMs;
+			timeoutTimer = setTimeout(() => {
+				if (settled) return;
+				timedOut = true;
+				stderrCapture.append(
+					`\n[orchestrator] dispatch timed out after ${Math.round(leafTimeoutMs / 60000)}min ` +
+						`(capability=${opts.capability ?? "unknown"}); killing process group`,
+				);
+				if (proc) killProcessTree(proc);
+				finish(124);
+			}, leafTimeoutMs);
+		}
 
 		const streamFailure = {
 			appendStderr: (text: string) => stderrCapture.append(text),
@@ -1860,6 +2026,9 @@ interface DispatchResult {
 	durationMs: number;
 	costUsd: number;
 	stopReason?: string;
+	outcome?: SubagentProcessResult["outcome"];
+	timeoutReason?: "inactivity" | "absolute";
+	interruption?: InterruptionReport;
 	filesChanged: string[];
 }
 
@@ -1971,6 +2140,9 @@ async function dispatchParallel(
 				durationMs: r.durationMs,
 				costUsd: r.costUsd,
 				stopReason: r.stopReason,
+				outcome: r.outcome,
+				timeoutReason: r.timeoutReason,
+				interruption: r.interruption,
 				// parseFilesChanged scrapes the child's prose, so a read-only reviewer
 				// or QA agent would "report" every path it merely mentioned.
 				filesChanged: r.personaCanMutate ? parseFilesChanged(r.stdout) : [],
@@ -3157,7 +3329,7 @@ export default function (pi: ExtensionAPI) {
 				const proceed = await Promise.race([session.cancellation.wait(), confirmStep(
 					ctx,
 					"Dispatch this plan?",
-					`${pipeline}\n\nEach stage runs headless (up to ${Math.round(DISPATCH_TIMEOUT_MS / 60000)} min per dispatch); live progress shows above the editor.`,
+					`${pipeline}\n\nOrchestrating stages use an inactivity limit plus an absolute ceiling (leaf dispatches use a fixed timeout); live progress shows above the editor.`,
 					parsed.interactive,
 				)]);
 				session.cancellation.throwIfCancelled();
@@ -3385,8 +3557,16 @@ export default function (pi: ExtensionAPI) {
 				// live. Always write it to disk; show it inline when there are no file
 				// edits to speak for the run, or when the lead raised open items.
 				const leadReports = leadResults
-					.filter((r) => r.stdout.trim())
-					.map((r) => `### ${r.taskId.replace(`${runId}-`, "")}\n\n${r.stdout.trim()}`);
+					.filter((r) => r.stdout.trim() || r.outcome === "timed_out" || r.outcome === "cancelled")
+					.map((r) => {
+						const interrupted = r.outcome === "timed_out" || r.outcome === "cancelled";
+						const reason = r.outcome === "cancelled"
+							? "cancelled"
+							: r.timeoutReason ?? "unknown";
+						const marker = interrupted ? `> UNVERIFIED PARTIAL WORK — ${reason}\n\n` : "";
+						const report = r.stdout.trim() || r.interruption?.partialText || "(no assistant text captured)";
+						return `${marker}### ${r.taskId.replace(`${runId}-`, "")}\n\n${report}`;
+					});
 				if (leadReports.length > 0) {
 					try {
 						writeFileSync(session.file("lead-report.md"), leadReports.join("\n\n---\n\n"));

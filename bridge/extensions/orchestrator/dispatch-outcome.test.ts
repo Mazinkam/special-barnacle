@@ -22,6 +22,14 @@ describe("classifyDispatchOutcome", () => {
 		});
 	});
 
+	test("cancellation cannot recover a settled stop result", () => {
+		expect(classifyDispatchOutcome({ ...recoveredInput, cancelled: true })).toEqual({
+			status: "cancelled",
+			effectiveExitCode: 137,
+			note: "Error: teardown failed",
+		});
+	});
+
 	test("does not recover a result without agent_settled", () => {
 		expect(classifyDispatchOutcome({ ...recoveredInput, sawAgentSettled: false }).status).toBe("failed");
 	});

@@ -147,6 +147,80 @@ describe("RunSession cancellation presentation", () => {
 	});
 });
 
+describe("RunSession progress reporting", () => {
+	test("renders stable nested workers, progress age, and tracker warnings without notify spam", () => {
+		const widgets: unknown[] = [];
+		const notify = mock();
+		const ctx = {
+			ui: {
+				setWidget: (_id: string, value: unknown) => widgets.push(value),
+				setStatus: (_id: string, _value: unknown) => {},
+				notify,
+			},
+		};
+		const session = new orchestrator.RunSession!("progress-ui-test", ctx as never, "track worker progress");
+		session.startDispatch("lead-1", "lead", "p/m");
+		const initialSnapshots = ["worker-1", "worker-2"].map((taskId) => ({
+			taskId,
+			agent: "worker",
+			depth: 1,
+			turns: 1,
+			exitCode: -1,
+			costUsd: 0.01,
+			latestText: "working",
+			finished: false,
+			changed: true,
+		}));
+		const warning = { kind: "inactivity" as const, text: "⚠ no meaningful progress for 23min (limit 30min; raise HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS) — last: inspect absolute path" };
+		session.recordProgress("lead-1", { kind: "progress", detail: "bash bun test", nested: initialSnapshots }, { expired: false, nextCheckMs: 1_000, inactiveMs: 0, elapsedMs: 0, warnings: [] });
+		session.recordProgress("lead-1", {
+			kind: "duplicate",
+			detail: "nested worker snapshot unchanged",
+			nested: initialSnapshots.map((snapshot) => ({ ...snapshot, changed: false, turns: 2, exitCode: 0, latestText: "ignored duplicate" })),
+		}, { expired: false, nextCheckMs: 1_000, inactiveMs: 1_000, elapsedMs: 1_000, warnings: [warning] });
+		session.recordProgress("lead-1", {
+			kind: "duplicate",
+			detail: "nested worker snapshot unchanged",
+			nested: initialSnapshots.map((snapshot) => ({ ...snapshot, changed: false, turns: 2, exitCode: 0, latestText: "ignored duplicate" })),
+		}, { expired: false, nextCheckMs: 1_000, inactiveMs: 1_000, elapsedMs: 1_000, warnings: [warning] });
+		session.render();
+		session.close(true);
+
+		const widget = widgets.at(-1) as string[];
+		expect(widget.filter((line) => line.includes("latest:"))).toHaveLength(2);
+		expect(widget.some((line) => line.includes("2 workers (2 turns)"))).toBe(true);
+		expect(widget.filter((line) => line.includes("latest:")).every((line) => !line.includes("✓"))).toBe(true);
+		expect(widget.some((line) => line.includes("progress") && line.includes("ago"))).toBe(true);
+		expect(widget.some((line) => line.includes("⚠"))).toBe(true);
+		expect(notify).not.toHaveBeenCalled();
+		const log = readFileSync(session.file("run.log"), "utf8");
+		// Identical warning text is logged at most once within the UI's five-minute suppression window.
+		expect(log.split(warning.text).length - 1).toBe(1);
+	});
+
+	test("throttles ordinary progress logs but keeps nested progress and sanitizes details", () => {
+		const ctx = { ui: { setWidget: () => {}, setStatus: () => {}, notify: () => {} } };
+		const session = new orchestrator.RunSession!("progress-log-test", ctx as never, "log progress carefully");
+		session.startDispatch("lead-1", "lead", "p/m");
+		const check = { expired: false as const, nextCheckMs: 1_000, inactiveMs: 0, elapsedMs: 0, warnings: [] as Array<{ kind: "inactivity" | "absolute"; text: string }> };
+		session.recordProgress("lead-1", { kind: "progress", detail: " initial\nprogress " }, check, 1_000);
+		session.recordProgress("lead-1", { kind: "progress", detail: "tool start" }, check, 30_000);
+		session.recordProgress("lead-1", { kind: "progress", detail: "nested worker progress: worker-1" }, check, 30_001);
+		session.recordProgress("lead-1", { kind: "progress", detail: "tool execution completed" }, check, 90_001);
+		session.recordProgress("lead-1", { kind: "progress", detail: "tool end" }, check, 90_002);
+		session.recordProgress("lead-1", { kind: "progress", detail: "tool end" }, check, 150_001);
+		session.close(true);
+
+		const log = readFileSync(session.file("run.log"), "utf8");
+		expect(log).toContain("progress: initial progress");
+		expect(log).toContain("progress: nested worker progress: worker-1");
+		expect(log).toContain("progress: tool end");
+		expect(log).not.toContain("progress: tool start");
+		expect(log).not.toContain("progress: tool execution completed");
+		expect(log.split("progress: tool end").length - 1).toBe(1);
+	});
+});
+
 describe("confirmation gates", () => {
 	test("passes the dispatch title and details as separate confirmation arguments", async () => {
 		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
@@ -179,7 +253,7 @@ describe("confirmation gates", () => {
 		expect(confirmStep).toHaveBeenCalledWith(
 			{},
 			"Dispatch this plan?",
-			"lead → workers → qa\n\nEach stage runs headless (up to 5 min per dispatch); live progress shows above the editor.",
+			"lead → workers → qa\n\nOrchestrating stages use an inactivity limit plus an absolute ceiling (leaf dispatches use a fixed timeout); live progress shows above the editor.",
 			false,
 		);
 	});
@@ -232,6 +306,203 @@ describe("runSubagentProcess process/event handling", () => {
 		return (_command: string, _args: readonly string[], options: unknown) =>
 			nodeSpawn(process.execPath, ["-e", code], options as never);
 	}
+
+	function createSession(id: string, widgets: string[][] = []) {
+		const ctx = {
+			ui: {
+				setWidget: (_id: string, value: string[] | undefined) => {
+					if (value) widgets.push(value);
+				},
+				setStatus: () => {},
+				notify: mock(),
+			},
+		};
+		return new orchestrator.RunSession!(id, ctx as never, "progress timeout test", repoDir);
+	}
+
+	function runLead(code: string, taskId: string, timeouts: { inactivityMs: number; maxMs: number }, session?: InstanceType<typeof orchestrator.RunSession>) {
+		return orchestrator.runSubagentProcess!({
+			cwd: repoDir,
+			agentName: "__no_persona__",
+			task: "do the fixture task",
+			model: "provider/model",
+			ctx: {} as never,
+			capability: "lead",
+			taskId,
+			label: "lead",
+			leadTimeouts: timeouts,
+			session,
+			spawnChild: spawnInlineScript(code),
+		});
+	}
+
+	test("active lead stays alive on distinct tool progress beyond inactivity and settles", async () => {
+		const result = await runLead(
+			`let i=0;const timer=setInterval(()=>{process.stdout.write(JSON.stringify({type:"tool_execution_start",toolName:"read",args:{path:"file-"+i++}})+"\\n");if(i===12){clearInterval(timer);setTimeout(()=>{for(const e of [{type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:"done"}],usage:{input:1,output:1,cost:{total:0}}}},{type:"agent_end"},{type:"agent_settled"}])process.stdout.write(JSON.stringify(e)+"\\n");},30)}},50);`,
+			"active-lead",
+			{ inactivityMs: 1000, maxMs: 5000 },
+		);
+
+		expect(result.outcome).toBe("completed");
+		expect(result.exitCode).toBe(0);
+	});
+
+	test("idle lead times out on message_start heartbeats with an inactivity report", async () => {
+		const result = await runLead(
+			`const timer=setInterval(()=>process.stdout.write(JSON.stringify({type:"message_start",message:{role:"assistant"}})+"\\n"),20);setTimeout(()=>clearInterval(timer),1500);`,
+			"idle-lead",
+			{ inactivityMs: 600, maxMs: 3000 },
+		);
+
+		expect(result.exitCode).toBe(124);
+		expect(result.outcome).toBe("timed_out");
+		expect(result.timeoutReason).toBe("inactivity");
+		expect(result.stderr).toContain("UNVERIFIED PARTIAL WORK — inactivity");
+	});
+
+	test("looping lead reports repeated tool calls before inactivity timeout", async () => {
+		const result = await runLead(
+			`setInterval(()=>process.stdout.write(JSON.stringify({type:"tool_execution_start",toolName:"read",args:{path:"same.ts"}})+"\\n"),20);`,
+			"looping-lead",
+			{ inactivityMs: 1500, maxMs: 5000 },
+		);
+
+		expect(result.outcome).toBe("timed_out");
+		expect(result.timeoutReason).toBe("inactivity");
+		expect(result.stderr).toContain("UNVERIFIED PARTIAL WORK — inactivity");
+		expect(result.stderr).toMatch(/repeatedToolCalls: [1-9]/);
+	});
+
+	test("active lead expires at its absolute ceiling despite ongoing progress", async () => {
+		const result = await runLead(
+			`let i=0;setInterval(()=>process.stdout.write(JSON.stringify({type:"tool_execution_start",toolName:"read",args:{path:"file-"+i++}})+"\\n"),25);`,
+			"absolute-lead",
+			{ inactivityMs: 2000, maxMs: 1000 },
+		);
+
+		expect(result.exitCode).toBe(124);
+		expect(result.outcome).toBe("timed_out");
+		expect(result.timeoutReason).toBe("absolute");
+		expect(result.stderr).toContain("clamped to the ceiling");
+		expect(result.stderr).toContain("UNVERIFIED PARTIAL WORK — absolute");
+	});
+
+	test("cancellation kills the child and records an unverified cancelled report", async () => {
+		const widgets: string[][] = [];
+		const session = createSession("cancelled-progress-lead", widgets);
+		try {
+			const pending = runLead(
+				`process.stdout.write(JSON.stringify({type:"message_start",message:{role:"assistant"}})+"\\n");setInterval(()=>{},1000);`,
+				"cancelled-lead",
+				{ inactivityMs: 1000, maxMs: 2000 },
+				session,
+			);
+			setTimeout(() => session.cancellation.cancel(), 60);
+			const result = await pending;
+
+			expect(result.exitCode).toBe(137);
+			expect(result.outcome).toBe("cancelled");
+			expect(session.cancelledDispatches()).toEqual(["lead"]);
+			const runLog = readFileSync(session.file("run.log"), "utf8");
+			expect(runLog).toContain("UNVERIFIED PARTIAL WORK — cancelled");
+			expect(runLog.match(/\ntaskId: cancelled-lead\n/g) ?? []).toHaveLength(1);
+			expect(runLog.match(/partialText:/g) ?? []).toHaveLength(1);
+			const doneRow = widgets.flat().find((line) => line.includes("UNVERIFIED PARTIAL WORK — cancelled"));
+			expect(doneRow).toBeDefined();
+			expect(doneRow).not.toContain("partialText:");
+			expect(doneRow).not.toContain("\\n");
+		} finally {
+			session.close();
+		}
+	});
+
+	test("pre-cancelled leaf does not arm a stale timeout", async () => {
+		const session = createSession("pre-cancelled-leaf");
+		const previousTimeout = process.env.HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS;
+		const originalSetTimeout = globalThis.setTimeout;
+		const scheduledTimeouts: Array<{ delay: number; timer: ReturnType<typeof setTimeout> }> = [];
+		globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+			const timer = originalSetTimeout(...args);
+			scheduledTimeouts.push({ delay: Number(args[1] ?? 0), timer });
+			return timer;
+		}) as typeof setTimeout;
+		process.env.HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS = "2000";
+		try {
+			const result = await orchestrator.runSubagentProcess!({
+				cwd: repoDir,
+				agentName: "__no_persona__",
+				task: "do the fixture task",
+				model: "provider/model",
+				ctx: {} as never,
+				taskId: "pre-cancelled-leaf",
+				capability: "worker",
+				session,
+				spawnChild: (_command: string, _args: readonly string[], options: unknown) => {
+					const child = nodeSpawn(process.execPath, ["-e", "setInterval(()=>{},1000);"], options as never);
+					session.cancellation.cancel();
+					return child;
+				},
+			});
+
+			expect(result.outcome).toBe("cancelled");
+			expect(result.exitCode).toBe(137);
+			const runLog = readFileSync(session.file("run.log"), "utf8");
+			expect(runLog.match(/\ntaskId: pre-cancelled-leaf\n/g) ?? []).toHaveLength(1);
+			expect(scheduledTimeouts.filter(({ delay }) => delay === 2000)).toHaveLength(0);
+		} finally {
+			globalThis.setTimeout = originalSetTimeout;
+			for (const { timer } of scheduledTimeouts) clearTimeout(timer);
+			if (previousTimeout === undefined) delete process.env.HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS;
+			else process.env.HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS = previousTimeout;
+			session.close();
+		}
+	});
+
+	test("cancellation racing a synchronous spawn failure records one interruption report", async () => {
+		const session = createSession("cancelled-spawn-race");
+		try {
+			const result = await orchestrator.runSubagentProcess!({
+				cwd: repoDir,
+				agentName: "__no_persona__",
+				task: "do the fixture task",
+				model: "provider/model",
+				ctx: {} as never,
+				taskId: "spawn-race-lead",
+				capability: "lead",
+				session,
+				spawnChild: () => {
+					session.cancellation.cancel();
+					throw new Error("synchronous spawn failure");
+				},
+			});
+
+			expect(result.outcome).toBe("cancelled");
+			expect(result.exitCode).toBe(137);
+			expect(result.interruption?.reason).toBe("cancelled");
+			const runLog = readFileSync(session.file("run.log"), "utf8");
+			expect(runLog.match(/\ntaskId: spawn-race-lead\n/g) ?? []).toHaveLength(1);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("nested worker turn growth keeps the lead alive and renders one worker summary", async () => {
+		const widgets: string[][] = [];
+		const session = createSession("nested-progress-lead", widgets);
+		const script = `const emit=(turns)=>process.stdout.write(JSON.stringify({type:"tool_execution_update",partialResult:{details:{results:[{taskId:"worker-1",agent:"worker",depth:1,exitCode:-1,latestText:"working",usage:{turns}}]}}})+"\\n");emit(1);setTimeout(()=>emit(1),200);setTimeout(()=>emit(2),500);setTimeout(()=>emit(2),700);setTimeout(()=>{},900);setInterval(()=>{},1000);`;
+		try {
+			const result = await runLead(script, "nested-lead", { inactivityMs: 1500, maxMs: 6000 }, session);
+			session.render();
+			const dispatch = (session as unknown as { dispatches: Map<string, { progress: { nested: Map<string, { turns: number }> } }> }).dispatches.get("nested-lead");
+			expect(result.outcome).toBe("timed_out");
+			expect(result.timeoutReason).toBe("inactivity");
+			expect(result.stderr).toContain("UNVERIFIED PARTIAL WORK — inactivity");
+			expect(dispatch?.progress.nested.size).toBe(1);
+			expect([...dispatch!.progress.nested.values()][0].turns).toBe(2);
+		} finally {
+			session.close();
+		}
+	});
 
 	test("recovers a settled, stop-reason result when the child exits non-zero afterward", async () => {
 		expect(orchestrator.runSubagentProcess).toBeFunction();
