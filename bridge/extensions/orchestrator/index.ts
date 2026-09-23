@@ -48,6 +48,7 @@ import { Type } from "typebox";
 
 import {
 	discoverAgents,
+	BorderedLoader,
 	type ExtensionAPI,
 	type ExtensionContext,
 	renderTaskWithContext,
@@ -90,6 +91,7 @@ import {
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
 import { BoundedCapture, classifyDispatchOutcome, summarizeStderr } from "./dispatch-outcome.ts";
 import { RunCancellation } from "./cancellation.ts";
+import { connectCancellationLoader } from "./run-ui.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -681,7 +683,7 @@ interface DispatchProgress {
 	toolCalls: number;
 	lastActivity: string;
 	costUsd: number;
-	status: "running" | "done" | "failed";
+	status: "running" | "done" | "failed" | "cancelled";
 }
 
 function fmtElapsed(ms: number): string {
@@ -716,7 +718,7 @@ function shortArgs(toolName: string, args: unknown): string {
  * Before this, the only trace of a run was the aggregate metrics row, so a
  * 20-minute silent dispatch could not be inspected while it ran or after.
  */
-class RunSession {
+export class RunSession {
 	readonly runId: string;
 	readonly ctx: ExtensionContext;
 	readonly goal: string;
@@ -828,9 +830,9 @@ class RunSession {
 		const d = this.dispatches.get(taskId);
 		if (!d) return;
 		d.endedAt = Date.now();
-		d.status = exitCode === 0 ? "done" : "failed";
+		d.status = this.cancellation.isCancelled ? "cancelled" : exitCode === 0 ? "done" : "failed";
 		d.costUsd = costUsd || d.costUsd;
-		d.lastActivity = note ?? (exitCode === 0 ? "finished" : `exit ${exitCode}`);
+		d.lastActivity = note ?? (d.status === "cancelled" ? "cancelled by user" : exitCode === 0 ? "finished" : `exit ${exitCode}`);
 		this.log(
 			`dispatch ${taskId} ${d.status} in ${fmtElapsed(d.endedAt - d.startedAt)} — ${d.turns} turns, ${d.toolCalls} tool calls, $${d.costUsd.toFixed(4)}${note ? ` — ${note}` : ""}`,
 		);
@@ -855,37 +857,49 @@ class RunSession {
 		if (this.closed) return;
 		const running = [...this.dispatches.values()].filter((d) => d.status === "running");
 		const done = [...this.dispatches.values()].filter((d) => d.status !== "running");
+		const cancelled = done.filter((d) => d.status === "cancelled").length;
 		const elapsed = fmtElapsed(Date.now() - this.startedAt);
 		this.ctx.ui.setStatus(
 			"orchestrator",
-			`orch ${elapsed} · ${this.phase} · ${running.length} running · $${this.totalCost().toFixed(3)}`,
+			`orch ${elapsed} · ${this.phase} · ${running.length} running · ${cancelled} cancelled · $${this.totalCost().toFixed(3)}`,
 		);
+		const goal = this.goal.replace(/\s+/g, " ").trim();
 		const lines: string[] = [
 			`▶ /orchestrate ${elapsed} — ${this.phase} — $${this.totalCost().toFixed(4)} — log: ${this.file("run.log")}`,
+			`Goal: ${goal.length > 120 ? `${goal.slice(0, 117)}…` : goal}`,
 		];
 		for (const d of running) {
 			lines.push(
 				`  ● ${d.label.padEnd(22)} ${shortName(d.model).padEnd(28)} ${fmtElapsed(Date.now() - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  ${d.lastActivity}`,
 			);
 		}
-		for (const d of done.slice(-4)) {
-			const mark = d.status === "done" ? "✓" : "✗";
+		for (const d of done.slice(-6)) {
+			const mark = d.status === "done" ? "✓" : d.status === "cancelled" ? "⏹" : "✗";
 			lines.push(
 				`  ${mark} ${d.label.padEnd(22)} ${shortName(d.model).padEnd(28)} ${fmtElapsed((d.endedAt ?? Date.now()) - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  $${d.costUsd.toFixed(4)} ${d.lastActivity}`,
 			);
 		}
-		if (done.length > 4) lines.push(`  … ${done.length - 4} earlier dispatch(es) in run.log`);
+		if (done.length > 6) lines.push(`  … ${done.length - 6} earlier dispatch(es) in run.log`);
 		this.ctx.ui.setWidget("orchestrator", lines);
 	}
 
-	close(): void {
+	close(preserveCancelled = false): void {
 		if (this.closed) return;
-		this.closed = true;
 		if (this.tickTimer) clearInterval(this.tickTimer);
 		if (this.renderTimer) clearTimeout(this.renderTimer);
-		this.ctx.ui.setWidget("orchestrator", undefined);
-		this.ctx.ui.setStatus("orchestrator", undefined);
+		if (preserveCancelled) {
+			this.phase = "cancelled";
+			this.render();
+		} else {
+			this.ctx.ui.setWidget("orchestrator", undefined);
+			this.ctx.ui.setStatus("orchestrator", undefined);
+		}
+		this.closed = true;
 		this.log(`run ${this.runId} closed after ${fmtElapsed(Date.now() - this.startedAt)}`);
+	}
+
+	cancelledDispatches(): string[] {
+		return [...this.dispatches.values()].filter((d) => d.status === "cancelled").map((d) => d.label);
 	}
 }
 
@@ -2593,6 +2607,15 @@ export default function (pi: ExtensionAPI) {
 			session.log(`models (profile "${resolved.profileName}"):\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
 			for (const n of resolved.notes) session.log(`note: ${n}`);
 			const cwd = process.cwd();
+			let closeTui: (() => void) | undefined;
+			let tuiCompletion: Promise<void> | undefined;
+			if (ctx.mode === "tui") {
+				tuiCompletion = ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+					const loader = new BorderedLoader(tui, theme, "Orchestrating — press Esc to cancel");
+					closeTui = connectCancellationLoader(loader, () => session.cancel(), () => done());
+					return loader;
+				});
+			}
 
 			try {
 				// -----------------------------------------------------------------
@@ -2937,9 +2960,13 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(summary.join("\n"), passedVerification || (dispatchOk && verificationSkipped) ? "info" : "warning");
 			} catch (err) {
 				if (session.cancellation.isCancelled) {
-					session.log("run cancelled by user (Ctrl+C)");
-					await failRun(runId, "cancelled by user (Ctrl+C)");
-					ctx.ui.notify(`Orchestration cancelled. See ${session.file("run.log")}`, "info");
+					const stopped = session.cancelledDispatches();
+					session.log(`run cancelled by user; stopped dispatches: ${stopped.join(", ") || "none active"}`);
+					await failRun(runId, "cancelled by user (Esc or Ctrl+C)");
+					ctx.ui.notify(
+						`Orchestration cancelled. ${stopped.length ? `Stopped: ${stopped.join(", ")}. ` : "No child dispatch was active. "}Progress is retained above the editor; run log: ${session.file("run.log")}`,
+						"info",
+					);
 				} else {
 					// Any uncaught throw used to leave the run half-recorded (no outcome
 					// row) and the UI stuck on the last notify. Record + surface it.
@@ -2952,8 +2979,10 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 			} finally {
-				session.close();
+				session.close(session.cancellation.isCancelled);
 				ACTIVE_RUN = null;
+				closeTui?.();
+				if (tuiCompletion) await tuiCompletion.catch(() => {});
 			}
 		},
 	});
