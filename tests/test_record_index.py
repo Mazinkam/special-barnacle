@@ -9,12 +9,36 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator import record_batch
-from orchestrator.record_index import DATABASE_FILE, RecordIndex
-from orchestrator.runtime import read_json
+from orchestrator.record_index import DATABASE_FILE, RecordIndex, encode_key
+from orchestrator.runtime import EventStore, read_json
 from orchestrator.state import rebuild
-from tests.record_io_probe import measure_io
+from tests import record_io_probe
+from tests.record_io_probe import IoMeterUnsupported, measure_io
 from tests.test_record_batch import (TemporaryRootTestCase, _checkpoint_snapshot, _completed_run, _fill_streams,
-    _forge_index_with_stream_access, run_batch, sample_batch, cli_env, stream_ids, strip_volatile)
+    _forge_index_with_stream_access, _fsync_by_inode, run_batch, sample_batch, cli_env, stream_ids, strip_volatile)
+
+
+def _require_io_meter(case):
+    """Skip only when the native SQLite VFS hook is genuinely unsupported here; never measure partially."""
+    reason = record_io_probe.unsupported_reason()
+    if reason:
+        case.skipTest(f'record_io_probe unsupported on this interpreter: {reason}')
+
+
+_REFRESHLESS_CHILD = '''
+import json, sys
+from orchestrator import record_batch
+result = record_batch.write_batch(sys.argv[1], json.loads(sys.stdin.read()), refresh=False)
+print(json.dumps({k: v for k, v in result.items() if k != 'records'}))
+'''
+
+
+def _write_in_child(root: Path, records: list) -> dict:
+    """A fresh process (fresh cache load) running only the durable writer, not the dashboard."""
+    child = subprocess.run([sys.executable, '-B', '-c', _REFRESHLESS_CHILD, str(root)], input=json.dumps(records),
+        text=True, capture_output=True, env=cli_env(root), timeout=60)
+    assert child.returncode == 0, child.stderr
+    return json.loads(child.stdout)
 
 
 _CRASH_SWEEP_CHILD = '''
@@ -59,6 +83,7 @@ def _crash_write_at_step(root: Path, records: list, step: int) -> tuple[int, int
 
 class ExactIndexTests(TemporaryRootTestCase):
     def test_io_meter_counts_fdopen_writes_once(self):
+        _require_io_meter(self)
         self.root.mkdir()
         with measure_io() as counts:
             (self.root / 'path').write_bytes(b'a' * 128)
@@ -96,7 +121,7 @@ class ExactIndexTests(TemporaryRootTestCase):
     def test_forged_metric_presence_cannot_drop_cost(self):
         _completed_run(self)
         db = sqlite3.connect(self.root / DATABASE_FILE)
-        db.execute('INSERT INTO ids VALUES (?, ?)', ('metric', 'ghost'))
+        db.execute('INSERT INTO ids VALUES (?, ?)', ('metric', encode_key('ghost')))
         db.commit(); db.close()
         result = record_batch.write_batch(self.root, [{'stream': 'metric', 'record_id': 'ghost', 'cost_usd': 7}], refresh=False)
         self.assertEqual(result['persisted']['metric'], 1)
@@ -107,7 +132,7 @@ class ExactIndexTests(TemporaryRootTestCase):
         db = sqlite3.connect(self.root / DATABASE_FILE)
         try:
             with self.assertRaises(sqlite3.IntegrityError):
-                db.execute('INSERT INTO ids VALUES (?, ?)', ('metric', 'm-1'))
+                db.execute('INSERT INTO ids VALUES (?, ?)', ('metric', encode_key('m-1')))
         finally:
             db.close()
         (self.root / record_batch.CHECKPOINT_FILE).unlink()
@@ -288,6 +313,7 @@ record_batch.write_batch(sys.argv[1], json.loads(sys.stdin.read()))
         self.assertEqual((self.root / 'metrics.jsonl').read_bytes(), before)
 
     def test_malformed_tail_is_not_rescanned_by_unrelated_writes(self):
+        _require_io_meter(self)
         _fill_streams(self.root, 500)
         with (self.root / 'events.jsonl').open('ab') as f:
             f.write(b'{"fragment":"' + b'x' * 2_000_000)
@@ -302,6 +328,7 @@ record_batch.write_batch(sys.argv[1], json.loads(sys.stdin.read()))
         self.assertEqual((self.root / 'events.jsonl').read_bytes(), before)
 
     def test_total_io_per_write_does_not_scale_with_all_ids(self):
+        _require_io_meter(self)
         measurements = {}
         for multiplier in (1, 2, 4):
             with tempfile.TemporaryDirectory() as tmp:
@@ -319,3 +346,84 @@ record_batch.write_batch(sys.argv[1], json.loads(sys.stdin.read()))
             self.assertLessEqual(measurements[4][direction], measurements[1][direction] + 100_000, measurements)
         self.assertGreater(measurements[4]['sqlite_read'], 0, 'meter must include SQLite C-level I/O')
         self.assertGreater(measurements[4]['sqlite_write'], 0)
+
+
+class RemediationTask2BTests(TemporaryRootTestCase):
+    """Task 2B: historical IDs the SQLite text binding rejects, and durability of freshly created state roots."""
+
+    def test_historical_lone_surrogate_record_id_never_blocks_writes_and_still_dedups(self):
+        self.root.mkdir()
+        surrogate = 'old-\ud800'
+        historical = {'record_id': surrogate, 'event': 'model_call', 'run_id': 'R0', 'model': 'gpt-4o', 'cost_usd': 1}
+        line = json.dumps(historical, sort_keys=True) + '\n'
+        self.assertIn('\\ud800', line, 'the old writer escaped the lone surrogate; the file itself is valid ASCII')
+        metrics = self.root / 'metrics.jsonl'
+        metrics.write_bytes(line.encode('ascii'))
+        self.assertEqual(stream_ids(self.root, 'metric'), [surrogate], 'the JSON parser accepts the escaped surrogate')
+
+        ordinary = record_batch.write_batch(self.root, sample_batch(), refresh=False)
+        self.assertTrue(ordinary['ok'], ordinary)
+        self.assertEqual(ordinary['persisted'], {'event': 3, 'metric': 1, 'outcome': 1})
+        self.assertTrue(metrics.read_bytes().startswith(line.encode('ascii')), 'canonical history is untouched')
+        self.assertEqual(stream_ids(self.root, 'metric'), [surrogate, 'm-1'])
+
+        # Same-id retry in a fresh process: the historical surrogate id and the ordinary ids all dedup
+        # from the committed cache, whose keys must round-trip the exact Python string.
+        before = {s: (self.root / name).read_bytes() for s, name in record_batch.STREAMS.items()}
+        retry = _write_in_child(self.root, [{'stream': 'metric', **historical}, *sample_batch()])
+        self.assertTrue(retry['ok'], retry)
+        self.assertEqual(retry['duplicates'], {'event': 3, 'metric': 2, 'outcome': 1})
+        self.assertEqual(retry['persisted'], {'event': 0, 'metric': 0, 'outcome': 0})
+        for stream, name in record_batch.STREAMS.items():
+            self.assertEqual((self.root / name).read_bytes(), before[stream], stream)
+        self.assertEqual(sorted(_checkpoint_snapshot(self.root)['streams']['metric']['ids']), sorted([surrogate, 'm-1']))
+
+        # A new id with a lone surrogate is not rejected: the writer can store, dedup and replay it.
+        fresh = {'stream': 'metric', 'record_id': 'fresh-\udfff', 'event': 'model_call', 'run_id': 'R0', 'cost_usd': 2}
+        self.assertEqual(record_batch.write_batch(self.root, [fresh], refresh=False)['persisted']['metric'], 1)
+        self.assertEqual(_write_in_child(self.root, [fresh])['duplicates']['metric'], 1)
+        self.assertEqual(stream_ids(self.root, 'metric'), [surrogate, 'm-1', 'fresh-\udfff'])
+
+    def test_historical_lone_surrogate_event_id_replays_into_the_ledger(self):
+        self.root.mkdir()
+        events = self.root / 'events.jsonl'
+        events.write_bytes((json.dumps({'record_id': 'start-\ud800', 'event': 'run_started', 'run_id': 'R1'}) + '\n').encode('ascii'))
+        done = [{'stream': 'event', 'record_id': 'done', 'event': 'run_completed', 'run_id': 'R1'}]
+        with patch('orchestrator.record_batch.generate_dashboard'):  # dashboard rendering is outside this writer's contract
+            result = record_batch.write_batch(self.root, done)
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['ledger_updated'])
+        ledger = read_json(self.root / 'ledger.json', {})
+        self.assertEqual(ledger['runs']['R1']['status'], 'completed')
+        self.assertEqual(ledger['checkpoint']['events_replayed'], 2)
+        self.assertEqual(strip_volatile(rebuild(self.root)), strip_volatile(ledger))
+        self.assertEqual(_write_in_child(self.root, done)['duplicates']['event'], 1)
+
+    def test_first_write_makes_every_created_ancestor_directory_durable(self):
+        """T exists; T/new/deeper/state is created by the first write. Every new entry must be fsynced up to T."""
+        for creator in ('write_batch', 'event_store'):
+            with self.subTest(creator=creator), tempfile.TemporaryDirectory() as tmp:
+                existing = Path(tmp)
+                root = existing / 'new' / 'deeper' / 'state'
+                calls: list[int] = []
+                with patch('os.fsync', _fsync_by_inode(calls)):
+                    if creator == 'write_batch':
+                        self.assertTrue(record_batch.write_batch(root, sample_batch(), refresh=False)['ok'])
+                    else:
+                        EventStore(root).emit('run_started', run_id='R1')
+                synced = set(calls)
+                for path in (existing, existing / 'new', existing / 'new' / 'deeper', root, root / 'events.jsonl'):
+                    self.assertIn(path.stat().st_ino, synced, f'{creator}: {path.relative_to(existing) if path != existing else "T"} was not fsynced')
+                self.assertTrue(stream_ids(root, 'event'), 'the acknowledged record is in the stream')
+
+    def test_io_meter_refuses_to_report_partial_io_when_the_vfs_hook_is_unavailable(self):
+        with patch.object(record_io_probe, '_sqlite_library', side_effect=OSError('no libsqlite3 symbols')):
+            with self.assertRaises(IoMeterUnsupported):
+                with measure_io():
+                    self.fail('the meter must not yield counts without the SQLite hook')
+            self.assertIn('no libsqlite3', record_io_probe.unsupported_reason())
+        # Hook installs but intercepts nothing (e.g. sqlite3 bound to another library): also unsupported, never partial.
+        with patch.object(record_io_probe, '_exercise_sqlite', lambda path: None):
+            with self.assertRaises(IoMeterUnsupported):
+                with measure_io():
+                    self.fail('an un-intercepted hook must not yield counts')

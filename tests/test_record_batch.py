@@ -809,24 +809,24 @@ class ReviewRegressionTests(TemporaryRootTestCase):
 
 def _checkpoint_snapshot(root: Path) -> dict:
     """Inspect committed cache content without changing it or its independent receipt."""
-    from orchestrator.record_index import DATABASE_FILE
+    from orchestrator.record_index import DATABASE_FILE, decode_key
     db = sqlite3.connect(f'file:{root / DATABASE_FILE}?mode=ro', uri=True)
     try:
         streams = {s: json.loads(value) for s, value in db.execute('SELECT stream, value FROM meta')}
         for stream, entry in streams.items():
-            entry['ids'] = [r[0] for r in db.execute('SELECT record_id FROM ids WHERE stream=? ORDER BY record_id', (stream,))]
+            entry['ids'] = [decode_key(r[0]) for r in db.execute('SELECT record_id FROM ids WHERE stream=? ORDER BY record_id', (stream,))]
         return {'streams': streams}
     finally:
         db.close()
 
 
 def _drop_ids_from_checkpoint(root: Path, removals: dict[str, list[str]]) -> None:
-    from orchestrator.record_index import DATABASE_FILE
+    from orchestrator.record_index import DATABASE_FILE, encode_key
     db = sqlite3.connect(root / DATABASE_FILE)
     try:
         for stream, ids in removals.items():
             for rid in ids:
-                assert db.execute('DELETE FROM ids WHERE stream=? AND record_id=?', (stream, rid)).rowcount == 1
+                assert db.execute('DELETE FROM ids WHERE stream=? AND record_id=?', (stream, encode_key(rid))).rowcount == 1
         db.commit()
         assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
     finally:
@@ -1075,12 +1075,13 @@ class IndexThreatModelTests(TemporaryRootTestCase):
         from orchestrator import record_batch
         _completed_run(self)
         checkpoint = self.root / record_batch.CHECKPOINT_FILE
-        from orchestrator.record_index import DATABASE_FILE, INDEX_VERSION
+        from orchestrator.record_index import DATABASE_FILE, INDEX_VERSION, encode_key
 
         with self.subTest("bit-rot inside an id"):
             db = sqlite3.connect(self.root / DATABASE_FILE)
-            db.execute("UPDATE ids SET record_id='e-l' WHERE stream='event' AND record_id='e-1'")
+            changed = db.execute("UPDATE ids SET record_id=? WHERE stream='event' AND record_id=?", (encode_key('e-l'), encode_key('e-1'))).rowcount
             db.commit(); db.close()
+            self.assertEqual(changed, 1, 'the test must corrupt a real cache key')
             before = (self.root / "events.jsonl").read_bytes()
             body = json.loads(run_batch(self.root, [sample_batch()[0]]).stdout)
             self.assertEqual(body["duplicates"]["event"], 1, "the real id is still present in the stream")

@@ -27,6 +27,15 @@ JSONL combined with append growth are outside the append-only contract: discard
 the receipt/rebuild after an intentional history edit. No canonical bytes are
 ever removed here. Malformed tails have a separately saved observed file identity
 so an unchanged fragment is not repeatedly parsed by unrelated writes.
+
+Cache keys are BLOBs: the exact Python string of a ``record_id`` encoded as UTF-8
+with ``surrogatepass`` (see ``encode_key``). ``json.loads`` accepts an escaped
+lone surrogate such as ``"\\ud800"`` that the sqlite3 TEXT binding rejects; a
+historical line like that must never make derivation raise, or every later write
+would fail forever. The encoding is injective (valid UTF-8 never contains encoded
+surrogates) and reversible, so no two distinct ids share a key. Only string ids
+are indexed: the writer never accepts a non-string id, so a foreign ``7`` has no
+retry to dedup and must not shadow a legitimate new ``"7"``.
 """
 from __future__ import annotations
 
@@ -38,8 +47,17 @@ from typing import Any
 from .runtime import RECORD_INDEX_FILE, read_json, tail_fingerprint
 
 DATABASE_FILE = 'records.index.sqlite3'
-INDEX_VERSION = 1
+INDEX_VERSION = 2  # 2: BLOB keys (surrogatepass); receipts of version 1 (TEXT keys) are discarded
 STREAMS = {'event': 'events.jsonl', 'metric': 'metrics.jsonl', 'outcome': 'outcomes.jsonl'}
+
+
+def encode_key(record_id: str) -> bytes:
+    """Reversible cache key for any Python string, including lone surrogates from historical JSON."""
+    return record_id.encode('utf-8', 'surrogatepass')
+
+
+def decode_key(key: bytes) -> str:
+    return bytes(key).decode('utf-8', 'surrogatepass')
 
 
 def signature(path: Path) -> list[int] | None:
@@ -97,7 +115,7 @@ class RecordIndex:
         self.db = sqlite3.connect(self.root / DATABASE_FILE)
         self.db.execute('PRAGMA journal_mode=DELETE')
         self.db.execute('PRAGMA synchronous=FULL')
-        self.db.execute('CREATE TABLE IF NOT EXISTS ids (stream TEXT NOT NULL, record_id TEXT NOT NULL, '
+        self.db.execute('CREATE TABLE IF NOT EXISTS ids (stream TEXT NOT NULL, record_id BLOB NOT NULL, '
                         'PRIMARY KEY(stream, record_id)) WITHOUT ROWID')
         self.db.execute('CREATE TABLE IF NOT EXISTS meta (stream TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID')
         self.db.execute('BEGIN IMMEDIATE')
@@ -136,8 +154,8 @@ class RecordIndex:
                         record = json.loads(line)
                     except (ValueError, UnicodeDecodeError):
                         record = None
-                    if isinstance(record, dict) and record.get('record_id'):
-                        self.add(stream, str(record['record_id']))
+                    if isinstance(record, dict) and isinstance(record.get('record_id'), str) and record['record_id']:
+                        self.add(stream, record['record_id'])
                     if not complete:
                         tail = 'complete' if isinstance(record, dict) else 'fragment'
                         break
@@ -149,10 +167,10 @@ class RecordIndex:
 
     def contains(self, stream: str, record_id: str) -> bool:
         return self.db.execute('SELECT 1 FROM ids WHERE stream=? AND record_id=?',
-                               (stream, record_id)).fetchone() is not None
+                               (stream, encode_key(record_id))).fetchone() is not None
 
     def add(self, stream: str, record_id: str) -> None:
-        self.db.execute('INSERT OR IGNORE INTO ids VALUES (?, ?)', (stream, record_id))
+        self.db.execute('INSERT OR IGNORE INTO ids VALUES (?, ?)', (stream, encode_key(record_id)))
 
     def commit(self) -> dict[str, Any]:
         for stream, entry in self.entries.items():

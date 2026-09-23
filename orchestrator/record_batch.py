@@ -26,7 +26,7 @@ from typing import Any
 from .dashboard import generate_dashboard
 from .record_index import RecordIndex, STREAMS
 from .runtime import (RECORD_INDEX_FILE, default_attribution, default_state_root, encode_jsonl,
-                      fsync_directory, meter, utc_now, write_json, writer_lock)
+                      ensure_durable_directory, fsync_directory, meter, utc_now, write_json, writer_lock)
 from .state import REDUCER_KEY_FIELDS, invalid_key_field, ledger_is_current, replay_ledger
 
 FORMAT_VERSION = 1
@@ -152,7 +152,7 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
     """Durably append once per ID; report derived-state failure with same-ID retry guidance."""
     validated = validate_batch(records)
     root = Path(root) if root is not None else default_state_root()
-    root.mkdir(parents=True, exist_ok=True)
+    ensure_durable_directory(root)  # every directory entry created here is synced before any record is acknowledged
     persisted = _counts(); duplicates = _counts(); statuses: list[dict[str, Any]] = []
     built: list[dict[str, Any]] = []
     ledger_updated = False; dashboard_updated = False; error: str | None = None; status = 'ok'

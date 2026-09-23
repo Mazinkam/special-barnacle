@@ -34,6 +34,25 @@ def fsync_directory(path: Path):
     try: os.fsync(fd)
     finally: os.close(fd)
 
+def ensure_durable_directory(path: Path) -> Path:
+    """`mkdir -p`, then fsync the parent of every directory this call created, up to the first existing ancestor.
+
+    A stream fsync plus an fsync of the state root only makes the *file* entries durable. When the
+    root itself (or `T/new/state`, several levels) was just created, each new directory entry lives in
+    its parent and needs that parent synced too, or a power loss after an acknowledged write can drop
+    the whole state tree. Existing directories are not fsynced; a concurrent creator makes some of
+    these syncs redundant but never unsafe.
+    """
+    path = Path(path)
+    created: list[Path] = []
+    probe = path
+    while not probe.exists() and probe.parent != probe:
+        created.append(probe); probe = probe.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for directory in created:  # deepest first: `state` in `new`, then `new` in `T`
+        fsync_directory(directory.parent)
+    return path
+
 
 def write_json(path: Path, value: Any, *, compact: bool=False, durable: bool=False):
     for _ in range(100):
@@ -189,7 +208,7 @@ def meter(payload: dict[str,Any]) -> dict[str,Any]:
 
 class EventStore:
     def __init__(self, root: str|Path|None=None):
-        self.root=Path(root) if root is not None else default_state_root(); self.root.mkdir(parents=True,exist_ok=True)
+        self.root=Path(root) if root is not None else default_state_root(); ensure_durable_directory(self.root)
         self.events=self.root/'events.jsonl'; self.metrics=self.root/'metrics.jsonl'; self.discoveries=self.root/'discoveries.jsonl'; self.outcomes=self.root/'outcomes.jsonl'
         for p in [self.events,self.metrics,self.discoveries,self.outcomes]:
             if not p.exists(): p.touch(exist_ok=True)
