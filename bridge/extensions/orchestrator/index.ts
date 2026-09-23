@@ -965,7 +965,7 @@ let ACTIVE_RUN: RunSession | null = null;
  * internally — we just launch it from a context (extension handler) where the
  * human-facing wrapper doesn't have what it needs.
  */
-async function runSubagentProcess(opts: {
+export async function runSubagentProcess(opts: {
 	cwd: string;
 	agentName: string;
 	task: string;
@@ -979,6 +979,13 @@ async function runSubagentProcess(opts: {
 	label?: string;
 	/** Selects the wall clock: orchestrating capabilities wait on their own children. */
 	capability?: string;
+	/**
+	 * Test seam only: replaces the real child launcher. Defaults to node's
+	 * `spawn`; production callers never set this. Lets tests exercise the real
+	 * stream/event/close handling below against a deterministic local fixture
+	 * instead of the actual `humain-terminal --mode json` binary.
+	 */
+	spawnChild?: typeof spawn;
 }): Promise<SubagentProcessResult> {
 	const emptyUsage: SubagentUsageStats = {
 		input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
@@ -1205,8 +1212,9 @@ async function runSubagentProcess(opts: {
 		// Optional so `finish()` can run from the synchronous-spawn-throw path,
 		// where no child was ever created.
 		let proc: ReturnType<typeof spawn> | undefined;
+		const spawnChild = opts.spawnChild ?? spawn;
 		try {
-			proc = spawn(invocation.command, invocation.args, {
+			proc = spawnChild(invocation.command, invocation.args, {
 				cwd: opts.cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
