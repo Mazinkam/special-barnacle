@@ -7,19 +7,17 @@ behind `EventStore.emit/metric/outcome`. It owns four rules that every writer mu
    check → append → fsync → checkpoint → incremental ledger replay. Rebuilds take the same lock,
    so a published ledger always describes a complete prefix of `events.jsonl`.
 2. **Idempotency by stable `record_id`, decided by the authoritative stream.** The checkpoint
-   (`records.checkpoint.json`) caches an *exact* index of every record id per stream. It is only
-   trusted when its `binding` — a SHA-256 over the *entire* complete prefix of the stream file
-   followed by the id list — recomputes from the bytes on disk, so a cached membership can never be
-   accepted without re-reading the authoritative stream it claims to describe. A checkpoint that
-   merely re-hashes itself proves nothing and is rejected; a checkpoint whose id list drifted from
-   the stream (an id lost, an id invented) fails the binding and is rebuilt from the stream before
-   any record is classified. On top of that, a cached "already present" verdict is still confirmed
-   by re-reading the stream before a record is reported as a duplicate. Together: a "new" verdict
-   never rests on an unverified cache, and a "duplicate" verdict never rests on the cache at all.
-   A record whose full JSON is present but lacks its newline counts as present; the newline is
-   added before it is acknowledged so replay sees it. Visible bytes that no checkpoint vouched for
-   (a writer that died between `write` and `fsync`, or whose `fsync` failed) are fsynced before
-   they are acknowledged as duplicates or covered by a checkpoint.
+   (`records.checkpoint.json`) is a rebuildable cache holding an *exact* index of every record id per
+   stream, plus the byte size of the complete prefix it describes. It is trusted for a "new" verdict
+   only after cheap, stream-bound validation (below); a cached "already present" verdict is *never*
+   trusted: the stream is re-read before a record is reported as a duplicate. Together: a false
+   positive in the cache can never discard a record, and a false negative can only be produced by
+   something that read the stream (threat model below). A record whose full JSON is present but
+   lacks its newline counts as present; the newline is added before it is acknowledged so replay sees
+   it. Visible bytes that no checkpoint vouched for (a writer that died between `write` and `fsync`,
+   or whose `fsync` failed) are fsynced before they are acknowledged as duplicates or covered by a
+   checkpoint. No step reads more of the history than the stream's last line (<= 4 KiB) plus whatever
+   lies beyond the checkpointed prefix, so the cost of a write does not grow with the history.
 3. **JSONL is authoritative and append-only.** Records are appended and fsynced before anything is
    acknowledged; the checkpoint and ledger are derived and rebuildable. A batch is validated
    all-or-nothing before any byte is written (shape, stream, record_id, event name, and the
@@ -34,6 +32,35 @@ behind `EventStore.emit/metric/outcome`. It owns four rules that every writer mu
    crash between checkpoint and publish, a newline-less record repaired by an earlier batch whose
    publish failed, an old-code writer, a legacy or missing ledger) the ledger is replayed before
    the batch is acknowledged. A batch that leaves the ledger current does not rewrite it.
+
+Index threat model (what the cache validation does and does not promise)
+------------------------------------------------------------------------
+Every checkpoint entry is `{size, audited_size, ids, binding}` with
+`binding = SHA-256(fingerprint of the stream's last complete line before size ‖ size ‖ audited_size ‖ ids)`.
+The fingerprint is *not* stored in the checkpoint, so the binding cannot be recomputed from the
+checkpoint file alone. Detected before any record is classified, and repaired by re-deriving the
+stream's membership from byte 0 ("accidental" class):
+
+- a missing, unparseable or older-format checkpoint;
+- checkpoint bit-rot or a torn copy (any byte of size/ids/binding changed → binding mismatch);
+- an id list altered by anything that did not read the stream (a tool, a bug, a hand edit);
+- a checkpoint that describes another state of the stream: the file shrank, `size` no longer lands
+  on a line boundary, or the last checkpointed line was rewritten, rotated or restored;
+- a stale checkpoint (crash after append, failed checkpoint write, unsynced bytes, an old-code
+  writer): the bytes beyond `size` are reconciled from the stream and fsynced before acknowledgment.
+
+Not detected per write, and out of scope for per-write validation: an index written by something
+that *did* read the stream and produced a wrong membership with a matching binding. No check that
+avoids re-reading the whole history can distinguish it from an honest index, because a verifier's
+inputs (the checkpoint plus O(1) bytes of stream) are available to whoever wrote the forgery; and
+whoever can write this state directory can forge the authoritative JSONL directly, so the index is
+not a privileged surface relative to the streams. What *is* guaranteed even then: a record is never
+lost (a wrong "new" only appends an extra copy); full replay (`state.rebuild`) collapses copies by
+`record_id` and discards the index so the next write re-derives it; and every stream's membership
+is re-derived from byte 0 whenever the stream has at least doubled since the last full derivation
+(`audited_size`, geometric so the total audit cost stays linear in the history), which bounds how
+long any inconsistent index — however produced — can survive. Incremental ledger replay does not
+collapse duplicates; `rebuild` is the recovery path.
 
 Persisted format (`format_version` 1): one JSON object per line, each carrying `record_id`, `ts`,
 `agent_runtime`, `repository`, and the caller's payload (`event` records carry `event`; metric
@@ -59,20 +86,20 @@ from pathlib import Path
 from typing import Any
 
 from .dashboard import generate_dashboard
-from .runtime import (default_attribution, default_state_root, encode_jsonl, iter_jsonl_from, meter, read_json,
-                      utc_now, write_json, writer_lock)
+from .runtime import (RECORD_INDEX_FILE, default_attribution, default_state_root, encode_jsonl, iter_jsonl_from, meter,
+                      read_json, tail_fingerprint, utc_now, write_json, writer_lock)
 from .state import REDUCER_KEY_FIELDS, invalid_key_field, ledger_is_current, replay_ledger
 
 FORMAT_VERSION = 1
-CHECKPOINT_FILE = 'records.checkpoint.json'
-CHECKPOINT_VERSION = 3
+CHECKPOINT_FILE = RECORD_INDEX_FILE
+CHECKPOINT_VERSION = 4
+AUDIT_GROWTH = 2  # re-derive a stream's membership from byte 0 once it is this many times the last audited size
 STREAMS: dict[str, str] = {'event': 'events.jsonl', 'metric': 'metrics.jsonl', 'outcome': 'outcomes.jsonl'}
 MAX_BATCH_RECORDS = 500
 MAX_RECORD_ID_LENGTH = 200
 RESERVED_KEYS = {'stream'}
 RETRY_SAME_IDS = 'same_ids'
 _TAIL_CHUNK = 65536
-_HASH_CHUNK = 1 << 20
 
 
 class BatchValidationError(ValueError):
@@ -162,26 +189,19 @@ def build_record(record: dict[str, Any]) -> dict[str, Any]:
 
 # --- exact id index (checkpoint) ---------------------------------------------------------------
 
-def _binding(path: Path, size: int, ids: list[str]) -> str:
-    """Checksum binding an id list to the authoritative stream prefix it was derived from.
+def _binding(path: Path, size: int, audited_size: int, ids: list[str]) -> str:
+    """Checksum binding a checkpoint entry to the stream state it describes.
 
-    SHA-256 over the first `size` bytes of the stream file, a NUL separator (JSON cannot contain
-    one), then the JSON-encoded id list. It cannot be recomputed from the checkpoint alone: anyone
-    producing a matching value must have read exactly those stream bytes. Verifying it therefore
-    re-reads the whole complete prefix on every load — the cost of never trusting cached
-    membership blind (~6 ms per 50 000 records). A file shorter than `size` yields a value that
-    matches nothing.
+    SHA-256 over the fingerprint of the last complete line ending at `size` (read from the stream,
+    never stored in the checkpoint), the sizes, and the JSON-encoded id list. Recomputing it needs the
+    stream's tail, so an entry edited without reading the stream, an entry whose bytes rotted, or an
+    entry describing a stream whose last checkpointed line changed all fail to validate. Reads at most
+    `runtime.TAIL_FINGERPRINT_BYTES` of the stream. See the module docstring for what it does not prove.
     """
-    digest = hashlib.sha256()
-    remaining = size
-    if remaining:
-        with path.open('rb') as handle:
-            while remaining > 0:
-                chunk = handle.read(min(remaining, _HASH_CHUNK))
-                if not chunk:
-                    return 'short'
-                digest.update(chunk); remaining -= len(chunk)
-    digest.update(b'\0'); digest.update(json.dumps(ids, separators=(',', ':')).encode('utf-8'))
+    digest = hashlib.sha256(b'record-index\0')
+    digest.update(str(tail_fingerprint(path, size)).encode('utf-8')); digest.update(b'\0')
+    digest.update(f'{size}\0{audited_size}\0'.encode('ascii'))
+    digest.update(json.dumps(ids, separators=(',', ':')).encode('utf-8'))
     return digest.hexdigest()
 
 
@@ -199,17 +219,21 @@ def _record_id_of(record: Any) -> str | None:
     return None
 
 
-def _scan_ids(path: Path, offset: int, into: list[str]) -> tuple[int, str | None]:
+def _scan_ids(path: Path, offset: int, into: list[str], known: set[str]) -> tuple[int, str | None]:
     """Collect record ids from `offset` on. Returns (complete-prefix end, tail kind).
 
     Tail kind is None (stream ends in a newline), 'complete' (a whole record missing only its
     newline; its id is collected because the record is already durable data) or 'fragment'.
+    Ids already in `known` (repeated lines) are not collected twice.
     """
+    def collect(record: Any) -> None:
+        rid = _record_id_of(record)
+        if rid and rid not in known:
+            into.append(rid); known.add(rid)
+
     end = offset
     for record, end in iter_jsonl_from(path, offset):
-        rid = _record_id_of(record)
-        if rid:
-            into.append(rid)
+        collect(record)
     size = path.stat().st_size if path.exists() else 0
     if size <= end:
         return end, None
@@ -217,25 +241,26 @@ def _scan_ids(path: Path, offset: int, into: list[str]) -> tuple[int, str | None
         handle.seek(end)
         tail = handle.read()
     if _is_complete_record(tail):
-        rid = _record_id_of(json.loads(tail))
-        if rid:
-            into.append(rid)
+        collect(json.loads(tail))
         return end, 'complete'
     return end, 'fragment'
 
 
 def _valid_entry(entry: Any, path: Path, size_now: int) -> bool:
-    """Does this checkpoint entry still describe a complete prefix of the stream, with membership bound to it?"""
+    """Does this checkpoint entry still describe a complete prefix of the stream, with its binding intact?"""
     if not isinstance(entry, dict):
         return False
-    size = entry.get('size'); ids = entry.get('ids')
-    if isinstance(size, bool) or not isinstance(size, int) or size < 0 or size > size_now:
+    size = entry.get('size'); audited = entry.get('audited_size'); ids = entry.get('ids')
+    for value in (size, audited):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return False
+    if size > size_now or audited > size:
         return False
     if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
         return False
     if size and not _ends_line(path, size):
         return False
-    return isinstance(entry.get('binding'), str) and entry['binding'] == _binding(path, size, ids)
+    return isinstance(entry.get('binding'), str) and entry['binding'] == _binding(path, size, audited, ids)
 
 
 def _ends_line(path: Path, size: int) -> bool:
@@ -245,17 +270,24 @@ def _ends_line(path: Path, size: int) -> bool:
 
 
 def _from_stream(path: Path, entry: dict[str, Any], offset: int, ids: list[str]) -> None:
-    end, tail = _scan_ids(path, offset, ids)
-    entry.update({'size': end, 'ids': ids, 'known': set(ids), 'tail': tail})
+    """Extend `ids` (membership of the prefix ending at `offset`) with everything the stream holds beyond it."""
+    known = set(ids)
+    end, tail = _scan_ids(path, offset, ids, known)
+    entry.update({'size': end, 'ids': ids, 'known': known, 'tail': tail})
+    if offset == 0:
+        entry['audited_size'] = end
 
 
 def _load_index(root: Path) -> dict[str, dict[str, Any]]:
-    """Exact record-id index per stream: the checkpoint where its binding to the stream verifies, the stream otherwise.
+    """Exact record-id index per stream: the checkpoint where it validates and is not due for an audit, the stream otherwise.
 
-    Verifying the binding re-reads every stream's complete prefix, so a cached membership is only
-    ever used after the authoritative bytes it was derived from have been confirmed byte-for-byte.
-    `durable_size` is how many bytes an earlier writer's checkpoint vouched as fsynced; anything the
-    index learns beyond that from the stream itself must be fsynced before it is acknowledged.
+    Validation reads only the stream's last checkpointed line (`_binding`), so a load costs the same
+    however long the history is; the bytes beyond the checkpointed prefix are then reconciled from
+    the stream. Once a stream has grown to `AUDIT_GROWTH` times the size at which its membership was
+    last derived from byte 0, it is derived from byte 0 again (geometric, so linear in total) and the
+    old entry's durability claim is dropped with it. `durable_size` is how many bytes an earlier
+    writer's checkpoint vouched as fsynced; anything the index learns beyond that from the stream
+    itself must be fsynced before it is acknowledged.
     """
     raw = read_json(root / CHECKPOINT_FILE, None)
     saved = raw.get('streams') if isinstance(raw, dict) and raw.get('format_version') == CHECKPOINT_VERSION else None
@@ -266,9 +298,10 @@ def _load_index(root: Path) -> dict[str, dict[str, Any]]:
         path = root / name
         size_now = path.stat().st_size if path.exists() else 0
         saved_entry = saved.get(stream)
-        entry: dict[str, Any] = {'durable_size': 0}
-        if _valid_entry(saved_entry, path, size_now):
+        entry: dict[str, Any] = {'durable_size': 0, 'audited_size': 0}
+        if _valid_entry(saved_entry, path, size_now) and size_now < AUDIT_GROWTH * saved_entry['audited_size']:
             entry['durable_size'] = saved_entry['size']
+            entry['audited_size'] = saved_entry['audited_size']
             _from_stream(path, entry, saved_entry['size'], list(saved_entry['ids']))
         else:
             _from_stream(path, entry, 0, [])
@@ -282,11 +315,12 @@ def _rebuild_from_stream(root: Path, stream: str, entry: dict[str, Any]) -> None
 
 
 def _write_checkpoint(root: Path, index: dict[str, dict[str, Any]]) -> None:
-    """Publish the index, binding each id list to the fsynced stream bytes it now describes (re-read from disk)."""
+    """Publish the index, binding each entry to the fsynced stream tail it now describes (re-read from disk)."""
     streams = {}
     for stream, entry in index.items():
-        size = entry['size']; ids = list(entry['ids'])
-        streams[stream] = {'size': size, 'ids': ids, 'binding': _binding(root / STREAMS[stream], size, ids)}
+        size = entry['size']; audited = min(entry['audited_size'], size); ids = list(entry['ids'])
+        streams[stream] = {'size': size, 'audited_size': audited, 'ids': ids,
+                           'binding': _binding(root / STREAMS[stream], size, audited, ids)}
     write_json(root / CHECKPOINT_FILE, {'format_version': CHECKPOINT_VERSION, 'streams': streams}, compact=True)
 
 
@@ -350,7 +384,7 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
     with writer_lock(root):
         try:
             index = _load_index(root)
-            # The loaded index is already bound to the stream bytes; a cached "present" verdict is
+            # The loaded index passed its stream-bound validation; a cached "present" verdict is
             # nevertheless confirmed against the authoritative stream before it can turn a record
             # into a duplicate; the rebuilt index then decides for the whole stream.
             for stream in {r['stream'] for r in validated if r['record_id'] in index[r['stream']]['known']}:

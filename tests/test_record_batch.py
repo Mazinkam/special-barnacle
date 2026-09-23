@@ -6,6 +6,7 @@ checkpoint and ledger behaviour is exercised across process boundaries rather th
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -546,8 +547,8 @@ class ReviewRegressionTests(TemporaryRootTestCase):
             raw = json.loads(checkpoint.read_text())
             entry = raw["streams"]["event"]
             entry["ids"].append(record_id)
-            if consistent:  # forge the stream-bound checksum too (needs the stream bytes): consistent but wrong
-                entry["binding"] = record_batch._binding(self.root / "events.jsonl", entry["size"], entry["ids"])
+            if consistent:  # forge the stream-bound checksum too (needs the stream's tail): consistent but wrong
+                entry["binding"] = record_batch._binding(self.root / "events.jsonl", entry["size"], entry["audited_size"], entry["ids"])
             checkpoint.write_text(json.dumps(raw), encoding="utf-8")
 
         for label, consistent in (("detectable corruption", False), ("internally consistent but wrong", True)):
@@ -825,15 +826,25 @@ def _drop_ids_from_checkpoint(root: Path, removals: dict[str, list[str]]) -> Non
     checkpoint.write_text(json.dumps(raw), encoding="utf-8")
 
 
+def _completed_run(case: TemporaryRootTestCase) -> list[dict]:
+    """sample_batch() followed by run_completed, so a stale run_started retry is the worst case for the ledger."""
+    late = [{"stream": "event", "record_id": "e-late", "event": "run_completed", "run_id": "R1"}]
+    case.assertEqual(run_batch(case.root, sample_batch()).returncode, 0)
+    case.assertEqual(run_batch(case.root, late).returncode, 0)
+    case.assertEqual(read_json(case.root / "ledger.json", {})["runs"]["R1"]["status"], "completed")
+    return late
+
+
 class SecurityReviewRound2Tests(TemporaryRootTestCase):
-    """A cached 'not present' verdict is never the sole basis for an append, and ledger catch-up is authoritative."""
+    """An index altered without re-deriving it from the stream fails its stream-bound checksum and is rebuilt.
+
+    `_drop_ids_from_checkpoint` recomputes everything derivable from the checkpoint file alone; the
+    binding also covers bytes of the stream, so it is not recomputed here. The adversary who *does*
+    read the stream is the round-3 case (`IndexThreatModelTests`).
+    """
 
     def _completed_run(self) -> list[dict]:
-        late = [{"stream": "event", "record_id": "e-late", "event": "run_completed", "run_id": "R1"}]
-        self.assertEqual(run_batch(self.root, sample_batch()).returncode, 0)
-        self.assertEqual(run_batch(self.root, late).returncode, 0)
-        self.assertEqual(read_json(self.root / "ledger.json", {})["runs"]["R1"]["status"], "completed")
-        return late
+        return _completed_run(self)
 
     # A false-negative index (an id the stream has but the cache lost) must not append the record again.
     def test_index_missing_existing_ids_cannot_append_them_again_or_regress_the_ledger(self):
@@ -938,6 +949,204 @@ class SecurityReviewRound2Tests(TemporaryRootTestCase):
         again = record_batch.write_batch(self.root, metric)
         self.assertTrue(again["ok"]); self.assertFalse(again["ledger_updated"])
         self.assertEqual(read_json(self.root / "ledger.json", {})["runs"]["R1"]["status"], "completed")
+
+
+def _forge_index_with_stream_access(root: Path, removals: dict[str, list[str]]) -> None:
+    """The round-3 adversary: drop ids the stream contains and recompute *every* checksum, stream-bound ones included.
+
+    Whoever can do this can read (and, in this state directory, write) the authoritative stream, so no
+    check the writer can afford without re-reading the whole history distinguishes the result from an
+    honest index. The tests below pin what the writer guarantees anyway.
+    """
+    from orchestrator import record_batch
+    checkpoint = root / record_batch.CHECKPOINT_FILE
+    raw = json.loads(checkpoint.read_text(encoding="utf-8"))
+    for stream, ids in removals.items():
+        entry = raw["streams"][stream]
+        for rid in ids:
+            assert rid in entry["ids"], f"{rid} must be present before it is dropped"
+            entry["ids"].remove(rid)
+        entry["binding"] = record_batch._binding(root / STREAM_FILES[stream], entry["size"], entry["audited_size"], entry["ids"])
+    checkpoint.write_text(json.dumps(raw), encoding="utf-8")
+
+
+class _CountingFile:
+    """Binary read proxy that counts the bytes handed to the caller."""
+
+    def __init__(self, raw, counter: list[int]):
+        self._raw = raw; self._counter = counter
+
+    def read(self, n: int = -1):
+        data = self._raw.read(n); self._counter[0] += len(data); return data
+
+    def readline(self, *args):
+        line = self._raw.readline(*args); self._counter[0] += len(line); return line
+
+    def __iter__(self): return self
+
+    def __next__(self):
+        line = next(self._raw); self._counter[0] += len(line); return line
+
+    def __enter__(self): return self
+
+    def __exit__(self, *exc): return self._raw.__exit__(*exc)
+
+    def __getattr__(self, name): return getattr(self._raw, name)
+
+
+def _count_stream_bytes_read(fn):
+    """Run `fn()` and return how many bytes it read from `*.jsonl` files (buffered opens and os.pread)."""
+    counter = [0]
+    real_open = io.open; real_pread = os.pread
+
+    def counting_open(file, mode="r", *args, **kwargs):
+        handle = real_open(file, mode, *args, **kwargs)
+        if str(file).endswith(".jsonl") and "b" in mode and "r" in mode:
+            return _CountingFile(handle, counter)
+        return handle
+
+    def counting_pread(fd, n, offset):
+        data = real_pread(fd, n, offset); counter[0] += len(data); return data
+
+    with patch("io.open", counting_open), patch("os.pread", counting_pread):
+        fn()
+    return counter[0]
+
+
+def _fill_streams(root: Path, per_stream: int) -> None:
+    """`per_stream` events and metrics with distinct ids, appended through the writer in maximal batches."""
+    from orchestrator import record_batch
+    for stream in ("event", "metric"):
+        for start in range(0, per_stream, record_batch.MAX_BATCH_RECORDS):
+            rows = []
+            for i in range(start, min(start + record_batch.MAX_BATCH_RECORDS, per_stream)):
+                if stream == "event":
+                    rows.append({"stream": "event", "record_id": f"e-{i}", "event": "task_created", "run_id": f"R{i // 50}", "task_id": f"T{i}"})
+                else:
+                    rows.append({"stream": "metric", "record_id": f"m-{i}", "event": "model_call", "run_id": f"R{i // 50}",
+                                 "task_id": f"T{i}", "model": "claude-sonnet-4-5", "input_tokens": 100, "output_tokens": 50})
+            record_batch.write_batch(root, rows, refresh=False)
+
+
+class IndexThreatModelTests(TemporaryRootTestCase):
+    """Round 3: the record index is a rebuildable cache with a documented threat model, not a per-write history scan.
+
+    Accidental corruption (bit-rot, a checkpoint that no longer describes this stream, an id list
+    altered without reading the stream) is detected before any record is classified. An index forged
+    by something that *did* read the stream is indistinguishable from an honest one without re-reading
+    the whole history; its only effect is an extra copy of a record (never a lost one), bounded by the
+    periodic re-derivation from byte 0 and by `rebuild`, and collapsed by full replay.
+    """
+
+    def _checkpoint_ids(self, stream: str) -> list[str]:
+        from orchestrator import record_batch
+        return json.loads((self.root / record_batch.CHECKPOINT_FILE).read_text(encoding="utf-8"))["streams"][stream]["ids"]
+
+    # --- intentional modification by a stream reader: bounded and recoverable, documented ---------
+
+    def test_index_forged_by_a_stream_reader_is_recovered_by_rebuild(self):
+        from orchestrator.state import rebuild
+        _completed_run(self)
+        _forge_index_with_stream_access(self.root, {"event": ["e-1", "e-2"]})
+        retry = run_batch(self.root, [sample_batch()[0]])  # stale run_started after run_completed
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        # Documented limit: the forged index passes every affordable check, so the record is appended
+        # again. It is never lost, and JSONL stays authoritative: full replay collapses the copy.
+        self.assertEqual(json.loads(retry.stdout)["persisted"]["event"], 1)
+        self.assertEqual(stream_ids(self.root, "event").count("e-1"), 2)
+        ledger = rebuild(self.root)
+        self.assertEqual(ledger["runs"]["R1"]["status"], "completed", "full replay collapses the duplicate by record_id")
+        self.assertEqual(ledger["checkpoint"]["events_replayed"], 4)
+        # `rebuild` is the recovery path for derived state: the forged index is discarded and the next
+        # write re-derives membership from the stream, so e-2 (forged away, never re-appended) dedups.
+        events_after = (self.root / "events.jsonl").read_bytes()
+        retry = run_batch(self.root, [sample_batch()[2]])
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        body = json.loads(retry.stdout)
+        self.assertEqual(body["duplicates"], {"event": 1, "metric": 0, "outcome": 0}, "after rebuild the index must come from the stream")
+        self.assertEqual((self.root / "events.jsonl").read_bytes(), events_after)
+        self.assertEqual(sorted(set(self._checkpoint_ids("event"))), ["e-1", "e-2", "e-3", "e-late"])
+        self.assertEqual(read_json(self.root / "ledger.json", {})["runs"]["R1"]["status"], "completed")
+        self.assertEqual(strip_volatile(rebuild(self.root)), strip_volatile(read_json(self.root / "ledger.json", {})))
+
+    def test_forged_index_is_re_derived_from_the_stream_once_it_doubles(self):
+        from orchestrator import record_batch
+        _completed_run(self)
+        _forge_index_with_stream_access(self.root, {"metric": ["m-1"]})
+        metrics = self.root / "metrics.jsonl"
+        size_at_forgery = metrics.stat().st_size
+        i = 0
+        while metrics.stat().st_size < 2 * size_at_forgery:  # honest growth, no retries of m-1
+            i += 1
+            record_batch.write_batch(self.root, [{"stream": "metric", "record_id": f"grow-{i}", "event": "model_call", "run_id": "R1",
+                                                  "model": "gpt-4o", "input_tokens": 1, "output_tokens": 1}], refresh=False)
+        # The next load finds the stream at least doubled since its last derivation from byte 0 and re-derives it.
+        record_batch.write_batch(self.root, [{"stream": "metric", "record_id": "grow-last", "event": "model_call", "run_id": "R1",
+                                              "model": "gpt-4o", "input_tokens": 1, "output_tokens": 1}], refresh=False)
+        self.assertIn("m-1", self._checkpoint_ids("metric"), "the audit must have re-derived membership from the stream")
+        saved = json.loads((self.root / record_batch.CHECKPOINT_FILE).read_text(encoding="utf-8"))["streams"]["metric"]
+        self.assertGreaterEqual(saved["audited_size"], 2 * size_at_forgery)
+        before = metrics.read_bytes()
+        retry = record_batch.write_batch(self.root, [sample_batch()[1]], refresh=False)
+        self.assertEqual(retry["duplicates"]["metric"], 1)
+        self.assertEqual(metrics.read_bytes(), before)
+
+    # --- accidental corruption: detected before any record is classified -------------------------
+
+    def test_accidental_index_corruption_is_detected_before_any_record_is_classified(self):
+        from orchestrator import record_batch
+        _completed_run(self)
+        checkpoint = self.root / record_batch.CHECKPOINT_FILE
+        honest = checkpoint.read_text(encoding="utf-8")
+
+        with self.subTest("bit-rot inside an id"):
+            raw = json.loads(honest); raw["streams"]["event"]["ids"][0] = "e-1".replace("1", "l")
+            checkpoint.write_text(json.dumps(raw), encoding="utf-8")
+            before = (self.root / "events.jsonl").read_bytes()
+            body = json.loads(run_batch(self.root, [sample_batch()[0]]).stdout)
+            self.assertEqual(body["duplicates"]["event"], 1, "the real id is still present in the stream")
+            self.assertEqual((self.root / "events.jsonl").read_bytes(), before)
+            self.assertEqual(self._checkpoint_ids("event"), ["e-1", "e-2", "e-3", "e-late"])
+
+        with self.subTest("checkpoint from another stream state (last line rewritten in place)"):
+            events = self.root / "events.jsonl"
+            data = events.read_bytes()
+            self.assertEqual(data.count(b'"e-late"'), 1)
+            events.write_bytes(data.replace(b'"e-late"', b'"e-LATE"'))  # same size, different last line
+            body = json.loads(run_batch(self.root, [{"stream": "event", "record_id": "e-LATE", "event": "run_completed", "run_id": "R1"}]).stdout)
+            self.assertEqual(body["duplicates"]["event"], 1, "membership must be re-derived from the rewritten stream")
+            self.assertEqual(stream_ids(self.root, "event"), ["e-1", "e-2", "e-3", "e-LATE"])
+            self.assertEqual(self._checkpoint_ids("event"), ["e-1", "e-2", "e-3", "e-LATE"])
+
+        with self.subTest("previous checkpoint format"):
+            raw = json.loads(checkpoint.read_text(encoding="utf-8")); raw["format_version"] = record_batch.CHECKPOINT_VERSION - 1
+            checkpoint.write_text(json.dumps(raw), encoding="utf-8")
+            body = json.loads(run_batch(self.root, sample_batch()).stdout)
+            self.assertEqual(body["duplicates"], {"event": 3, "metric": 1, "outcome": 1})
+            self.assertEqual(json.loads(checkpoint.read_text(encoding="utf-8"))["format_version"], record_batch.CHECKPOINT_VERSION)
+
+    # --- cost of a new write does not scale with the history (1x / 2x / 4x fixtures) --------------
+
+    def test_new_write_reads_a_bounded_amount_of_history(self):
+        from orchestrator import record_batch
+        measured: dict[int, int] = {}
+        for multiplier in (1, 2, 4):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp, "state")
+                _fill_streams(root, 600 * multiplier)
+
+                def probe(i: int, root=root):
+                    return record_batch.write_batch(root, [{"stream": "event", "record_id": f"probe-{i}", "event": "task_created",
+                                                            "run_id": "RP", "task_id": f"P{i}"}], refresh=False)
+
+                probe(0); probe(1)  # let any due periodic re-derivation happen before measuring
+                measured[multiplier] = _count_stream_bytes_read(lambda: probe(2))
+                self.assertEqual(stream_ids(root, "event")[-3:], ["probe-0", "probe-1", "probe-2"])
+                history = sum((root / name).stat().st_size for name in STREAM_FILES.values() if (root / name).exists())
+                self.assertGreater(history, 1e5 * multiplier)
+        self.assertLess(measured[1], 64 * 1024, f"a single write must not read the history: {measured}")
+        self.assertLessEqual(measured[4], measured[1] + 4096, f"bytes read per write must not grow with history: {measured}")
+        self.assertLessEqual(measured[2], measured[1] + 4096, measured)
 
 
 if __name__ == "__main__":

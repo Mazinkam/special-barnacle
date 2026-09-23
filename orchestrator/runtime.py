@@ -57,6 +57,7 @@ def exclusive_file_lock(path: Path):
         finally: fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 WRITER_LOCK_FILE='ledger.lock'
+RECORD_INDEX_FILE='records.checkpoint.json'  # derived record-id index owned by record_batch; rebuild() discards it
 
 def writer_lock(root: Path):
     """The single process-wide lock that serializes check/append/checkpoint/ledger writes.

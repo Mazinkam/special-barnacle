@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Any
-from .runtime import EventStore, write_json, read_json, utc_now, writer_lock, iter_jsonl_from, tail_fingerprint
+from .runtime import EventStore, write_json, read_json, utc_now, writer_lock, iter_jsonl_from, tail_fingerprint, RECORD_INDEX_FILE
 
 LEDGER_FILE='ledger.json'
 LEDGER_CHECKPOINT_VERSION=1
@@ -116,9 +116,16 @@ def ledger_is_current(root: str|Path, events_offset:int)->bool:
     return ck is not None and ck['events_offset']==events_offset
 
 def rebuild(root: str|Path|None=None)->dict[str,Any]:
-    """Full recovery replay of events.jsonl into ledger.json (serialized with all writers)."""
+    """Full recovery replay of events.jsonl into ledger.json (serialized with all writers).
+
+    Every derived file is re-derived from the authoritative JSONL: the ledger is replayed from byte 0
+    (collapsing repeated record_ids) and the record-id index is discarded so the next writer rebuilds
+    its membership from the streams instead of trusting a cache that may be wrong.
+    """
     root=EventStore(root).root
-    with writer_lock(root): return replay_ledger(root,full=True)
+    with writer_lock(root):
+        (root/RECORD_INDEX_FILE).unlink(missing_ok=True)
+        return replay_ledger(root,full=True)
 
 def refresh_ledger(root: str|Path|None=None)->dict[str,Any]:
     """Incremental catch-up of the ledger from its durable event offset (serialized with all writers)."""
