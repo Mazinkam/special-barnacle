@@ -17,7 +17,7 @@
  *   5. spawn subagent via HT subagent tool   -> dispatchHierarchical
  *   6. record every model call              -> captureDispatchCost
  *   7. run deterministic verification       -> runVerification
- *   8. build QualityEvidence + verify_task   -> verifyTask
+ *   8. QA gate verdict (the only verdict)   -> runVerification + recordOutcome
  *   9. escalate only the failing subproblem -> escalateIfNeeded
  *  10. complete_run / fail_run              -> completeRun / failRun + recordOutcome
  *
@@ -1800,14 +1800,30 @@ async function recordOutcome(outcome: Record<string, unknown>): Promise<void> {
 	}
 }
 
-async function completeRun(runId: string, summary: Record<string, unknown>): Promise<void> {
-	await recordOutcome({
+export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality: number, note: string): Record<string, unknown> {
+	return {
+		run_id: runId,
+		task_id: `${runId}-qa`,
+		outcome: passed ? "verified" : "fail",
+		verification_scope: "run",
+		quality,
+		note,
+	};
+}
+
+export function runCompletionOutcomeFor(runId: string, summary: Record<string, unknown>): Record<string, unknown> {
+	return {
 		run_id: runId,
 		task_id: "run-complete",
-		outcome: "verified",
+		outcome: summary.verification_passed === false ? "fail" : "verified",
+		verification_scope: "run",
 		quality: summary.success_rate ?? 0,
 		note: JSON.stringify(summary),
-	});
+	};
+}
+
+async function completeRun(runId: string, summary: Record<string, unknown>): Promise<void> {
+	await recordOutcome(runCompletionOutcomeFor(runId, summary));
 }
 
 async function failRun(runId: string, error: string): Promise<void> {
@@ -1815,6 +1831,7 @@ async function failRun(runId: string, error: string): Promise<void> {
 		run_id: runId,
 		task_id: "run-failed",
 		outcome: "fail",
+		verification_scope: "run",
 		quality: 0,
 		note: error,
 	});
@@ -2275,22 +2292,69 @@ async function captureDispatchCost(
 	opts: CaptureOpts,
 	result: DispatchResult,
 ): Promise<void> {
+	for (const record of dispatchRecordsFor(opts, result)) {
+		await recordModelCall(record);
+	}
+}
+
+/**
+ * Every metrics row one dispatch is accountable for, as pure data so the whole
+ * set can be asserted without spawning the Python CLI. Exactly two rows — and
+ * deliberately not a third.
+ *
+ * There is no `task_verified` / `task_failed` row here. `records.py` classifies
+ * those events as ATTESTED, its strongest evidence class, meaning "a runtime
+ * states that this task cleared its quality gates". A process exit code cannot
+ * support that claim, and deriving one from it is the exact conflation this
+ * branch exists to remove — it is how `Verified tasks` read 174 when 22 tasks
+ * had a real verdict. Three reasons, all reproducible:
+ *
+ * 1. Redundancy. The dispatch-level signal is already reported twice, honestly:
+ *    `result: 'pass' | 'fail'` on the `model_call` row and `executed_passes` on
+ *    the `route_executed` row. `records.py` reads `result` as DISPATCH strength,
+ *    which is exactly what an exit code is worth.
+ * 2. Ordering. `runVerification` bills its QA dispatch through here BEFORE the
+ *    gate verdict exists (`qaResult.exitCode === 0 && failedChecks.length === 0`
+ *    is computed afterwards). A QA agent that exits 0 while reporting failed
+ *    checks therefore emitted an attested `task_verified` while `recordOutcome`
+ *    wrote `outcome: 'fail'` for the SAME `task_id`.
+ * 3. Attribution. Five of the six call sites dispatch coordination, not
+ *    deliverable tasks: `${runId}-architect`, `${runId}-lead-${i}`,
+ *    `triage-<slug>`, the escalation retry, and the QA pass itself. Attesting
+ *    verification of a synthetic coordination id asserts nothing about work.
+ *
+ * Per-task attestation is not derivable in this bridge, so the gap is left
+ * honest rather than filled with a fabrication (`records.UNINSTRUMENTED_FIELDS`
+ * exists so the dashboard can report exactly that): one QA pass returns ONE
+ * verdict over the union of changed files; `changedSince` flattens that union to
+ * a `string[]` whose task provenance does not survive the git-snapshot
+ * intersection; `failedChecks` names checks (`typecheck`), not tasks; and the
+ * real deliverable tasks are the leads' own workers, which this bridge never
+ * observes (`dispatchHierarchical` returns `workerResults: []`). The one genuine
+ * gate verdict that does exist is written by `runVerification` through
+ * `recordOutcome`, after `failedChecks` is known.
+ */
+export function dispatchRecordsFor(
+	opts: CaptureOpts,
+	result: DispatchResult,
+): Record<string, unknown>[] {
 	// Defensive defaults: every field on `result` may be sparse when HT
 	// returns a partial / cancelled dispatch. Normalize once at the top so
-	// the metric payload below is always well-formed and the split() on
+	// the metric payloads below are always well-formed and the split() on
 	// the model id can't throw.
 	const model = result?.model ?? "unknown";
 	const usage = result?.usage ?? {};
 	const provider = model.includes("/") ? model.split("/")[0] : "unknown";
+	const taskId = result?.taskId ?? `unknown-${opts.runId}`;
 
 	// 1. The model_call record HT actually produced. `cost_source: "reported"`
 	//    means the harness reported cost directly; if cost is missing, the
 	//    pricing table resolves it to `estimated`.
 	const hasReportedCost = (result?.costUsd ?? 0) > 0;
-	await recordModelCall({
+	return [{
 		event: "model_call",
 		run_id: opts.runId,
-		task_id: result?.taskId ?? `unknown-${opts.runId}`,
+		task_id: taskId,
 		task_class: opts.taskClass,
 		complexity: opts.complexity,
 		risk: opts.risk,
@@ -2312,16 +2376,14 @@ async function captureDispatchCost(
 		stop_reason: result?.stopReason,
 		files_changed: result?.filesChanged ?? [],
 		plan_id: opts.planId,
-	});
-
-	// 2. The executed-route record. This is the closing half of the
-	//    (recommended, executed, observed) triple: the plan-time
-	//    `adaptive_route_decision` event already has `recommended_*`; this
-	//    event records what was actually dispatched and what it cost.
-	await recordModelCall({
+	}, {
+		// 2. The executed-route record. This is the closing half of the
+		//    (recommended, executed, observed) triple: the plan-time
+		//    `adaptive_route_decision` event already has `recommended_*`; this
+		//    event records what was actually dispatched and what it cost.
 		event: "route_executed",
 		run_id: opts.runId,
-		task_id: result?.taskId ?? `unknown-${opts.runId}`,
+		task_id: taskId,
 		plan_id: opts.planId,
 		task_class: opts.taskClass,
 		complexity: opts.complexity,
@@ -2342,34 +2404,8 @@ async function captureDispatchCost(
 		recommended_estimated_quality_evidence:
 			opts.recommended.estimated_quality_evidence,
 		adaptive_mode: opts.mode,
-	});
+	}];
 
-	// 3. Task verification. `executed_passes` above IS the authoritative
-	//    pass/fail decision for this dispatch — this is not a second source
-	//    of truth, just the same boolean reported under the canonical
-	//    vocabulary Python's `Engine.verify_task()` and `records.py` expect
-	//    (`event: task_verified|task_failed`, `result: verified|fail`) so the
-	//    runtime that actually does the work also reports the outcome.
-	//    `quality_evidence_score` is deliberately omitted: nothing at this
-	//    call site has graded evidence (only a binary exit code), and
-	//    `records.INSTRUMENTED_FIELDS` documents that field as written only
-	//    by `Engine.verify_task` in tests — fabricating a number here would be
-	//    worse than the dashboard's current em-dash. No `cost_usd` either:
-	//    `records.classify` treats task_verified/task_failed as a non-cost
-	//    EVENT, and the model_call record above already reported the spend.
-	//    `review_wait_ms` is likewise omitted: nothing in dispatchParallel /
-	//    mapWithConcurrency timestamps when a task entered the queue versus
-	//    when its worker actually started, so deriving a wait would require
-	//    new bookkeeping, not a read of an existing value.
-	const passed = result?.exitCode === 0;
-	await recordModelCall({
-		event: passed ? "task_verified" : "task_failed",
-		run_id: opts.runId,
-		task_id: result?.taskId ?? `unknown-${opts.runId}`,
-		plan_id: opts.planId,
-		result: passed ? "verified" : "fail",
-		capability_class: result?.capability ?? "unknown",
-	});
 }
 
 // -----------------------------------------------------------------------------
@@ -2442,13 +2478,7 @@ async function runVerification(
 	const failedChecks = parseFailedChecks(out);
 	const passed = qaResult.exitCode === 0 && failedChecks.length === 0;
 
-	await recordOutcome({
-		run_id: runId,
-		task_id: `${runId}-qa`,
-		outcome: passed ? "verified" : "fail",
-		quality: passed ? 0.95 : 0.0,
-		note: out.slice(0, 2000),
-	});
+	await recordOutcome(qaVerificationOutcomeFor(runId, passed, passed ? 0.95 : 0.0, out.slice(0, 2000)));
 
 	return {
 		passed,

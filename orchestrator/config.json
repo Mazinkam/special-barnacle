@@ -55,115 +55,153 @@
         "input_per_mtok": 1.0,
         "output_per_mtok": 5.0,
         "cache_read_per_mtok": 0.1,
-        "cache_write_per_mtok": 1.25
+        "cache_write_per_mtok": 1.25,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "claude-sonnet-4-5": {
         "input_per_mtok": 3.0,
         "output_per_mtok": 15.0,
         "cache_read_per_mtok": 0.3,
-        "cache_write_per_mtok": 3.75
+        "cache_write_per_mtok": 3.75,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "claude-sonnet-5": {
         "input_per_mtok": 2.0,
         "output_per_mtok": 10.0,
         "cache_read_per_mtok": 0.2,
-        "cache_write_per_mtok": 2.5
+        "cache_write_per_mtok": 2.5,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "claude-opus-4-5": {
         "input_per_mtok": 5.0,
         "output_per_mtok": 25.0,
         "cache_read_per_mtok": 0.5,
-        "cache_write_per_mtok": 6.25
+        "cache_write_per_mtok": 6.25,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "claude-opus-5": {
         "input_per_mtok": 5.0,
         "output_per_mtok": 25.0,
         "cache_read_per_mtok": 0.5,
-        "cache_write_per_mtok": 6.25
+        "cache_write_per_mtok": 6.25,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "gpt-5.5": {
         "input_per_mtok": 5.0,
         "output_per_mtok": 30.0,
         "cache_read_per_mtok": 0.5,
-        "cache_write_per_mtok": 0.0
+        "cache_write_per_mtok": 0.0,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "gpt-5.6-sol": {
         "input_per_mtok": 5.0,
         "output_per_mtok": 30.0,
         "cache_read_per_mtok": 0.5,
-        "cache_write_per_mtok": 6.25
+        "cache_write_per_mtok": 6.25,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "gpt-5.6-terra": {
         "input_per_mtok": 2.0,
         "output_per_mtok": 12.0,
         "cache_read_per_mtok": 0.2,
-        "cache_write_per_mtok": 2.5
+        "cache_write_per_mtok": 2.5,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "gpt-5.6-luna": {
         "input_per_mtok": 0.2,
         "output_per_mtok": 1.2,
         "cache_read_per_mtok": 0.02,
-        "cache_write_per_mtok": 0.25
+        "cache_write_per_mtok": 0.25,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "gpt-6-astra": {
         "input_per_mtok": 10.0,
         "output_per_mtok": 50.0,
         "cache_read_per_mtok": 1.0,
-        "cache_write_per_mtok": 12.5
+        "cache_write_per_mtok": 12.5,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "gpt-5.3-codex-spark": {
         "input_per_mtok": 1.75,
         "output_per_mtok": 14.0,
         "cache_read_per_mtok": 0.175,
-        "cache_write_per_mtok": 0.0
+        "cache_write_per_mtok": 0.0,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "claude-sonnet-4-20250514": {
         "input_per_mtok": 3.0,
         "output_per_mtok": 15.0,
         "cache_read_per_mtok": 0.3,
-        "cache_write_per_mtok": 3.75
+        "cache_write_per_mtok": 3.75,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "claude-sonnet-4-6": {
         "input_per_mtok": 3.3,
         "output_per_mtok": 16.5,
         "cache_read_per_mtok": 0.33,
-        "cache_write_per_mtok": 4.125
+        "cache_write_per_mtok": 4.125,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "claude-opus-4-6": {
         "input_per_mtok": 5.5,
         "output_per_mtok": 27.5,
         "cache_read_per_mtok": 0.55,
-        "cache_write_per_mtok": 6.875
+        "cache_write_per_mtok": 6.875,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "claude-opus-4-8": {
         "input_per_mtok": 5.0,
         "output_per_mtok": 25.0,
         "cache_read_per_mtok": 0.5,
-        "cache_write_per_mtok": 6.25
+        "cache_write_per_mtok": 6.25,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "claude-fable-5": {
         "input_per_mtok": 10.0,
         "output_per_mtok": 50.0,
         "cache_read_per_mtok": 1.0,
-        "cache_write_per_mtok": 12.5
+        "cache_write_per_mtok": 12.5,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "amazon.nova-pro": {
         "input_per_mtok": 0.8,
         "output_per_mtok": 3.2,
         "cache_read_per_mtok": 0.2,
-        "cache_write_per_mtok": 0.8
+        "cache_write_per_mtok": 0.8,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "amazon.nova-2-lite": {
         "input_per_mtok": 0.33,
         "output_per_mtok": 2.75,
         "cache_read_per_mtok": 0.0825,
-        "cache_write_per_mtok": 0.33
+        "cache_write_per_mtok": 0.33,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       },
       "minimax-m2": {
         "input_per_mtok": 0.3,
         "output_per_mtok": 1.2,
         "cache_read_per_mtok": 0.0,
-        "cache_write_per_mtok": 0.0
+        "cache_write_per_mtok": 0.0,
+        "source": "unverified-local-catalog",
+        "verified_on": null
       }
     },
     "unrated_note": "Models with no locally verifiable rate stay unmetered by design: minimax-m3 and humain-m3-research-preview and gpt-5-mini are absent from the local catalogs. Add rates from the provider of record to meter them."
