@@ -11,13 +11,16 @@ fail for the right reason.
 """
 import json
 import math
+import os
 import re
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 from pathlib import Path
 
-from orchestrator.dashboard import (INSTRUMENTATION, MIN_TAIL_SAMPLES, build_data, generate_dashboard,
-                                    safe, tail_ratio)
+from orchestrator.dashboard import (INSTRUMENTATION, MIN_TAIL_SAMPLES, build_data, build_ingest_status,
+                                    generate_dashboard, safe, tail_ratio)
 from orchestrator.economics import quantile
 from orchestrator.records import NO_DATA, is_no_data, to_json
 
@@ -626,6 +629,80 @@ class SerializationContractTests(StreamCase):
             if isinstance(value, float):
                 self.assertTrue(math.isfinite(value), f'{key} is not finite')
             json.dumps({key: value})
+
+
+class IngestStatusTests(unittest.TestCase):
+    def test_status_contract_handles_success_partial_error_missing_malformed_stale_and_future(self):
+        now = datetime(2026, 9, 23, 12, tzinfo=timezone.utc)
+        recent = (now - timedelta(minutes=1)).isoformat()
+        stale = (now - timedelta(minutes=31)).isoformat()
+        future = (now + timedelta(days=1)).isoformat()
+
+        cases = [
+            ({'status': 'ok', 'last_attempt_at': recent, 'last_success_at': recent,
+              'emitted': 4, 'failure_count': 0, 'error': None, 'sweep_interval_seconds': 900},
+             'ok', recent, recent, 4, 0, None, 1800),
+            ({'status': 'partial', 'last_attempt_at': recent, 'last_success_at': None,
+              'emitted': 2, 'failure_count': 1, 'error': 'one file failed'},
+             'partial', recent, None, 2, 1, 'one file failed', 1800),
+            ({'status': 'error', 'last_attempt_at': recent, 'last_success_at': recent,
+              'emitted': 0, 'failure_count': 1, 'error': 'render failed'},
+             'error', recent, recent, 0, 1, 'render failed', 1800),
+            ({}, 'unknown', None, None, 0, 0, None, 1800),
+            ({'status': ['ok'], 'last_attempt_at': recent, 'last_success_at': recent},
+             'unknown', None, None, 0, 0, None, 1800),
+            ({'status': 'ok', 'last_attempt_at': 'not-a-time', 'last_success_at': recent},
+             'unknown', None, None, 0, 0, None, 1800),
+            ({'status': 'ok', 'last_attempt_at': stale, 'last_success_at': stale,
+              'sweep_interval_seconds': 900}, 'stale', stale, stale, 0, 0, None, 1800),
+            ({'status': 'ok', 'last_attempt_at': future, 'last_success_at': future,
+              'sweep_interval_seconds': 900}, 'ok', future, future, 0, 0, None, 1800),
+        ]
+        for raw, *expected in cases:
+            with self.subTest(raw=raw):
+                result = build_ingest_status(raw, now=now)
+                self.assertEqual(set(result), {'status', 'last_attempt_at', 'last_success_at', 'emitted',
+                                               'failure_count', 'error', 'stale_after_seconds'})
+                self.assertEqual(list(result.values()), expected)
+
+    def test_build_data_reads_status_and_render_escapes_status_values(self):
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with tempfile.TemporaryDirectory() as directory:
+            write_stream(directory)
+            Path(directory, 'ingest_status.json').write_text(json.dumps({
+                'status': 'ok', 'last_attempt_at': timestamp,
+                'last_success_at': timestamp, 'emitted': 3, 'failure_count': 1,
+                'error': '<img src=x onerror=alert(1)>', 'sweep_interval_seconds': 900,
+                'message': 'PRIVATE SESSION MESSAGE MUST NOT APPEAR',
+            }), encoding='utf-8')
+            data = build_data(Path(directory), config={})
+            html = generate_dashboard(directory, config={}).read_text(encoding='utf-8')
+
+        self.assertEqual(data['ingest_status']['status'], 'ok')
+        self.assertIn('Session ingest health', html)
+        self.assertIn('${esc(I.status)}', html)
+        self.assertIn('${esc(I.error)}', html)
+        self.assertNotIn('PRIVATE SESSION MESSAGE MUST NOT APPEAR', html)
+
+    def test_missing_status_is_unknown_and_panel_says_not_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_stream(directory)
+            data = build_data(Path(directory), config={})
+            html = generate_dashboard(directory, config={}).read_text(encoding='utf-8')
+        self.assertEqual(data['ingest_status']['status'], 'unknown')
+        self.assertIn('not reported', html)
+
+    def test_failed_atomic_replacement_preserves_existing_dashboard_and_removes_temp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_stream(directory)
+            output = Path(directory, 'dashboard.html')
+            original = b'previous usable dashboard'
+            output.write_bytes(original)
+            with patch('orchestrator.dashboard.os.replace', side_effect=OSError('forced replace failure')):
+                with self.assertRaisesRegex(OSError, 'forced replace failure'):
+                    generate_dashboard(directory, config={})
+            self.assertEqual(output.read_bytes(), original)
+            self.assertEqual(list(Path(directory).glob('.dashboard.html.*.tmp')), [])
 
 
 class RenderingTests(unittest.TestCase):
