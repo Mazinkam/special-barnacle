@@ -27,7 +27,7 @@
  * skill's history has (recommended, executed, observed) triples to learn from.
  */
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
 	appendFileSync,
 	existsSync,
@@ -1170,13 +1170,26 @@ const NO_PERSONA = "__no_persona__";
 let ACTIVE_RUN: RunSession | null = null;
 
 /**
+ * Narrow, single-signature shape for the child launcher seam. `spawn` itself
+ * is a heavily overloaded function (stdio-shape-dependent return types,
+ * options-optional variants, ...); assigning that whole overload set to an
+ * optional property makes both the default (`spawn`) and a test's injected
+ * function fight the overload resolver. Only the
+ * `(command, args, options) => ChildProcess` overload is ever used at the one
+ * call site below, so the seam is typed to exactly that call shape — the real
+ * `spawn` satisfies it structurally, and tests can supply a plain function
+ * without fighting the overload set.
+ */
+type ChildSpawner = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
+
+/**
  * Spawn Pi as a one-shot subagent and parse its JSON event stream for the
  * assistant `message_end`, which carries `model`, `usage`, and `cost.total`.
  * This is the same on-the-wire protocol the human-facing subagent tool uses
  * internally — we just launch it from a context (extension handler) where the
  * human-facing wrapper doesn't have what it needs.
  */
-async function runSubagentProcess(opts: {
+export async function runSubagentProcess(opts: {
 	cwd: string;
 	agentName: string;
 	task: string;
@@ -1192,6 +1205,13 @@ async function runSubagentProcess(opts: {
 	capability?: string;
 	/** Nesting depth for the widget (0 = top-level, 1 = child of a lead, etc.). */
 	depth?: number;
+	/**
+	 * Test seam only: replaces the real child launcher. Defaults to node's
+	 * `spawn`; production callers never set this. Lets tests exercise the real
+	 * stream/event/close handling below against a deterministic local fixture
+	 * instead of the actual `humain-terminal --mode json` binary.
+	 */
+	spawnChild?: ChildSpawner;
 }): Promise<SubagentProcessResult> {
 	const emptyUsage: SubagentUsageStats = {
 		input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
@@ -1417,9 +1437,10 @@ async function runSubagentProcess(opts: {
 		// runs and the persona prompt temp dir leaks.
 		// Optional so `finish()` can run from the synchronous-spawn-throw path,
 		// where no child was ever created.
-		let proc: ReturnType<typeof spawn> | undefined;
+		let proc: ChildProcess | undefined;
+		const spawnChild: ChildSpawner = opts.spawnChild ?? spawn;
 		try {
-			proc = spawn(invocation.command, invocation.args, {
+			proc = spawnChild(invocation.command, invocation.args, {
 				cwd: opts.cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
