@@ -93,10 +93,10 @@ import { BoundedCapture, classifyDispatchOutcome, summarizeStderr } from "./disp
 import { RunCancellation } from "./cancellation.ts";
 import { connectCancellationLoader } from "./run-ui.ts";
 // Rule-2 recon planning/evidence helpers (pure; see recon.ts). `dispatchHierarchical()`
-// does not yet dispatch these — that integration is a separate change — but
-// `DispatchTask` below is kept structurally compatible with `ReconTaskPlan` so
-// planned recon tasks can be handed to the existing dispatch path unchanged.
-import type { ReconTaskPlan } from "./recon.ts";
+// dispatches these as ordinary parent-owned tasks through the existing
+// `dispatchParallel()` path; `DispatchTask` is kept structurally compatible
+// with `ReconTaskPlan` so a planned recon task needs no conversion step.
+import { formatReconEvidence, planReconTasks, type ReconTaskPlan } from "./recon.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -153,6 +153,19 @@ const ORCHESTRATING_CAPABILITIES = new Set(["lead", "architect", "technical_lead
 const LEAD_DISPATCH_TIMEOUT_MS = positiveIntEnv(
 	"HUMAIN_ORCHESTRATOR_LEAD_TIMEOUT_MS",
 	Math.max(90 * 60 * 1000, DISPATCH_TIMEOUT_MS * 4),
+);
+
+/**
+ * Bounds the aggregate parent-owned recon evidence packet handed to every
+ * lead prompt (see `formatReconEvidence` in recon.ts). Derived from
+ * method.json's `evidence_packet_max_tokens` — a token budget the policy
+ * already declares — via a conservative ~4 chars/token estimate, rather than
+ * inventing a new, undeclared character cap.
+ */
+const CHARS_PER_TOKEN_ESTIMATE = 4;
+const RECON_EVIDENCE_MAX_CHARS = positiveIntEnv(
+	"HUMAIN_ORCHESTRATOR_RECON_EVIDENCE_MAX_CHARS",
+	METHOD.rules.pre_implementation_recon.evidence_packet_max_tokens * CHARS_PER_TOKEN_ESTIMATE,
 );
 
 function dispatchTimeoutFor(capability: string | undefined): number {
@@ -2204,14 +2217,62 @@ async function dispatchHierarchical(
 	const leadCount = Number.isFinite(leads)
 		? Math.min(MAX_LEADS, Math.max(1, Math.trunc(leads)))
 		: 1;
+
+	// Rule 2: parent-owned, read-only recon dispatched directly by the bridge
+	// (not left to a lead's discretion) so it is an observable, billed dispatch
+	// with its own progress row, log files, and cost — not an optimistic claim
+	// that "workers fan out inside each lead".
+	const captureOpts: CaptureOpts = {
+		runId,
+		planId,
+		taskClass: plan.task_class,
+		complexity: plan.complexity,
+		risk: plan.risk,
+		recommended: plan.route.recommended,
+		mode: plan.route.mode,
+	};
+	const reconTasks: DispatchTask[] = planReconTasks({
+		method: METHOD.rules.pre_implementation_recon,
+		complexity: plan.complexity,
+		taskClass: plan.task_class,
+		goal,
+		runId,
+	});
+	let workerResults: DispatchResult[] = [];
+	if (reconTasks.length === 0) {
+		ACTIVE_RUN?.setPhase(
+			`no parent-owned recon required (complexity ${plan.complexity} below Rule-2 threshold ${METHOD.rules.pre_implementation_recon.min_complexity}, or task class "${plan.task_class}" is exempt)`,
+		);
+	} else {
+		ACTIVE_RUN?.setPhase(`recon: 0/${reconTasks.length} starting`);
+		workerResults = await dispatchParallel(cwd, runId, reconTasks, adapter, ctx);
+		for (const result of workerResults) await captureDispatchCost(captureOpts, result);
+		const completedRecon = workerResults.filter((r) => r.exitCode === 0).length;
+		ACTIVE_RUN?.setPhase(`recon: ${completedRecon}/${reconTasks.length} completed; dispatching lead(s)`);
+	}
+	// Every completed/failed recon result is folded into one bounded evidence
+	// packet; failed workers are represented as unavailable, never silently
+	// dropped. If ALL recon calls failed, say so explicitly rather than
+	// letting the per-worker diagnostics read as ordinary partial coverage.
+	const reconEvidenceBody = formatReconEvidence(workerResults, RECON_EVIDENCE_MAX_CHARS);
+	const reconAllFailed = reconTasks.length > 0 && workerResults.every((r) => r.exitCode !== 0);
+	const reconEvidence = reconAllFailed
+		? `DEGRADED: all ${workerResults.length} parent-owned recon worker(s) failed; no verified recon evidence is available for this run. Raw diagnostics follow for context only:\n\n${reconEvidenceBody}`
+		: reconEvidenceBody;
+
 	const leadTasks: DispatchTask[] = Array.from({ length: leadCount }, (_, i) => ({
 		capability: "lead",
-		task: leadPrompt(goal, plan, architectResult, i, leadCount, adapter),
+		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter),
 		taskId: `${runId}-lead-${i}`,
 	}));
 
+	const completedReconCount = workerResults.filter((r) => r.exitCode === 0).length;
+	const reconPhaseNote =
+		reconTasks.length > 0
+			? `${completedReconCount}/${reconTasks.length} completed recon packet(s)`
+			: "no parent-owned recon packets (not required for this task)";
 	ACTIVE_RUN?.setPhase(
-		`${leadCount} lead(s) executing on ${shortName(adapter.lead?.model ?? "?")} — workers fan out inside each lead`,
+		`${leadCount} lead(s) executing on ${shortName(adapter.lead?.model ?? "?")} with ${reconPhaseNote}; nested subagent calls inside a lead are not authoritative worker accounting`,
 	);
 	const leadResults = await dispatchParallel(cwd, runId, leadTasks, adapter, ctx);
 	for (const r of leadResults) {
@@ -2222,12 +2283,11 @@ async function dispatchHierarchical(
 		);
 	}
 
-	// Lead agents own their own worker fan-out via HT's subagent tool. We
-	// don't see worker results here; they'll land in HT's own session log +
-	// subsequently in our cost capture via the architectResult's reports.
-	// For depth <= 2, the "lead" dispatch IS the orchestrator-lead and it
-	// does its own fan-out inside its own context window.
-	return { leadResults, workerResults: [], architectResult, escalationResults: [] };
+	// Recon is parent-owned and returned for billing/reporting. Any further
+	// fan-out a lead performs via HT's own subagent tool happens inside that
+	// lead's own context window; the bridge has no visibility into it and does
+	// not count it as part of this run's authoritative worker accounting.
+	return { leadResults, workerResults, architectResult, escalationResults: [] };
 }
 
 /** An architect is worth spawning at the same complexity where method.json Rule 2 mandates recon. */
@@ -2282,10 +2342,11 @@ function modelTableForLead(adapter: Adapter): string[] {
 	];
 }
 
-function leadPrompt(
+export function leadPrompt(
 	goal: string,
 	plan: PlanResponse,
 	architectResult: DispatchResult | undefined,
+	reconEvidence: string,
 	leadIndex: number,
 	leadCount: number,
 	adapter: Adapter,
@@ -2301,6 +2362,17 @@ function leadPrompt(
 		leadCount > 1
 			? `You are lead ${leadIndex + 1} of ${leadCount}. Focus on your assigned sub-domain; other leads handle parallel sub-domains.`
 			: "You are the sole lead for this orchestration.";
+	// The orchestrator already dispatched and billed the required Rule-2 recon
+	// workers before this lead ever started (see dispatchHierarchical). State
+	// that plainly, whether evidence exists or not, instead of letting the lead
+	// assume no recon happened just because this section is silent.
+	const reconSection = [
+		"Recon evidence (already gathered by dedicated parent-owned recon workers the orchestrator dispatched and billed before you started; treat it as ground truth for this run):",
+		"",
+		reconEvidence || "(none: this task's complexity/task class does not require parent-owned recon)",
+		"",
+		"Do not repeat broad repository discovery already covered by the recon evidence above. You may still use your own tools to verify a specific, material uncertainty before acting.",
+	].join("\n");
 	return [
 		`You are the orchestrator lead for the following goal. Drive it to completion.`,
 		"",
@@ -2313,13 +2385,15 @@ function leadPrompt(
 		scopeNote,
 		architectOutput,
 		"",
+		reconSection,
+		"",
 		"You are running non-interactively: there is no human to answer questions mid-run. If the goal is ambiguous, make the conservative choice, do the unambiguous part, and list every open question under '## Open items' in your final report instead of stopping to ask.",
 		"",
-		"Use the subagent tool to dispatch workers. For each dispatch:",
+		"You may use the subagent tool for implementation, review, and QA work. Nested subagent calls you make run inside your own context: the orchestrator bridge does not see, log, or bill them the way it does the parent-owned recon above, so they are not authoritative worker accounting for this run — only your own final report is. For each nested dispatch:",
 		"- Choose the right agent (orch-worker, orch-implementation-strong, orch-implementation-fast, orch-technical-review, orch-security-review, orch-qa-agent).",
 		"- Pass a narrowly-scoped task prompt.",
 		"- Pass the `model` for that agent from the routing table below.",
-		"- After all workers finish, run QA via orch-qa-agent. If verification fails, escalate per method.json rules.review_after_fix (Rule 1).",
+		"- After implementation is done, run QA via orch-qa-agent. If verification fails, escalate per method.json rules.review_after_fix (Rule 1).",
 		"",
 		...modelTableForLead(adapter),
 	].join("\n");

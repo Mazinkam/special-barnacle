@@ -62,6 +62,73 @@ describe("RunSession cancellation presentation", () => {
 	});
 });
 
+describe("leadPrompt recon evidence handoff", () => {
+	const planFixture = {
+		plan_id: "plan-1",
+		run_id: "run-1",
+		task_class: "implementation",
+		complexity: 6,
+		risk: "medium",
+		topology: { depth: 2, leads: 1, workers: 3, shape: "lead-workers" },
+		route: {
+			selected: { capability: "lead", effort: "standard", verification_depth: "targeted" },
+			recommended: { capability: "lead", effort: "standard", verification_depth: "targeted" },
+			mode: "adaptive",
+			history_sufficient: true,
+			explanation: {},
+		},
+		effective_quality_floor: 0.8,
+		cost_aggressiveness: 0.5,
+	};
+	const adapterFixture = { lead: { model: "amazon-bedrock/anthropic.claude-sonnet-5" } };
+
+	test("adds completed recon evidence to the lead prompt", () => {
+		expect(orchestrator.leadPrompt).toBeFunction();
+		const prompt = orchestrator.leadPrompt!(
+			"repair flow",
+			planFixture as never,
+			undefined,
+			"### run-recon-0\naffected: src/a.ts",
+			0,
+			1,
+			adapterFixture as never,
+		);
+		expect(prompt).toContain("Recon evidence");
+		expect(prompt).toContain("affected: src/a.ts");
+		expect(prompt).toContain("Do not repeat broad repository discovery");
+	});
+
+	test("states no parent-owned recon was required when evidence is empty", () => {
+		expect(orchestrator.leadPrompt).toBeFunction();
+		const prompt = orchestrator.leadPrompt!(
+			"repair flow",
+			planFixture as never,
+			undefined,
+			"",
+			0,
+			1,
+			adapterFixture as never,
+		);
+		expect(prompt).toContain("Recon evidence");
+		expect(prompt).toContain("none");
+	});
+
+	test("tells the lead nested subagent fan-out is not authoritative worker accounting", () => {
+		expect(orchestrator.leadPrompt).toBeFunction();
+		const prompt = orchestrator.leadPrompt!(
+			"repair flow",
+			planFixture as never,
+			undefined,
+			"### run-recon-0\naffected: src/a.ts",
+			0,
+			1,
+			adapterFixture as never,
+		);
+		expect(prompt).not.toContain("workers fan out inside each lead");
+		expect(prompt).toContain("not authoritative worker accounting");
+	});
+});
+
 describe("confirmation gates", () => {
 	test.each([false, true])("dispatch call passes separate confirmation arguments (interactive=%s)", async (interactive) => {
 		// Execute the actual call expression after the plan summary, not a copy of it.
