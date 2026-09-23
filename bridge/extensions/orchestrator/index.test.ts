@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -63,6 +63,42 @@ describe("RunSession cancellation presentation", () => {
 });
 
 describe("confirmation gates", () => {
+	test("passes the dispatch title and details as separate confirmation arguments", async () => {
+		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+		const planSummary = source.indexOf("const planSummary = [");
+		const callStart = source.indexOf("confirmStep(", planSummary);
+		const callEnd = source.indexOf("\n\t\t\t\t)", callStart) + "\n\t\t\t\t)".length;
+		expect(planSummary).toBeGreaterThanOrEqual(0);
+		expect(callStart).toBeGreaterThan(planSummary);
+		expect(callEnd).toBeGreaterThan(callStart);
+
+		const runCall = new Function(
+			"confirmStep",
+			"ctx",
+			"pipeline",
+			"parsed",
+			"DISPATCH_TIMEOUT_MS",
+			`return ${source.slice(callStart, callEnd)};`,
+		) as (
+			confirmStep: (...args: unknown[]) => Promise<boolean>,
+			ctx: object,
+			pipeline: string,
+			parsed: { interactive: boolean },
+			DISPATCH_TIMEOUT_MS: number,
+		) => Promise<boolean>;
+		const confirmStep = mock(async (..._args: unknown[]) => true);
+
+		await expect(
+			runCall(confirmStep, {}, "lead → workers → qa", { interactive: false }, 300_000),
+		).resolves.toBe(true);
+		expect(confirmStep).toHaveBeenCalledWith(
+			{},
+			"Dispatch this plan?",
+			"lead → workers → qa\n\nEach stage runs headless (up to 5 min per dispatch); live progress shows above the editor.",
+			false,
+		);
+	});
+
 	test("auto-confirms when interactive confirmation is not requested", async () => {
 		expect(orchestrator.confirmStep).toBeFunction();
 		const confirm = mock(() => false);
