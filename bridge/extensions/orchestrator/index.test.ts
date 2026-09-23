@@ -15,6 +15,20 @@ mock.module("@humain/terminal", () => ({
 	renderTaskWithContext: (task: string) => task,
 }));
 
+// Capture env that runModule forwards to spawned children. Existing tests rely
+// on real spawn behavior, so the mock forwards to the real implementation
+// outside of capture mode.
+let captureRunModuleEnv = false;
+const capturedRunModuleEnvs: NodeJS.ProcessEnv[] = [];
+mock.module("node:child_process", () => {
+	const real = require("node:child_process");
+	const fakeSpawn = ((command: any, args: any, options: any) => {
+		if (captureRunModuleEnv) capturedRunModuleEnvs.push(options?.env ?? {});
+		return real.spawn(command, args, options);
+	}) as typeof real.spawn;
+	return { ...real, spawn: fakeSpawn };
+});
+
 const testStateRoot = mkdtempSync(join(tmpdir(), "orch-run-session-test-"));
 process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = testStateRoot;
 process.env.CODING_AGENT_ORCHESTRATOR_HOME = testStateRoot;
@@ -201,11 +215,54 @@ describe("session ingest hook wiring", () => {
 			expect(status.status).toBe("error");
 			expect(status.last_success_at).toBe("2025-12-31T23:00:00Z");
 			expect(status.failure_count).toBe(1);
-			expect(status.error.length).toBeLessThanOrEqual(500);
+			expect(status.error.length).toBeLessThanOrEqual(240);
 			expect(status.error).not.toContain("\n");
 			expect(readdirSync(root).sort()).toEqual(["ingest_status.json"]);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("recordHookFailure redacts absolute paths and bounds error to 240 chars", () => {
+		const root = mkdtempSync(join(tmpdir(), "orch-hook-redact-test-"));
+		try {
+			orchestrator.recordHookFailure!(root, "ingest failed at /Users/alice/.local/state/foo/bar.jsonl: " + "x".repeat(2000));
+			const status = JSON.parse(readFileSync(join(root, "ingest_status.json"), "utf8"));
+			expect(status.status).toBe("error");
+			expect(status.error.length).toBeLessThanOrEqual(240);
+			expect(status.error).not.toContain("/Users/alice");
+			expect(status.error).toContain("<path>");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("runModule forwards STATE_ROOT as CODING_AGENT_ORCHESTRATOR_HOME", async () => {
+		const customRoot = mkdtempSync(join(tmpdir(), "orch-runmodule-state-"));
+		const previousState = process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT;
+		process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = customRoot;
+		try {
+			// Re-import the module so STATE_ROOT (read at module load time) reflects
+			// the freshly-set HUMAIN_ORCHESTRATOR_STATE_ROOT. The cache-busting query
+			// string forces a fresh module evaluation under Bun's test runner.
+			const fresh = (await import(`./index.ts?propagate=${Date.now()}-${Math.random()}`)) as typeof orchestrator;
+			expect(fresh.runModule).toBeFunction();
+			// Capture the env that `runModule` forwards to its child via the file-level
+			// captureRunModuleEnv seam; restore the flag in `finally` so the rest of the
+			// suite keeps using real spawns.
+			captureRunModuleEnv = true;
+			capturedRunModuleEnvs.length = 0;
+			try {
+				await fresh.runModule!("noop", []);
+			} finally {
+				captureRunModuleEnv = false;
+			}
+			expect(capturedRunModuleEnvs.length).toBeGreaterThan(0);
+			expect(capturedRunModuleEnvs.at(-1)?.CODING_AGENT_ORCHESTRATOR_HOME).toBe(customRoot);
+		} finally {
+			if (previousState === undefined) delete process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT;
+			else process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = previousState;
+			rmSync(customRoot, { recursive: true, force: true });
 		}
 	});
 });

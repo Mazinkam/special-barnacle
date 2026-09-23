@@ -111,6 +111,13 @@ const PYTHON = process.env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3";
  * older `orchestrator-adapter.json` is migrated into profile "default" on first
  * load and then ignored.
  */
+// Match absolute paths under common user homes so the bounded Status Contract
+// `error` field never leaks filesystem locations. Mirrors the redaction the
+// Python CLI applies when writing `ingest_status.json`.
+const PATH_RE = /(\/Users\/[^\s|]+|\/home\/[^\s|]+|~\/[^\s|]+)/g;
+function redactPaths(text: string): string {
+	return text.replace(PATH_RE, "<path>");
+}
 const PROFILES_PATH =
 	process.env.HUMAIN_ORCHESTRATOR_PROFILES_FILE ??
 	join(homedir(), ".humain-terminal", "agent", "orchestrator-profiles.json");
@@ -1687,18 +1694,22 @@ function runCli(args: string[], stdin?: string): Promise<CliResult> {
 /**
  * Run a Python module under the orchestrator's SKILL_ROOT. We set
  * CODING_AGENT_RUNTIME so the dispatched metrics land under
- * `agent_runtime: "humain-terminal"` and PYTHONPATH so the `orchestrator`
- * package is importable.
+ * `agent_runtime: "humain-terminal"`, PYTHONPATH so the `orchestrator`
+ * package is importable, and CODING_AGENT_ORCHESTRATOR_HOME so Python
+ * ingestion and the TypeScript hook reporting layer write to the same state
+ * root even when HUMAIN_ORCHESTRATOR_STATE_ROOT is customized.
  */
-function runModule(module: string, args: string[] = []): Promise<CliResult> {
+export function runModule(module: string, args: string[] = []): Promise<CliResult> {
 	return new Promise((resolve) => {
 		const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
+		const expandedStateRoot = STATE_ROOT.replace(/^~/, homedir());
 		const child = spawn(PYTHON, ["-m", module, ...args], {
 			env: {
 				...process.env,
 				CODING_AGENT_RUNTIME: "humain-terminal",
 				CODING_AGENT_REPOSITORY: process.env.CODING_AGENT_REPOSITORY ?? process.cwd(),
 				PYTHONPATH: expandedSkillRoot,
+				CODING_AGENT_ORCHESTRATOR_HOME: expandedStateRoot,
 			},
 			stdio: ["pipe", "pipe", "pipe"],
 		});
@@ -2970,10 +2981,16 @@ export function recordHookFailure(stateRoot: string, detail: string): void {
 		} catch {
 			// A missing or malformed prior status must not prevent reporting failure.
 		}
-		const safeDetail = String(detail).replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 500);
+		const safeDetail = redactPaths(String(detail))
+			.replace(/[\u0000-\u001f\u007f]+/g, " ")
+			.trim()
+			.slice(0, 240);
 		const emptyExitDetail = /exit \d+:\s*(.*)$/.exec(safeDetail);
 		const previousError = typeof previous.error === "string"
-			? previous.error.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 500)
+			? redactPaths(previous.error)
+					.replace(/[\u0000-\u001f\u007f]+/g, " ")
+					.trim()
+					.slice(0, 240)
 			: "";
 		const error = emptyExitDetail && !emptyExitDetail[1].trim()
 			? previousError || safeDetail || "session ingest failed"
