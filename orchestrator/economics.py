@@ -40,16 +40,31 @@ from .records import (
 REPORTED = 'reported'
 ESTIMATED = 'estimated'
 UNMETERED = 'unmetered'
+TOKEN_KEYS = ('input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_write_tokens')
 
-#: `row_cost` is deliberately *the same function object* as `records.row_cost`. Imported above and
-#: re-exported here so existing callers (`dashboard`, `scripts/`) keep working while the definition
-#: of a row's cost exists once, in the classification seam.
+
 __all__ = [
-    'REPORTED', 'ESTIMATED', 'UNMETERED', 'row_cost', 'cost_class', 'is_call_row',
-    'is_session_ingest', 'cost_attribution', 'verified_cost', 'quantile', 'per_call_costs',
-    'cost_distribution', 'is_unsuccessful_attempt', 'waste_cost', 'coordination_roles',
-    'verification_roles', 'orchestration_overhead', 'fanout_rework', 'topology_regret',
+    'REPORTED', 'ESTIMATED', 'UNMETERED', 'TOKEN_KEYS', 'row_cost', 'has_reported_tokens',
+    'cost_class', 'is_call_row', 'is_session_ingest', 'cost_attribution', 'verified_cost',
+    'quantile', 'per_call_costs', 'cost_distribution', 'is_unsuccessful_attempt',
+    'waste_cost', 'coordination_roles', 'verification_roles', 'orchestration_overhead',
+    'fanout_rework', 'topology_regret',
 ]
+
+
+def has_reported_tokens(row: dict) -> bool:
+    """True only when the row reports a positive token count somewhere.
+
+    All-zero usage measured nothing: HT writes `*_tokens=0` when a child crashes before
+    reporting usage, and that must not read as 'this call was free'.
+    """
+    for key in TOKEN_KEYS:
+        try:
+            if int(float(row.get(key) or 0)) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def cost_class(row: dict) -> str:
@@ -59,16 +74,21 @@ def cost_class(row: dict) -> str:
     'controller-context-not-metered'), so normalize it here rather than trusting exact values.
     A cost with no stated provenance counts as estimated, never as reported: reported is the
     stronger claim and must be explicit.
+
+    A $0 row is metered only when it also reports positive tokens — a genuinely free call was
+    measured, whereas `cost_usd=0, cost_source='estimated-from-reported-tokens', *_tokens=0`
+    (HT's shape for a child that crashed before reporting usage) is a coverage gap, not spend.
+    This is the single classifier for summary cards, per-runtime cards, and run evidence.
     """
     source = str(row.get('cost_source') or '').strip().lower()
-    has_cost = row_cost(row) > 0
+    measured = row_cost(row) > 0 or has_reported_tokens(row)
     if 'estimat' in source or 'blended' in source or 'derived' in source:
-        return ESTIMATED
+        return ESTIMATED if measured else UNMETERED
     if source in {'reported', 'provider', 'provider_reported', 'provider-reported', 'metered', 'measured', 'actual'}:
-        return REPORTED if has_cost else UNMETERED
+        return REPORTED if measured else UNMETERED
     if 'not_metered' in source or 'not-metered' in source or 'unmetered' in source or 'unknown' in source:
-        return ESTIMATED if has_cost else UNMETERED
-    return ESTIMATED if has_cost else UNMETERED
+        return ESTIMATED if row_cost(row)>0 else UNMETERED
+    return ESTIMATED if row_cost(row)>0 else UNMETERED
 
 
 def is_call_row(row: dict) -> bool:

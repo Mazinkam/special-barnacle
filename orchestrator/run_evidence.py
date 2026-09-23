@@ -11,7 +11,9 @@ Rules that keep the numbers honest:
   they are never pooled into one "samples" figure.
 - Missing cost, tokens, or duration is reported as missing (`None` / unmetered counts),
   never as zero. A call whose cost is "estimated" from zero tokens at $0 measured nothing
-  and is unmetered. Elapsed time is only taken from explicit start/finish/elapsed fields
+  and is unmetered (`economics.cost_class` is the single classifier shared with the
+  dashboard cards, so run rows and summary cards always agree). Elapsed time is only taken
+  from explicit start/finish/elapsed fields
   written at the terminal boundary; record `ts` values alone never fabricate a duration,
   and `elapsed_source` is whatever the writer declared (`'reported'` when it declared none).
 - Interactive-session ingestion is excluded even when it carries a `run_id`, and never
@@ -30,7 +32,7 @@ from datetime import datetime
 from typing import Any
 import json
 
-from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, is_call_row, is_session_ingest, row_cost
+from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, has_reported_tokens, is_call_row, is_session_ingest, row_cost
 
 ACTUAL = 'actual'
 COUNTERFACTUAL = 'counterfactual'
@@ -38,7 +40,6 @@ TERMINAL_OUTCOME_TASKS = {'run-complete': 'completed', 'run-failed': 'failed'}
 TERMINAL_EVENTS = {'run_completed': 'completed', 'run_failed': 'failed'}
 IMPLEMENTATION_ROLES = {'worker', 'implementer', 'complex_implementer', 'implementation_fast', 'implementation_strong'}
 BAD_OUTCOME_KEYS = ('reopened', 'regression', 'rollback', 'human_correction', 'incident', 'major_rewrite')
-TOKEN_KEYS = ('input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_write_tokens')
 
 
 def _parse_ts(value: Any) -> datetime | None:
@@ -59,23 +60,6 @@ def _role(row: dict) -> str:
 
 def _is_verification_row(row: dict) -> bool:
     return row.get('event') == 'task_verified' or row.get('result') == 'verified'
-
-
-def _has_tokens(row: dict) -> bool:
-    """True only when the row reports a positive token count somewhere; all-zero usage measured nothing."""
-    return any((_int_or_none(row.get(k)) or 0) > 0 for k in TOKEN_KEYS)
-
-
-def _cost_class(row: dict) -> str:
-    """`economics.cost_class` plus one evidence rule: an estimate priced from no tokens is unmetered.
-
-    HT writes `cost_usd=0, cost_source='estimated-from-reported-tokens', *_tokens=0` when a child
-    crashes before reporting usage. The shared classifier keeps that as a metered $0 estimate for
-    legacy attribution; here it must be a coverage gap, or a crashed run looks fully priced.
-    """
-    cls = cost_class(row)
-    if cls == ESTIMATED and row_cost(row) <= 0 and not _has_tokens(row): return UNMETERED
-    return cls
 
 
 def _terminal_fields(record: dict) -> dict[str, Any]:
@@ -111,8 +95,8 @@ def _counterfactual(calls: list[dict], baseline_model: str, pricing: dict[str, A
                                 cached_input_tokens=row.get('cached_input_tokens'), cache_write_tokens=row.get('cache_write_tokens'), pricing=pricing)
         if est is None: unpriced += 1
         else: total += float(est['cost_usd']); priced += 1
-    metered_actual = sum(1 for r in calls if _cost_class(r) != UNMETERED)
-    actual_known = sum(row_cost(r) for r in calls if _cost_class(r) != UNMETERED)
+    metered_actual = sum(1 for r in calls if cost_class(r) != UNMETERED)
+    actual_known = sum(row_cost(r) for r in calls if cost_class(r) != UNMETERED)
     comparable = bool(calls) and unpriced == 0 and metered_actual == len(calls)
     reason = None
     if not calls: reason = 'no calls observed'
@@ -202,9 +186,9 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
     result = []
     for rid in (run_ids[i] for i in order):
         rows = calls[rid]
-        metered = [r for r in rows if _cost_class(r) != UNMETERED]
-        reported = sum(row_cost(r) for r in rows if _cost_class(r) == REPORTED)
-        estimated = sum(row_cost(r) for r in rows if _cost_class(r) == ESTIMATED)
+        metered = [r for r in rows if cost_class(r) != UNMETERED]
+        reported = sum(row_cost(r) for r in rows if cost_class(r) == REPORTED)
+        estimated = sum(row_cost(r) for r in rows if cost_class(r) == ESTIMATED)
         known = reported + estimated if metered else None
         overhead_by_role: dict[str, float] = defaultdict(float)
         implementation = 0.0
@@ -215,7 +199,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
         overhead = sum(overhead_by_role.values()) if metered else None
         durations = [_int_or_none(r.get('duration_ms')) for r in rows]
         known_durations = [d for d in durations if d is not None]
-        tokens_known = sum(1 for r in rows if _has_tokens(r))
+        tokens_known = sum(1 for r in rows if has_reported_tokens(r))
         verified_tasks = {str(v.get('task_id')) for v in verifications[rid] if v.get('task_id') is not None}
         retries = len(retry_dispatches[rid]) or sum(1 for r in rows if _int_or_none(r.get('retry')))
         note = summary_note.get(rid, {})
