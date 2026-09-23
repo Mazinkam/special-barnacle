@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import os
 import subprocess
@@ -12,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from orchestrator import cli
+from orchestrator.cli import make_ingest_status
 from orchestrator.runtime import load_jsonl, read_json
 from test_ingest import humain_terminal_log
 
@@ -64,7 +63,34 @@ def test_duplicate_only_batch_writes_ok_status_with_exact_fields(tmp_path):
     }
 
 
-def test_partial_batch_materializes_success_and_cli_exits_nonzero(tmp_path, monkeypatch):
+def test_make_ingest_status_bounds_failure_details():
+    result = make_ingest_status({}, {
+        'failures': [{'error': 'first detail ' + 'x' * 700}, {'error': 'second detail'}],
+        'files_scanned': 2,
+        'emitted': 0,
+    })
+
+    assert result['status'] == 'partial'
+    assert result['error'].startswith('2 file(s) failed; first: first detail ')
+    assert len(result['error']) == 500
+
+
+def test_ingest_reports_per_file_progress_to_stderr_when_not_quiet(tmp_path, monkeypatch, capsys):
+    root = tmp_path / 'state'
+    session = humain_terminal_log(tmp_path / 'session.jsonl')
+    monkeypatch.setattr(cli, 'ROOT', root)
+    monkeypatch.setattr('sys.argv', ['orchestrator', 'ingest', str(session), '--runtime',
+                                     'humain-terminal', '--granularity', 'session'])
+
+    cli.main()
+
+    captured = capsys.readouterr()
+    assert '[1/1] humain-terminal' in captured.err
+    assert session.name in captured.err
+    assert json.loads(captured.out)['emitted'] == 1
+
+
+def test_partial_batch_materializes_success_and_cli_exits_nonzero(tmp_path, monkeypatch, capsys):
     root = tmp_path / 'state'
     session = humain_terminal_log(tmp_path / 'session.jsonl')
     missing = tmp_path / 'unreadable.jsonl'
@@ -72,10 +98,12 @@ def test_partial_batch_materializes_success_and_cli_exits_nonzero(tmp_path, monk
     monkeypatch.setattr('sys.argv', ['orchestrator', 'ingest', str(missing), str(session),
                                      '--runtime', 'humain-terminal', '--granularity', 'session', '--quiet'])
 
-    stdout = io.StringIO()
-    with contextlib.redirect_stdout(stdout), pytest.raises(SystemExit) as raised:
+    with pytest.raises(SystemExit) as raised:
         cli.main()
 
+    captured = capsys.readouterr()
+    stdout = captured.out
+    stderr = captured.err
     status = read_json(root / 'ingest_status.json', {})
     assert raised.value.code == 1
     assert status['status'] == 'partial'
@@ -86,7 +114,9 @@ def test_partial_batch_materializes_success_and_cli_exits_nonzero(tmp_path, monk
     assert status['last_success_at'] is None
     assert status['error']
     assert len(load_jsonl(root / 'metrics.jsonl')) == 1
-    assert '"failures"' in stdout.getvalue()
+    assert '1 file(s) failed; first:' in stderr
+    assert len(stderr.splitlines()) == 1
+    assert '"failures"' in stdout
 
 
 def test_dry_run_does_not_write_status_or_refresh(tmp_path):

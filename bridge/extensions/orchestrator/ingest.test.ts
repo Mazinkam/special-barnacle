@@ -166,10 +166,16 @@ describe("SessionIngestScheduler", () => {
 		const timers = fakeTimers();
 		const first = deferred<{ ok: boolean }>();
 		const second = deferred<{ ok: boolean }>();
+		const secondEntered = deferred<void>();
 		let attempts = 0;
 		let flushDone = false;
 		const s = new SessionIngestScheduler({
-			run: () => (++attempts === 1 ? first.promise : second.promise),
+			run: () => {
+				attempts++;
+				if (attempts === 1) return first.promise;
+				secondEntered.resolve();
+				return second.promise;
+			},
 			...timers,
 		});
 		s.schedule("/s/a.jsonl");
@@ -177,12 +183,40 @@ describe("SessionIngestScheduler", () => {
 		s.schedule("/s/a.jsonl");
 		const flushing = s.flush("/s/a.jsonl").then(() => { flushDone = true; });
 		first.resolve({ ok: true });
-		await Promise.resolve();
-		await Promise.resolve();
+		await secondEntered.promise;
 		expect(attempts).toBe(2);
 		expect(flushDone).toBe(false);
 		second.resolve({ ok: true });
 		await flushing;
+		expect(flushDone).toBe(true);
+	});
+
+	test("flush in the completion microtask cannot lose a rerun", async () => {
+		const timers = fakeTimers();
+		const first = deferred<{ ok: boolean }>();
+		const second = deferred<{ ok: boolean }>();
+		const secondEntered = deferred<void>();
+		let attempts = 0;
+		let flushDone = false;
+		const s = new SessionIngestScheduler({
+			run: () => {
+				attempts++;
+				if (attempts === 1) return first.promise;
+				secondEntered.resolve();
+				return second.promise;
+			},
+			...timers,
+		});
+		const initialFlush = s.flush("/s/a.jsonl");
+		const sameTickFlush = first.promise.then(() => undefined)
+			.then(() => s.flush("/s/a.jsonl"))
+			.then(() => { flushDone = true; });
+		first.resolve({ ok: true });
+		await secondEntered.promise;
+		expect(attempts).toBe(2);
+		expect(flushDone).toBe(false);
+		second.resolve({ ok: true });
+		await Promise.all([initialFlush, sameTickFlush]);
 		expect(flushDone).toBe(true);
 	});
 

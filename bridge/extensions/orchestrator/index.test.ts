@@ -162,6 +162,25 @@ describe("session ingest hook wiring", () => {
 		}
 	});
 
+	test("empty CLI failure detail falls back to the previous status error", () => {
+		const root = mkdtempSync(join(tmpdir(), "orch-hook-empty-error-test-"));
+		try {
+			writeFileSync(join(root, "ingest_status.json"), JSON.stringify({
+				version: 1,
+				last_success_at: "2025-12-31T23:00:00Z",
+				status: "partial",
+				error: "previous useful failure detail",
+			}));
+			orchestrator.recordHookFailure!(root, "ingest /session.jsonl: exit 2:   ");
+
+			const status = JSON.parse(readFileSync(join(root, "ingest_status.json"), "utf8"));
+			expect(status.error).toBe("previous useful failure detail");
+			expect(status.last_success_at).toBe("2025-12-31T23:00:00Z");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("final hook failure atomically records bounded status and preserves last success", () => {
 		const root = mkdtempSync(join(tmpdir(), "orch-hook-failure-test-"));
 		try {

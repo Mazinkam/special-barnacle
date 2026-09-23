@@ -122,7 +122,7 @@ export class SessionIngestScheduler {
 			state.pending = false;
 			return state.inFlight;
 		}
-		if (!state.pending) return Promise.resolve();
+		if (!state.pending && !state.rerun) return Promise.resolve();
 
 		state.inFlight = (async () => {
 			while (state.pending || state.rerun) {

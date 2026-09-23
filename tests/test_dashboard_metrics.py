@@ -642,9 +642,11 @@ class IngestStatusTests(unittest.TestCase):
             ({'status': 'ok', 'last_attempt_at': recent, 'last_success_at': recent,
               'emitted': 4, 'failure_count': 0, 'error': None, 'sweep_interval_seconds': 900},
              'ok', recent, recent, 4, 0, None, 1800),
-            ({'status': 'partial', 'last_attempt_at': recent, 'last_success_at': None,
-              'emitted': 2, 'failure_count': 1, 'error': 'one file failed'},
-             'partial', recent, None, 2, 1, 'one file failed', 1800),
+            ({'status': 'partial', 'last_attempt_at': recent, 'last_success_at': stale,
+              'emitted': 2, 'failure_count': 1, 'error': 'one file failed', 'sweep_interval_seconds': 900},
+             'partial', recent, stale, 2, 1, 'one file failed', 1800),
+            ({'status': 'error', 'last_attempt_at': stale, 'last_success_at': stale,
+              'sweep_interval_seconds': 900}, 'error', stale, stale, 0, 0, None, 1800),
             ({'status': 'error', 'last_attempt_at': recent, 'last_success_at': recent,
               'emitted': 0, 'failure_count': 1, 'error': 'render failed'},
              'error', recent, recent, 0, 1, 'render failed', 1800),
@@ -664,6 +666,17 @@ class IngestStatusTests(unittest.TestCase):
                 self.assertEqual(set(result), {'status', 'last_attempt_at', 'last_success_at', 'emitted',
                                                'failure_count', 'error', 'stale_after_seconds'})
                 self.assertEqual(list(result.values()), expected)
+
+    def test_build_ingest_status_truncates_error_details(self):
+        now = datetime(2026, 9, 23, 12, tzinfo=timezone.utc)
+        timestamp = now.isoformat()
+        status = build_ingest_status({
+            'status': 'error', 'last_attempt_at': timestamp, 'last_success_at': None,
+            'error': 'x' * 700,
+        }, now=now)
+
+        self.assertEqual(status['status'], 'error')
+        self.assertEqual(status['error'], 'x' * 500)
 
     def test_build_data_reads_status_and_render_escapes_status_values(self):
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -691,6 +704,16 @@ class IngestStatusTests(unittest.TestCase):
             html = generate_dashboard(directory, config={}).read_text(encoding='utf-8')
         self.assertEqual(data['ingest_status']['status'], 'unknown')
         self.assertIn('not reported', html)
+
+    def test_generated_refresh_survives_unavailable_storage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_stream(directory)
+            html = generate_dashboard(directory, config={}).read_text(encoding='utf-8')
+        self.assertIn("try{paused=localStorage.getItem('orch-pause')==='1';}catch{}", html)
+        self.assertIn("try{sessionStorage.setItem('orch-scroll',String(window.scrollY));}catch{}", html)
+        self.assertIn('try{const savedScroll=sessionStorage.getItem', html)
+        self.assertIn('try{localStorage.setItem', html)
+        self.assertIn('Pause auto-refresh', html)
 
     def test_failed_atomic_replacement_preserves_existing_dashboard_and_removes_temp(self):
         with tempfile.TemporaryDirectory() as directory:

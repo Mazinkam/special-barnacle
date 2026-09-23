@@ -2971,6 +2971,13 @@ export function recordHookFailure(stateRoot: string, detail: string): void {
 			// A missing or malformed prior status must not prevent reporting failure.
 		}
 		const safeDetail = String(detail).replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 500);
+		const emptyExitDetail = /exit \d+:\s*(.*)$/.exec(safeDetail);
+		const previousError = typeof previous.error === "string"
+			? previous.error.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 500)
+			: "";
+		const error = emptyExitDetail && !emptyExitDetail[1].trim()
+			? previousError || safeDetail || "session ingest failed"
+			: safeDetail || previousError || "session ingest failed";
 		const failureCount = previous.failure_count;
 		const status = {
 			...previous,
@@ -2981,7 +2988,7 @@ export function recordHookFailure(stateRoot: string, detail: string): void {
 			files_scanned: typeof previous.files_scanned === "number" ? previous.files_scanned : 1,
 			emitted: typeof previous.emitted === "number" ? previous.emitted : 0,
 			failure_count: typeof failureCount === "number" && Number.isFinite(failureCount) ? failureCount + 1 : 1,
-			error: safeDetail || "session ingest failed",
+			error,
 			sweep_interval_seconds:
 				typeof previous.sweep_interval_seconds === "number" ? previous.sweep_interval_seconds : 900,
 		};

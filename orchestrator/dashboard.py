@@ -309,7 +309,7 @@ def build_ingest_status(raw: Any, *, now: datetime) -> dict[str, Any]:
     now_utc = now.astimezone(timezone.utc)
     status = reported_status
     # Future success timestamps represent clock skew, not an old successful check.
-    if success is not None and (now_utc - success).total_seconds() > stale_after:
+    if reported_status == 'ok' and success is not None and (now_utc - success).total_seconds() > stale_after:
         status = 'stale'
 
     def safe_count(value: Any) -> int:
@@ -327,7 +327,7 @@ def build_ingest_status(raw: Any, *, now: datetime) -> dict[str, Any]:
         'last_success_at': success_raw,
         'emitted': safe_count(raw.get('emitted')),
         'failure_count': safe_count(raw.get('failure_count')),
-        'error': error if isinstance(error, str) else None,
+        'error': error[:500] if isinstance(error, str) else None,
         'stale_after_seconds': stale_after,
     }
 
@@ -636,11 +636,11 @@ const R=Object.entries(D.by_role).sort((a,b)=>b[1].cost-a[1].cost),maxR=Math.max
 const A=Object.entries(D.by_runtime).sort((a,b)=>b[1].cost-a[1].cost),maxA=Math.max(.000001,...A.map(x=>x[1].cost));$('#runtimes').innerHTML=`<div class="small">Metered + unmetered always reconciles against <em>cost-accountable rows</em>, not against total rows: orchestration events (routing decisions, dispatches) are rows that are not calls.</div>`+A.map(([k,v])=>{const unmetered=n0(v.unmetered_calls),metered=n0(v.metered_calls);const label=metered?m$('cost',v.cost):(unmetered?'<span class="warn">unmetered</span>':m$('cost',v.cost));const detail=[nz(v.rows)+' rows',nz(v.call_rows)+' cost-accountable ('+nz(metered)+' metered + '+nz(unmetered)+' unmetered)',n0(v.session_rows)?nz(v.session_rows)+' session aggregates'+(n0(v.covered_calls)>n0(v.call_rows)?' covering '+nz(v.covered_calls)+' stated calls':' (calls per aggregate unstated)'):null,n0(v.estimated_cost)>0?'est. '+money(n0(v.estimated_cost)):null,n0(v.reported_cost)>0?'reported '+money(n0(v.reported_cost)):null].filter(Boolean).join(' · ');return `<div style="display:grid;grid-template-columns:190px 1fr 130px;gap:10px;align-items:center;margin:9px 0"><div><b>${esc(k)}</b><div class="small">${detail}</div></div><div class="bar"><i style="width:${(v.cost/maxA*100).toFixed(1)}%"></i></div><div style="text-align:right">${label}</div></div>`}).join('');
 $('#events').innerHTML=D.events.slice().reverse().map(e=>`<div class="event"><span class="small">${esc(e.ts||'')}</span> <b>${esc(e.event||'')}</b><div class="small"><code>${esc(JSON.stringify(e).slice(0,600))}</code></div></div>`).join('');
 const IS=D.interactive_sessions||{rows:0,calls:0,cost:0,tokens:0,by_runtime:{},sessions:null};const isRt=Object.entries(IS.by_runtime||{}).sort((a,b)=>b[1].cost-a[1].cost);$('#interactive').innerHTML=`<div class="small">These rows come from interactive-session ingestion, not orchestrated runs, and are excluded from the role/runtime charts above. ${nz(IS.aggregate_rows)} of ${nz(IS.rows)} rows are session aggregates covering many calls each, so cost per call must be divided by <b>calls</b>, never by <b>rows</b>.</div><div class="risk"><span>Ingested rows</span><b>${n$('interactive_rows',IS.rows)}</b></div><div class="risk"><span>Model calls (rows + covered calls)</span><b>${n$('interactive_calls',IS.calls)}</b></div><div class="risk"><span>Cost</span><b class="warn">${m$('interactive_cost',IS.cost)}</b></div><div class="risk"><span>Tokens</span><b>${n$('interactive_tokens',IS.tokens)}</b></div><div class="risk"><span>Distinct sessions</span><b>${n$('interactive_sessions',IS.sessions)}</b></div>`+(isRt.length?isRt.map(([k,v])=>`<div style="display:grid;grid-template-columns:190px 1fr 90px;gap:10px;align-items:center;margin:9px 0"><div><b>${esc(k)}</b><div class="small">${nz(v.rows)} rows · ${nz(v.calls)} calls</div></div><div class="bar"><i style="width:${(v.cost/Math.max(.000001,IS.cost)*100).toFixed(1)}%"></i></div><div style="text-align:right">${m$('cost',v.cost)}</div></div>`).join(''):'<div class="small">No runtime breakdown available.</div>');
-const pauseButton=$('#pause-refresh');let paused=localStorage.getItem('orch-pause')==='1';
+const pauseButton=$('#pause-refresh');let paused=false;try{paused=localStorage.getItem('orch-pause')==='1';}catch{}
 const syncPauseLabel=()=>{pauseButton.textContent=paused?'Resume auto-refresh':'Pause auto-refresh';pauseButton.setAttribute('aria-pressed',String(paused));};syncPauseLabel();
-pauseButton.addEventListener('click',()=>{paused=!paused;localStorage.setItem('orch-pause',paused?'1':'0');syncPauseLabel();});
-const savedScroll=sessionStorage.getItem('orch-scroll');if(savedScroll!==null){window.scrollTo(0,Number(savedScroll)||0);sessionStorage.removeItem('orch-scroll');}
-setInterval(()=>{if(document.visibilityState!=='visible'||localStorage.getItem('orch-pause')==='1')return;sessionStorage.setItem('orch-scroll',String(window.scrollY));window.location.reload();},5000);
+pauseButton.addEventListener('click',()=>{paused=!paused;try{localStorage.setItem('orch-pause',paused?'1':'0');}catch{}syncPauseLabel();});
+try{const savedScroll=sessionStorage.getItem('orch-scroll');if(savedScroll!==null){window.scrollTo(0,Number(savedScroll)||0);sessionStorage.removeItem('orch-scroll');}}catch{}
+setInterval(()=>{if(document.visibilityState!=='visible'||paused)return;try{if(localStorage.getItem('orch-pause')==='1')return;}catch{}try{sessionStorage.setItem('orch-scroll',String(window.scrollY));}catch{}window.location.reload();},5000);
 </script></main></body></html>'''
     out = root / 'dashboard.html'
     tmp = out.with_name(f'.{out.name}.{secrets.token_hex(8)}.tmp')
