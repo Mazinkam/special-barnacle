@@ -489,5 +489,321 @@ class RecoveryTests(TemporaryRootTestCase):
         self.assertEqual(replayed["checkpoint"]["events_replayed"], 6)
 
 
+def _fsync_by_inode(calls: list, fail_inode: int | None = None, fail_once: bool = True):
+    """Wrap os.fsync so a test can see which files were synced and inject one failure."""
+    original = os.fsync
+    state = {"failed": False}
+
+    def wrapper(fd):
+        inode = os.fstat(fd).st_ino
+        calls.append(inode)
+        if fail_inode is not None and inode == fail_inode and not (fail_once and state["failed"]):
+            state["failed"] = True
+            raise OSError(5, "Input/output error")
+        return original(fd)
+
+    return wrapper
+
+
+class ReviewRegressionTests(TemporaryRootTestCase):
+    """Regressions for the review findings on the first durable-writer implementation."""
+
+    # (1) A bounded recent-id window must never let an old record id through again.
+    def test_duplicate_older_than_any_bounded_window_is_still_rejected(self):
+        from orchestrator import record_batch
+        total = 4200  # more than the 4096-id window the first implementation kept
+        first = [{"stream": "metric", "record_id": "m-0", "event": "model_call", "run_id": "R1", "model": "gpt-4o",
+                  "input_tokens": 1, "output_tokens": 1}]
+        record_batch.write_batch(self.root, first, refresh=False)
+        for start in range(1, total, record_batch.MAX_BATCH_RECORDS):
+            batch = [{"stream": "metric", "record_id": f"m-{i}", "event": "model_call", "run_id": "R1", "model": "gpt-4o",
+                      "input_tokens": 1, "output_tokens": 1} for i in range(start, min(start + record_batch.MAX_BATCH_RECORDS, total))]
+            record_batch.write_batch(self.root, batch, refresh=False)
+        before = (self.root / "metrics.jsonl").read_bytes()
+        self.assertEqual(before.count(b'"record_id": "m-0"'), 1)
+        retry = record_batch.write_batch(self.root, first, refresh=False)
+        self.assertEqual(retry["duplicates"], {"event": 0, "metric": 1, "outcome": 0})
+        self.assertEqual(retry["persisted"], {"event": 0, "metric": 0, "outcome": 0})
+        self.assertEqual((self.root / "metrics.jsonl").read_bytes(), before, "an old id must not be appended a second time")
+        # The same holds across processes (fresh index load) and for the event stream.
+        events = [{"stream": "event", "record_id": f"e-{i}", "event": "task_created", "run_id": "R1", "task_id": f"T{i}"}
+                  for i in range(total)]
+        for start in range(0, total, record_batch.MAX_BATCH_RECORDS):
+            record_batch.write_batch(self.root, events[start:start + record_batch.MAX_BATCH_RECORDS], refresh=False)
+        result = run_batch(self.root, events[:3])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["duplicates"]["event"], 3)
+        self.assertEqual(len(stream_ids(self.root, "event")), total)
+
+    # (2) Cached membership can never be the reason a new record is silently dropped.
+    def test_valid_shaped_corrupt_checkpoint_cannot_discard_a_new_record(self):
+        from orchestrator import record_batch
+        self.assertEqual(run_batch(self.root, sample_batch()).returncode, 0)
+        checkpoint = self.root / record_batch.CHECKPOINT_FILE
+
+        def corrupt(record_id: str, *, consistent: bool):
+            """Add an id the stream never saw, keeping the checkpoint valid-shaped and size-accurate."""
+            raw = json.loads(checkpoint.read_text())
+            entry = raw["streams"]["event"]
+            entry["ids"].append(record_id)
+            if consistent:  # forge the self-checksum too: an internally consistent cache that is simply wrong
+                entry["ids_hash"] = record_batch._ids_hash(entry["ids"])
+            checkpoint.write_text(json.dumps(raw), encoding="utf-8")
+
+        for label, consistent in (("detectable corruption", False), ("internally consistent but wrong", True)):
+            with self.subTest(label):
+                rid = f"ghost-{int(consistent)}"
+                corrupt(rid, consistent=consistent)
+                result = run_batch(self.root, [{"stream": "event", "record_id": rid, "event": "task_created", "run_id": "R1",
+                                                "task_id": f"G{int(consistent)}"}])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                body = json.loads(result.stdout)
+                self.assertEqual(body["persisted"]["event"], 1, f"{label}: the record must be appended, not silently dropped")
+                self.assertEqual(body["duplicates"]["event"], 0)
+                self.assertIn(rid, stream_ids(self.root, "event"))
+                self.assertEqual(read_json(self.root / "ledger.json", {})["tasks"][f"G{int(consistent)}"]["status"], "created")
+        # The cache is rebuilt from the authoritative stream afterwards: a genuine retry still dedups.
+        again = run_batch(self.root, sample_batch())
+        self.assertEqual(json.loads(again.stdout)["duplicates"], {"event": 3, "metric": 1, "outcome": 1})
+        self.assertEqual(stream_ids(self.root, "event"), ["e-1", "e-2", "e-3", "ghost-0", "ghost-1"])
+
+    # (3) A complete record that merely lacks its newline is data, not garbage.
+    def test_complete_record_without_trailing_newline_is_recognized_and_not_duplicated_on_retry(self):
+        self.assertEqual(run_batch(self.root, sample_batch()).returncode, 0)
+        events = self.root / "events.jsonl"
+        late = {"stream": "event", "record_id": "nl-less", "event": "task_created", "run_id": "R1", "task_id": "NL"}
+        with events.open("ab") as handle:  # a writer that lost its newline (torn write of the final byte)
+            handle.write(json.dumps({k: v for k, v in late.items() if k != "stream"}).encode())
+        retry = run_batch(self.root, [late])
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        body = json.loads(retry.stdout)
+        self.assertEqual(body["duplicates"], {"event": 1, "metric": 0, "outcome": 0}, "the complete record is already durable")
+        self.assertEqual(body["persisted"], {"event": 0, "metric": 0, "outcome": 0})
+        data = events.read_bytes()
+        self.assertTrue(data.endswith(b"\n"), "acknowledging the record must make it a replayable line")
+        self.assertEqual(data.count(b'"nl-less"'), 1)
+        self.assertEqual(stream_ids(self.root, "event"), ["e-1", "e-2", "e-3", "nl-less"])
+        self.assertEqual(read_json(self.root / "ledger.json", {})["tasks"]["NL"]["status"], "created")
+
+    def test_complete_record_without_newline_is_terminated_even_by_an_unrelated_batch(self):
+        self.assertEqual(run_batch(self.root, sample_batch()).returncode, 0)
+        events = self.root / "events.jsonl"
+        with events.open("ab") as handle:
+            handle.write(json.dumps({"record_id": "nl-less", "event": "task_created", "run_id": "R1", "task_id": "NL"}).encode())
+        result = run_batch(self.root, [{"stream": "metric", "record_id": "m-9", "event": "model_call", "run_id": "R1",
+                                        "model": "gpt-4o", "input_tokens": 1, "output_tokens": 1}])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(events.read_bytes().endswith(b"\n"))
+        self.assertEqual(stream_ids(self.root, "event"), ["e-1", "e-2", "e-3", "nl-less"])
+        self.assertEqual(read_json(self.root / "ledger.json", {})["tasks"]["NL"]["status"], "created")
+
+    def test_incomplete_fragment_is_left_untouched_when_nothing_is_appended_to_its_stream(self):
+        self.assertEqual(run_batch(self.root, sample_batch()).returncode, 0)
+        events = self.root / "events.jsonl"
+        with events.open("ab") as handle:
+            handle.write(b'{"event":"task_created","task_id":"FRAG","record_id":"frag')
+        before = events.read_bytes()
+        result = run_batch(self.root, sample_batch()[:1])  # duplicate-only for the event stream
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["duplicates"]["event"], 1)
+        self.assertEqual(events.read_bytes(), before, "a fragment that might still be completed is not rewritten")
+        self.assertNotIn("FRAG", read_json(self.root / "ledger.json", {})["tasks"])
+        # Appending to that stream terminates the fragment so the new record is parseable (no truncation).
+        result = run_batch(self.root, [{"stream": "event", "record_id": "e-after", "event": "task_created", "run_id": "R1", "task_id": "T2"}])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = events.read_bytes()
+        self.assertTrue(data.startswith(before), "append-only: earlier bytes are never rewritten or truncated")
+        self.assertEqual(stream_ids(self.root, "event"), ["e-1", "e-2", "e-3", "e-after"])
+
+    # (4) Visible-but-unsynced bytes must be fsynced before a retry acknowledges them as duplicates.
+    def test_fsync_failure_is_reported_and_the_retry_syncs_visible_duplicates_before_acknowledging(self):
+        from orchestrator import record_batch
+        metrics = self.root / "metrics.jsonl"
+        record_batch.write_batch(self.root, sample_batch()[:1], refresh=False)  # creates the root and event stream
+        metrics.touch()
+        metrics_inode = metrics.stat().st_ino
+        calls: list[int] = []
+        with patch("orchestrator.record_batch.os.fsync", _fsync_by_inode(calls, fail_inode=metrics_inode)):
+            with self.assertRaises(record_batch.BatchAppendError) as caught:
+                record_batch.write_batch(self.root, sample_batch(), refresh=False)
+        self.assertEqual(caught.exception.persisted, {"event": 2, "metric": 0, "outcome": 0}, "an unsynced stream is not persisted")
+        self.assertIn("same record ids", str(caught.exception))
+        self.assertEqual(stream_ids(self.root, "metric"), ["m-1"], "the bytes are visible even though the sync failed")
+        self.assertFalse((self.root / record_batch.CHECKPOINT_FILE).exists() and
+                         json.loads((self.root / record_batch.CHECKPOINT_FILE).read_text())["streams"]["metric"]["size"] > 0,
+                         "no checkpoint may vouch for unsynced bytes")
+
+        calls.clear()
+        with patch("orchestrator.record_batch.os.fsync", _fsync_by_inode(calls)):
+            retry = record_batch.write_batch(self.root, sample_batch())
+        self.assertTrue(retry["ok"], retry)
+        self.assertEqual(retry["duplicates"], {"event": 3, "metric": 1, "outcome": 0})
+        self.assertEqual(retry["persisted"], {"event": 0, "metric": 0, "outcome": 1})
+        self.assertIn(metrics_inode, calls, "visible duplicates must be fsynced before they are acknowledged")
+        self.assertEqual(stream_ids(self.root, "metric"), ["m-1"])
+
+    def test_bytes_appended_by_a_crashed_writer_are_synced_before_the_checkpoint_vouches_for_them(self):
+        from orchestrator import record_batch
+        self.assertEqual(run_batch(self.root, sample_batch()).returncode, 0)
+        events = self.root / "events.jsonl"
+        with events.open("ab") as handle:  # a writer that died between write() and fsync()
+            handle.write(json.dumps({"record_id": "unsynced", "event": "task_created", "run_id": "R1", "task_id": "U"}).encode() + b"\n")
+        calls: list[int] = []
+        with patch("orchestrator.record_batch.os.fsync", _fsync_by_inode(calls)):
+            result = record_batch.write_batch(self.root, [{"stream": "outcome", "record_id": "o-2", "run_id": "R1", "task_id": "U", "outcome": "verified"}])
+        self.assertTrue(result["ok"])
+        self.assertIn(events.stat().st_ino, calls, "the catch-up region of the event stream must be fsynced")
+        checkpoint = json.loads((self.root / record_batch.CHECKPOINT_FILE).read_text())
+        self.assertEqual(checkpoint["streams"]["event"]["size"], events.stat().st_size)
+
+    # (5) Reducer key fields are validated before anything is appended; nothing raises a raw traceback.
+    def test_unhashable_stream_and_key_fields_are_rejected_with_structured_errors(self):
+        bad_stream = [{"stream": ["event"], "record_id": "x-1", "event": "run_started", "run_id": "R1"}]
+        result = run_batch(self.root, bad_stream)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        body = json.loads(result.stdout)
+        self.assertFalse(body["ok"]); self.assertIn("index 0", body["error"]); self.assertIn("stream", body["error"])
+        key_cases = {
+            "run_id list": {"stream": "event", "record_id": "k-1", "event": "run_started", "run_id": ["R1"]},
+            "run_id object": {"stream": "event", "record_id": "k-2", "event": "run_started", "run_id": {"id": "R1"}},
+            "run_id integer": {"stream": "event", "record_id": "k-3", "event": "run_started", "run_id": 7},
+            "task_id list": {"stream": "event", "record_id": "k-4", "event": "task_created", "run_id": "R1", "task_id": ["T"]},
+            "decision_id bool": {"stream": "event", "record_id": "k-5", "event": "decision_created", "decision_id": True},
+            "workstream_id list": {"stream": "event", "record_id": "k-6", "event": "workstream_created", "workstream_id": []},
+            "resource object": {"stream": "event", "record_id": "k-7", "event": "lock_acquired", "resource": {}},
+            "metric run_id list": {"stream": "metric", "record_id": "k-8", "event": "model_call", "run_id": ["R1"], "model": "gpt-4o"},
+            "outcome task_id list": {"stream": "outcome", "record_id": "k-9", "run_id": "R1", "task_id": ["T1"]},
+        }
+        for label, bad in key_cases.items():
+            with self.subTest(label):
+                records = [*sample_batch(), bad]
+                result = run_batch(self.root, records)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                body = json.loads(result.stdout)
+                field = label.split()[-2] if label.startswith(("metric", "outcome")) else label.split()[0]
+                self.assertIn("index 5", body["error"]); self.assertIn(field, body["error"])
+                for stream in STREAM_FILES:
+                    self.assertEqual(stream_ids(self.root, stream), [], f"{label}: all-or-nothing")
+        # Null key fields are allowed (the reducer ignores them), so existing callers are unaffected.
+        ok = run_batch(self.root, [{"stream": "event", "record_id": "n-1", "event": "run_started", "run_id": None}])
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+
+    def test_single_record_commands_reject_bad_payloads_without_tracebacks(self):
+        for label, args in {
+            "event unhashable run_id": ("event", "run_started", json.dumps({"run_id": ["R1"]})),
+            "event payload not an object": ("event", "run_started", "[1,2]"),
+            "event payload invalid json": ("event", "run_started", "{nope"),
+            "metric unhashable task_id": ("metric", json.dumps({"event": "model_call", "task_id": {"x": 1}})),
+            "outcome payload not an object": ("outcome", "42"),
+        }.items():
+            with self.subTest(label):
+                result = run_cli(self.root, *args)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                body = json.loads(result.stdout)
+                self.assertFalse(body["ok"]); self.assertEqual(body["status"], "invalid")
+        for stream in STREAM_FILES:
+            self.assertEqual(stream_ids(self.root, stream), [])
+        from orchestrator.record_batch import BatchValidationError
+        store = EventStore(self.root)
+        with self.assertRaises(BatchValidationError):
+            store.emit("run_started", run_id={"id": "R1"})
+        with self.assertRaises(BatchValidationError):
+            store.metric(event="model_call", run_id=["R1"])
+
+    def test_legacy_poison_record_with_unhashable_key_does_not_break_replay(self):
+        from orchestrator.state import rebuild, refresh_ledger
+        self.assertEqual(run_batch(self.root, sample_batch()).returncode, 0)
+        with (self.root / "events.jsonl").open("a", encoding="utf-8") as handle:  # written by an older writer
+            handle.write(json.dumps({"record_id": "poison", "event": "run_started", "run_id": ["R9"]}) + "\n")
+            handle.write(json.dumps({"record_id": "fine", "event": "run_started", "run_id": "R2"}) + "\n")
+        ledger = refresh_ledger(self.root)
+        self.assertEqual(set(ledger["runs"]), {"R1", "R2"})
+        self.assertEqual(ledger["checkpoint"]["events_offset"], (self.root / "events.jsonl").stat().st_size)
+        self.assertEqual(set(rebuild(self.root)["runs"]), {"R1", "R2"})
+
+    # (6) A checkpoint write failure after the fsync is a structured partial result, not a traceback.
+    def test_checkpoint_write_failure_after_durable_append_returns_structured_result(self):
+        from orchestrator import record_batch
+        with patch("orchestrator.record_batch.write_json", side_effect=OSError(28, "No space left on device")):
+            result = record_batch.write_batch(self.root, sample_batch())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "checkpoint_failed")
+        self.assertEqual(result["persisted"], {"event": 3, "metric": 1, "outcome": 1}, "the records are durable")
+        self.assertEqual(result["retry"], "same_ids")
+        self.assertIn("No space left", result["error"]); self.assertIn("same record ids", result["error"])
+        self.assertFalse(result["ledger_updated"]); self.assertFalse(result["dashboard_updated"])
+        self.assertEqual(stream_ids(self.root, "event"), ["e-1", "e-2", "e-3"])
+        self.assertFalse((self.root / record_batch.CHECKPOINT_FILE).exists())
+
+        retry = record_batch.write_batch(self.root, sample_batch())
+        self.assertTrue(retry["ok"], retry)
+        self.assertEqual(retry["duplicates"], {"event": 3, "metric": 1, "outcome": 1})
+        self.assertIsNone(retry["retry"])
+        self.assertTrue(retry["ledger_updated"]); self.assertTrue(retry["dashboard_updated"])
+        self.assertTrue((self.root / record_batch.CHECKPOINT_FILE).exists())
+        self.assertEqual(stream_ids(self.root, "event"), ["e-1", "e-2", "e-3"])
+        self.assertEqual(read_json(self.root / "ledger.json", {})["tasks"]["T1"]["status"], "completed")
+
+    def test_checkpoint_write_failure_exit_code_and_body_carry_retry_guidance(self):
+        script = textwrap.dedent(
+            """
+            import sys
+            from unittest.mock import patch
+            from orchestrator import record_batch, cli
+            sys.argv = ["orchestrator", "batch"]
+            with patch("orchestrator.record_batch.write_json", side_effect=OSError(28, "No space left on device")):
+                cli.main()
+            """
+        )
+        result = subprocess.run([sys.executable, "-B", "-c", script], input=json.dumps(sample_batch()), capture_output=True,
+                                text=True, env=cli_env(self.root), cwd=str(REPO), timeout=60)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        body = json.loads(result.stdout)
+        self.assertEqual(body["status"], "checkpoint_failed")
+        self.assertEqual(body["persisted"], {"event": 3, "metric": 1, "outcome": 1})
+        self.assertEqual(body["retry"], "same_ids")
+        self.assertEqual(stream_ids(self.root, "event"), ["e-1", "e-2", "e-3"])
+
+    def test_append_failure_body_carries_retry_guidance(self):
+        from orchestrator import record_batch
+        with patch.object(record_batch, "_append_stream", side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(record_batch.BatchAppendError) as caught:
+                record_batch.write_batch(self.root, sample_batch())
+        self.assertIn("same record ids", str(caught.exception))
+        self.assertEqual(caught.exception.persisted, {"event": 0, "metric": 0, "outcome": 0})
+
+    # Single-record commands: the command decides the stream (and event name); the payload cannot override them.
+    def test_single_record_command_stream_and_event_cannot_be_overridden_by_payload(self):
+        conflicts = {
+            "event payload redirects to metric": ("event", "run_started", json.dumps({"stream": "metric", "run_id": "X"})),
+            "metric payload redirects to event": ("metric", json.dumps({"stream": "event", "event": "run_started", "run_id": "X"})),
+            "outcome payload redirects to event": ("outcome", json.dumps({"stream": "event", "event": "run_started", "run_id": "X"})),
+            "event payload renames the event": ("event", "run_started", json.dumps({"event": "run_failed", "run_id": "X"})),
+        }
+        for label, args in conflicts.items():
+            with self.subTest(label):
+                result = run_cli(self.root, *args)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                body = json.loads(result.stdout)
+                self.assertFalse(body["ok"]); self.assertEqual(body["status"], "invalid")
+        for stream in STREAM_FILES:
+            self.assertEqual(stream_ids(self.root, stream), [], stream)
+        # A payload that agrees with the command is fine.
+        ok = run_cli(self.root, "event", "run_started", json.dumps({"stream": "event", "event": "run_started", "run_id": "X"}))
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertEqual([e["event"] for e in load_jsonl(self.root / "events.jsonl")], ["run_started"])
+        from orchestrator.record_batch import BatchValidationError
+        store = EventStore(self.root)
+        with self.assertRaises(BatchValidationError):
+            store.metric(stream="event", event="model_call", run_id="X")
+        self.assertEqual(len(load_jsonl(self.root / "events.jsonl")), 1)
+        self.assertEqual(stream_ids(self.root, "metric"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

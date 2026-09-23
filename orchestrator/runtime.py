@@ -180,19 +180,19 @@ class EventStore:
         self.root=Path(root) if root is not None else default_state_root(); self.root.mkdir(parents=True,exist_ok=True)
         self.events=self.root/'events.jsonl'; self.metrics=self.root/'metrics.jsonl'; self.discoveries=self.root/'discoveries.jsonl'; self.outcomes=self.root/'outcomes.jsonl'
         for p in [self.events,self.metrics,self.discoveries,self.outcomes]: p.touch(exist_ok=True)
-    def _write(self,stream:str,payload:dict[str,Any]):
+    def _write(self,stream:str,payload:dict[str,Any],*,event:str|None=None):
         """Route a single record through the coordinated writer (lock + dedup + checkpoint).
 
         Callers that want the ledger/dashboard refreshed do so explicitly, as before; the writer
-        here only guarantees the durable, deduplicated append. Imported lazily: `record_batch`
-        depends on this module.
+        here only guarantees the durable, deduplicated append. The stream (and event name) named
+        by the method win over anything in the payload. Imported lazily: `record_batch` depends
+        on this module.
         """
-        from .record_batch import write_batch, new_record_id
-        record={'stream':stream,'record_id':payload.get('record_id') or new_record_id(),**payload}
-        result=write_batch(self.root,[record],refresh=False)
+        from .record_batch import write_batch, single_record
+        result=write_batch(self.root,[single_record(stream,payload,event=event)],refresh=False)
         return result['records'][0]
     def emit(self,event:str,**payload):
-        return self._write('event',{'event':event,**payload})
+        return self._write('event',payload,event=event)
     def preview_metric(self,**payload):
         """Build the record a `metric()` call would write, without writing it (dry runs)."""
         return {'ts':utc_now(),**default_attribution(),**meter(payload)}

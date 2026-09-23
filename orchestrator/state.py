@@ -7,6 +7,17 @@ LEDGER_FILE='ledger.json'
 LEDGER_CHECKPOINT_VERSION=1
 EMPTY={"schema_version":3,"updated_at":None,"runs":{},"tasks":{},"decisions":{},"workstreams":{},"locks":{},"artifacts":{},"verification":{},"repo_revision":None,"adaptive":{},"checkpoint":None}
 _SECTIONS=['runs','tasks','decisions','workstreams','locks','artifacts','verification','adaptive']
+# Identifier fields `reduce_event` (and the dashboard) use as dict keys. They must be strings: an
+# unhashable value raises mid-replay and poisons every later refresh, and a non-string hashable
+# (7 vs "7") splits one entity into two keys that collide again after JSON round-tripping.
+REDUCER_KEY_FIELDS=('run_id','task_id','decision_id','workstream_id','resource')
+
+def invalid_key_field(record:dict[str,Any])->str|None:
+    """Name of the first identifier field that is present but not a string (None is allowed), else None."""
+    for field in REDUCER_KEY_FIELDS:
+        value=record.get(field)
+        if value is not None and not isinstance(value,str): return field
+    return None
 
 def reduce_event(state:dict[str,Any], e:dict[str,Any])->dict[str,Any]:
     t=e.get('event'); rid=e.get('run_id'); tid=e.get('task_id')
@@ -63,6 +74,7 @@ def _replay_into(state:dict[str,Any], events:Path, offset:int, replayed:int, see
     for record,end in iter_jsonl_from(events,offset):
         offset=end
         if record is None or not isinstance(record,dict): continue
+        if invalid_key_field(record) is not None: continue  # legacy poison line; skipped like a malformed one
         rid=record.get('record_id')
         if seen_ids is not None and rid:
             if rid in seen_ids: continue

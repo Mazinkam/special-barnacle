@@ -6,7 +6,7 @@ from typing import Any, Callable
 from .runtime import EventStore,QualityEvidence,default_state_root,read_json,utc_now,write_json
 from .state import rebuild,load_or_rebuild
 from .dashboard import generate_dashboard
-from .record_batch import write_batch,new_record_id,BatchValidationError,BatchAppendError,STREAMS
+from .record_batch import write_batch,single_record,BatchValidationError,BatchAppendError,STREAMS,RETRY_SAME_IDS
 from .history import load_stats
 from .scheduler import recommend_package,topology_for
 from .context import ContextRegistry
@@ -88,28 +88,33 @@ def process_ingest(paths: list[Path], *, state_root: Path, runtime: str | None,
     return result
 
 # Exit codes for the durable-write commands (`batch`, `event`, `metric`, `outcome`). The JSON body on
-# stdout always carries `persisted`/`duplicates`, so a caller seeing 2 or 3 retries the same ids.
+# stdout always carries `persisted`/`duplicates`/`retry`; `retry == 'same_ids'` (exit 2 or 3) means the
+# durable records are fine and resubmitting the same ids finishes the work without appending twice.
 EXIT_OK=0; EXIT_INVALID=1; EXIT_APPEND_FAILED=2; EXIT_REFRESH_FAILED=3
 
-def _batch_payload(raw:str|None):
-    text=raw if raw not in (None,'-') else sys.stdin.read()
+def _parse_json(text:str,what:str):
     try: return json.loads(text)
-    except json.JSONDecodeError as exc: raise BatchValidationError(f'batch payload is not valid JSON: {exc}')
+    except json.JSONDecodeError as exc: raise BatchValidationError(f'{what} is not valid JSON: {exc}')
 
-def _failure(status:str,error:str,persisted:dict|None=None)->str:
+def _batch_payload(raw:str|None):
+    return _parse_json(raw if raw not in (None,'-') else sys.stdin.read(),'batch payload')
+
+def _failure(status:str,error:str,persisted:dict|None=None,retry:str|None=None)->str:
     empty={s:0 for s in STREAMS}
-    return json.dumps({'ok':False,'status':status,'error':error,'persisted':persisted or empty,'duplicates':empty,'ledger_updated':False,'dashboard_updated':False})
+    return json.dumps({'ok':False,'status':status,'error':error,'persisted':persisted or empty,'duplicates':empty,'ledger_updated':False,'dashboard_updated':False,'retry':retry})
 
 def write_records(records)->int:
     """Run the coordinated writer for the CLI and print its JSON result; return the exit code."""
     try: result=write_batch(ROOT,records,config=cfg())
     except BatchValidationError as exc: print(_failure('invalid',str(exc))); return EXIT_INVALID
-    except BatchAppendError as exc: print(_failure('append_failed',str(exc),exc.persisted)); return EXIT_APPEND_FAILED
+    except BatchAppendError as exc: print(_failure('append_failed',str(exc),exc.persisted,RETRY_SAME_IDS)); return EXIT_APPEND_FAILED
     print(json.dumps({k:v for k,v in result.items() if k!='records'}))
     return EXIT_OK if result['ok'] else EXIT_REFRESH_FAILED
 
-def _single(stream:str,payload:dict)->int:
-    record={'stream':stream,'record_id':payload.get('record_id') or new_record_id(),**payload}
+def _single(stream:str,payload_text:str,event:str|None=None)->int:
+    """One-record form of `write_records`: the command names the stream (and event); the payload cannot override them."""
+    try: record=single_record(stream,_parse_json(payload_text,'payload'),event=event)
+    except BatchValidationError as exc: print(_failure('invalid',str(exc))); return EXIT_INVALID
     return write_records([record])
 
 def main():
@@ -139,9 +144,9 @@ def main():
     if args.cmd=='features':
         f=FeaturePolicy(C.get('features',{})).resolve(); print(json.dumps(feature_inventory(f),indent=2)); return
     if args.cmd=='recommend-policy': print(json.dumps(eng.recommend_policy(),indent=2)); return
-    if args.cmd=='event': raise SystemExit(_single('event',{'event':args.event,**json.loads(args.payload)}))
-    if args.cmd=='metric': raise SystemExit(_single('metric',json.loads(args.payload)))
-    if args.cmd=='outcome': raise SystemExit(_single('outcome',json.loads(args.payload)))
+    if args.cmd=='event': raise SystemExit(_single('event',args.payload,event=args.event))
+    if args.cmd=='metric': raise SystemExit(_single('metric',args.payload))
+    if args.cmd=='outcome': raise SystemExit(_single('outcome',args.payload))
     if args.cmd=='batch':
         try: records=_batch_payload(args.payload)
         except BatchValidationError as exc: print(_failure('invalid',str(exc))); raise SystemExit(EXIT_INVALID)
