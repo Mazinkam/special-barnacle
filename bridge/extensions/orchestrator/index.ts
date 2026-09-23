@@ -31,6 +31,7 @@ import { spawn, spawnSync } from "node:child_process";
 import {
 	appendFileSync,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
@@ -1726,27 +1727,102 @@ function formatTaskPrompt(t: DispatchTask, runId: string): string {
 	].join("\n");
 }
 
+/** Fingerprint recorded for a dirty path that no longer exists on disk. */
+const DELETED_FINGERPRINT = "<deleted>";
+/** Fingerprint for dirty entries that are not regular files (submodules, nested repos, symlinked dirs). */
+const NON_FILE_FINGERPRINT = "<non-file>";
+/** Fingerprint for paths `git hash-object --stdin-paths` cannot accept (embedded newline). */
+const UNHASHABLE_FINGERPRINT = "<unhashable>";
+/** Generous cap for `git status` / `hash-object` output on large, noisy trees. */
+const GIT_OUTPUT_MAX_BUFFER = 64 * 1024 * 1024;
+
 /**
  * Paths that differ from HEAD (modified, added, deleted, renamed, untracked),
- * repo-relative. `null` when `cwd` is not inside a git work tree, in which case
- * callers fall back to the scraped list.
+ * repo-relative, mapped to a content fingerprint (git blob hash, or
+ * `DELETED_FINGERPRINT`). Two snapshots taken around a run let callers tell a
+ * file that was actually edited apart from one that was already dirty and
+ * merely mentioned in a report. `null` when `cwd` is not inside a git work
+ * tree, in which case callers fall back to the scraped list.
  */
-function gitDirtyFiles(cwd: string): Set<string> | null {
-	const res = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], {
-		cwd,
+export function gitDirtySnapshot(cwd: string): Map<string, string> | null {
+	// `git status` reports paths relative to the repository root, not `cwd`, so
+	// resolve the root once for the filesystem checks below.
+	const top = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf-8", timeout: 10_000 });
+	if (top.status !== 0) return null;
+	const root = top.stdout.trim();
+	if (!root) return null;
+	const status = spawnSync("git", ["status", "--porcelain", "-z", "--untracked-files=all"], {
+		cwd: root,
 		encoding: "utf-8",
 		timeout: 10_000,
+		maxBuffer: GIT_OUTPUT_MAX_BUFFER,
 	});
-	if (res.status !== 0) return null;
-	const out = new Set<string>();
-	for (const line of res.stdout.split("\n")) {
-		if (line.length < 4) continue;
-		// "XY path" or "XY old -> new" for renames; take the destination.
-		const p = line.slice(3);
-		const arrow = p.indexOf(" -> ");
-		out.add(arrow === -1 ? p : p.slice(arrow + 4));
+	if (status.status !== 0) return null;
+	const paths: string[] = [];
+	const entries = status.stdout.split("\0");
+	for (let i = 0; i < entries.length; i++) {
+		const entry = entries[i];
+		if (entry.length < 4) continue;
+		// "XY path"; renames/copies emit the destination here and the source as
+		// the next NUL-terminated record, which we skip.
+		paths.push(entry.slice(3));
+		if (entry[0] === "R" || entry[0] === "C" || entry[1] === "R" || entry[1] === "C") i++;
+	}
+	const out = new Map<string, string>();
+	const present: string[] = [];
+	for (const p of paths) {
+		let st: ReturnType<typeof lstatSync> | null = null;
+		try {
+			st = lstatSync(join(root, p));
+		} catch {
+			st = null;
+		}
+		if (!st) out.set(p, DELETED_FINGERPRINT);
+		// `hash-object` refuses directories (submodules, nested repos) and would
+		// abort the whole batch; fingerprint them by kind instead of content.
+		else if (!st.isFile()) out.set(p, NON_FILE_FINGERPRINT);
+		// `--stdin-paths` is newline-delimited and has no -z form.
+		else if (p.includes("\n")) out.set(p, UNHASHABLE_FINGERPRINT);
+		else present.push(p);
+	}
+	if (present.length > 0) {
+		const hashed = spawnSync("git", ["hash-object", "--stdin-paths"], {
+			cwd: root,
+			encoding: "utf-8",
+			input: `${present.join("\n")}\n`,
+			timeout: 30_000,
+			maxBuffer: GIT_OUTPUT_MAX_BUFFER,
+		});
+		if (hashed.status !== 0) return null;
+		const hashes = hashed.stdout.trim().split("\n");
+		if (hashes.length !== present.length) return null;
+		present.forEach((p, idx) => out.set(p, hashes[idx]));
 	}
 	return out;
+}
+
+/**
+ * Decide which files a lead phase actually changed. A path counts when it is
+ * dirty after the run and either was clean before or has different content
+ * now. `claimed` (paths scraped from lead prose) is only used when git
+ * snapshots are unavailable, and to report phantoms — files the lead named
+ * but did not touch. Note a pre-dirty file the lead reverts to HEAD drops out
+ * of `after` and is therefore not reported as changed.
+ */
+export function diffDirtySnapshots(
+	before: Map<string, string> | null,
+	after: Map<string, string> | null,
+	claimed: Iterable<string>,
+): { changed: string[]; phantom: string[] } {
+	const claimedSet = new Set(claimed);
+	if (!before || !after) return { changed: [...claimedSet], phantom: [] };
+	const changed: string[] = [];
+	for (const [path, fingerprint] of after) {
+		if (before.get(path) !== fingerprint) changed.push(path);
+	}
+	const changedSet = new Set(changed);
+	const phantom = [...claimedSet].filter((f) => !changedSet.has(f));
+	return { changed, phantom };
 }
 
 function parseFilesChanged(text: string): string[] {
@@ -2755,7 +2831,7 @@ export default function (pi: ExtensionAPI) {
 					log_dir: session.dir,
 				});
 
-				const dirtyBefore = gitDirtyFiles(cwd);
+				const dirtyBefore = gitDirtySnapshot(cwd);
 				const { leadResults, architectResult, escalationResults } = await dispatchHierarchical(
 					cwd,
 					runId,
@@ -2782,17 +2858,19 @@ export default function (pi: ExtensionAPI) {
 				// `filesChanged` is scraped from the lead's prose, so a report that merely
 				// MENTIONS README.md counted it as changed and sent QA after a phantom.
 				// When the workspace is a git repo, trust the working tree instead: a file
-				// is "changed" if it is dirty now and was either clean before the run or
-				// is also named by the lead.
+				// is "changed" only if it is dirty now and its content differs from the
+				// pre-run snapshot (or it was clean then). Pre-existing untracked scratch
+				// files the lead happens to name are therefore not sent to QA.
 				const claimed = new Set(leadResults.flatMap((r) => r.filesChanged));
-				const dirtyAfter = gitDirtyFiles(cwd);
-				const allFiles =
-					dirtyBefore && dirtyAfter
-						? [...dirtyAfter].filter((f) => !dirtyBefore.has(f) || claimed.has(f))
-						: [...claimed];
-				if (dirtyBefore && dirtyAfter) {
-					const phantom = [...claimed].filter((f) => !dirtyAfter.has(f));
-					if (phantom.length > 0) session.log(`lead named ${phantom.length} file(s) that are not modified in git; ignored: ${phantom.join(", ")}`);
+				const dirtyAfter = gitDirtySnapshot(cwd);
+				if (!dirtyBefore || !dirtyAfter) {
+					session.log(
+						`git snapshot unavailable (${!dirtyBefore ? "before" : "after"} lead phase); falling back to ${claimed.size} file(s) scraped from lead prose`,
+					);
+				}
+				const { changed: allFiles, phantom } = diffDirtySnapshots(dirtyBefore, dirtyAfter, claimed);
+				if (phantom.length > 0) {
+					session.log(`lead named ${phantom.length} file(s) not modified during this run; ignored: ${phantom.join(", ")}`);
 				}
 
 				let retries = 0;

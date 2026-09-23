@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -127,5 +128,108 @@ describe("confirmation gates", () => {
 			"Dispatch?: no UI to confirm — remove --interactive to run automatically",
 			"error",
 		);
+	});
+});
+
+describe("changed-file detection around the lead phase", () => {
+	function initRepo(): string {
+		const dir = mkdtempSync(join(tmpdir(), "orch-dirty-snapshot-"));
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		git("init", "-q");
+		git("config", "user.email", "t@example.com");
+		git("config", "user.name", "t");
+		git("config", "commit.gpgsign", "false");
+		writeFileSync(join(dir, "tracked.ts"), "export const a = 1;\n");
+		git("add", "tracked.ts");
+		git("commit", "-q", "-m", "init");
+		return dir;
+	}
+
+	test("pre-existing untracked scratch file named in lead prose is a phantom, not a change", () => {
+		const dir = initRepo();
+		try {
+			writeFileSync(join(dir, "scratch.js"), "console.log(1)\n");
+			const before = orchestrator.gitDirtySnapshot(dir);
+			// Lead runs, touches nothing, but its report mentions `scratch.js`.
+			const after = orchestrator.gitDirtySnapshot(dir);
+			const result = orchestrator.diffDirtySnapshots(before, after, ["scratch.js"]);
+			expect(result.changed).toEqual([]);
+			expect(result.phantom).toEqual(["scratch.js"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("pre-dirty file whose content changed during the run is reported as changed", () => {
+		const dir = initRepo();
+		try {
+			writeFileSync(join(dir, "scratch.js"), "v1\n");
+			const before = orchestrator.gitDirtySnapshot(dir);
+			writeFileSync(join(dir, "scratch.js"), "v2\n");
+			const after = orchestrator.gitDirtySnapshot(dir);
+			expect(orchestrator.diffDirtySnapshots(before, after, []).changed).toEqual(["scratch.js"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("new, modified-tracked, and deleted-tracked files are all detected", () => {
+		const dir = initRepo();
+		try {
+			writeFileSync(join(dir, "old-untracked.md"), "keep\n");
+			const before = orchestrator.gitDirtySnapshot(dir);
+			mkdirSync(join(dir, "src"));
+			writeFileSync(join(dir, "src", "new file.ts"), "export {};\n");
+			writeFileSync(join(dir, "tracked.ts"), "export const a = 2;\n");
+			const after = orchestrator.gitDirtySnapshot(dir);
+			const changed = orchestrator.diffDirtySnapshots(before, after, ["old-untracked.md"]).changed.sort();
+			expect(changed).toEqual(["src/new file.ts", "tracked.ts"]);
+
+			unlinkSync(join(dir, "tracked.ts"));
+			const afterDelete = orchestrator.gitDirtySnapshot(dir);
+			expect(afterDelete?.get("tracked.ts")).toBe("<deleted>");
+			expect(orchestrator.diffDirtySnapshots(after, afterDelete, []).changed).toEqual(["tracked.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("resolves paths against the repo root when cwd is a subdirectory", () => {
+		const dir = initRepo();
+		try {
+			mkdirSync(join(dir, "pkg"));
+			writeFileSync(join(dir, "pkg", "scratch.js"), "v1\n");
+			const before = orchestrator.gitDirtySnapshot(join(dir, "pkg"));
+			expect(before?.get("pkg/scratch.js")).not.toBe("<deleted>");
+			writeFileSync(join(dir, "pkg", "scratch.js"), "v2\n");
+			const after = orchestrator.gitDirtySnapshot(join(dir, "pkg"));
+			expect(orchestrator.diffDirtySnapshots(before, after, []).changed).toEqual(["pkg/scratch.js"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("nested repos and staged renames do not abort the snapshot", () => {
+		const dir = initRepo();
+		try {
+			const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+			mkdirSync(join(dir, "inner"));
+			execFileSync("git", ["init", "-q"], { cwd: join(dir, "inner"), stdio: "pipe" });
+			writeFileSync(join(dir, "inner", "x.txt"), "x\n");
+			git("mv", "tracked.ts", "renamed.ts");
+			const snap = orchestrator.gitDirtySnapshot(dir);
+			expect(snap).not.toBeNull();
+			expect(snap?.get("inner/")).toBe("<non-file>");
+			expect(snap?.get("renamed.ts")).toMatch(/^[0-9a-f]{40,64}$/);
+			expect(snap?.has("tracked.ts")).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("diffDirtySnapshots falls back to the de-duplicated scraped list without git snapshots", () => {
+		const result = orchestrator.diffDirtySnapshots(null, new Map(), ["a.ts", "a.ts", "b.ts"]);
+		expect(result.changed).toEqual(["a.ts", "b.ts"]);
+		expect(result.phantom).toEqual([]);
 	});
 });
