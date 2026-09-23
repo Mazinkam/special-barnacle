@@ -104,6 +104,17 @@ def replay_ledger(root: str|Path, *, full:bool=False)->dict[str,Any]:
     offset,replayed=_replay_into(state,events,0,0,set())
     return _publish(root,state,offset,replayed)
 
+def ledger_is_current(root: str|Path, events_offset:int)->bool:
+    """Does the published ledger resumably describe exactly the complete prefix ending at `events_offset`?
+
+    Authoritative catch-up test for writers (caller holds `writer_lock`): compares the ledger's
+    durable offset with the complete-prefix end the caller derived from `events.jsonl` itself, after
+    verifying the offset still lands on a line boundary of the current file. A missing, legacy or
+    stale ledger, or one whose prefix was repaired/extended by another writer, is not current.
+    """
+    root=Path(root); ck=_resumable_checkpoint(read_json(root/LEDGER_FILE,None),root/'events.jsonl')
+    return ck is not None and ck['events_offset']==events_offset
+
 def rebuild(root: str|Path|None=None)->dict[str,Any]:
     """Full recovery replay of events.jsonl into ledger.json (serialized with all writers)."""
     root=EventStore(root).root

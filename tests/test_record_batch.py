@@ -546,8 +546,8 @@ class ReviewRegressionTests(TemporaryRootTestCase):
             raw = json.loads(checkpoint.read_text())
             entry = raw["streams"]["event"]
             entry["ids"].append(record_id)
-            if consistent:  # forge the self-checksum too: an internally consistent cache that is simply wrong
-                entry["ids_hash"] = record_batch._ids_hash(entry["ids"])
+            if consistent:  # forge the stream-bound checksum too (needs the stream bytes): consistent but wrong
+                entry["binding"] = record_batch._binding(self.root / "events.jsonl", entry["size"], entry["ids"])
             checkpoint.write_text(json.dumps(raw), encoding="utf-8")
 
         for label, consistent in (("detectable corruption", False), ("internally consistent but wrong", True)):
@@ -803,6 +803,141 @@ class ReviewRegressionTests(TemporaryRootTestCase):
             store.metric(stream="event", event="model_call", run_id="X")
         self.assertEqual(len(load_jsonl(self.root / "events.jsonl")), 1)
         self.assertEqual(stream_ids(self.root, "metric"), [])
+
+
+def _drop_ids_from_checkpoint(root: Path, removals: dict[str, list[str]]) -> None:
+    """Remove ids the stream *does* contain from the cached index, keeping the entry internally consistent.
+
+    Every checksum that can be recomputed from the checkpoint alone is recomputed, so the only thing
+    wrong with the entry is its membership; size and any stream-position fingerprint are untouched.
+    """
+    from orchestrator import record_batch
+    from orchestrator.runtime import stable_hash
+    checkpoint = root / record_batch.CHECKPOINT_FILE
+    raw = json.loads(checkpoint.read_text(encoding="utf-8"))
+    for stream, ids in removals.items():
+        entry = raw["streams"][stream]
+        for rid in ids:
+            assert rid in entry["ids"], f"{rid} must be present before it is dropped"
+            entry["ids"].remove(rid)
+        if "ids_hash" in entry:  # v2 self-checksum of the id list
+            entry["ids_hash"] = stable_hash(entry["ids"])
+    checkpoint.write_text(json.dumps(raw), encoding="utf-8")
+
+
+class SecurityReviewRound2Tests(TemporaryRootTestCase):
+    """A cached 'not present' verdict is never the sole basis for an append, and ledger catch-up is authoritative."""
+
+    def _completed_run(self) -> list[dict]:
+        late = [{"stream": "event", "record_id": "e-late", "event": "run_completed", "run_id": "R1"}]
+        self.assertEqual(run_batch(self.root, sample_batch()).returncode, 0)
+        self.assertEqual(run_batch(self.root, late).returncode, 0)
+        self.assertEqual(read_json(self.root / "ledger.json", {})["runs"]["R1"]["status"], "completed")
+        return late
+
+    # A false-negative index (an id the stream has but the cache lost) must not append the record again.
+    def test_index_missing_existing_ids_cannot_append_them_again_or_regress_the_ledger(self):
+        from orchestrator.state import rebuild
+        self._completed_run()
+        _drop_ids_from_checkpoint(self.root, {"event": ["e-1"], "metric": ["m-1"]})
+        events_before = (self.root / "events.jsonl").read_bytes()
+        metrics_before = (self.root / "metrics.jsonl").read_bytes()
+        ledger_before = read_json(self.root / "ledger.json", {})
+
+        # Retrying the stale run_started (e-1) after run_completed is the worst case: a wrong append
+        # would flip the run back to 'running' in the incremental ledger only.
+        retry = run_batch(self.root, [sample_batch()[0], sample_batch()[1]])
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        body = json.loads(retry.stdout)
+        self.assertEqual(body["duplicates"], {"event": 1, "metric": 1, "outcome": 0}, "membership comes from the stream, not the cache")
+        self.assertEqual(body["persisted"], {"event": 0, "metric": 0, "outcome": 0})
+        self.assertEqual((self.root / "events.jsonl").read_bytes(), events_before, "no duplicate event line")
+        self.assertEqual((self.root / "metrics.jsonl").read_bytes(), metrics_before, "no duplicate metric line")
+        ledger = read_json(self.root / "ledger.json", {})
+        self.assertEqual(ledger["runs"]["R1"]["status"], "completed", "a stale run_started must not regress the run")
+        self.assertEqual(ledger["checkpoint"]["events_replayed"], ledger_before["checkpoint"]["events_replayed"])
+        self.assertEqual(strip_volatile(rebuild(self.root)), strip_volatile(ledger), "incremental ledger must equal full replay")
+
+    def test_index_with_every_id_removed_is_not_trusted_for_new_verdicts(self):
+        from orchestrator import record_batch
+        self._completed_run()
+        _drop_ids_from_checkpoint(self.root, {"event": ["e-1", "e-2", "e-3", "e-late"], "metric": ["m-1"], "outcome": ["o-1"]})
+        before = {stream: (self.root / name).read_bytes() for stream, name in STREAM_FILES.items()}
+        result = record_batch.write_batch(self.root, sample_batch())
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["duplicates"], {"event": 3, "metric": 1, "outcome": 1})
+        self.assertEqual(result["persisted"], {"event": 0, "metric": 0, "outcome": 0})
+        for stream, name in STREAM_FILES.items():
+            self.assertEqual((self.root / name).read_bytes(), before[stream], stream)
+        # The rebuilt checkpoint is complete again.
+        saved = json.loads((self.root / record_batch.CHECKPOINT_FILE).read_text())
+        self.assertEqual(saved["streams"]["event"]["ids"], ["e-1", "e-2", "e-3", "e-late"])
+        self.assertEqual(saved["streams"]["metric"]["ids"], ["m-1"])
+
+    def test_loaded_index_membership_always_matches_the_stream(self):
+        from orchestrator import record_batch
+        self._completed_run()
+        _drop_ids_from_checkpoint(self.root, {"event": ["e-2"]})
+        index = record_batch._load_index(self.root)
+        self.assertEqual(index["event"]["ids"], stream_ids(self.root, "event"))
+        self.assertEqual(index["event"]["known"], set(stream_ids(self.root, "event")))
+        # An honest checkpoint is still accepted (no needless rebuild), and a v2 checkpoint is rebuilt once.
+        record_batch.write_batch(self.root, sample_batch()[:1], refresh=False)
+        index = record_batch._load_index(self.root)
+        self.assertEqual(index["event"]["durable_size"], (self.root / "events.jsonl").stat().st_size)
+
+    # A metric batch that repairs a newline-less event but cannot checkpoint must not leave the
+    # ledger behind after the same-id retry succeeds.
+    def test_repaired_newline_less_event_reaches_the_ledger_after_a_failed_checkpoint_and_same_id_retry(self):
+        from orchestrator import record_batch
+        self.assertEqual(run_batch(self.root, sample_batch()).returncode, 0)
+        events = self.root / "events.jsonl"
+        with events.open("ab") as handle:  # a crashed writer: whole record, newline lost
+            handle.write(json.dumps({"record_id": "nl-late", "event": "run_completed", "run_id": "R1"}).encode())
+        metric = [{"stream": "metric", "record_id": "m-9", "event": "model_call", "run_id": "R1", "model": "gpt-4o",
+                   "input_tokens": 1, "output_tokens": 1}]
+        with patch("orchestrator.record_batch.write_json", side_effect=OSError(28, "No space left on device")):
+            first = record_batch.write_batch(self.root, metric)
+        self.assertEqual(first["status"], "checkpoint_failed")
+        self.assertEqual(first["retry"], "same_ids")
+        self.assertTrue(events.read_bytes().endswith(b"\n"), "the complete record was repaired by the unrelated batch")
+        self.assertEqual(stream_ids(self.root, "event"), ["e-1", "e-2", "e-3", "nl-late"])
+        self.assertEqual(read_json(self.root / "ledger.json", {})["runs"]["R1"]["status"], "running", "ledger is behind")
+
+        retry = run_batch(self.root, metric)  # fresh process, fresh index load
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        body = json.loads(retry.stdout)
+        self.assertTrue(body["ok"]); self.assertEqual(body["duplicates"], {"event": 0, "metric": 1, "outcome": 0})
+        self.assertTrue(body["ledger_updated"], "OK may only be returned once the ledger covers the complete authoritative prefix")
+        ledger = read_json(self.root / "ledger.json", {})
+        self.assertEqual(ledger["runs"]["R1"]["status"], "completed")
+        self.assertEqual(ledger["checkpoint"]["events_offset"], events.stat().st_size)
+        self.assertEqual(ledger["checkpoint"]["events_replayed"], 4)
+
+    def test_any_batch_refreshes_a_ledger_that_is_behind_the_complete_event_prefix(self):
+        from orchestrator import record_batch
+        self.assertEqual(run_batch(self.root, sample_batch()).returncode, 0)
+        metric = [{"stream": "metric", "record_id": "m-9", "event": "model_call", "run_id": "R1", "model": "gpt-4o",
+                   "input_tokens": 1, "output_tokens": 1}]
+        current = record_batch.write_batch(self.root, metric)
+        self.assertTrue(current["ok"]); self.assertFalse(current["ledger_updated"], "a current ledger is not rewritten")
+        events = self.root / "events.jsonl"
+        with events.open("ab") as handle:  # an old-code writer appended a complete line without publishing
+            handle.write(json.dumps({"record_id": "old-writer", "event": "run_completed", "run_id": "R1"}).encode() + b"\n")
+        self.assertEqual(read_json(self.root / "ledger.json", {})["runs"]["R1"]["status"], "running")
+        behind = record_batch.write_batch(self.root, metric)  # duplicate metric, no event touched by this batch
+        self.assertTrue(behind["ok"], behind)
+        self.assertEqual(behind["duplicates"]["metric"], 1)
+        self.assertTrue(behind["ledger_updated"], "ledger offset behind the complete prefix must trigger a refresh")
+        ledger = read_json(self.root / "ledger.json", {})
+        self.assertEqual(ledger["runs"]["R1"]["status"], "completed")
+        self.assertEqual(ledger["checkpoint"]["events_offset"], events.stat().st_size)
+        # A trailing fragment is not part of the complete prefix: the ledger stays current and is not rewritten.
+        with events.open("ab") as handle:
+            handle.write(b'{"event":"run_failed","run_id":"R1","record_id":"frag')
+        again = record_batch.write_batch(self.root, metric)
+        self.assertTrue(again["ok"]); self.assertFalse(again["ledger_updated"])
+        self.assertEqual(read_json(self.root / "ledger.json", {})["runs"]["R1"]["status"], "completed")
 
 
 if __name__ == "__main__":

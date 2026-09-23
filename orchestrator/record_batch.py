@@ -1,21 +1,25 @@
 """Durable, coordinated batch writes for the orchestrator's authoritative JSONL streams.
 
 This is the single writer behind the CLI `batch`, `event`, `metric` and `outcome` commands and
-behind `EventStore.emit/metric/outcome`. It owns three rules that every writer must share:
+behind `EventStore.emit/metric/outcome`. It owns four rules that every writer must share:
 
 1. **One process-safe lock** (`runtime.writer_lock`, the `ledger.lock` file) around
    check → append → fsync → checkpoint → incremental ledger replay. Rebuilds take the same lock,
    so a published ledger always describes a complete prefix of `events.jsonl`.
 2. **Idempotency by stable `record_id`, decided by the authoritative stream.** The checkpoint
-   (`records.checkpoint.json`) caches an *exact* index of every record id per stream, bound to the
-   stream by its complete-prefix size, a fingerprint of the last line and a checksum of the ids.
-   A cached "already present" verdict is never trusted on its own: before a record is reported as
-   a duplicate its stream is re-read and the index rebuilt from it, so a wrong cache can only ever
-   cost an extra append (collapsed by full replay), never a silently discarded record. A record
-   whose full JSON is present but lacks its newline counts as present; the newline is added before
-   it is acknowledged so replay sees it. Visible bytes that no checkpoint vouched for (a writer
-   that died between `write` and `fsync`, or whose `fsync` failed) are fsynced before they are
-   acknowledged as duplicates or covered by a checkpoint.
+   (`records.checkpoint.json`) caches an *exact* index of every record id per stream. It is only
+   trusted when its `binding` — a SHA-256 over the *entire* complete prefix of the stream file
+   followed by the id list — recomputes from the bytes on disk, so a cached membership can never be
+   accepted without re-reading the authoritative stream it claims to describe. A checkpoint that
+   merely re-hashes itself proves nothing and is rejected; a checkpoint whose id list drifted from
+   the stream (an id lost, an id invented) fails the binding and is rebuilt from the stream before
+   any record is classified. On top of that, a cached "already present" verdict is still confirmed
+   by re-reading the stream before a record is reported as a duplicate. Together: a "new" verdict
+   never rests on an unverified cache, and a "duplicate" verdict never rests on the cache at all.
+   A record whose full JSON is present but lacks its newline counts as present; the newline is
+   added before it is acknowledged so replay sees it. Visible bytes that no checkpoint vouched for
+   (a writer that died between `write` and `fsync`, or whose `fsync` failed) are fsynced before
+   they are acknowledged as duplicates or covered by a checkpoint.
 3. **JSONL is authoritative and append-only.** Records are appended and fsynced before anything is
    acknowledged; the checkpoint and ledger are derived and rebuildable. A batch is validated
    all-or-nothing before any byte is written (shape, stream, record_id, event name, and the
@@ -24,6 +28,12 @@ behind `EventStore.emit/metric/outcome`. It owns three rules that every writer m
    unacknowledged, and the same-id retry skips them. Existing bytes are never rewritten or
    truncated: a torn fragment is only ever terminated with a newline when something must be
    appended after it (so the new record is parseable); otherwise it is left alone.
+4. **The ledger is caught up from the authoritative prefix, not from what this batch did.** After
+   the appends, the ledger's durable event offset is compared with the complete prefix of
+   `events.jsonl` as derived from the file itself; whenever they differ (records appended here, a
+   crash between checkpoint and publish, a newline-less record repaired by an earlier batch whose
+   publish failed, an old-code writer, a legacy or missing ledger) the ledger is replayed before
+   the batch is acknowledged. A batch that leaves the ledger current does not rewrite it.
 
 Persisted format (`format_version` 1): one JSON object per line, each carrying `record_id`, `ts`,
 `agent_runtime`, `repository`, and the caller's payload (`event` records carry `event`; metric
@@ -41,6 +51,7 @@ same batch (same ids) and the writer will catch up without appending anything tw
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -49,18 +60,19 @@ from typing import Any
 
 from .dashboard import generate_dashboard
 from .runtime import (default_attribution, default_state_root, encode_jsonl, iter_jsonl_from, meter, read_json,
-                      stable_hash, tail_fingerprint, utc_now, write_json, writer_lock)
-from .state import REDUCER_KEY_FIELDS, invalid_key_field, replay_ledger
+                      utc_now, write_json, writer_lock)
+from .state import REDUCER_KEY_FIELDS, invalid_key_field, ledger_is_current, replay_ledger
 
 FORMAT_VERSION = 1
 CHECKPOINT_FILE = 'records.checkpoint.json'
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 STREAMS: dict[str, str] = {'event': 'events.jsonl', 'metric': 'metrics.jsonl', 'outcome': 'outcomes.jsonl'}
 MAX_BATCH_RECORDS = 500
 MAX_RECORD_ID_LENGTH = 200
 RESERVED_KEYS = {'stream'}
 RETRY_SAME_IDS = 'same_ids'
 _TAIL_CHUNK = 65536
+_HASH_CHUNK = 1 << 20
 
 
 class BatchValidationError(ValueError):
@@ -150,8 +162,27 @@ def build_record(record: dict[str, Any]) -> dict[str, Any]:
 
 # --- exact id index (checkpoint) ---------------------------------------------------------------
 
-def _ids_hash(ids: list[str]) -> str:
-    return stable_hash(ids)
+def _binding(path: Path, size: int, ids: list[str]) -> str:
+    """Checksum binding an id list to the authoritative stream prefix it was derived from.
+
+    SHA-256 over the first `size` bytes of the stream file, a NUL separator (JSON cannot contain
+    one), then the JSON-encoded id list. It cannot be recomputed from the checkpoint alone: anyone
+    producing a matching value must have read exactly those stream bytes. Verifying it therefore
+    re-reads the whole complete prefix on every load — the cost of never trusting cached
+    membership blind (~6 ms per 50 000 records). A file shorter than `size` yields a value that
+    matches nothing.
+    """
+    digest = hashlib.sha256()
+    remaining = size
+    if remaining:
+        with path.open('rb') as handle:
+            while remaining > 0:
+                chunk = handle.read(min(remaining, _HASH_CHUNK))
+                if not chunk:
+                    return 'short'
+                digest.update(chunk); remaining -= len(chunk)
+    digest.update(b'\0'); digest.update(json.dumps(ids, separators=(',', ':')).encode('utf-8'))
+    return digest.hexdigest()
 
 
 def _is_complete_record(tail: bytes) -> bool:
@@ -194,19 +225,23 @@ def _scan_ids(path: Path, offset: int, into: list[str]) -> tuple[int, str | None
 
 
 def _valid_entry(entry: Any, path: Path, size_now: int) -> bool:
-    """Does this checkpoint entry still describe a complete prefix of the stream, with intact ids?"""
+    """Does this checkpoint entry still describe a complete prefix of the stream, with membership bound to it?"""
     if not isinstance(entry, dict):
         return False
-    size = entry.get('size'); ids = entry.get('ids'); tail_hash = entry.get('tail_hash')
+    size = entry.get('size'); ids = entry.get('ids')
     if isinstance(size, bool) or not isinstance(size, int) or size < 0 or size > size_now:
         return False
     if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
         return False
-    if entry.get('ids_hash') != _ids_hash(ids):
+    if size and not _ends_line(path, size):
         return False
-    if size == 0:
-        return tail_hash is None
-    return isinstance(tail_hash, str) and tail_hash != 'unterminated' and tail_fingerprint(path, size) == tail_hash
+    return isinstance(entry.get('binding'), str) and entry['binding'] == _binding(path, size, ids)
+
+
+def _ends_line(path: Path, size: int) -> bool:
+    with path.open('rb') as handle:
+        handle.seek(size - 1)
+        return handle.read(1) == b'\n'
 
 
 def _from_stream(path: Path, entry: dict[str, Any], offset: int, ids: list[str]) -> None:
@@ -215,8 +250,10 @@ def _from_stream(path: Path, entry: dict[str, Any], offset: int, ids: list[str])
 
 
 def _load_index(root: Path) -> dict[str, dict[str, Any]]:
-    """Exact record-id index per stream: the checkpoint where it is provably current, the stream otherwise.
+    """Exact record-id index per stream: the checkpoint where its binding to the stream verifies, the stream otherwise.
 
+    Verifying the binding re-reads every stream's complete prefix, so a cached membership is only
+    ever used after the authoritative bytes it was derived from have been confirmed byte-for-byte.
     `durable_size` is how many bytes an earlier writer's checkpoint vouched as fsynced; anything the
     index learns beyond that from the stream itself must be fsynced before it is acknowledged.
     """
@@ -245,12 +282,11 @@ def _rebuild_from_stream(root: Path, stream: str, entry: dict[str, Any]) -> None
 
 
 def _write_checkpoint(root: Path, index: dict[str, dict[str, Any]]) -> None:
+    """Publish the index, binding each id list to the fsynced stream bytes it now describes (re-read from disk)."""
     streams = {}
     for stream, entry in index.items():
-        path = root / STREAMS[stream]
-        size = entry['size']
-        streams[stream] = {'size': size, 'tail_hash': tail_fingerprint(path, size) if size else None,
-                           'ids': list(entry['ids']), 'ids_hash': _ids_hash(entry['ids'])}
+        size = entry['size']; ids = list(entry['ids'])
+        streams[stream] = {'size': size, 'ids': ids, 'binding': _binding(root / STREAMS[stream], size, ids)}
     write_json(root / CHECKPOINT_FILE, {'format_version': CHECKPOINT_VERSION, 'streams': streams}, compact=True)
 
 
@@ -314,8 +350,9 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
     with writer_lock(root):
         try:
             index = _load_index(root)
-            # A cached "present" verdict is confirmed against the authoritative stream before it can
-            # turn a record into a duplicate; the rebuilt index then decides for the whole stream.
+            # The loaded index is already bound to the stream bytes; a cached "present" verdict is
+            # nevertheless confirmed against the authoritative stream before it can turn a record
+            # into a duplicate; the rebuilt index then decides for the whole stream.
             for stream in {r['stream'] for r in validated if r['record_id'] in index[r['stream']]['known']}:
                 _rebuild_from_stream(root, stream, index[stream])
         except OSError as exc:
@@ -334,7 +371,6 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
             index[stream]['known'].add(record_id); new_ids[stream].append(record_id)
             built.append(materialized)
             statuses.append({'record_id': record_id, 'stream': stream, 'status': 'persisted'})
-        modified: dict[str, bool] = {stream: False for stream in STREAMS}
         for stream, lines in pending.items():
             entry = index[stream]; path = root / STREAMS[stream]
             # Sync when appending, when acknowledging duplicates, when the index learned bytes no
@@ -349,7 +385,6 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
                 raise BatchAppendError(f'{what} failed after persisting {persisted}: {exc}', persisted) from exc
             persisted[stream] = len(lines)
             entry['ids'].extend(new_ids[stream])
-            modified[stream] = bool(lines) or entry['tail'] == 'complete' or new_size != entry['size']
             entry['size'] = new_size
         try:
             _write_checkpoint(root, index)
@@ -357,13 +392,14 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
             status = 'checkpoint_failed'
             error = (f'checkpoint write failed after the records were durably appended: {exc}; '
                      f'retry with the same record ids to rebuild the index and refresh the ledger')
-        # Refresh for duplicate events too: a retry after a crash between checkpoint and ledger
-        # publish must still bring the ledger up to the work it is now acknowledging.
-        touched_events = persisted['event'] or duplicates['event'] or modified['event']
-        if refresh and error is None and (touched_events or _ledger_missing(root)):
+        # Catch the ledger up whenever its durable offset is not the complete authoritative prefix of
+        # events.jsonl (as just derived from the file), regardless of what this batch appended: a
+        # retry after a crash or failed checkpoint must not return OK with the ledger behind.
+        if refresh and error is None:
             try:
-                replay_ledger(root)
-                ledger_updated = True
+                if not ledger_is_current(root, index['event']['size']):
+                    replay_ledger(root)
+                    ledger_updated = True
             except Exception as exc:  # noqa: BLE001 - reported to the caller, records are already durable
                 status = 'refresh_failed'; error = f'ledger refresh failed: {exc}'
     if refresh and error is None:
@@ -378,7 +414,3 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
         'dashboard_updated': dashboard_updated, 'error': error, 'retry': None if error is None else RETRY_SAME_IDS,
         'statuses': statuses, 'records': built,
     }
-
-
-def _ledger_missing(root: Path) -> bool:
-    return not (root / 'ledger.json').exists()
