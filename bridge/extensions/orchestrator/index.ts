@@ -17,7 +17,7 @@
  *   5. spawn subagent via HT subagent tool   -> dispatchHierarchical
  *   6. record every model call              -> captureDispatchCost
  *   7. run deterministic verification       -> runVerification
- *   8. report task_verified/task_failed      -> captureDispatchCost
+ *   8. build QualityEvidence + verify_task   -> verifyTask
  *   9. escalate only the failing subproblem -> escalateIfNeeded
  *  10. complete_run / fail_run              -> completeRun / failRun + recordOutcome
  *
