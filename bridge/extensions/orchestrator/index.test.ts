@@ -140,7 +140,7 @@ describe("RunSession cancellation presentation", () => {
 		session.close(true);
 
 		const finalWidget = widgets.at(-1) as string[];
-		expect(finalWidget).toContain("Goal: update the payments page");
+		expect(finalWidget.some((line) => line.includes("Goal:") && line.includes("update the payments page"))).toBe(true);
 		expect(finalWidget.some((line) => line.includes("lead") && line.includes("cancelled by user"))).toBe(true);
 		expect(statuses.at(-1)).toContain("cancelled");
 	});

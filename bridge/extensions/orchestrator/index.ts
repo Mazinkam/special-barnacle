@@ -730,9 +730,15 @@ interface DispatchProgress {
 	turns: number;
 	toolCalls: number;
 	lastActivity: string;
+	/** Last few activity strings, newest at the end; rendered as a dim sub-line. */
+	activityTail: string[];
 	costUsd: number;
 	status: "running" | "done" | "failed" | "cancelled";
+	/** Nesting depth (0 = top-level dispatch, 1 = child of a lead, …). */
+	depth: number;
 }
+
+const MAX_ACTIVITY_TAIL = 4;
 
 function fmtElapsed(ms: number): string {
 	const s = Math.max(0, Math.round(ms / 1000));
@@ -755,6 +761,52 @@ function shortArgs(toolName: string, args: unknown): string {
 }
 
 /**
+ * Detect the git worktree the orchestrator is running in. Cheap: two short
+ * `git` invocations cached at session start. Returns null when `cwd` is not
+ * inside a git worktree so callers can fall back gracefully.
+ */
+export interface WorktreeInfo {
+	root: string;
+	branch: string;
+	shortBranch: string;
+	name: string;
+}
+
+function detectWorktree(cwd: string): WorktreeInfo | null {
+	try {
+		const rootR = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+			encoding: "utf-8", timeout: 5000,
+		});
+		if (rootR.status !== 0 || !rootR.stdout.trim()) return null;
+		const root = rootR.stdout.trim();
+		const branchR = spawnSync("git", ["-C", cwd, "branch", "--show-current"], {
+			encoding: "utf-8", timeout: 5000,
+		});
+		const branch = branchR.status === 0 ? branchR.stdout.trim() : "";
+		return {
+			root,
+			branch,
+			shortBranch: branch || "(detached)",
+			name: basename(root),
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** Braille-pattern spinner frames, ticked by the run's existing 1s interval. */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+function spinnerFrame(now: number): string {
+	return SPINNER_FRAMES[Math.floor(now / 80) % SPINNER_FRAMES.length];
+}
+
+/** Hard cap on buffered user messages so a chatty operator can't blow context. */
+const MAX_QUEUED_MESSAGES = 10;
+/** Soft per-message cap in characters; longer messages are truncated in the
+ *  prompt but preserved in full in run.log. */
+const MAX_MESSAGE_CHARS = 1500;
+
+/**
  * One /orchestrate invocation. Owns the widget/status lines the user sees while
  * children run, and the on-disk log under `<STATE_ROOT>/runs/<runId>/`:
  *
@@ -771,6 +823,8 @@ export class RunSession {
 	readonly ctx: ExtensionContext;
 	readonly goal: string;
 	readonly dir: string;
+	/** Git worktree the run is operating in (null when cwd isn't git-tracked). */
+	readonly worktree: WorktreeInfo | null;
 	private readonly dispatches = new Map<string, DispatchProgress>();
 	private phase = "starting";
 	private renderTimer: ReturnType<typeof setTimeout> | undefined;
@@ -778,12 +832,17 @@ export class RunSession {
 	private tickTimer: ReturnType<typeof setInterval> | undefined;
 	private closed = false;
 	readonly cancellation = new RunCancellation();
+	/** User messages queued while a run is live; drained at the next dispatch boundary. */
+	private queuedMessages: Array<{ text: string; queuedAt: number }> = [];
+	/** History of message batches we've folded into prompts, so the user can see delivery. */
+	private deliveryLog: Array<{ count: number; to: string; ts: number }> = [];
 
-	constructor(runId: string, ctx: ExtensionContext, goal: string) {
+	constructor(runId: string, ctx: ExtensionContext, goal: string, cwd: string = process.cwd()) {
 		this.runId = runId;
 		this.ctx = ctx;
 		this.goal = goal;
 		this.dir = join(runsDir(), runId);
+		this.worktree = detectWorktree(cwd);
 		try {
 			mkdirSync(this.dir, { recursive: true });
 		} catch (err) {
@@ -791,9 +850,58 @@ export class RunSession {
 		}
 		this.log(`run ${runId} started`);
 		this.log(`goal: ${goal}`);
+		if (this.worktree) {
+			this.log(`worktree: ${this.worktree.root} [${this.worktree.shortBranch}]`);
+		}
 		// Elapsed counters must tick even when a child is silent — a frozen board
 		// is indistinguishable from a hung run, which is the complaint that led here.
 		this.tickTimer = setInterval(() => this.render(), 1000);
+	}
+
+	/**
+	 * Append a user message to be delivered to the next dispatched task. Returns
+	 * the new queue depth. We drain on dispatch — never mid-flight — because
+	 * the subprocess protocol (humain-terminal --mode json --no-session) has no
+	 * stdin injection channel.
+	 */
+	enqueueMessage(text: string): number {
+		const trimmed = text.trim();
+		if (!trimmed) return this.queuedMessages.length;
+		const capped = trimmed.length > MAX_MESSAGE_CHARS
+			? `${trimmed.slice(0, MAX_MESSAGE_CHARS)}…`
+			: trimmed;
+		if (this.queuedMessages.length >= MAX_QUEUED_MESSAGES) {
+			this.queuedMessages.shift();
+		}
+		this.queuedMessages.push({ text: capped, queuedAt: Date.now() });
+		this.log(`user message queued (depth=${this.queuedMessages.length}): ${capped.slice(0, 200)}`);
+		this.render();
+		return this.queuedMessages.length;
+	}
+
+	/**
+	 * Atomically return queued messages and clear the queue, recording the
+	 * delivery in the run's delivery log. Returns [] when nothing queued.
+	 */
+	drainMessages(recipient: string): string[] {
+		if (this.queuedMessages.length === 0) return [];
+		const msgs = this.queuedMessages.map((m) => m.text);
+		this.deliveryLog.push({
+			count: msgs.length,
+			to: recipient,
+			ts: Date.now(),
+		});
+		// Keep the delivery log bounded.
+		if (this.deliveryLog.length > 20) this.deliveryLog.splice(0, this.deliveryLog.length - 20);
+		this.queuedMessages.length = 0;
+		this.log(`delivered ${msgs.length} user message(s) to ${recipient}`);
+		this.render();
+		return msgs;
+	}
+
+	/** Number of currently queued (undelivered) messages. */
+	queuedDepth(): number {
+		return this.queuedMessages.length;
 	}
 
 	file(name: string): string {
@@ -824,7 +932,7 @@ export class RunSession {
 		this.render();
 	}
 
-	startDispatch(taskId: string, label: string, model: string): void {
+	startDispatch(taskId: string, label: string, model: string, depth: number = 0): void {
 		this.dispatches.set(taskId, {
 			taskId,
 			label,
@@ -833,10 +941,12 @@ export class RunSession {
 			turns: 0,
 			toolCalls: 0,
 			lastActivity: "starting",
+			activityTail: ["starting"],
 			costUsd: 0,
 			status: "running",
+			depth,
 		});
-		this.log(`dispatch ${taskId} → ${label} on ${model}`);
+		this.log(`dispatch ${taskId} → ${label} on ${model} (depth=${depth})`);
 		this.render();
 	}
 
@@ -844,32 +954,40 @@ export class RunSession {
 	onChildEvent(taskId: string, event: any): void {
 		const d = this.dispatches.get(taskId);
 		if (!d) return;
+		let changed: string | null = null;
 		switch (event?.type) {
 			case "tool_execution_start": {
 				d.toolCalls += 1;
 				const detail = shortArgs(event.toolName, event.args);
-				d.lastActivity = `${event.toolName}${detail ? ` ${detail}` : ""}`;
-				this.log(`  ${taskId} tool#${d.toolCalls} ${d.lastActivity}`);
+				changed = `${event.toolName}${detail ? ` ${detail}` : ""}`;
+				this.log(`  ${taskId} tool#${d.toolCalls} ${changed}`);
 				break;
 			}
 			case "tool_execution_end":
 				if (event.isError) {
-					d.lastActivity = `${event.toolName} ✗`;
+					changed = `${event.toolName} ✗`;
 					this.log(`  ${taskId} tool ${event.toolName} returned error`);
 				}
 				break;
 			case "message_start":
-				if (event.message?.role === "assistant") d.lastActivity = "thinking";
+				if (event.message?.role === "assistant") changed = "thinking";
 				break;
 			case "message_end":
 				if (event.message?.role === "assistant") {
 					d.turns += 1;
 					d.costUsd += event.message?.usage?.cost?.total || 0;
-					d.lastActivity = `turn ${d.turns} done`;
+					changed = `turn ${d.turns} done (${d.toolCalls} tools)`;
 				}
 				break;
 			default:
 				return;
+		}
+		if (changed) {
+			d.lastActivity = changed;
+			d.activityTail.push(changed);
+			if (d.activityTail.length > MAX_ACTIVITY_TAIL) {
+				d.activityTail.splice(0, d.activityTail.length - MAX_ACTIVITY_TAIL);
+			}
 		}
 		this.scheduleRender();
 	}
@@ -903,32 +1021,125 @@ export class RunSession {
 
 	render(): void {
 		if (this.closed) return;
+		const now = Date.now();
 		const running = [...this.dispatches.values()].filter((d) => d.status === "running");
 		const done = [...this.dispatches.values()].filter((d) => d.status !== "running");
+		const failed = done.filter((d) => d.status === "failed").length;
 		const cancelled = done.filter((d) => d.status === "cancelled").length;
-		const elapsed = fmtElapsed(Date.now() - this.startedAt);
+		const elapsed = fmtElapsed(now - this.startedAt);
+		const totalCost = this.totalCost();
+		const worktree = this.worktree;
+
+		// Compact status line for the bar: phase + headline numbers. The phase is
+		// most important when terminal (cancelled, failed) — keeping it visible
+		// here means the user can see the verdict in the status bar even after
+		// the widget has been closed.
+		const wtShort = worktree ? ` · ${worktree.shortBranch} @ ${worktree.name}` : "";
 		this.ctx.ui.setStatus(
 			"orchestrator",
-			`orch ${elapsed} · ${this.phase} · ${running.length} running · ${cancelled} cancelled · $${this.totalCost().toFixed(3)}`,
+			`orch ${this.phase} · ${elapsed} · ${running.length} running · ${failed} failed${wtShort} · $${totalCost.toFixed(3)}`,
 		);
+
+		const lines: string[] = [];
+		// Title bar: run id, phase, elapsed, total cost, worktree.
+		const titleWt = worktree
+			? `  ${worktree.shortBranch} @ ${worktree.root}`
+			: "";
+		lines.push(
+			`▶ /orchestrate  ${this.runId}  ·  ${this.phase}  ·  ${elapsed}  ·  $${totalCost.toFixed(4)}${titleWt}`,
+		);
+		// Goal line: keep first 80 + last 40 chars so the user can recognize long goals.
 		const goal = this.goal.replace(/\s+/g, " ").trim();
-		const lines: string[] = [
-			`▶ /orchestrate ${elapsed} — ${this.phase} — $${this.totalCost().toFixed(4)} — log: ${this.file("run.log")}`,
-			`Goal: ${goal.length > 120 ? `${goal.slice(0, 117)}…` : goal}`,
-		];
-		for (const d of running) {
+		if (goal.length <= 120) {
+			lines.push(`  Goal: ${goal}`);
+		} else {
+			lines.push(`  Goal: ${goal.slice(0, 80)} … ${goal.slice(-40)}`);
+		}
+		// Rollup line only when at least one task has finished.
+		if (done.length > 0) {
 			lines.push(
-				`  ● ${d.label.padEnd(22)} ${shortName(d.model).padEnd(28)} ${fmtElapsed(Date.now() - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  ${d.lastActivity}`,
+				`  ${running.length} running  ${done.length} done  ${failed} failed  ${cancelled} cancelled`,
 			);
 		}
-		for (const d of done.slice(-6)) {
-			const mark = d.status === "done" ? "✓" : d.status === "cancelled" ? "⏹" : "✗";
-			lines.push(
-				`  ${mark} ${d.label.padEnd(22)} ${shortName(d.model).padEnd(28)} ${fmtElapsed((d.endedAt ?? Date.now()) - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  $${d.costUsd.toFixed(4)} ${d.lastActivity}`,
-			);
+
+		// Running section.
+		if (running.length > 0) {
+			lines.push("");
+			lines.push(`  ▸ running (${running.length})`);
+			for (const d of running) {
+				lines.push(this.formatRunningRow(d, now));
+				this.appendActivityTail(lines, d);
+			}
 		}
-		if (done.length > 6) lines.push(`  … ${done.length - 6} earlier dispatch(es) in run.log`);
+
+		// Completed section — tail of most recent 6.
+		if (done.length > 0) {
+			lines.push("");
+			lines.push(`  ▸ completed (${done.length})`);
+			const tail = done.slice(-6);
+			for (const d of tail) lines.push(this.formatDoneRow(d, now));
+			if (done.length > 6) {
+				lines.push(`    … ${done.length - 6} earlier in run.log`);
+			}
+		}
+
+		// Message queue indicator — only when there is something queued.
+		if (this.queuedMessages.length > 0) {
+			lines.push("");
+			lines.push(
+				`  ↳ ${this.queuedMessages.length} message${this.queuedMessages.length === 1 ? "" : "s"} queued for next dispatch — /omsg <text>`,
+			);
+		} else {
+			// Most recent delivery within the last 5 minutes — confirms the agent saw it.
+			const lastDelivery = this.deliveryLog[this.deliveryLog.length - 1];
+			if (lastDelivery && now - lastDelivery.ts < 5 * 60 * 1000) {
+				const ago = fmtElapsed(now - lastDelivery.ts);
+				lines.push(
+					`  ✓ ${lastDelivery.count} message${lastDelivery.count === 1 ? "" : "s"} delivered to ${lastDelivery.to} — ${ago} ago`,
+				);
+			}
+		}
+
+		lines.push("");
+		lines.push(`  ↯ updated ${new Date(now).toISOString().slice(11, 19)} UTC · log: ${this.file("run.log")}`);
 		this.ctx.ui.setWidget("orchestrator", lines);
+	}
+
+	private formatRunningRow(d: DispatchProgress, now: number): string {
+		const indent = "  ".repeat(1 + d.depth);
+		const spin = spinnerFrame(now);
+		const model = shortName(d.model).padEnd(20);
+		const elapsed = fmtElapsed(now - d.startedAt).padStart(7);
+		const turns = `t${d.turns}`.padStart(4);
+		const tools = `⚙${d.toolCalls}`.padStart(5);
+		const cost = `$${d.costUsd.toFixed(4)}`.padStart(9);
+		return `${indent}${spin} ${d.label.padEnd(20)}  ${model}  ${elapsed}  ${turns} ${tools}  ${cost}`;
+	}
+
+	private appendActivityTail(lines: string[], d: DispatchProgress): void {
+		if (d.activityTail.length <= 1) return;
+		// Show second-most-recent through the oldest kept; the latest is already
+		// implied by the row being alive.
+		const tail = d.activityTail.slice(0, -1);
+		if (tail.length === 0) return;
+		const indent = "  ".repeat(2 + d.depth);
+		lines.push(`${indent}↳ ${tail.join(" · ")}`);
+	}
+
+	private formatDoneRow(d: DispatchProgress, now: number): string {
+		const indent = "  ".repeat(1 + d.depth);
+		const mark = d.status === "done" ? "✓" : d.status === "cancelled" ? "⏹" : "✗";
+		const model = shortName(d.model).padEnd(20);
+		const elapsed = fmtElapsed((d.endedAt ?? now) - d.startedAt).padStart(7);
+		const turns = `t${d.turns}`.padStart(4);
+		const tools = `⚙${d.toolCalls}`.padStart(5);
+		const cost = `$${d.costUsd.toFixed(4)}`.padStart(9);
+		// Surface the captured note for failed and cancelled dispatches so the
+		// user can see "exit 1", "cancelled by user", or the stderr summary at a
+		// glance. For normal completions the ✓ mark already conveys status.
+		const note =
+			d.status !== "done" && d.lastActivity ? `  ${d.lastActivity}` : "";
+		return `${indent}${mark} ${d.label.padEnd(20)}  ${model}  ${elapsed}  ${turns} ${tools}  ${cost}${note}`;
 	}
 
 	close(preserveCancelled = false): void {
@@ -979,6 +1190,8 @@ async function runSubagentProcess(opts: {
 	label?: string;
 	/** Selects the wall clock: orchestrating capabilities wait on their own children. */
 	capability?: string;
+	/** Nesting depth for the widget (0 = top-level, 1 = child of a lead, etc.). */
+	depth?: number;
 }): Promise<SubagentProcessResult> {
 	const emptyUsage: SubagentUsageStats = {
 		input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
@@ -996,7 +1209,7 @@ async function runSubagentProcess(opts: {
 		} catch {
 			/* best-effort */
 		}
-		session.startDispatch(taskId, opts.label ?? opts.agentName, opts.model);
+		session.startDispatch(taskId, opts.label ?? opts.agentName, opts.model, opts.depth ?? 0);
 	}
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
@@ -1618,8 +1831,19 @@ async function dispatchParallel(
 	tasks: DispatchTask[],
 	adapter: Adapter,
 	ctx: ExtensionContext,
+	depth: number = 0,
 ): Promise<DispatchResult[]> {
 	if (tasks.length === 0) return [];
+
+	// Drain queued user messages ONCE at the start of this batch. Every task in
+	// the batch sees the same messages; the next dispatchParallel call picks up
+	// anything that arrived during or after this one. Draining mid-batch would
+	// split messages across two prompts in non-obvious ways.
+	const session = ACTIVE_RUN;
+	const recipient = tasks.length === 1
+		? `${tasks[0].capability}:${tasks[0].taskId.replace(`${runId}-`, "")}`
+		: `${tasks.length} ${tasks[0].capability} tasks`;
+	const userMessages = session ? session.drainMessages(recipient) : [];
 
 	const taskInputs = tasks.map((t) => {
 		// Adapter lookups can return undefined if the dynamic adapter
@@ -1634,7 +1858,7 @@ async function dispatchParallel(
 			{ model: "unknown" };
 		return {
 			agent: agentNameFor(t.capability),
-			task: formatTaskPrompt(t, runId),
+			task: formatTaskPrompt(t, runId, userMessages),
 			model: binding.model ?? "unknown",
 			effort: binding.effort,
 			cwd,
@@ -1674,6 +1898,7 @@ async function dispatchParallel(
 				taskId: input._taskId,
 				label: shortId,
 				capability: input._capability,
+				depth,
 				// Deliberately no `tools` override: each orch-* persona declares its
 				// own allow-list in frontmatter, and those lists encode policy
 				// (reviewers and scouts are read-only). Hardcoding a set here both
@@ -1755,9 +1980,16 @@ function agentNameFor(capability: string): string {
 	return CAPABILITY_AGENT_ALIASES[capability] ?? `orch-${capability.replace(/_/g, "-")}`;
 }
 
-function formatTaskPrompt(t: DispatchTask, runId: string): string {
+function formatTaskPrompt(
+	t: DispatchTask,
+	runId: string,
+	userMessages: string[] = [],
+): string {
 	const retryNote = t.retryOf
 		? `\n\n[Retry context: this is retry #${(t.retryCount ?? 0) + 1} of a previous failed attempt on task_id=${t.retryOf}. The previous attempt's review/QA feedback is captured in the orchestrator ledger; if you need that context, ask the lead before starting. Per method.json rules.review_after_fix: re-review at or above the original reviewer's tier, never the cheap tier.]`
+		: "";
+	const userNote = userMessages.length > 0
+		? `\n\n[User messages while this run was in progress — ${userMessages.length === 1 ? "1 message" : `${userMessages.length} messages`}, addressed to you]:\n${userMessages.map((m, i) => `  ${i + 1}. ${m}`).join("\n")}\n\nTreat these as high-priority steering from the operator. Adjust your plan and execution accordingly. If a message asks you to stop, finish the current sub-step and report back; do not start new work.`
 		: "";
 	return [
 		`[orchestrator:run_id=${runId}]`,
@@ -1766,6 +1998,7 @@ function formatTaskPrompt(t: DispatchTask, runId: string): string {
 		"",
 		t.task,
 		retryNote,
+		userNote,
 		"",
 		"---",
 		"Output format (required):",
@@ -1776,7 +2009,7 @@ function formatTaskPrompt(t: DispatchTask, runId: string): string {
 		"## Verification",
 		"Checks run + result.",
 		"## Notes / Escalation",
-		"Anything the lead should know.",
+		"Anything the lead should know — reply to any user messages here.",
 	].join("\n");
 }
 
@@ -2088,6 +2321,33 @@ async function captureDispatchCost(
 		recommended_estimated_quality_evidence:
 			opts.recommended.estimated_quality_evidence,
 		adaptive_mode: opts.mode,
+	});
+
+	// 3. Task verification. `executed_passes` above IS the authoritative
+	//    pass/fail decision for this dispatch — this is not a second source
+	//    of truth, just the same boolean reported under the canonical
+	//    vocabulary Python's `Engine.verify_task()` and `records.py` expect
+	//    (`event: task_verified|task_failed`, `result: verified|fail`) so the
+	//    runtime that actually does the work also reports the outcome.
+	//    `quality_evidence_score` is deliberately omitted: nothing at this
+	//    call site has graded evidence (only a binary exit code), and
+	//    `records.INSTRUMENTED_FIELDS` documents that field as written only
+	//    by `Engine.verify_task` in tests — fabricating a number here would be
+	//    worse than the dashboard's current em-dash. No `cost_usd` either:
+	//    `records.classify` treats task_verified/task_failed as a non-cost
+	//    EVENT, and the model_call record above already reported the spend.
+	//    `review_wait_ms` is likewise omitted: nothing in dispatchParallel /
+	//    mapWithConcurrency timestamps when a task entered the queue versus
+	//    when its worker actually started, so deriving a wait would require
+	//    new bookkeeping, not a read of an existing value.
+	const passed = result?.exitCode === 0;
+	await recordModelCall({
+		event: passed ? "task_verified" : "task_failed",
+		run_id: opts.runId,
+		task_id: result?.taskId ?? `unknown-${opts.runId}`,
+		plan_id: opts.planId,
+		result: passed ? "verified" : "fail",
+		capability_class: result?.capability ?? "unknown",
 	});
 }
 
@@ -3391,6 +3651,40 @@ export default function (pi: ExtensionAPI) {
 				}
 				ctx.ui.notify(stdout.split("\n").slice(0, 20).join("\n"), "info");
 			});
+		},
+	});
+
+	// Message inbound while a run is live — queued in RunSession and folded
+	// into the prompt of the next dispatched task. Cannot be injected into a
+	// running Pi subprocess (humain-terminal --mode json --no-session has no
+	// stdin channel), so delivery is at the next dispatch boundary.
+	pi.registerCommand("omsg", {
+		description:
+			"Send a message to the running orchestration (queued, delivered to the next dispatched task). " +
+			"Usage: /omsg <text> — the lead will see and respond to it. Use '\\n' for newlines if needed.",
+		handler: async (args, ctx) => {
+			const text = args.trim();
+			if (!text) {
+				ctx.ui.notify("Usage: /omsg <message>  (queues one message for the next dispatch)", "warning");
+				return;
+			}
+			if (!ACTIVE_RUN) {
+				ctx.ui.notify(
+					"No orchestration is running. Start one with /orchestrate <goal> first — " +
+						"messages are only delivered to a live run.",
+					"warning",
+				);
+				return;
+			}
+			// Literal "\n" in the input becomes a real newline so multi-line
+			// instructions paste cleanly from shell history.
+			const normalized = text.replace(/\\n/g, "\n");
+			const depth = ACTIVE_RUN.enqueueMessage(normalized);
+			const preview = normalized.length > 80 ? `${normalized.slice(0, 77)}…` : normalized;
+			ctx.ui.notify(
+				`Queued for next dispatch (depth=${depth}): “${preview}”`,
+				"info",
+			);
 		},
 	});
 }
