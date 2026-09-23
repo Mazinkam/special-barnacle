@@ -1,9 +1,12 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Any
-from .runtime import EventStore, write_json, read_json, utc_now, exclusive_file_lock
+from .runtime import EventStore, write_json, read_json, utc_now, writer_lock, iter_jsonl_from, tail_fingerprint
 
-EMPTY={"schema_version":3,"updated_at":None,"runs":{},"tasks":{},"decisions":{},"workstreams":{},"locks":{},"artifacts":{},"verification":{},"repo_revision":None,"adaptive":{}}
+LEDGER_FILE='ledger.json'
+LEDGER_CHECKPOINT_VERSION=1
+EMPTY={"schema_version":3,"updated_at":None,"runs":{},"tasks":{},"decisions":{},"workstreams":{},"locks":{},"artifacts":{},"verification":{},"repo_revision":None,"adaptive":{},"checkpoint":None}
+_SECTIONS=['runs','tasks','decisions','workstreams','locks','artifacts','verification','adaptive']
 
 def reduce_event(state:dict[str,Any], e:dict[str,Any])->dict[str,Any]:
     t=e.get('event'); rid=e.get('run_id'); tid=e.get('task_id')
@@ -34,16 +37,73 @@ def reduce_event(state:dict[str,Any], e:dict[str,Any])->dict[str,Any]:
             else: state['locks'].pop(key,None)
     state['updated_at']=e.get('ts',utc_now()); return state
 
+def _empty_state()->dict[str,Any]:
+    state={k:(v.copy() if isinstance(v,dict) else v) for k,v in EMPTY.items()}
+    for k in _SECTIONS: state[k]={}
+    return state
+
+def _checkpoint(events: Path, offset:int, replayed:int)->dict[str,Any]:
+    return {'format_version':LEDGER_CHECKPOINT_VERSION,'events_offset':offset,'events_tail_hash':tail_fingerprint(events,offset),'events_replayed':replayed}
+
+def _resumable_checkpoint(ledger:Any, events:Path)->dict[str,Any]|None:
+    """Return the ledger's checkpoint if it still describes a complete prefix of `events`, else None."""
+    if not isinstance(ledger,dict) or ledger.get('schema_version')!=3: return None
+    ck=ledger.get('checkpoint')
+    if not isinstance(ck,dict) or ck.get('format_version')!=LEDGER_CHECKPOINT_VERSION: return None
+    offset=ck.get('events_offset'); replayed=ck.get('events_replayed')
+    if isinstance(offset,bool) or not isinstance(offset,int) or offset<0: return None
+    if isinstance(replayed,bool) or not isinstance(replayed,int) or replayed<0: return None
+    if not events.exists() or offset>events.stat().st_size: return None
+    if tail_fingerprint(events,offset)!=ck.get('events_tail_hash'): return None
+    if not all(isinstance(ledger.get(k),dict) for k in _SECTIONS): return None
+    return ck
+
+def _replay_into(state:dict[str,Any], events:Path, offset:int, replayed:int, seen_ids:set[str]|None)->tuple[int,int]:
+    """Reduce every complete event line from `offset`; return (new_offset, replayed_count)."""
+    for record,end in iter_jsonl_from(events,offset):
+        offset=end
+        if record is None or not isinstance(record,dict): continue
+        rid=record.get('record_id')
+        if seen_ids is not None and rid:
+            if rid in seen_ids: continue
+            seen_ids.add(rid)
+        reduce_event(state,record); replayed+=1
+    return offset,replayed
+
+def _publish(root:Path, state:dict[str,Any], offset:int, replayed:int)->dict[str,Any]:
+    state['checkpoint']=_checkpoint(root/'events.jsonl',offset,replayed)
+    write_json(root/LEDGER_FILE,state); return state
+
+def replay_ledger(root: str|Path, *, full:bool=False)->dict[str,Any]:
+    """Bring the ledger up to the complete prefix of events.jsonl. Caller must hold `writer_lock`.
+
+    Incremental replay resumes from the checkpoint stored in ledger metadata when it still
+    matches the stream; otherwise (legacy ledger, corrupt or stale checkpoint, rewritten file,
+    `full=True`) the whole stream is replayed. Full replay also collapses repeated `record_id`s,
+    which is how duplicates that bypassed append-time deduplication are recovered.
+    """
+    root=Path(root); events=root/'events.jsonl'
+    if not full:
+        ledger=read_json(root/LEDGER_FILE,None); ck=_resumable_checkpoint(ledger,events)
+        if ck is not None:
+            offset,replayed=_replay_into(ledger,events,ck['events_offset'],ck['events_replayed'],None)
+            return _publish(root,ledger,offset,replayed)
+    state=_empty_state()
+    offset,replayed=_replay_into(state,events,0,0,set())
+    return _publish(root,state,offset,replayed)
+
 def rebuild(root: str|Path|None=None)->dict[str,Any]:
-    store=EventStore(root); root=store.root
-    with exclusive_file_lock(Path(root)/'ledger.lock'):
-        state={k:(v.copy() if isinstance(v,dict) else v) for k,v in EMPTY.items()}
-        for k in ['runs','tasks','decisions','workstreams','locks','artifacts','verification','adaptive']: state[k]={}
-        for e in store.all_events(): reduce_event(state,e)
-        write_json(Path(root)/'ledger.json',state); return state
+    """Full recovery replay of events.jsonl into ledger.json (serialized with all writers)."""
+    root=EventStore(root).root
+    with writer_lock(root): return replay_ledger(root,full=True)
+
+def refresh_ledger(root: str|Path|None=None)->dict[str,Any]:
+    """Incremental catch-up of the ledger from its durable event offset (serialized with all writers)."""
+    root=EventStore(root).root
+    with writer_lock(root): return replay_ledger(root)
 
 def load_or_rebuild(root: str|Path|None=None):
-    root=EventStore(root).root; p=root/'ledger.json'
+    root=EventStore(root).root; p=root/LEDGER_FILE
     obj=read_json(p,None)
     if not obj or obj.get('schema_version')!=3:
         return rebuild(root)

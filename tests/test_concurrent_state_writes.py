@@ -44,6 +44,25 @@ def _rebuild_with_pause(
             rebuild(root)
 
 
+def _append_batch_with_observed_lock(root, records, started, lock_attempted, lock_acquired, result_queue):
+    import fcntl
+    from orchestrator.record_batch import write_batch
+
+    original_flock = fcntl.flock
+
+    def observed_flock(fd, operation):
+        if operation == fcntl.LOCK_EX:
+            lock_attempted.set()
+            original_flock(fd, operation)
+            lock_acquired.set()
+        else:
+            original_flock(fd, operation)
+
+    with patch("orchestrator.runtime.fcntl.flock", observed_flock):
+        started.set()
+        result_queue.put(write_batch(root, records))
+
+
 class ConcurrentStateWriteTests(unittest.TestCase):
     def test_concurrent_json_writes_use_independent_temporary_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -70,6 +89,9 @@ class ConcurrentStateWriteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = EventStore(directory)
             store.emit("run_started", run_id="R1")
+            # Appends share the writer lock with rebuilds, so R2 is written before the first
+            # rebuild is paused while holding that lock.
+            store.emit("run_started", run_id="R2")
             context = multiprocessing.get_context("spawn")
             first_paused = context.Event()
             release_first = context.Event()
@@ -92,7 +114,6 @@ class ConcurrentStateWriteTests(unittest.TestCase):
             second_entered_while_first_paused = None
             try:
                 self.assertTrue(first_paused.wait(timeout=10))
-                store.emit("run_started", run_id="R2")
                 second.start()
                 self.assertTrue(second_started.wait(timeout=10))
                 self.assertTrue(second_lock_attempted.wait(timeout=10))
@@ -117,6 +138,63 @@ class ConcurrentStateWriteTests(unittest.TestCase):
             self.assertFalse(second_entered_while_first_paused)
             ledger = json.loads(Path(directory, "ledger.json").read_text())
             self.assertEqual(set(ledger["runs"]), {"R1", "R2"})
+
+    def test_batch_append_blocks_on_the_writer_lock_while_a_rebuild_is_in_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = EventStore(directory)
+            store.emit("run_started", run_id="R1")
+            context = multiprocessing.get_context("spawn")
+            first_paused = context.Event()
+            release_first = context.Event()
+            unused = [context.Event() for _ in range(4)]
+            appender_started = context.Event()
+            appender_lock_attempted = context.Event()
+            appender_lock_acquired = context.Event()
+            results = context.Queue()
+            records = [
+                {"stream": "event", "record_id": "cc-1", "event": "run_started", "run_id": "R2"},
+                {"stream": "metric", "record_id": "cc-2", "event": "model_call", "run_id": "R2", "model": "gpt-4o",
+                 "input_tokens": 1, "output_tokens": 1},
+            ]
+            rebuilder = context.Process(
+                target=_rebuild_with_pause,
+                args=(directory, "first", first_paused, release_first, *unused),
+            )
+            appender = context.Process(
+                target=_append_batch_with_observed_lock,
+                args=(directory, records, appender_started, appender_lock_attempted, appender_lock_acquired, results),
+            )
+
+            rebuilder.start()
+            try:
+                self.assertTrue(first_paused.wait(timeout=10))
+                appender.start()
+                self.assertTrue(appender_started.wait(timeout=10))
+                self.assertTrue(appender_lock_attempted.wait(timeout=10))
+                acquired_while_rebuild_paused = appender_lock_acquired.wait(timeout=0.25)
+                events_while_paused = Path(directory, "events.jsonl").read_text()
+            finally:
+                release_first.set()
+                rebuilder.join(timeout=10)
+                if appender.pid is not None:
+                    appender.join(timeout=10)
+                for process in (rebuilder, appender):
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=5)
+
+            self.assertEqual(rebuilder.exitcode, 0)
+            self.assertEqual(appender.exitcode, 0)
+            self.assertFalse(acquired_while_rebuild_paused, "append must wait for the in-progress rebuild's lock")
+            self.assertNotIn("cc-1", events_while_paused)
+            result = results.get(timeout=5)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["persisted"], {"event": 1, "metric": 1, "outcome": 0})
+            ledger = json.loads(Path(directory, "ledger.json").read_text())
+            self.assertEqual(set(ledger["runs"]), {"R1", "R2"}, "the acknowledged append must be visible in the published ledger")
+            events_path = Path(directory, "events.jsonl")
+            self.assertEqual(ledger["checkpoint"]["events_offset"], events_path.stat().st_size)
+            self.assertEqual(events_path.read_text().count("cc-1"), 1)
 
 
 if __name__ == "__main__":

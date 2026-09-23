@@ -28,7 +28,7 @@ def read_json(path: Path, default):
     try: return json.loads(path.read_text(encoding='utf-8'))
     except Exception: return default
 
-def write_json(path: Path, value: Any):
+def write_json(path: Path, value: Any, *, compact: bool=False):
     for _ in range(100):
         tmp = path.with_name(f'.{path.name}.{secrets.token_hex(8)}.tmp')
         try:
@@ -41,7 +41,8 @@ def write_json(path: Path, value: Any):
 
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(value, f, indent=2, sort_keys=True, default=str)
+            # json.dumps uses the C encoder; json.dump(fp) always falls back to the pure-Python one.
+            f.write(json.dumps(value, separators=(',',':') if compact else None, indent=None if compact else 2, sort_keys=True, default=str))
         tmp.replace(path)
     finally:
         try: tmp.unlink()
@@ -55,9 +56,55 @@ def exclusive_file_lock(path: Path):
         try: yield
         finally: fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
+WRITER_LOCK_FILE='ledger.lock'
+
+def writer_lock(root: Path):
+    """The single process-wide lock that serializes check/append/checkpoint/ledger writes.
+
+    The file name is the one the pre-batch code already used for rebuilds, so a process running
+    older code still excludes the new writer during a rolling upgrade. Advisory `flock` locks are
+    per open file description, so this must not be re-entered from the same call chain.
+    """
+    return exclusive_file_lock(Path(root)/WRITER_LOCK_FILE)
+
+def encode_jsonl(record: dict[str,Any]) -> bytes:
+    return (json.dumps(record,sort_keys=True,default=str)+'\n').encode('utf-8')
+
 def append_jsonl(path: Path, record: dict[str,Any]):
     path.parent.mkdir(parents=True,exist_ok=True)
-    with path.open('a',encoding='utf-8') as f: f.write(json.dumps(record,sort_keys=True,default=str)+'\n')
+    with path.open('ab') as f: f.write(encode_jsonl(record))
+
+def iter_jsonl_from(path: Path, offset: int=0):
+    """Yield `(record, end_offset)` for each complete line at or after `offset`.
+
+    Blank or malformed *complete* lines yield `(None, end_offset)` so a caller can still advance
+    past them; a trailing line without a newline is a torn or in-progress write and is never
+    yielded, so `end_offset` values always mark a replayable prefix.
+    """
+    if not path.exists(): return
+    with path.open('rb') as f:
+        f.seek(offset); pos=offset
+        for line in f:
+            if not line.endswith(b'\n'): return
+            pos+=len(line); stripped=line.strip()
+            if not stripped: yield None,pos; continue
+            try: yield json.loads(stripped),pos
+            except (json.JSONDecodeError,UnicodeDecodeError): yield None,pos
+
+TAIL_FINGERPRINT_BYTES=4096
+
+def tail_fingerprint(path: Path, offset: int) -> Optional[str]:
+    """Hash of the last complete line ending exactly at `offset` (None for an empty prefix).
+
+    Cheap identity check for a checkpointed prefix: if the bytes before the offset changed (file
+    rewritten, rotated, or offset landing mid-line) the fingerprint no longer matches.
+    """
+    if offset<=0: return None
+    with path.open('rb') as f:
+        start=max(0,offset-TAIL_FINGERPRINT_BYTES); f.seek(start); chunk=f.read(offset-start)
+    if not chunk.endswith(b'\n'): return 'unterminated'
+    body=chunk[:-1]; cut=body.rfind(b'\n')
+    return hashlib.sha256(body[cut+1:]).hexdigest()[:16]
 
 def load_jsonl(path: Path) -> list[dict[str,Any]]:
     if not path.exists(): return []
@@ -133,15 +180,26 @@ class EventStore:
         self.root=Path(root) if root is not None else default_state_root(); self.root.mkdir(parents=True,exist_ok=True)
         self.events=self.root/'events.jsonl'; self.metrics=self.root/'metrics.jsonl'; self.discoveries=self.root/'discoveries.jsonl'; self.outcomes=self.root/'outcomes.jsonl'
         for p in [self.events,self.metrics,self.discoveries,self.outcomes]: p.touch(exist_ok=True)
+    def _write(self,stream:str,payload:dict[str,Any]):
+        """Route a single record through the coordinated writer (lock + dedup + checkpoint).
+
+        Callers that want the ledger/dashboard refreshed do so explicitly, as before; the writer
+        here only guarantees the durable, deduplicated append. Imported lazily: `record_batch`
+        depends on this module.
+        """
+        from .record_batch import write_batch, new_record_id
+        record={'stream':stream,'record_id':payload.get('record_id') or new_record_id(),**payload}
+        result=write_batch(self.root,[record],refresh=False)
+        return result['records'][0]
     def emit(self,event:str,**payload):
-        rec={'ts':utc_now(),**default_attribution(),'event':event,**payload}; append_jsonl(self.events,rec); return rec
+        return self._write('event',{'event':event,**payload})
     def preview_metric(self,**payload):
         """Build the record a `metric()` call would write, without writing it (dry runs)."""
         return {'ts':utc_now(),**default_attribution(),**meter(payload)}
     def metric(self,**payload):
-        rec=self.preview_metric(**payload); append_jsonl(self.metrics,rec); return rec
+        return self._write('metric',payload)
     def discovery(self,**payload):
         rec={'ts':utc_now(),**default_attribution(),**payload}; append_jsonl(self.discoveries,rec); return rec
     def outcome(self,**payload):
-        rec={'ts':utc_now(),**default_attribution(),**payload}; append_jsonl(self.outcomes,rec); return rec
+        return self._write('outcome',payload)
     def all_events(self): return load_jsonl(self.events)

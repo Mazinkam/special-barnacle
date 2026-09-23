@@ -6,6 +6,7 @@ from typing import Any, Callable
 from .runtime import EventStore,QualityEvidence,default_state_root,read_json,utc_now,write_json
 from .state import rebuild,load_or_rebuild
 from .dashboard import generate_dashboard
+from .record_batch import write_batch,new_record_id,BatchValidationError,BatchAppendError,STREAMS
 from .history import load_stats
 from .scheduler import recommend_package,topology_for
 from .context import ContextRegistry
@@ -86,12 +87,39 @@ def process_ingest(paths: list[Path], *, state_root: Path, runtime: str | None,
             raise
     return result
 
+# Exit codes for the durable-write commands (`batch`, `event`, `metric`, `outcome`). The JSON body on
+# stdout always carries `persisted`/`duplicates`, so a caller seeing 2 or 3 retries the same ids.
+EXIT_OK=0; EXIT_INVALID=1; EXIT_APPEND_FAILED=2; EXIT_REFRESH_FAILED=3
+
+def _batch_payload(raw:str|None):
+    text=raw if raw not in (None,'-') else sys.stdin.read()
+    try: return json.loads(text)
+    except json.JSONDecodeError as exc: raise BatchValidationError(f'batch payload is not valid JSON: {exc}')
+
+def _failure(status:str,error:str,persisted:dict|None=None)->str:
+    empty={s:0 for s in STREAMS}
+    return json.dumps({'ok':False,'status':status,'error':error,'persisted':persisted or empty,'duplicates':empty,'ledger_updated':False,'dashboard_updated':False})
+
+def write_records(records)->int:
+    """Run the coordinated writer for the CLI and print its JSON result; return the exit code."""
+    try: result=write_batch(ROOT,records,config=cfg())
+    except BatchValidationError as exc: print(_failure('invalid',str(exc))); return EXIT_INVALID
+    except BatchAppendError as exc: print(_failure('append_failed',str(exc),exc.persisted)); return EXIT_APPEND_FAILED
+    print(json.dumps({k:v for k,v in result.items() if k!='records'}))
+    return EXIT_OK if result['ok'] else EXIT_REFRESH_FAILED
+
+def _single(stream:str,payload:dict)->int:
+    record={'stream':stream,'record_id':payload.get('record_id') or new_record_id(),**payload}
+    return write_records([record])
+
 def main():
     ap=argparse.ArgumentParser(prog='orchestrator'); sp=ap.add_subparsers(dest='cmd',required=True)
     sp.add_parser('init'); sp.add_parser('status'); sp.add_parser('dashboard'); sp.add_parser('rebuild'); sp.add_parser('features'); sp.add_parser('recommend-policy')
     e=sp.add_parser('event'); e.add_argument('event'); e.add_argument('payload',nargs='?',default='{}')
     m=sp.add_parser('metric'); m.add_argument('payload')
     o=sp.add_parser('outcome'); o.add_argument('payload')
+    b=sp.add_parser('batch',help='append an ordered batch of event/metric/outcome records (JSON array on stdin or as argument) and refresh once')
+    b.add_argument('payload',nargs='?',default=None,help="JSON array of {stream, record_id, ...} records, or '-'/omitted to read stdin")
     r=sp.add_parser('route'); r.add_argument('task_class'); r.add_argument('complexity',type=float); r.add_argument('risk'); r.add_argument('--run-id',default='cli-route'); r.add_argument('--quality-floor',type=float); r.add_argument('--cost-aggressiveness',type=float)
     p=sp.add_parser('plan'); p.add_argument('run_id'); p.add_argument('task_class'); p.add_argument('complexity',type=float); p.add_argument('risk'); p.add_argument('--coupling',type=float,default=.5); p.add_argument('--parallelizable',type=float,default=.5); p.add_argument('--repo-revision')
     sim=sp.add_parser('simulate-policy'); sim.add_argument('--quality-floor',type=float,required=True); sim.add_argument('--cost-aggressiveness',type=float,required=True)
@@ -111,9 +139,13 @@ def main():
     if args.cmd=='features':
         f=FeaturePolicy(C.get('features',{})).resolve(); print(json.dumps(feature_inventory(f),indent=2)); return
     if args.cmd=='recommend-policy': print(json.dumps(eng.recommend_policy(),indent=2)); return
-    if args.cmd=='event': store.emit(args.event,**json.loads(args.payload)); refresh(); return
-    if args.cmd=='metric': store.metric(**json.loads(args.payload)); generate_dashboard(ROOT,config=C); return
-    if args.cmd=='outcome': store.outcome(**json.loads(args.payload)); generate_dashboard(ROOT,config=C); return
+    if args.cmd=='event': raise SystemExit(_single('event',{'event':args.event,**json.loads(args.payload)}))
+    if args.cmd=='metric': raise SystemExit(_single('metric',json.loads(args.payload)))
+    if args.cmd=='outcome': raise SystemExit(_single('outcome',json.loads(args.payload)))
+    if args.cmd=='batch':
+        try: records=_batch_payload(args.payload)
+        except BatchValidationError as exc: print(_failure('invalid',str(exc))); raise SystemExit(EXIT_INVALID)
+        raise SystemExit(write_records(records))
     if args.cmd=='route':
         overrides={}
         if args.quality_floor is not None: overrides['quality_floor']=args.quality_floor
