@@ -416,6 +416,53 @@ class RemediationTask2BTests(TemporaryRootTestCase):
                     self.assertIn(path.stat().st_ino, synced, f'{creator}: {path.relative_to(existing) if path != existing else "T"} was not fsynced')
                 self.assertTrue(stream_ids(root, 'event'), 'the acknowledged record is in the stream')
 
+    def _assert_ancestry_synced_before_the_first_record(self, root: Path, calls: list[int]) -> None:
+        """Every directory from the real root up to its mount point was fsynced, and all of them before any stream byte."""
+        first_record = calls.index((root / 'events.jsonl').stat().st_ino)
+        directory = root.resolve(); device = directory.stat().st_dev
+        while True:
+            inode = directory.stat().st_ino
+            self.assertIn(inode, calls, f'{directory} was not fsynced')
+            self.assertLess(calls.index(inode), first_record, f'{directory} was first fsynced only after a record byte was')
+            if directory.parent == directory or directory.parent.stat().st_dev != device:
+                break
+            directory = directory.parent
+
+    def test_acknowledgement_syncs_the_whole_ancestry_even_when_someone_else_created_the_directories(self):
+        """Reviewer race: another process (or an older writer) created T/new/deeper/state a moment ago and has not
+        synced T yet, so this writer finds every directory already existing. Existence is not durability."""
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = Path(tmp)
+            root = existing / 'new' / 'deeper' / 'state'
+            os.makedirs(root)  # what the other process's mkdir left in the page cache: present, never fsynced
+            calls: list[int] = []
+            with patch('os.fsync', _fsync_by_inode(calls)):
+                self.assertTrue(record_batch.write_batch(root, sample_batch(), refresh=False)['ok'])
+            self._assert_ancestry_synced_before_the_first_record(root, calls)
+            self.assertEqual(stream_ids(root, 'event'), ['e-1', 'e-2', 'e-3'])
+
+    def test_retry_after_an_ancestor_fsync_failure_syncs_the_chain_before_acknowledging(self):
+        """The first attempt creates the directories but fails to sync T. The retry finds them existing and must
+        still sync the whole chain before any record is appended or acknowledged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = Path(tmp)
+            root = existing / 'new' / 'deeper' / 'state'
+            failed: list[int] = []
+            with patch('os.fsync', _fsync_by_inode(failed, fail_inode=existing.stat().st_ino)):
+                with self.assertRaises(record_batch.BatchAppendError) as caught:
+                    record_batch.write_batch(root, sample_batch(), refresh=False)
+            self.assertEqual(caught.exception.persisted, {'event': 0, 'metric': 0, 'outcome': 0})
+            self.assertEqual(caught.exception.retry, record_batch.RETRY_SAME_IDS)
+            self.assertTrue(root.is_dir(), 'the directories now exist although T was never synced')
+            self.assertFalse((root / 'events.jsonl').exists(), 'no record byte is written before the ancestry is durable')
+            calls: list[int] = []
+            with patch('os.fsync', _fsync_by_inode(calls)):
+                retry = record_batch.write_batch(root, sample_batch(), refresh=False)
+            self.assertTrue(retry['ok'], retry)
+            self.assertEqual(retry['persisted'], {'event': 3, 'metric': 1, 'outcome': 1})
+            self._assert_ancestry_synced_before_the_first_record(root, calls)
+            self.assertEqual(stream_ids(root, 'event'), ['e-1', 'e-2', 'e-3'])
+
     def test_io_meter_refuses_to_report_partial_io_when_the_vfs_hook_is_unavailable(self):
         with patch.object(record_io_probe, '_sqlite_library', side_effect=OSError('no libsqlite3 symbols')):
             with self.assertRaises(IoMeterUnsupported):

@@ -34,24 +34,28 @@ def fsync_directory(path: Path):
     try: os.fsync(fd)
     finally: os.close(fd)
 
-def ensure_durable_directory(path: Path) -> Path:
-    """`mkdir -p`, then fsync the parent of every directory this call created, up to the first existing ancestor.
+def fsync_directory_ancestry(path: Path) -> list[Path]:
+    """fsync the real `path` and every ancestor on the same filesystem, deepest first; return them.
 
-    A stream fsync plus an fsync of the state root only makes the *file* entries durable. When the
-    root itself (or `T/new/state`, several levels) was just created, each new directory entry lives in
-    its parent and needs that parent synced too, or a power loss after an acknowledged write can drop
-    the whole state tree. Existing directories are not fsynced; a concurrent creator makes some of
-    these syncs redundant but never unsafe.
+    A stream fsync plus an fsync of the state root only makes the *file* entries durable. Each
+    directory entry (`state` in `new`, `new` in `T`, ...) lives in its parent and needs that parent
+    synced too, or a power loss after an acknowledged write can drop the whole state tree. Existence
+    proves nothing about durability: a directory another process, an older writer or an earlier
+    attempt whose fsync failed created a moment ago may still live only in the page cache, so the
+    caller syncs the chain itself, whoever created it. The walk stops at the mount point: the entry
+    naming a mount point is on the parent filesystem and had to exist for the mount to be there at
+    all. Symlinks are resolved first so the physical chain is the one synced. An fsync of a clean
+    directory is a cheap syscall (~15 us here), so a write pays well under a millisecond for this.
     """
-    path = Path(path)
-    created: list[Path] = []
-    probe = path
-    while not probe.exists() and probe.parent != probe:
-        created.append(probe); probe = probe.parent
-    path.mkdir(parents=True, exist_ok=True)
-    for directory in created:  # deepest first: `state` in `new`, then `new` in `T`
-        fsync_directory(directory.parent)
-    return path
+    directory = Path(path).resolve()
+    device = directory.stat().st_dev
+    synced: list[Path] = []
+    while True:
+        fsync_directory(directory); synced.append(directory)
+        parent = directory.parent
+        if parent == directory or parent.stat().st_dev != device:
+            return synced
+        directory = parent
 
 
 def write_json(path: Path, value: Any, *, compact: bool=False, durable: bool=False):
@@ -208,7 +212,7 @@ def meter(payload: dict[str,Any]) -> dict[str,Any]:
 
 class EventStore:
     def __init__(self, root: str|Path|None=None):
-        self.root=Path(root) if root is not None else default_state_root(); ensure_durable_directory(self.root)
+        self.root=Path(root) if root is not None else default_state_root(); self.root.mkdir(parents=True,exist_ok=True)  # write_batch syncs the ancestry before any acknowledgement
         self.events=self.root/'events.jsonl'; self.metrics=self.root/'metrics.jsonl'; self.discoveries=self.root/'discoveries.jsonl'; self.outcomes=self.root/'outcomes.jsonl'
         for p in [self.events,self.metrics,self.discoveries,self.outcomes]:
             if not p.exists(): p.touch(exist_ok=True)

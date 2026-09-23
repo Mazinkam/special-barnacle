@@ -1,9 +1,9 @@
 """Durable coordinated writes to the authoritative event/metric/outcome JSONL.
 
-One advisory writer lock covers exact-ID classification, append, fsync, derived
-cache commit/receipt, and incremental ledger publication. Input validation is
-all-or-nothing; multi-stream append is not atomic. Every ambiguous failure must
-be retried with the same IDs. No canonical bytes are rewritten or truncated.
+One advisory writer lock covers the state-root ancestry fsync, exact-ID classification,
+append, fsync, derived cache commit/receipt, and incremental ledger publication. Input
+validation is all-or-nothing; multi-stream append is not atomic. Every ambiguous failure
+must be retried with the same IDs. No canonical bytes are rewritten or truncated.
 
 The exact-ID SQLite cache uses unique (stream, record_id) keys. Its independent
 receipt, validation boundary and crash recovery are documented in record_index.
@@ -26,7 +26,7 @@ from typing import Any
 from .dashboard import generate_dashboard
 from .record_index import RecordIndex, STREAMS
 from .runtime import (RECORD_INDEX_FILE, default_attribution, default_state_root, encode_jsonl,
-                      ensure_durable_directory, fsync_directory, meter, utc_now, write_json, writer_lock)
+                      fsync_directory, fsync_directory_ancestry, meter, utc_now, write_json, writer_lock)
 from .state import REDUCER_KEY_FIELDS, invalid_key_field, ledger_is_current, replay_ledger
 
 FORMAT_VERSION = 1
@@ -152,15 +152,19 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
     """Durably append once per ID; report derived-state failure with same-ID retry guidance."""
     validated = validate_batch(records)
     root = Path(root) if root is not None else default_state_root()
-    ensure_durable_directory(root)  # every directory entry created here is synced before any record is acknowledged
+    root.mkdir(parents=True, exist_ok=True)  # the lock file lives inside; durability of the chain is settled under the lock
     persisted = _counts(); duplicates = _counts(); statuses: list[dict[str, Any]] = []
     built: list[dict[str, Any]] = []
     ledger_updated = False; dashboard_updated = False; error: str | None = None; status = 'ok'
     with writer_lock(root):
         try:
+            # Existence is not durability: whoever created these directories (this call, a concurrent
+            # writer that has not synced yet, an attempt whose fsync failed), sync the whole chain
+            # before a single record byte is written or acknowledged.
+            fsync_directory_ancestry(root)
             index = RecordIndex(root)
         except (OSError, sqlite3.Error) as exc:
-            raise BatchAppendError(f'could not read the index/streams before appending ({exc}); nothing was written', _counts()) from exc
+            raise BatchAppendError(f'could not make the state root durable or read the index/streams before appending ({exc}); nothing was written', _counts()) from exc
         with index:
             pending: dict[str, list[bytes]] = {stream: [] for stream in STREAMS}
             new_ids: dict[str, list[str]] = {stream: [] for stream in STREAMS}
