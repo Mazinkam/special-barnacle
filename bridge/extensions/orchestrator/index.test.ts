@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,56 @@ const orchestrator = await import("./index.ts");
 afterAll(() => {
 	rmSync(testStateRoot, { recursive: true, force: true });
 });
+
+describe("session ingest hook wiring", () => {
+	test("both lifecycle hooks use the current session file and the supplied scheduler", async () => {
+		const handlers: Record<string, (...args: any[]) => unknown> = {};
+		const scheduled: string[] = [];
+		const flushed: string[] = [];
+		const scheduler = {
+			schedule: (file: string | undefined) => { if (file) scheduled.push(file); },
+			flush: async (file: string | undefined) => { if (file) flushed.push(file); },
+		};
+		orchestrator.registerSessionIngestHooks!({
+			on: (event: string, handler: (...args: any[]) => unknown) => { handlers[event] = handler; },
+		} as never, scheduler as never);
+
+		const ctxFor = (file: string) => ({ sessionManager: { getSessionFile: () => file } });
+		await handlers.agent_settled({}, ctxFor("/sessions/current-settled.jsonl"));
+		await handlers.session_shutdown({}, ctxFor("/sessions/current-shutdown.jsonl"));
+		expect(scheduled).toEqual(["/sessions/current-settled.jsonl"]);
+		expect(flushed).toEqual(["/sessions/current-shutdown.jsonl"]);
+	});
+
+	test("final hook failure atomically records bounded status and preserves last success", () => {
+		const root = mkdtempSync(join(tmpdir(), "orch-hook-failure-test-"));
+		try {
+			writeFileSync(join(root, "ingest_status.json"), JSON.stringify({
+				version: 1,
+				last_attempt_at: "2026-01-01T00:00:00Z",
+				last_success_at: "2025-12-31T23:00:00Z",
+				status: "ok",
+				files_scanned: 1,
+				emitted: 2,
+				failure_count: 0,
+				error: null,
+				sweep_interval_seconds: 900,
+			}));
+			orchestrator.recordHookFailure!(root, `failed\n${"x".repeat(2000)}`);
+
+			const status = JSON.parse(readFileSync(join(root, "ingest_status.json"), "utf8"));
+			expect(status.status).toBe("error");
+			expect(status.last_success_at).toBe("2025-12-31T23:00:00Z");
+			expect(status.failure_count).toBe(1);
+			expect(status.error.length).toBeLessThanOrEqual(500);
+			expect(status.error).not.toContain("\n");
+			expect(readdirSync(root).sort()).toEqual(["ingest_status.json"]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
 
 describe("/orchestrate argument parsing", () => {
 	test("runs without confirmation unless interactive mode is explicitly requested", () => {

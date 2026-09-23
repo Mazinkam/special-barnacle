@@ -2956,8 +2956,65 @@ const MODELS_USAGE = [
  * whose rows are deltas against what is already recorded, so it is safe to run
  * as often as we like and alongside the launchd sweep (install.sh).
  */
+export function recordHookFailure(stateRoot: string, detail: string): void {
+	const root = stateRoot.replace(/^~/, homedir());
+	const statusPath = join(root, "ingest_status.json");
+	const temporaryPath = `${statusPath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+	try {
+		let previous: Record<string, unknown> = {};
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(statusPath, "utf-8"));
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				previous = parsed as Record<string, unknown>;
+			}
+		} catch {
+			// A missing or malformed prior status must not prevent reporting failure.
+		}
+		const safeDetail = String(detail).replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 500);
+		const failureCount = previous.failure_count;
+		const status = {
+			...previous,
+			version: 1,
+			last_attempt_at: new Date().toISOString(),
+			last_success_at: previous.last_success_at ?? null,
+			status: "error",
+			files_scanned: typeof previous.files_scanned === "number" ? previous.files_scanned : 1,
+			emitted: typeof previous.emitted === "number" ? previous.emitted : 0,
+			failure_count: typeof failureCount === "number" && Number.isFinite(failureCount) ? failureCount + 1 : 1,
+			error: safeDetail || "session ingest failed",
+			sweep_interval_seconds:
+				typeof previous.sweep_interval_seconds === "number" ? previous.sweep_interval_seconds : 900,
+		};
+		mkdirSync(root, { recursive: true });
+		writeFileSync(temporaryPath, `${JSON.stringify(status, null, 2)}\n`, { mode: 0o600 });
+		renameSync(temporaryPath, statusPath);
+	} catch {
+		// Status reporting is best-effort and must never interrupt a terminal session.
+	} finally {
+		try {
+			rmSync(temporaryPath, { force: true });
+		} catch {
+			// Ignore temporary-file cleanup failures.
+		}
+	}
+}
+
+/** Register only the settled fast path and awaited shutdown flush. */
+export function registerSessionIngestHooks(
+	host: Pick<ExtensionAPI, "on">,
+	scheduler: Pick<SessionIngestScheduler, "schedule" | "flush">,
+): void {
+	host.on("agent_settled", async (_event, ctx) => {
+		scheduler.schedule(ctx.sessionManager.getSessionFile());
+	});
+	host.on("session_shutdown", async (_event, ctx) => {
+		await scheduler.flush(ctx.sessionManager.getSessionFile());
+	});
+}
+
 function installSessionIngest(pi: ExtensionAPI): void {
-	const logPath = join(STATE_ROOT.replace(/^~/, homedir()), "ingest-hook.log");
+	const stateRoot = STATE_ROOT.replace(/^~/, homedir());
+	const logPath = join(stateRoot, "ingest-hook.log");
 	const logError = (message: string) => {
 		try {
 			mkdirSync(dirname(logPath), { recursive: true });
@@ -2967,19 +3024,17 @@ function installSessionIngest(pi: ExtensionAPI): void {
 		}
 	};
 	const scheduler = new SessionIngestScheduler({
-		onError: logError,
+		onError: (message) => {
+			logError(message);
+			recordHookFailure(stateRoot, message);
+		},
 		run: async (sessionFile) => {
 			const res = await runModule("orchestrator.cli", ingestArgs(sessionFile));
 			if (res.exitCode === 0) return { ok: true };
 			return { ok: false, detail: `exit ${res.exitCode}: ${res.stderr.trim().split("\n").slice(-3).join(" | ")}` };
 		},
 	});
-	pi.on("agent_settled", async (_event, ctx) => {
-		scheduler.schedule(ctx.sessionManager.getSessionFile());
-	});
-	pi.on("session_shutdown", async (_event, ctx) => {
-		await scheduler.flush(ctx.sessionManager.getSessionFile());
-	});
+	registerSessionIngestHooks(pi, scheduler);
 }
 
 export default function (pi: ExtensionAPI) {
