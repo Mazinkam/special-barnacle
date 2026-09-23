@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.worktrees/
 .orchestrator/events.jsonl
 .orchestrator/metrics.jsonl
 .orchestrator/discoveries.jsonl
