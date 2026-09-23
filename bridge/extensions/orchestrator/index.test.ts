@@ -3,6 +3,7 @@ import { execFileSync, spawn as nodeSpawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 mock.module("@humain/terminal", () => ({
 	BorderedLoader: class {
@@ -215,7 +216,10 @@ describe("confirmation gates", () => {
 });
 
 describe("runSubagentProcess process/event handling", () => {
-	const fixturesDir = new URL("./fixtures/", import.meta.url).pathname;
+	// `fileURLToPath` (not `.pathname`) so this resolves correctly on paths with
+	// spaces or non-ASCII characters, which `.pathname` percent-encodes instead
+	// of decoding.
+	const fixturesDir = fileURLToPath(new URL("./fixtures/", import.meta.url));
 	const repoDir = mkdtempSync(join(tmpdir(), "orch-subagent-process-test-"));
 	afterAll(() => rmSync(repoDir, { recursive: true, force: true }));
 
@@ -231,7 +235,7 @@ describe("runSubagentProcess process/event handling", () => {
 
 	test("recovers a settled, stop-reason result when the child exits non-zero afterward", async () => {
 		expect(orchestrator.runSubagentProcess).toBeFunction();
-		const result = await orchestrator.runSubagentProcess!({
+		const result = await orchestrator.runSubagentProcess({
 			cwd: repoDir,
 			agentName: "__no_persona__",
 			task: "do the fixture task",
@@ -245,10 +249,12 @@ describe("runSubagentProcess process/event handling", () => {
 		expect(result.outcome).toBe("completed_after_process_error");
 		expect(result.stderr).toContain("fixture shutdown failure");
 		expect(result.exitCode).toBe(0);
+		expect(result.postCompletionError).toContain("process exited 1");
+		expect(result.postCompletionError).toContain("fixture shutdown failure");
 	});
 
 	test("does not recover a result that never reaches agent_settled", async () => {
-		const result = await orchestrator.runSubagentProcess!({
+		const result = await orchestrator.runSubagentProcess({
 			cwd: repoDir,
 			agentName: "__no_persona__",
 			task: "do the fixture task",
@@ -264,14 +270,18 @@ describe("runSubagentProcess process/event handling", () => {
 	});
 
 	test("does not recover a settled result with no final assistant text", async () => {
-		const result = await orchestrator.runSubagentProcess!({
+		// Isolates the final-text guard specifically: the assistant DOES stop
+		// cleanly (`stopReason: "stop"`) and the child DOES settle, but its only
+		// text block is whitespace-only, so `hasFinalText` must be the reason
+		// this stays failed — not a missing stop reason or missing settlement.
+		const result = await orchestrator.runSubagentProcess({
 			cwd: repoDir,
 			agentName: "__no_persona__",
 			task: "do the fixture task",
 			model: "provider/model",
 			ctx: {} as never,
 			spawnChild: spawnInlineScript(
-				`const e=[{type:"agent_end",messages:[]},{type:"agent_settled"}];for(const x of e)process.stdout.write(JSON.stringify(x)+"\\n");process.exitCode=1;`,
+				`const e=[{type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:"   "}]}},{type:"agent_end",messages:[]},{type:"agent_settled"}];for(const x of e)process.stdout.write(JSON.stringify(x)+"\\n");process.exitCode=1;`,
 			),
 		});
 
@@ -281,7 +291,7 @@ describe("runSubagentProcess process/event handling", () => {
 	});
 
 	test("does not recover an error stop reason even after agent_settled", async () => {
-		const result = await orchestrator.runSubagentProcess!({
+		const result = await orchestrator.runSubagentProcess({
 			cwd: repoDir,
 			agentName: "__no_persona__",
 			task: "do the fixture task",
@@ -296,8 +306,13 @@ describe("runSubagentProcess process/event handling", () => {
 		expect(result.exitCode).toBe(1);
 	});
 
-	test("treats a spawn failure as a failed dispatch, not a recoverable result", async () => {
-		const result = await orchestrator.runSubagentProcess!({
+	test("treats a synchronous spawnChild throw as a failed dispatch, not a recoverable result", async () => {
+		// `spawn()` itself can throw synchronously on argument-validation errors
+		// (as opposed to ENOENT, which arrives asynchronously via the child's
+		// 'error' event — see the next test). This exercises that separate,
+		// synchronous-throw code path in runSubagentProcess's own try/catch
+		// around the spawnChild(...) call.
+		const result = await orchestrator.runSubagentProcess({
 			cwd: repoDir,
 			agentName: "__no_persona__",
 			task: "do the fixture task",
@@ -311,6 +326,26 @@ describe("runSubagentProcess process/event handling", () => {
 		expect(result.outcome).toBe("failed");
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain("spawn ENOENT");
+	});
+
+	test("treats an asynchronous spawn error (ENOENT) as a failed dispatch, not a recoverable result", async () => {
+		// Exercises the real `proc.on("error", ...)` handler: spawnChild returns a
+		// real child process (no synchronous throw) for a deliberately nonexistent
+		// executable, so Node's child_process module emits an async 'error' event
+		// carrying the real ENOENT diagnostic.
+		const nonexistentExecutable = join(repoDir, "definitely-does-not-exist-orch-fixture-binary");
+		const result = await orchestrator.runSubagentProcess({
+			cwd: repoDir,
+			agentName: "__no_persona__",
+			task: "do the fixture task",
+			model: "provider/model",
+			ctx: {} as never,
+			spawnChild: (_command, _args, options) => nodeSpawn(nonexistentExecutable, [], options),
+		});
+
+		expect(result.outcome).toBe("failed");
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("ENOENT");
 	});
 });
 
