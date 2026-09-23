@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Any
-from .runtime import EventStore, write_json, read_json, utc_now
+from .runtime import EventStore, write_json, read_json, utc_now, exclusive_file_lock
 
 EMPTY={"schema_version":3,"updated_at":None,"runs":{},"tasks":{},"decisions":{},"workstreams":{},"locks":{},"artifacts":{},"verification":{},"repo_revision":None,"adaptive":{}}
 
@@ -35,10 +35,12 @@ def reduce_event(state:dict[str,Any], e:dict[str,Any])->dict[str,Any]:
     state['updated_at']=e.get('ts',utc_now()); return state
 
 def rebuild(root: str|Path|None=None)->dict[str,Any]:
-    store=EventStore(root); root=store.root; state={k:(v.copy() if isinstance(v,dict) else v) for k,v in EMPTY.items()}
-    for k in ['runs','tasks','decisions','workstreams','locks','artifacts','verification','adaptive']: state[k]={}
-    for e in store.all_events(): reduce_event(state,e)
-    write_json(Path(root)/'ledger.json',state); return state
+    store=EventStore(root); root=store.root
+    with exclusive_file_lock(Path(root)/'ledger.lock'):
+        state={k:(v.copy() if isinstance(v,dict) else v) for k,v in EMPTY.items()}
+        for k in ['runs','tasks','decisions','workstreams','locks','artifacts','verification','adaptive']: state[k]={}
+        for e in store.all_events(): reduce_event(state,e)
+        write_json(Path(root)/'ledger.json',state); return state
 
 def load_or_rebuild(root: str|Path|None=None):
     root=EventStore(root).root; p=root/'ledger.json'

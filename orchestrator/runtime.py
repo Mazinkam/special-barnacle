@@ -3,7 +3,8 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Optional
-import hashlib, json, os
+from contextlib import contextmanager
+import fcntl, hashlib, json, os, secrets
 
 
 def utc_now() -> str:
@@ -28,9 +29,31 @@ def read_json(path: Path, default):
     except Exception: return default
 
 def write_json(path: Path, value: Any):
-    tmp=path.with_suffix(path.suffix+'.tmp')
-    tmp.write_text(json.dumps(value,indent=2,sort_keys=True,default=str),encoding='utf-8')
-    tmp.replace(path)
+    for _ in range(100):
+        tmp = path.with_name(f'.{path.name}.{secrets.token_hex(8)}.tmp')
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError(f'Could not create a unique temporary file for {path}')
+
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(value, f, indent=2, sort_keys=True, default=str)
+        tmp.replace(path)
+    finally:
+        try: tmp.unlink()
+        except FileNotFoundError: pass
+
+@contextmanager
+def exclusive_file_lock(path: Path):
+    """Hold an advisory exclusive lock until the context exits."""
+    with path.open('a', encoding='utf-8') as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try: yield
+        finally: fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 def append_jsonl(path: Path, record: dict[str,Any]):
     path.parent.mkdir(parents=True,exist_ok=True)
