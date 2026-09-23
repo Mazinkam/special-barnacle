@@ -116,34 +116,43 @@ function truncate(text: string, maxChars: number): string {
 	return kept + TRUNCATION_MARKER;
 }
 
-/** Strip a leading "Error:"/"error:" so the short per-worker label reads naturally. */
-function shortFailureLabel(diagnostic: string): string {
-	const stripped = diagnostic.replace(/^\s*(?:[A-Za-z]*Error|error)\b\s*:\s*/, "").trim();
-	return stripped || diagnostic.trim() || "no diagnostics available";
-}
-
 /**
  * Fold completed recon dispatch results into one evidence packet for the
  * lead: successful workers contribute their reported findings, failed
  * workers contribute a summarized diagnostic (via `summarizeStderr`, shared
  * with the rest of the bridge's dispatch-outcome handling) rather than being
- * silently dropped. Both each worker's packet and the aggregate string are
- * bounded to `maxChars`, with an explicit truncation marker whenever content
- * had to be cut.
+ * silently dropped. Failure headers and a fair share of diagnostic space are
+ * reserved before allocating any space to successful output. Failures appear
+ * first so successful output cannot hide a later failure at the aggregate cap.
+ * Truncation is code-point-safe and marked explicitly. Caps too small to hold
+ * the failure headers and markers necessarily yield best-effort evidence.
  */
 export function formatReconEvidence(results: ReconDispatchResult[], maxChars: number): string {
 	if (results.length === 0) return "";
-	const perPacketBudget = Math.max(1, Math.floor(maxChars / results.length));
-
-	const packets = results.map((result) => {
-		if (result.exitCode === 0) {
-			const body = truncate(result.stdout.trim(), perPacketBudget) || "(no output reported)";
-			return `### ${result.taskId}\n${body}`;
-		}
-		const diagnostic = summarizeStderr(result.stderr, perPacketBudget) || "(no diagnostics available)";
-		const label = shortFailureLabel(diagnostic);
-		return `### ${result.taskId} ${label}\n${diagnostic}`;
-	});
-
-	return truncate(packets.join("\n\n"), maxChars);
+	const limit = Math.max(0, Math.trunc(maxChars));
+	const perPacketBudget = Math.max(1, Math.floor(limit / results.length));
+	const failures = results.filter((result) => result.exitCode !== 0);
+	const successes = results.filter((result) => result.exitCode === 0);
+	const headers = failures.map((result) => `### ${result.taskId} unavailable (failed, exit ${result.exitCode})\n`);
+	const structuralSize = headers.reduce((size, header) => size + header.length, 0)
+		+ Math.max(0, failures.length - 1) * 2;
+	// Leave a marker for omitted successful evidence, without risking a failure.
+	const successReserve = successes.length > 0 ? TRUNCATION_MARKER.length + 2 : 0;
+	const diagnosticBudget = Math.max(0, Math.min(
+		perPacketBudget,
+		Math.floor((limit - structuralSize - successReserve) / Math.max(1, failures.length)),
+	));
+	const failureEvidence = failures.map((result, index) => {
+		// Reuse line selection, but bypass its UTF-16 slicing: all cuts belong
+		// to truncate(), which preserves code points and adds our marker.
+		const diagnostic = summarizeStderr(result.stderr, Infinity) || "(no diagnostics available)";
+		return headers[index] + truncate(diagnostic, diagnosticBudget);
+	}).join("\n\n");
+	const successfulEvidence = successes.map((result) => {
+		const body = truncate(result.stdout.trim() || "(no output reported)", perPacketBudget);
+		return `### ${result.taskId}\n${body}`;
+	}).join("\n\n");
+	const separator = failureEvidence && successfulEvidence ? "\n\n" : "";
+	const remaining = limit - failureEvidence.length - separator.length;
+	return truncate(failureEvidence + separator + truncate(successfulEvidence, remaining), limit);
 }

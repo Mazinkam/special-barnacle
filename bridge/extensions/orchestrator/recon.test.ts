@@ -97,6 +97,54 @@ describe("formatReconEvidence", () => {
 		expect(evidence).toContain("truncated");
 	});
 
+	test("retains every failed worker after long successful output exhausts the aggregate budget", () => {
+		const evidence = formatReconEvidence(
+			[
+				{ taskId: "run-recon-0", exitCode: 0, stdout: "x".repeat(5_000), stderr: "" },
+				{ taskId: "run-recon-1", exitCode: 0, stdout: "y".repeat(5_000), stderr: "" },
+				{ taskId: "run-recon-2", exitCode: 1, stdout: "", stderr: "Error: unavailable " + "a".repeat(200) },
+				{ taskId: "run-recon-3", exitCode: 124, stdout: "", stderr: "Error: timed out " + "b".repeat(200) },
+			],
+			400,
+		);
+		expect(evidence.length).toBeLessThanOrEqual(400);
+		expect(evidence).toContain("run-recon-2 unavailable");
+		expect(evidence).toContain("Error: unavailable");
+		expect(evidence).toContain("run-recon-3");
+		expect(evidence).toContain("exit 124");
+		expect(evidence).toContain("Error: timed out");
+		expect(evidence).toContain("…[truncated]");
+	});
+
+	test("does not split an emoji when bounding a failed diagnostic", () => {
+		// The old stderr summary's 90-unit slice ends halfway through this emoji.
+		const evidence = formatReconEvidence(
+			[
+				{ taskId: "failed", exitCode: 1, stdout: "", stderr: "Error: " + "a".repeat(82) + "😀 tail" },
+				{ taskId: "ok", exitCode: 0, stdout: "done", stderr: "" },
+			],
+			180,
+		);
+		expect(evidence.length).toBeLessThanOrEqual(180);
+		expect(evidence).not.toMatch(/[\uD800-\uDFFF]/u);
+		expect(evidence).toContain("…[truncated]");
+	});
+
+	test("marks failed diagnostic truncation even when the aggregate would fit", () => {
+		const evidence = formatReconEvidence(
+			[
+				{ taskId: "f", exitCode: 1, stdout: "", stderr: "Error: " + "a".repeat(250) },
+				...Array.from({ length: 4 }, (_, index) => ({
+					taskId: `ok-${index}`, exitCode: 0, stdout: "done", stderr: "",
+				})),
+			],
+			500,
+		);
+		expect(evidence.length).toBeLessThanOrEqual(500);
+		expect(evidence).toContain("Error: ");
+		expect(evidence).toContain("…[truncated]");
+	});
+
 	test("returns empty string for no recon results", () => {
 		expect(formatReconEvidence([], 500)).toBe("");
 	});
