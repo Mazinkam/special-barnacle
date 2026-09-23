@@ -468,6 +468,56 @@ describe("RunSession progress reporting", () => {
 	});
 });
 
+describe("RunSession terminal timing", () => {
+	function fakeCtx() {
+		return { ui: { setWidget: () => {}, setStatus: () => {}, notify: mock() } };
+	}
+
+	test("reports wall-clock start/finish stamps and a monotonic elapsed_ms", async () => {
+		const before = Date.now();
+		const session = new orchestrator.RunSession!("timing-test", fakeCtx() as never, "goal");
+		await new Promise((r) => setTimeout(r, 25));
+		const timing = session.terminalTiming();
+		const after = Date.now();
+
+		expect(typeof timing.started_at).toBe("string");
+		expect(typeof timing.finished_at).toBe("string");
+		expect(Number.isNaN(Date.parse(timing.started_at))).toBe(false);
+		expect(Date.parse(timing.started_at)).toBeGreaterThanOrEqual(before - 1);
+		expect(Date.parse(timing.finished_at)).toBeLessThanOrEqual(after + 1);
+		expect(Date.parse(timing.finished_at)).toBeGreaterThanOrEqual(Date.parse(timing.started_at));
+		expect(Number.isInteger(timing.elapsed_ms)).toBe(true);
+		expect(timing.elapsed_ms).toBeGreaterThanOrEqual(20);
+		expect(timing.elapsed_ms).toBeLessThanOrEqual(after - before + 5);
+		expect(timing.elapsed_source).toBe("monotonic");
+	});
+
+	test("elapsed_ms is never negative even if the wall clock steps backwards", () => {
+		const session = new orchestrator.RunSession!("timing-test-2", fakeCtx() as never, "goal");
+		const original = performance.now;
+		try {
+			performance.now = () => -1e9;
+			expect(session.terminalTiming().elapsed_ms).toBe(0);
+		} finally {
+			performance.now = original;
+		}
+	});
+
+	test("run terminal outcomes carry the timing fields", () => {
+		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+		const complete = source.slice(source.indexOf("async function completeRun("), source.indexOf("async function failRun("));
+		const fail = source.slice(source.indexOf("async function failRun("), source.indexOf("// Subagent dispatch"));
+		for (const fn of [complete, fail]) {
+			expect(fn).toContain("...timing");
+		}
+		// Every terminal call inside the /orchestrate handler must pass the session timing.
+		const handler = source.slice(source.indexOf('pi.registerCommand("orchestrate"'), source.indexOf('pi.registerCommand("orchestrator-models"'));
+		const calls = handler.match(/await (?:completeRun|failRun)\([^;]*?\);/gs) ?? [];
+		expect(calls.length).toBeGreaterThanOrEqual(6);
+		for (const call of calls) expect(call).toContain("session.terminalTiming()");
+	});
+});
+
 describe("confirmation gates", () => {
 	test("passes the dispatch title and details as separate confirmation arguments", async () => {
 		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");

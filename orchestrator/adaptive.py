@@ -65,8 +65,32 @@ def _apply_switch_guards(empirical: dict[str, Any], default: dict[str, Any], fea
     return out
 
 
+def route_evidence(stats: list[dict[str, Any]], *, task_class: str, complexity: float, risk: str, package: dict[str, Any]) -> dict[str, int]:
+    """Evidence behind a package recommendation, counted in verified tasks and runs, not metric rows.
+
+    Legacy stats that predate the split fields carry no `verified_tasks`; they count as zero
+    evidence so the gate stays conservative rather than trusting a row count.
+    """
+    cb = bucket_complexity(complexity)
+    matches = [s for s in stats if s.get('task_class') == task_class and s.get('complexity_bucket') == cb and s.get('risk') == risk
+               and s.get('capability') == package.get('capability') and s.get('effort') == package.get('effort')
+               and s.get('verification_depth') == package.get('verification_depth')]
+    return {
+        'verified_tasks': max((int(s.get('verified_tasks') or 0) for s in matches), default=0),
+        'run_samples': max((int(s.get('run_samples') or 0) for s in matches), default=0),
+        'call_samples': max((int(s.get('call_samples') or 0) for s in matches), default=0),
+    }
+
+
+def configured_min_samples(features: dict[str, Any], default: int = 12) -> int:
+    return int(features.get('historical_learning', {}).get('minimum_samples', default))
+
+
 def recommend_topology(*, task_class: str, complexity: float, risk: str, coupling: float, parallelizable: float,
-                       stats: list[dict[str, Any]], quality_floor: float, features: dict[str, Any]) -> dict[str, Any]:
+                       stats: list[dict[str, Any]], quality_floor: float, features: dict[str, Any],
+                       min_samples: int | None = None) -> dict[str, Any]:
+    if min_samples is None:
+        min_samples = configured_min_samples(features)
     heuristic = topology_for(complexity, coupling, parallelizable, risk)
     if not features.get('dynamic_depth', {}).get('enabled', True):
         heuristic = {'depth':1,'leads':0,'workers':1,'shape':'direct'}
@@ -80,7 +104,8 @@ def recommend_topology(*, task_class: str, complexity: float, risk: str, couplin
     if not features.get('dynamic_parallelism', {}).get('enabled', True):
         heuristic['workers'] = 1
 
-    # Empirical topology learning only activates when topology-tagged data exists.
+    # Empirical topology learning only activates when topology-tagged data exists, and it must
+    # meet the same verified-task evidence threshold as package routing before it can be enforced.
     cb = bucket_complexity(complexity)
     comparable = [s for s in stats if s.get('task_class') == task_class and s.get('complexity_bucket') == cb and s.get('risk') == risk and s.get('topology_shape')]
     candidates=[]
@@ -89,14 +114,21 @@ def recommend_topology(*, task_class: str, complexity: float, risk: str, couplin
         cost=s.get('verified_cost_usd')
         if quality is None or cost is None:
             continue
+        verified_tasks=int(s.get('verified_tasks') or 0)
         candidates.append({
-            'shape':s.get('topology_shape'), 'samples':s.get('samples',0), 'verified_cost_usd':cost,
-            'quality_evidence':quality, 'feasible':quality >= quality_floor,
+            'shape':s.get('topology_shape'), 'samples':s.get('samples',0), 'verified_tasks':verified_tasks,
+            'run_samples':int(s.get('run_samples') or 0), 'verified_cost_usd':cost,
+            'quality_evidence':quality, 'meets_quality_floor':quality >= quality_floor,
+            'sufficient':verified_tasks >= min_samples, 'feasible':quality >= quality_floor and verified_tasks >= min_samples,
             'depth':s.get('topology_depth'), 'workers':s.get('topology_workers'), 'leads':s.get('topology_leads'),
         })
     feasible=[c for c in candidates if c['feasible']]
     learned=min(feasible,key=lambda x:x['verified_cost_usd'],default=None)
-    return {'heuristic':heuristic,'empirical':learned,'candidates':candidates}
+    if learned is not None: fallback_reason=None
+    elif not candidates: fallback_reason='no_comparable_history'
+    elif not any(c['meets_quality_floor'] for c in candidates): fallback_reason='below_quality_floor'
+    else: fallback_reason='insufficient_history'
+    return {'heuristic':heuristic,'empirical':learned,'candidates':candidates,'min_samples':min_samples,'fallback_reason':fallback_reason}
 
 
 def adaptive_route(*, run_id: str, task_class: str, complexity: float, risk: str, quality_floor: float,
@@ -114,8 +146,10 @@ def adaptive_route(*, run_id: str, task_class: str, complexity: float, risk: str
     )
     recommended = _apply_switch_guards(empirical['choice']['package'], default, features)
 
-    # If history is below the V3 threshold, recommendation is informative but execution remains conservative.
-    sufficient = bool(empirical['choice'].get('historical')) and int(empirical['choice'].get('samples', 0)) >= min_samples
+    # History is sufficient only when enough independently verified tasks back the recommended
+    # package. Row counts (calls, verification markers, decisions) are not evidence samples.
+    evidence = route_evidence(stats if history_on else [], task_class=task_class, complexity=complexity, risk=risk, package=empirical['choice']['package'])
+    sufficient = bool(empirical['choice'].get('historical')) and evidence['verified_tasks'] >= min_samples
     selected = dict(default)
     action = 'static_default'
     if mode == 'observe':
@@ -156,6 +190,10 @@ def adaptive_route(*, run_id: str, task_class: str, complexity: float, risk: str
         'action': action,
         'history_sufficient': sufficient,
         'historical_samples': int(empirical['choice'].get('samples',0) or 0),
+        'verified_task_samples': evidence['verified_tasks'],
+        'run_samples': evidence['run_samples'],
+        'call_samples': evidence['call_samples'],
+        'min_samples': int(min_samples),
         'quality_floor': quality_floor,
         'cost_aggressiveness': cost_aggressiveness,
         'default': default,

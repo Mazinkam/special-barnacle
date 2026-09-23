@@ -838,6 +838,11 @@ export class RunSession {
 	private phase = "starting";
 	private renderTimer: ReturnType<typeof setTimeout> | undefined;
 	private readonly startedAt = Date.now();
+	// Wall-clock stamp for the ledger and a monotonic origin for elapsed time. `Date.now()`
+	// can step (NTP, sleep/wake) mid-run, so the duration written to outcomes must never be
+	// derived from two wall-clock reads.
+	private readonly startedAtIso = new Date().toISOString();
+	private readonly startedMono = performance.now();
 	private tickTimer: ReturnType<typeof setInterval> | undefined;
 	private closed = false;
 	readonly cancellation = new RunCancellation();
@@ -915,6 +920,20 @@ export class RunSession {
 
 	file(name: string): string {
 		return join(this.dir, name);
+	}
+
+	/**
+	 * Time fields recorded at the run's terminal boundary (complete/fail/cancel/crash).
+	 * `elapsed_ms` is monotonic and clamped at zero; consumers treat a run without these
+	 * fields as "duration unknown", never as zero.
+	 */
+	terminalTiming(): RunTiming {
+		return {
+			started_at: this.startedAtIso,
+			finished_at: new Date().toISOString(),
+			elapsed_ms: Math.max(0, Math.round(performance.now() - this.startedMono)),
+			elapsed_source: "monotonic",
+		};
 	}
 
 	cancel(): void {
@@ -1977,6 +1996,14 @@ async function recordOutcome(outcome: Record<string, unknown>): Promise<void> {
 	}
 }
 
+/** Terminal-boundary time fields written to the run outcome row. */
+export interface RunTiming {
+	started_at: string;
+	finished_at: string;
+	elapsed_ms: number;
+	elapsed_source: "monotonic";
+}
+
 export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality: number, note: string): Record<string, unknown> {
 	return {
 		run_id: runId,
@@ -1999,11 +2026,11 @@ export function runCompletionOutcomeFor(runId: string, summary: Record<string, u
 	};
 }
 
-async function completeRun(runId: string, summary: Record<string, unknown>): Promise<void> {
-	await recordOutcome(runCompletionOutcomeFor(runId, summary));
+async function completeRun(runId: string, summary: Record<string, unknown>, timing?: RunTiming): Promise<void> {
+	await recordOutcome({ ...runCompletionOutcomeFor(runId, summary), ...timing });
 }
 
-async function failRun(runId: string, error: string): Promise<void> {
+async function failRun(runId: string, error: string, timing?: RunTiming): Promise<void> {
 	await recordOutcome({
 		run_id: runId,
 		task_id: "run-failed",
@@ -2011,6 +2038,7 @@ async function failRun(runId: string, error: string): Promise<void> {
 		verification_scope: "run",
 		quality: 0,
 		note: error,
+		...timing,
 	});
 }
 
@@ -3428,7 +3456,7 @@ export default function (pi: ExtensionAPI) {
 								? "interactive confirmation unavailable after triage"
 								: "cancelled by user after triage";
 							session.log(reason);
-							await failRun(runId, reason);
+							await failRun(runId, reason, session.terminalTiming());
 							ctx.ui.notify("Cancelled.", "info");
 							return;
 						}
@@ -3460,7 +3488,7 @@ export default function (pi: ExtensionAPI) {
 				} catch (err) {
 					if (session.cancellation.isCancelled) throw err;
 					session.log(`plan failed: ${(err as Error).message}`);
-					await failRun(runId, `plan failed: ${(err as Error).message}`);
+					await failRun(runId, `plan failed: ${(err as Error).message}`, session.terminalTiming());
 					ctx.ui.notify(`Plan failed: ${(err as Error).message}`, "error");
 					return;
 				}
@@ -3500,7 +3528,7 @@ export default function (pi: ExtensionAPI) {
 						? "interactive confirmation unavailable before dispatch"
 						: "cancelled by user at plan confirmation";
 					session.log(reason);
-					await failRun(runId, reason);
+					await failRun(runId, reason, session.terminalTiming());
 					ctx.ui.notify("Cancelled.", "info");
 					return;
 				}
@@ -3713,7 +3741,7 @@ export default function (pi: ExtensionAPI) {
 					retries,
 					models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
 					log_dir: session.dir,
-				});
+				}, session.terminalTiming());
 
 				// The lead's final report is the only place its reasoning, open
 				// questions, and non-file results (audits, package lists, verdicts)
@@ -3786,7 +3814,7 @@ export default function (pi: ExtensionAPI) {
 				if (session.cancellation.isCancelled) {
 					const stopped = session.cancelledDispatches();
 					session.log(`run cancelled by user; stopped dispatches: ${stopped.join(", ") || "none active"}`);
-					await failRun(runId, "cancelled by user (Esc or Ctrl+C)");
+					await failRun(runId, "cancelled by user (Esc or Ctrl+C)", session.terminalTiming());
 					ctx.ui.notify(
 						`Orchestration cancelled. ${stopped.length ? `Stopped: ${stopped.join(", ")}. ` : "No child dispatch was active. "}Progress is retained above the editor; run log: ${session.file("run.log")}`,
 						"info",
@@ -3796,7 +3824,7 @@ export default function (pi: ExtensionAPI) {
 					// row) and the UI stuck on the last notify. Record + surface it.
 					const message = (err as Error).stack ?? String(err);
 					session.log(`run crashed: ${message}`);
-					await failRun(runId, `crashed: ${(err as Error).message}`);
+					await failRun(runId, `crashed: ${(err as Error).message}`, session.terminalTiming());
 					ctx.ui.notify(
 						`Orchestration crashed: ${(err as Error).message}\nSee ${session.file("run.log")}`,
 						"error",

@@ -44,7 +44,7 @@ class V3EngineTests(unittest.TestCase):
             # Every pre-existing section must survive.
             for anchor in ('id="cards"','id="adaptiveHealth"','id="risk"','id="features"','id="adaptive"',
                            'id="policies"','id="trends"','id="routes"','id="roles"','id="runtimes"',
-                           'id="interactive"','id="events"'):
+                           'id="interactive"','id="runs"','id="events"'):
                 self.assertIn(anchor,html)
             self.assertIn('prefers-color-scheme',html)
 
@@ -106,6 +106,29 @@ class V3EngineTests(unittest.TestCase):
         interactive=data['interactive_sessions']
         self.assertGreaterEqual(interactive['calls'],interactive['rows'])
         self.assertIn('rows',interactive)
+
+    def test_dashboard_reports_complete_run_evidence_coverage(self):
+        from orchestrator.dashboard import build_data
+        with tempfile.TemporaryDirectory() as td:
+            engine = OrchestrationEngine(td)
+            engine.plan_run(run_id='r1', task_class='crud', complexity=3, risk='low')
+            engine.record_model_call(run_id='r1', task_id='r1-a', role='worker',
+                                     capability_class='implementation_fast', model='known',
+                                     cost_usd=.05, cost_source='reported')
+            engine.record_model_call(run_id='r1', task_id='r1-b', role='worker',
+                                     capability_class='implementation_fast', model='unknown',
+                                     cost_source='unmetered')
+            data = build_data(Path(td), config=engine.config)
+            runs = {row['run_id']: row for row in data['runs']}
+            self.assertIn('r1', runs)
+            self.assertAlmostEqual(runs['r1']['cost_known_usd'], .05)
+            self.assertEqual(runs['r1']['unmetered_calls'], 1)
+            self.assertEqual(runs['r1']['call_rows'], 2)
+            self.assertIsNone(runs['r1']['elapsed_ms'])
+            self.assertEqual(data['run_evidence']['runs'], 1)
+            self.assertEqual(data['run_evidence']['runs_fully_priced'], 0)
+            self.assertEqual(data['run_evidence']['runs_with_elapsed'], 0)
+            self.assertTrue(all(route['capability'] != 'interactive_session' for route in data['routes']))
 
     def test_master_switch_freezes_route(self):
         with tempfile.TemporaryDirectory() as td:

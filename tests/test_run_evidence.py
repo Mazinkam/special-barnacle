@@ -1,0 +1,201 @@
+import json, unittest
+from orchestrator.run_evidence import summarize_runs, evidence_coverage
+
+PRICING={'enabled':True,'models':{'claude-sonnet-4-5':{'input_per_mtok':3.0,'output_per_mtok':15.0,'cache_read_per_mtok':0.3,'cache_write_per_mtok':3.75}}}
+
+def call(run_id,task_id,**kw):
+    row={'event':'model_call','run_id':run_id,'task_id':task_id,'role':'worker','capability_class':'implementation_fast','model':'anthropic/claude-sonnet-4-5','agent_runtime':'humain-terminal'}
+    row.update(kw); return row
+
+def by_run(runs):
+    return {r['run_id']:r for r in runs}
+
+
+class SeparateRowsTests(unittest.TestCase):
+    def test_cost_verification_and_decision_rows_are_not_interchangeable(self):
+        metrics=[
+            {'event':'adaptive_route_decision','run_id':'r1','task_class':'crud','selected_capability':'implementation_fast'},
+            call('r1','r1-t1',cost_usd=.02,cost_source='reported',input_tokens=100,output_tokens=50),
+            {'event':'task_verified','run_id':'r1','task_id':'r1-t1','result':'verified','quality_evidence_score':.97},
+        ]
+        r=by_run(summarize_runs(metrics,[],[]))['r1']
+        self.assertEqual(r['cost_provenance'],'actual')
+        self.assertEqual(r['call_rows'],1)
+        self.assertEqual(r['verification_rows'],1)
+        self.assertEqual(r['decision_rows'],1)
+        self.assertEqual(r['verified_tasks'],1)
+        self.assertAlmostEqual(r['cost_known_usd'],.02)
+        self.assertAlmostEqual(r['cost_reported_usd'],.02)
+        self.assertEqual(r['unmetered_calls'],0)
+        self.assertTrue(r['cost_complete'])
+
+    def test_session_ingest_rows_are_excluded_even_with_run_id(self):
+        metrics=[
+            call('r1','r1-t1',cost_usd=.02,cost_source='reported'),
+            call('r1','r1-x',cost_usd=5.0,cost_source='estimated',source='session_ingest'),
+            {'event':'model_call','run_id':'r1','role':'interactive_session','cost_usd':7.0},
+        ]
+        r=by_run(summarize_runs(metrics,[],[]))['r1']
+        self.assertEqual(r['call_rows'],1)
+        self.assertAlmostEqual(r['cost_known_usd'],.02)
+        self.assertEqual(r['excluded_session_ingest_rows'],2)
+
+
+class MissingDataTests(unittest.TestCase):
+    def test_absent_tokens_cost_and_duration_are_unknown_not_zero(self):
+        metrics=[
+            call('r2','r2-a',cost_usd=.05,cost_source='reported',input_tokens=10,output_tokens=5,duration_ms=1000),
+            call('r2','r2-b'),  # no cost, no tokens, no duration, no cost_source
+            call('r2','r2-c',cost_source='unmetered'),
+        ]
+        r=by_run(summarize_runs(metrics,[],[]))['r2']
+        # actual cost equals the sum of observed (metered) calls only
+        self.assertAlmostEqual(r['cost_known_usd'],.05)
+        self.assertEqual(r['call_rows'],3)
+        self.assertEqual(r['metered_calls'],1)
+        self.assertEqual(r['unmetered_calls'],2)
+        self.assertNotEqual(r['unmetered_calls'],0)
+        self.assertFalse(r['cost_complete'])
+        self.assertAlmostEqual(r['cost_coverage'],1/3)
+        self.assertEqual(r['tokens_known_calls'],1)
+        self.assertEqual(r['tokens_missing_calls'],2)
+        self.assertIsNone(r['elapsed_ms'])
+        self.assertEqual(r['elapsed_source'],'unknown')
+        self.assertEqual(r['status'],'incomplete')
+        self.assertEqual(r['verification'],'unknown')
+        # dispatch durations are reported for what was observed, with the missing count
+        self.assertEqual(r['dispatch_duration_ms_total'],1000)
+        self.assertEqual(r['duration_missing_calls'],2)
+
+    def test_run_with_no_calls_has_no_cost_not_zero_cost(self):
+        events=[{'event':'run_started','run_id':'r3','ts':'2026-09-23T10:00:00+00:00'}]
+        r=by_run(summarize_runs([],events,[]))['r3']
+        self.assertEqual(r['call_rows'],0)
+        self.assertIsNone(r['cost_known_usd'])
+        self.assertIsNone(r['cost_coverage'])
+        self.assertIsNone(r['elapsed_ms'])
+
+
+class ElapsedTests(unittest.TestCase):
+    def test_elapsed_spans_parallel_workers_from_terminal_boundary(self):
+        metrics=[
+            call('r4','r4-w1',cost_usd=.1,cost_source='reported',duration_ms=60000),
+            call('r4','r4-w2',cost_usd=.1,cost_source='reported',duration_ms=60000),
+        ]
+        outcomes=[{'ts':'2026-09-23T10:01:05+00:00','run_id':'r4','task_id':'run-complete','outcome':'verified','quality':1,
+                   'note':json.dumps({'success_rate':1,'verification_passed':True,'retries':0}),
+                   'started_at':'2026-09-23T10:00:00.000Z','finished_at':'2026-09-23T10:01:05.000Z','elapsed_ms':65000}]
+        r=by_run(summarize_runs(metrics,[],outcomes))['r4']
+        self.assertEqual(r['elapsed_ms'],65000)
+        self.assertEqual(r['elapsed_source'],'monotonic')
+        self.assertEqual(r['dispatch_duration_ms_total'],120000)
+        self.assertNotEqual(r['elapsed_ms'],r['dispatch_duration_ms_total'])
+        self.assertEqual(r['status'],'completed')
+        self.assertEqual(r['started_at'],'2026-09-23T10:00:00.000Z')
+        self.assertEqual(r['finished_at'],'2026-09-23T10:01:05.000Z')
+        self.assertEqual(r['verification'],'passed')
+        self.assertEqual(r['workers'],2)
+
+    def test_elapsed_from_timestamps_when_monotonic_missing(self):
+        outcomes=[{'run_id':'r5','task_id':'run-failed','outcome':'fail','note':'crashed',
+                   'started_at':'2026-09-23T10:00:00+00:00','finished_at':'2026-09-23T10:00:30+00:00'}]
+        r=by_run(summarize_runs([],[],outcomes))['r5']
+        self.assertEqual(r['elapsed_ms'],30000)
+        self.assertEqual(r['elapsed_source'],'timestamps')
+        self.assertEqual(r['status'],'failed')
+
+    def test_engine_terminal_events_with_time_fields(self):
+        events=[{'event':'run_started','run_id':'r6','ts':'2026-09-23T10:00:00+00:00'},
+                {'event':'run_completed','run_id':'r6','ts':'2026-09-23T10:00:09+00:00','elapsed_ms':9000}]
+        r=by_run(summarize_runs([],events,[]))['r6']
+        self.assertEqual(r['status'],'completed')
+        self.assertEqual(r['elapsed_ms'],9000)
+
+    def test_record_timestamps_alone_never_fabricate_elapsed(self):
+        events=[{'event':'run_started','run_id':'r7','ts':'2026-09-23T10:00:00+00:00'},
+                {'event':'run_completed','run_id':'r7','ts':'2026-09-23T10:00:09+00:00'}]
+        r=by_run(summarize_runs([],events,[]))['r7']
+        self.assertIsNone(r['elapsed_ms'])
+        self.assertEqual(r['elapsed_source'],'unknown')
+
+
+class VerificationAndReworkTests(unittest.TestCase):
+    def test_qa_outcome_retries_and_delayed_outcomes(self):
+        metrics=[
+            call('r8','r8-lead',role='lead',capability_class='lead',cost_usd=.5,cost_source='reported'),
+            call('r8','r8-w1',cost_usd=.1,cost_source='reported',result='fail'),
+            call('r8','r8-w1-retry1',cost_usd=.1,cost_source='reported',retry=1),
+            call('r8','r8-qa',role='qa_agent',capability_class='qa_agent',cost_usd=.2,cost_source='reported'),
+        ]
+        events=[{'event':'dispatch_started','run_id':'r8','task_id':'r8-w1-retry1','retry_of':'r8-w1'}]
+        outcomes=[
+            {'run_id':'r8','task_id':'r8-qa','outcome':'fail','quality':0.0,'note':'FAIL tests'},
+            {'run_id':'r8','task_id':'run-complete','outcome':'verified','quality':1,'note':json.dumps({'verification_passed':False,'retries':1})},
+            {'run_id':'r8','task_id':'r8-w1','reopened':True},
+        ]
+        r=by_run(summarize_runs(metrics,events,outcomes))['r8']
+        self.assertEqual(r['verification'],'failed')
+        self.assertEqual(r['retries'],1)
+        self.assertTrue(r['delayed_bad_outcome'])
+        self.assertAlmostEqual(r['cost_known_usd'],.9)
+        self.assertAlmostEqual(r['overhead_cost_usd'],.7)
+        self.assertAlmostEqual(r['implementation_cost_usd'],.2)
+        self.assertAlmostEqual(r['overhead_ratio'],.7/.9)
+        self.assertEqual(r['overhead_by_role'],{'lead':.5,'qa_agent':.2})
+
+
+class CounterfactualTests(unittest.TestCase):
+    def test_flat_baseline_is_labelled_counterfactual_and_never_claims_savings_without_coverage(self):
+        metrics=[
+            call('r9','r9-a',cost_usd=.02,cost_source='reported',input_tokens=1000,output_tokens=1000),
+            call('r9','r9-b',cost_usd=.5,cost_source='reported'),  # reported cost, but no tokens to reprice
+        ]
+        r=by_run(summarize_runs(metrics,[],[],baseline_model='claude-sonnet-4-5',pricing=PRICING))['r9']
+        cf=r['counterfactual']
+        self.assertEqual(cf['provenance'],'counterfactual')
+        self.assertEqual(cf['baseline_model'],'claude-sonnet-4-5')
+        self.assertAlmostEqual(cf['cost_usd'],(1000*3.0+1000*15.0)/1e6)
+        self.assertEqual(cf['priced_calls'],1)
+        self.assertEqual(cf['unpriced_calls'],1)
+        self.assertFalse(cf['comparable'])
+        self.assertIsNone(cf['delta_usd'])
+        self.assertIn('coverage',cf['reason'])
+
+    def test_full_coverage_reports_delta_but_still_counterfactual(self):
+        metrics=[call('r10','r10-a',cost_usd=.5,cost_source='reported',input_tokens=1000,output_tokens=1000)]
+        r=by_run(summarize_runs(metrics,[],[],baseline_model='claude-sonnet-4-5',pricing=PRICING))['r10']
+        cf=r['counterfactual']
+        self.assertTrue(cf['comparable'])
+        self.assertAlmostEqual(cf['delta_usd'],.5-.018)
+        self.assertEqual(cf['provenance'],'counterfactual')
+
+    def test_no_baseline_means_no_counterfactual_block(self):
+        r=by_run(summarize_runs([call('r11','r11-a',cost_usd=.5,cost_source='reported')],[],[]))['r11']
+        self.assertIsNone(r['counterfactual'])
+
+
+class CoverageTests(unittest.TestCase):
+    def test_evidence_coverage_counts_runs_not_rows(self):
+        metrics=[
+            call('c1','c1-a',cost_usd=.1,cost_source='reported'),
+            call('c1','c1-b',cost_usd=.1,cost_source='reported'),
+            call('c2','c2-a'),
+            call('c2','c2-b',cost_usd=.1,cost_source='reported'),
+        ]
+        outcomes=[{'run_id':'c1','task_id':'run-complete','outcome':'verified','note':json.dumps({'verification_passed':True}),'elapsed_ms':1000,
+                   'started_at':'2026-09-23T10:00:00+00:00','finished_at':'2026-09-23T10:00:01+00:00'}]
+        runs=summarize_runs(metrics,[],outcomes)
+        cov=evidence_coverage(runs)
+        self.assertEqual(cov['runs'],2)
+        self.assertEqual(cov['runs_completed'],1)
+        self.assertEqual(cov['runs_fully_priced'],1)
+        self.assertEqual(cov['runs_with_elapsed'],1)
+        self.assertEqual(cov['runs_with_verification'],1)
+        self.assertAlmostEqual(cov['priced_run_coverage'],.5)
+        self.assertAlmostEqual(cov['duration_coverage'],.5)
+        self.assertEqual(cov['unmetered_calls'],1)
+        self.assertEqual(cov['call_rows'],4)
+        self.assertEqual(cov['cost_provenance'],'actual')
+
+
+if __name__=='__main__': unittest.main()

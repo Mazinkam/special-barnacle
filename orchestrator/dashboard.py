@@ -36,6 +36,7 @@ from .economics import (ESTIMATED, REPORTED, UNMETERED, cost_attribution, cost_c
 from .features import feature_inventory
 from .history import build_route_stats
 from .outcomes import outcome_summary
+from .run_evidence import summarize_runs, evidence_coverage
 from .records import NO_DATA
 from .runtime import default_state_root, load_jsonl, read_json
 from .verification import flaky_stats
@@ -428,6 +429,8 @@ def build_data(root: Path, config: dict | None = None):
     quality_samples = sum(1 for r in orchestrated if r.get('quality_evidence_score') is not None)
     retry_samples = sum(1 for r in orchestrated if 'retry' in r)
     outsum = outcome_summary(root)
+    runs = summarize_runs(orchestrated, events, outcomes)
+    run_cov = evidence_coverage(runs)
     mature30 = [x for x in outsum if x['mature_30d']]
     delayed_bad = sum(1 for x in mature30 if x['bad_outcome'])
     actions = defaultdict(int)
@@ -446,6 +449,13 @@ def build_data(root: Path, config: dict | None = None):
         'unmetered_calls': attribution[UNMETERED]['calls'],
         'call_rows': attribution['call_rows'],
         'covered_calls': attribution['covered_calls'],
+        'runs': run_cov['runs'],
+        'runs_fully_priced': run_cov['runs_fully_priced'],
+        'runs_with_elapsed': run_cov['runs_with_elapsed'],
+        'priced_run_coverage': run_cov['priced_run_coverage'],
+        'duration_coverage': run_cov['duration_coverage'],
+        'verification_coverage': run_cov['verification_coverage'],
+        'cost_provenance': run_cov['cost_provenance'],
         'cost_coverage': attribution['coverage'],
         # Attested verifications only — a dispatch `result: 'pass'` is a process exit code, not a
         # gate outcome, and counting it here reported 174 verified tasks for 18 real ones.
@@ -568,6 +578,7 @@ def build_data(root: Path, config: dict | None = None):
                 'quality': quality_samples, 'avg_quality_evidence': quality_samples,
                 'retry_rate': retry_samples}),
             'routes': build_route_stats(orchestrated, outcomes), 'outcomes': outsum,
+            'run_evidence': run_cov, 'runs': runs[-200:],
             # flaky_stats only matches rows with event=='verification_result'; session-ingest rows
             # are event=='model_call' and never contribute, but we pass `orchestrated` for
             # consistency with the rest of this function's inputs.
@@ -593,6 +604,7 @@ def generate_dashboard(state_dir=None, config: dict | None = None):
 <div class="section card"><h2>Recent adaptive decisions</h2><div class="scroll"><table id="adaptive"></table></div></div>
 <div class="section card"><h2>Policy cohorts</h2><div class="scroll"><table id="policies"></table></div></div>
 <div class="section card"><h2>Daily trend</h2><div class="scroll"><table id="trends"></table></div></div>
+<div class="section card"><h2>Run evidence (actual, by run)</h2><div class="small">Joined by run_id across metrics, events, and outcomes. Missing cost or duration remains unknown; any flat-baseline comparison is a counterfactual estimate, not observed savings.</div><div class="scroll"><table id="runs"></table></div></div>
 <div class="section card"><h2>Historical route economics</h2><div class="scroll"><table id="routes"></table></div></div>
 <div class="section card"><h2>Cost by role</h2><div id="roles"></div></div>
 <div class="section card"><h2>Cost by agent runtime</h2><div id="runtimes"></div></div>
@@ -632,6 +644,8 @@ $('#adaptive').innerHTML='<thead><tr><th>Time</th><th>Task</th><th>Risk</th><th>
 $('#policies').innerHTML='<thead><tr><th>Policy</th><th>Cost aggr.</th><th>Cost</th><th>Rows (per-call)</th><th>Verified (attested)</th><th>Cost/attested</th><th>Dispatch pass (exit 0)</th><th>Quality evidence</th></tr></thead><tbody>'+D.policies.map(p=>`<tr><td><code>${esc(p.policy_id)}</code></td><td>${p$('cost_aggressiveness',p.cost_aggressiveness)}</td><td>${m$('cost',p.cost)}</td><td>${nz(p.rows)} (${nz(p.call_rows)})</td><td>${nz(p.verified)}</td><td>${m$('verified_cost',p.verified_cost)}</td><td>${nz(p.dispatch_pass)}</td><td>${p$('quality',p.quality)}</td></tr>`).join('')+'</tbody>';
 $('#trends').innerHTML='<thead><tr><th>Day</th><th>Cost aggr.</th><th>Spend</th><th>Rows (per-call)</th><th>Verified (attested)</th><th>Cost/attested</th><th>Dispatch pass (exit 0)</th><th>Quality</th><th>Retries</th><th>Adaptive</th></tr></thead><tbody>'+D.trends.map(t=>`<tr><td>${esc(t.day)}</td><td>${p$('cost_aggressiveness',t.cost_aggressiveness)}</td><td>${m$('cost',t.cost)}</td><td>${nz(t.rows)} (${nz(t.call_rows)})</td><td>${nz(t.verified)}</td><td>${m$('verified_cost',t.verified_cost)}</td><td>${nz(t.dispatch_pass)}</td><td>${p$('quality',t.quality)}</td><td>${nz(t.retries)}</td><td>${nz(t.adaptive)}</td></tr>`).join('')+'</tbody>';
 $('#routes').innerHTML='<thead><tr><th>Task</th><th>Complexity</th><th>Risk</th><th>Capability</th><th>Effort</th><th>Verify</th><th>Topology</th><th>N</th><th>Verified cost (attested)</th><th>Quality</th><th>Retry</th><th>Delayed fail</th></tr></thead><tbody>'+D.routes.map(r=>`<tr><td>${esc(r.task_class)}</td><td>${esc(r.complexity_bucket)}</td><td>${esc(r.risk)}</td><td>${esc(r.capability)}</td><td>${esc(r.effort)}</td><td>${esc(r.verification_depth)}</td><td>${esc(r.topology_shape||'—')}</td><td>${nz(r.samples)}</td><td>${m$('verified_cost',r.verified_cost_usd)}</td><td>${p$('avg_quality_evidence',r.avg_quality_evidence)}</td><td>${p$('retry_rate',r.retry_rate)}</td><td>${p$('delayed_failure_rate',r.delayed_failure_rate)}</td></tr>`).join('')+'</tbody>';
+const dur=x=>x==null?'<span class="warn">unknown</span>':(Number(x)/1000).toFixed(1)+'s';const knownCost=r=>r.cost_known_usd==null?'<span class="warn">unmetered</span>':m$('run_cost',r.cost_known_usd)+(r.unmetered_calls?` <span class="warn">+${nz(r.unmetered_calls)} unmetered</span>`:'');const cf=r=>r.counterfactual?(r.counterfactual.cost_usd==null?'—':m$('run_cost',r.counterfactual.cost_usd)+(r.counterfactual.comparable?'':' <span class="warn">(partial)</span>')):'—';
+$('#runs').innerHTML='<thead><tr><th>Run</th><th>Status</th><th>Elapsed</th><th>Known cost</th><th>Coverage</th><th>Overhead</th><th>Calls</th><th>Tasks</th><th>Retries</th><th>Verification</th><th>Delayed bad</th><th>Counterfactual</th></tr></thead><tbody>'+D.runs.slice().reverse().map(r=>`<tr><td><code>${esc(r.run_id)}</code></td><td>${esc(r.status)}</td><td>${dur(r.elapsed_ms)}</td><td>${knownCost(r)}</td><td>${p$('run_coverage',r.cost_coverage)}</td><td>${p$('run_overhead',r.overhead_ratio)}</td><td>${nz(r.call_rows)}</td><td>${nz(r.tasks)}</td><td>${nz(r.retries)}</td><td>${esc(r.verification)}</td><td>${r.delayed_bad_outcome==null?'—':(r.delayed_bad_outcome?'yes':'no')}</td><td>${cf(r)}</td></tr>`).join('')+'</tbody>';
 const R=Object.entries(D.by_role).sort((a,b)=>b[1].cost-a[1].cost),maxR=Math.max(.000001,...R.map(x=>x[1].cost));$('#roles').innerHTML=`<div class="small">Rows are records, not calls: session-aggregate rows each cover many calls, so per-row magnitudes are not per-call magnitudes.</div>`+R.map(([k,v])=>`<div style="display:grid;grid-template-columns:190px 1fr 90px;gap:10px;align-items:center;margin:9px 0"><div><b>${esc(k)}</b><div class="small">${nz(v.rows)} rows · ${nz(v.call_rows)} cost-accountable · ${nz(v.session_rows)} session aggregates${v.covered_calls>v.call_rows?' covering '+nz(v.covered_calls)+' stated calls':''} · ${nz(v.tokens)} tokens</div></div><div class="bar"><i style="width:${(v.cost/maxR*100).toFixed(1)}%"></i></div><div style="text-align:right">${m$('cost',v.cost)}</div></div>`).join('');
 const A=Object.entries(D.by_runtime).sort((a,b)=>b[1].cost-a[1].cost),maxA=Math.max(.000001,...A.map(x=>x[1].cost));$('#runtimes').innerHTML=`<div class="small">Metered + unmetered always reconciles against <em>cost-accountable rows</em>, not against total rows: orchestration events (routing decisions, dispatches) are rows that are not calls.</div>`+A.map(([k,v])=>{const unmetered=n0(v.unmetered_calls),metered=n0(v.metered_calls);const label=metered?m$('cost',v.cost):(unmetered?'<span class="warn">unmetered</span>':m$('cost',v.cost));const detail=[nz(v.rows)+' rows',nz(v.call_rows)+' cost-accountable ('+nz(metered)+' metered + '+nz(unmetered)+' unmetered)',n0(v.session_rows)?nz(v.session_rows)+' session aggregates'+(n0(v.covered_calls)>n0(v.call_rows)?' covering '+nz(v.covered_calls)+' stated calls':' (calls per aggregate unstated)'):null,n0(v.estimated_cost)>0?'est. '+money(n0(v.estimated_cost)):null,n0(v.reported_cost)>0?'reported '+money(n0(v.reported_cost)):null].filter(Boolean).join(' · ');return `<div style="display:grid;grid-template-columns:190px 1fr 130px;gap:10px;align-items:center;margin:9px 0"><div><b>${esc(k)}</b><div class="small">${detail}</div></div><div class="bar"><i style="width:${(v.cost/maxA*100).toFixed(1)}%"></i></div><div style="text-align:right">${label}</div></div>`}).join('');
 $('#events').innerHTML=D.events.slice().reverse().map(e=>`<div class="event"><span class="small">${esc(e.ts||'')}</span> <b>${esc(e.event||'')}</b><div class="small"><code>${esc(JSON.stringify(e).slice(0,600))}</code></div></div>`).join('');

@@ -1,0 +1,240 @@
+from __future__ import annotations
+"""Complete-run evidence rollups.
+
+Joins the three authoritative JSONL streams by `run_id` so a run can be judged on what
+was actually observed: known versus unmetered cost, token provenance, elapsed wall time
+recorded at the run's terminal boundary, verification result, retries/rework, delayed
+outcomes, and orchestration overhead versus implementation spend.
+
+Rules that keep the numbers honest:
+- A model call, a verification marker, and a routing decision are counted separately;
+  they are never pooled into one "samples" figure.
+- Missing cost, tokens, or duration is reported as missing (`None` / unmetered counts),
+  never as zero. Elapsed time is only taken from explicit start/finish/elapsed fields
+  written at the terminal boundary; record `ts` values alone never fabricate a duration.
+- Interactive-session ingestion is excluded even when it carries a `run_id`.
+- Everything derived from observed metrics is labelled `actual`; a flat-model repricing
+  of the observed tokens is labelled `counterfactual` and never yields a savings delta
+  unless every call in the run is priced under both views.
+"""
+from collections import defaultdict
+from datetime import datetime
+from typing import Any
+import json
+
+from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, is_call_row, is_session_ingest, row_cost
+
+ACTUAL = 'actual'
+COUNTERFACTUAL = 'counterfactual'
+TERMINAL_OUTCOME_TASKS = {'run-complete': 'completed', 'run-failed': 'failed'}
+TERMINAL_EVENTS = {'run_completed': 'completed', 'run_failed': 'failed'}
+IMPLEMENTATION_ROLES = {'worker', 'implementer', 'complex_implementer', 'implementation_fast', 'implementation_strong'}
+BAD_OUTCOME_KEYS = ('reopened', 'regression', 'rollback', 'human_correction', 'incident', 'major_rewrite')
+TOKEN_KEYS = ('input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_write_tokens')
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    if not value: return None
+    try: return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except Exception: return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or value == '': return None
+    try: return int(float(value))
+    except (TypeError, ValueError): return None
+
+
+def _role(row: dict) -> str:
+    return str(row.get('role') or row.get('capability_class') or 'unknown')
+
+
+def _is_verification_row(row: dict) -> bool:
+    return row.get('event') == 'task_verified' or row.get('result') == 'verified'
+
+
+def _has_tokens(row: dict) -> bool:
+    return any(_int_or_none(row.get(k)) is not None for k in TOKEN_KEYS)
+
+
+def _terminal_fields(record: dict) -> dict[str, Any]:
+    """Explicit time fields written by a runtime at its run-terminal boundary."""
+    return {'started_at': record.get('started_at'), 'finished_at': record.get('finished_at'), 'elapsed_ms': _int_or_none(record.get('elapsed_ms'))}
+
+
+def _elapsed(terminal: dict[str, Any] | None) -> tuple[int | None, str]:
+    if not terminal: return None, 'unknown'
+    if terminal.get('elapsed_ms') is not None: return max(0, int(terminal['elapsed_ms'])), 'monotonic'
+    start, finish = _parse_ts(terminal.get('started_at')), _parse_ts(terminal.get('finished_at'))
+    if start and finish: return max(0, int((finish - start).total_seconds() * 1000)), 'timestamps'
+    return None, 'unknown'
+
+
+def _note_json(note: Any) -> dict:
+    if isinstance(note, dict): return note
+    if isinstance(note, str) and note.startswith('{'):
+        try:
+            obj = json.loads(note)
+            return obj if isinstance(obj, dict) else {}
+        except Exception: return {}
+    return {}
+
+
+def _counterfactual(calls: list[dict], baseline_model: str, pricing: dict[str, Any] | None) -> dict[str, Any]:
+    from .pricing import estimate_cost_usd, load_pricing
+    pricing = load_pricing() if pricing is None else pricing
+    total = 0.0; priced = 0; unpriced = 0
+    for row in calls:
+        est = estimate_cost_usd(model=baseline_model, input_tokens=row.get('input_tokens'), output_tokens=row.get('output_tokens'),
+                                cached_input_tokens=row.get('cached_input_tokens'), cache_write_tokens=row.get('cache_write_tokens'), pricing=pricing)
+        if est is None: unpriced += 1
+        else: total += float(est['cost_usd']); priced += 1
+    metered_actual = sum(1 for r in calls if cost_class(r) != UNMETERED)
+    actual_known = sum(row_cost(r) for r in calls if cost_class(r) != UNMETERED)
+    comparable = bool(calls) and unpriced == 0 and metered_actual == len(calls)
+    reason = None
+    if not calls: reason = 'no calls observed'
+    elif not comparable:
+        gaps = []
+        if unpriced: gaps.append(f'{unpriced} call(s) lack tokens or a baseline rate')
+        if metered_actual != len(calls): gaps.append(f'{len(calls) - metered_actual} actual call(s) unmetered')
+        reason = 'incomplete coverage: ' + '; '.join(gaps)
+    return {
+        'provenance': COUNTERFACTUAL, 'baseline_model': baseline_model, 'basis': 'observed tokens repriced at one flat model; not an observed cohort',
+        'cost_usd': total if priced else None, 'priced_calls': priced, 'unpriced_calls': unpriced,
+        'comparable': comparable, 'delta_usd': (actual_known - total) if comparable else None, 'reason': reason,
+    }
+
+
+def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict], *, baseline_model: str | None = None,
+                   pricing: dict[str, Any] | None = None) -> list[dict]:
+    """One evidence row per run_id joined across metrics, events, and outcomes."""
+    calls: dict[str, list[dict]] = defaultdict(list)
+    verifications: dict[str, list[dict]] = defaultdict(list)
+    decisions: dict[str, int] = defaultdict(int)
+    other_rows: dict[str, int] = defaultdict(int)
+    excluded: dict[str, int] = defaultdict(int)
+    run_ids: list[str] = []
+    seen: set[str] = set()
+
+    def touch(rid: Any) -> str | None:
+        if rid is None: return None
+        rid = str(rid)
+        if rid not in seen: seen.add(rid); run_ids.append(rid)
+        return rid
+
+    for row in metrics:
+        rid = row.get('run_id')
+        if rid is None: continue
+        if is_session_ingest(row): excluded[str(rid)] += 1; touch(rid); continue
+        rid = touch(rid)
+        if row.get('event') == 'adaptive_route_decision': decisions[rid] += 1
+        elif is_call_row(row):
+            calls[rid].append(row)
+            if _is_verification_row(row): verifications[rid].append(row)
+        elif _is_verification_row(row): verifications[rid].append(row)
+        else: other_rows[rid] += 1
+
+    started_events: dict[str, dict] = {}
+    terminal: dict[str, dict[str, Any]] = {}
+    status: dict[str, str] = {}
+    retry_dispatches: dict[str, set[str]] = defaultdict(set)
+    rework_events: dict[str, int] = defaultdict(int)
+    for e in events:
+        rid = e.get('run_id')
+        if rid is None: continue
+        rid = touch(rid); kind = e.get('event')
+        if kind == 'run_started': started_events.setdefault(rid, e)
+        elif kind in TERMINAL_EVENTS:
+            status[rid] = TERMINAL_EVENTS[kind]; terminal[rid] = {**terminal.get(rid, {}), **{k: v for k, v in _terminal_fields(e).items() if v is not None}}
+        elif kind == 'dispatch_started' and e.get('retry_of'): retry_dispatches[rid].add(str(e.get('task_id') or e.get('retry_of')))
+        elif kind in {'rework', 'decision_invalidated', 'merge_conflict_resolution'}: rework_events[rid] += 1
+
+    verification: dict[str, str] = {}
+    summary_note: dict[str, dict] = {}
+    delayed_bad: dict[str, bool] = defaultdict(bool)
+    outcome_tasks: dict[str, set[str]] = defaultdict(set)
+    for o in outcomes:
+        rid = o.get('run_id')
+        if rid is None: continue
+        rid = touch(rid); tid = str(o.get('task_id') or '')
+        if any(o.get(k) for k in BAD_OUTCOME_KEYS): delayed_bad[rid] = True
+        if tid in TERMINAL_OUTCOME_TASKS:
+            status[rid] = TERMINAL_OUTCOME_TASKS[tid]
+            terminal[rid] = {**terminal.get(rid, {}), **{k: v for k, v in _terminal_fields(o).items() if v is not None}}
+            summary_note[rid] = _note_json(o.get('note'))
+            continue
+        outcome_tasks[rid].add(tid)
+        if tid.endswith('-qa') or o.get('verification') is not None:
+            passed = o.get('verification') if o.get('verification') is not None else o.get('outcome') == 'verified'
+            verification[rid] = 'passed' if passed else 'failed'
+
+    result = []
+    for rid in run_ids:
+        rows = calls[rid]
+        metered = [r for r in rows if cost_class(r) != UNMETERED]
+        reported = sum(row_cost(r) for r in rows if cost_class(r) == REPORTED)
+        estimated = sum(row_cost(r) for r in rows if cost_class(r) == ESTIMATED)
+        known = reported + estimated if metered else None
+        overhead_by_role: dict[str, float] = defaultdict(float)
+        implementation = 0.0
+        for r in metered:
+            role = _role(r)
+            if role in IMPLEMENTATION_ROLES: implementation += row_cost(r)
+            else: overhead_by_role[role] += row_cost(r)
+        overhead = sum(overhead_by_role.values()) if metered else None
+        durations = [_int_or_none(r.get('duration_ms')) for r in rows]
+        known_durations = [d for d in durations if d is not None]
+        tokens_known = sum(1 for r in rows if _has_tokens(r))
+        verified_tasks = {str(v.get('task_id')) for v in verifications[rid] if v.get('task_id') is not None}
+        retries = len(retry_dispatches[rid]) or sum(1 for r in rows if _int_or_none(r.get('retry')))
+        note = summary_note.get(rid, {})
+        if retries == 0 and _int_or_none(note.get('retries')): retries = int(note['retries'])
+        verdict = verification.get(rid)
+        if verdict is None and note.get('verification_passed') is not None: verdict = 'passed' if note['verification_passed'] else 'failed'
+        if verdict is None and verified_tasks: verdict = 'passed'
+        term = terminal.get(rid)
+        elapsed_ms, elapsed_source = _elapsed(term)
+        result.append({
+            'run_id': rid, 'cost_provenance': ACTUAL, 'status': status.get(rid, 'incomplete'),
+            'started_at': (term or {}).get('started_at') or started_events.get(rid, {}).get('started_at'),
+            'finished_at': (term or {}).get('finished_at'), 'elapsed_ms': elapsed_ms, 'elapsed_source': elapsed_source,
+            'call_rows': len(rows), 'metered_calls': len(metered), 'unmetered_calls': len(rows) - len(metered),
+            'cost_coverage': (len(metered) / len(rows)) if rows else None, 'cost_complete': bool(rows) and len(metered) == len(rows),
+            'cost_known_usd': known, 'cost_reported_usd': reported if metered else None, 'cost_estimated_usd': estimated if metered else None,
+            'overhead_cost_usd': overhead, 'implementation_cost_usd': implementation if metered else None,
+            'overhead_ratio': (overhead / known) if known else None, 'overhead_by_role': dict(overhead_by_role),
+            'tokens_known_calls': tokens_known, 'tokens_missing_calls': len(rows) - tokens_known,
+            'input_tokens': sum(_int_or_none(r.get('input_tokens')) or 0 for r in rows) if tokens_known else None,
+            'output_tokens': sum(_int_or_none(r.get('output_tokens')) or 0 for r in rows) if tokens_known else None,
+            'cached_input_tokens': sum(_int_or_none(r.get('cached_input_tokens')) or 0 for r in rows) if tokens_known else None,
+            'cache_write_tokens': sum(_int_or_none(r.get('cache_write_tokens')) or 0 for r in rows) if tokens_known else None,
+            'dispatch_duration_ms_total': sum(known_durations) if known_durations else None, 'duration_missing_calls': len(rows) - len(known_durations),
+            'workers': len({str(r.get('task_id')) for r in rows if r.get('task_id') is not None}),
+            'roles': sorted({_role(r) for r in rows}), 'retries': retries, 'rework_events': rework_events[rid],
+            'verification': verdict or 'unknown', 'verification_rows': len(verifications[rid]), 'verified_tasks': len(verified_tasks),
+            'decision_rows': decisions[rid], 'other_metric_rows': other_rows[rid], 'excluded_session_ingest_rows': excluded[rid],
+            'delayed_bad_outcome': delayed_bad[rid] if (outcome_tasks[rid] or delayed_bad[rid]) else None,
+            'counterfactual': _counterfactual(rows, baseline_model, pricing) if baseline_model else None,
+        })
+    return result
+
+
+def evidence_coverage(runs: list[dict]) -> dict[str, Any]:
+    """Coverage by runs (not rows): how many runs can honestly be priced, timed, and verified."""
+    n = len(runs)
+    fully_priced = sum(1 for r in runs if r.get('cost_complete'))
+    with_elapsed = sum(1 for r in runs if r.get('elapsed_ms') is not None)
+    with_verification = sum(1 for r in runs if r.get('verification') in {'passed', 'failed'})
+    return {
+        'cost_provenance': ACTUAL, 'runs': n,
+        'runs_completed': sum(1 for r in runs if r.get('status') == 'completed'),
+        'runs_failed': sum(1 for r in runs if r.get('status') == 'failed'),
+        'runs_incomplete': sum(1 for r in runs if r.get('status') == 'incomplete'),
+        'runs_fully_priced': fully_priced, 'runs_with_elapsed': with_elapsed, 'runs_with_verification': with_verification,
+        'priced_run_coverage': (fully_priced / n) if n else None, 'duration_coverage': (with_elapsed / n) if n else None,
+        'verification_coverage': (with_verification / n) if n else None,
+        'call_rows': sum(int(r.get('call_rows') or 0) for r in runs), 'unmetered_calls': sum(int(r.get('unmetered_calls') or 0) for r in runs),
+        'cost_known_usd': sum(float(r.get('cost_known_usd') or 0) for r in runs),
+        'elapsed_ms_total_known': sum(int(r['elapsed_ms']) for r in runs if r.get('elapsed_ms') is not None) if with_elapsed else None,
+    }

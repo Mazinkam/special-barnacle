@@ -7,6 +7,7 @@ import math
 from .runtime import default_state_root, load_jsonl
 from . import records
 from .outcomes import bad_signal
+from .economics import is_call_row, is_session_ingest
 
 
 def bucket_complexity(x:float,width:int=2)->str:
@@ -66,12 +67,22 @@ def _resolve_verified_task_ids(metrics:list[dict], outcomes:list[dict]|None)->se
 
 
 def build_route_stats(metrics:list[dict], outcomes:list[dict]|None=None, width:int=2, decay_half_life_days:float|None=None)->list[dict]:
+    """Comparable-route aggregates.
+
+    `samples`/`effective_samples` keep their legacy meaning (every contributing row). The
+    sample counts that gate empirical routing are reported separately, because a model call,
+    a verification marker, and a decision row are not interchangeable evidence:
+    `call_samples`, `verification_samples`, `task_samples`, `run_samples`, `verified_tasks`,
+    `verified_runs`. Interactive-session ingestion never contributes to orchestrated routes.
+    """
     groups=defaultdict(list)
     out_by_task=defaultdict(list)
     verified_task_ids=_resolve_verified_task_ids(metrics,outcomes)
     for o in outcomes or []:
         if o.get('task_id'): out_by_task[o['task_id']].append(o)
     for r in metrics:
+        if is_session_ingest(r):
+            continue
         if r.get('event') not in {None,'model_call','task_verified','route_observation','adaptive_route_decision'} and not r.get('cost_usd'):
             continue
         if not (r.get('capability_class') or r.get('role')):
@@ -110,10 +121,13 @@ def build_route_stats(metrics:list[dict], outcomes:list[dict]|None=None, width:i
             if str(tid) in verified_task_ids: task_weights[tid]=max(task_weights.get(tid,0),w)
         verified_weight=sum(task_weights.values())
         verified=set(task_weights)
-        # `pass_rate` intentionally keeps the DISPATCH-level signal: it measures how often a
-        # dispatched attempt succeeded, which is exactly what `result` reports, so `pass` belongs
-        # here. It is NOT a verification rate and must not be read as one — compare `verified_tasks`
-        # for that. Kept unchanged on purpose rather than silently retargeted.
+        # Keep dispatch success separate from attested verification; routing thresholds use the
+        # explicit sample counts below rather than treating every record as interchangeable.
+        verified_runs={x.get('run_id') for x in rows if x.get('run_id') is not None and x.get('task_id') in verified}
+        call_samples=sum(1 for x in rows if is_call_row(x))
+        verification_samples=sum(1 for x in rows if x.get('result')=='verified' or x.get('event')=='task_verified')
+        task_samples=len({x.get('task_id') for x in rows}-{None})
+        run_samples=len({x.get('run_id') for x in rows}-{None})
         successes=sum(w for x,w in weighted if x.get('result') in {'pass','verified','success'})
         quality_num=sum(float(x['quality_evidence_score'])*w for x,w in weighted if x.get('quality_evidence_score') is not None)
         quality_den=sum(w for x,w in weighted if x.get('quality_evidence_score') is not None)
@@ -133,17 +147,11 @@ def build_route_stats(metrics:list[dict], outcomes:list[dict]|None=None, width:i
             'topology_shape':shape,'topology_depth':round(sum(depths)/len(depths)) if depths else None,
             'topology_workers':round(sum(workers)/len(workers)) if workers else None,'topology_leads':round(sum(leads)/len(leads)) if leads else None,
             'samples':len(rows),'effective_samples':eff,'total_cost_usd':total,'avg_call_cost_usd':total/eff if eff else None,
-            # `verified_tasks`/`verified_cost_usd` are attested-only; None (NO_DATA) when a group has
-            # dispatch passes but nothing attested, rather than a cost-per-dispatch-pass wearing the
-            # cost-per-verified-task label.
-            'verified_tasks':len(verified),'verified_cost_usd':total/verified_weight if verified_weight else None,
-            # Dispatch-level success rate (see `successes` above), not a verification rate.
+            # Verified metrics are attested-only, while dispatch success remains a separate signal.
+            'call_samples':call_samples,'verification_samples':verification_samples,'task_samples':task_samples,'run_samples':run_samples,
+            'verified_tasks':len(verified),'verified_runs':len(verified_runs),'verified_cost_usd':total/verified_weight if verified_weight else None,
             'pass_rate':successes/eff if eff else None,
-            # `quality_evidence_score` is written only by Engine.verify_task, never by a live run
-            # (0 of 410 rows) — NO_DATA distinguishes "no producer yet" from "measured zero".
             'avg_quality_evidence':records.metric(quality_num/quality_den if quality_den else None,quality_den),
-            # NO_DATA when no row in the group carries `retry` at all (a fabricated 0.0 otherwise);
-            # a real 0.0 is kept when rows do carry retry==0.
             'retry_rate':(retries/eff if eff else None) if has_retry else records.NO_DATA,
             'delayed_failure_rate':delayed_bad/delayed_total if delayed_total else None
         })
