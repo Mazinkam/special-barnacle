@@ -11,9 +11,50 @@ from unittest.mock import patch
 from orchestrator import record_batch
 from orchestrator.record_index import DATABASE_FILE, RecordIndex
 from orchestrator.runtime import read_json
+from orchestrator.state import rebuild
 from tests.record_io_probe import measure_io
-from tests.test_record_batch import (TemporaryRootTestCase, _completed_run, _fill_streams,
-    _forge_index_with_stream_access, run_batch, sample_batch, cli_env, stream_ids)
+from tests.test_record_batch import (TemporaryRootTestCase, _checkpoint_snapshot, _completed_run, _fill_streams,
+    _forge_index_with_stream_access, run_batch, sample_batch, cli_env, stream_ids, strip_volatile)
+
+
+_CRASH_SWEEP_CHILD = '''
+import json, os, sys
+from orchestrator import record_batch
+from orchestrator.record_index import RecordIndex
+step = int(sys.argv[2]); ticks = [0]
+def tick():
+    ticks[0] += 1
+    if ticks[0] == step:
+        os._exit(9)
+def hook(fn, *, after=False):
+    def wrapped(*args, **kwargs):
+        if not after: tick()
+        result = fn(*args, **kwargs)
+        if after: tick()
+        return result
+    return wrapped
+os.write = hook(os.write); os.fsync = hook(os.fsync)
+RecordIndex.add = hook(RecordIndex.add)
+RecordIndex.commit = hook(hook(RecordIndex.commit), after=True)
+record_batch._write_checkpoint = hook(record_batch._write_checkpoint, after=True)
+record_batch.replay_ledger = hook(hook(record_batch.replay_ledger), after=True)
+result = record_batch.write_batch(sys.argv[1], json.loads(sys.stdin.read()))
+assert result['ok'], result
+print(ticks[0])
+'''
+
+
+def _crash_write_at_step(root: Path, records: list, step: int) -> tuple[int, int]:
+    """Run write_batch in a real child that hard-exits (no rollback, no cleanup) at the `step`-th durable I/O step.
+
+    Steps are every stream/receipt/directory write and fsync, every cache insert, and the cache
+    commit, receipt publication and ledger publication boundaries. Returns ``(exit_status, total_steps)``:
+    exit 9 = crashed at `step`; exit 0 = completed, with `total_steps` the number of steps the write has.
+    """
+    child = subprocess.run([sys.executable, '-B', '-c', _CRASH_SWEEP_CHILD, str(root), str(step)],
+        input=json.dumps(records), text=True, capture_output=True, env=cli_env(root), timeout=60)
+    total = int(child.stdout.strip()) if child.returncode == 0 else 0
+    return child.returncode, total
 
 
 class ExactIndexTests(TemporaryRootTestCase):
@@ -125,6 +166,38 @@ record_batch.write_batch(sys.argv[1], json.loads(sys.stdin.read()))
                 for stream, name in record_batch.STREAMS.items():
                     self.assertEqual((root / name).read_bytes(), before[stream])
                 self.assertEqual(read_json(root / 'ledger.json', {})['runs']['R1']['status'], 'completed')
+
+    def test_crash_at_every_durable_step_is_recovered_by_same_id_retry(self):
+        """Sweep every instrumented crash point instead of hand-picked ones; retry must converge without duplicates."""
+        records = [{'stream': 'event', 'record_id': 'done', 'event': 'run_completed', 'run_id': 'R1'},
+                   {'stream': 'metric', 'record_id': 'cost', 'cost_usd': 3}]
+
+        def seeded_root(tmp: str) -> Path:
+            root = Path(tmp)
+            self.assertTrue(record_batch.write_batch(root, sample_batch())['ok'])
+            return root
+
+        with tempfile.TemporaryDirectory() as tmp:
+            status, total_steps = _crash_write_at_step(seeded_root(tmp), records, step=0)
+        self.assertEqual(status, 0)
+        self.assertGreaterEqual(total_steps, 12, 'too few durable steps are instrumented for the sweep to mean anything')
+        for step in range(1, total_steps + 1):
+            with self.subTest(step=step), tempfile.TemporaryDirectory() as tmp:
+                root = seeded_root(tmp)
+                status, _ = _crash_write_at_step(root, records, step)
+                self.assertEqual(status, 9, f'child did not crash at step {step}')
+                retry = record_batch.write_batch(root, records)
+                self.assertTrue(retry['ok'], retry)
+                for stream in ('event', 'metric'):
+                    self.assertEqual(retry['persisted'][stream] + retry['duplicates'][stream], 1, (step, retry))
+                self.assertEqual(stream_ids(root, 'event'), ['e-1', 'e-2', 'e-3', 'done'], step)
+                self.assertEqual(stream_ids(root, 'metric'), ['m-1', 'cost'], step)
+                self.assertEqual(read_json(root / 'ledger.json', {})['runs']['R1']['status'], 'completed', step)
+                snapshot = _checkpoint_snapshot(root)
+                for stream in ('event', 'metric', 'outcome'):
+                    self.assertEqual(sorted(snapshot['streams'][stream]['ids']), sorted(stream_ids(root, stream)), (step, stream))
+                    self.assertEqual(snapshot['streams'][stream]['size'], (root / record_batch.STREAMS[stream]).stat().st_size, (step, stream))
+                self.assertEqual(strip_volatile(read_json(root / 'ledger.json', {})), strip_volatile(rebuild(root)), step)
 
     def test_process_dies_mid_canonical_write_then_same_id_retry_repairs_tail(self):
         self.assertTrue(record_batch.write_batch(self.root, sample_batch())['ok'])
