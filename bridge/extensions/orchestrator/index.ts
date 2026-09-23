@@ -92,6 +92,11 @@ import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
 import { BoundedCapture, classifyDispatchOutcome, summarizeStderr } from "./dispatch-outcome.ts";
 import { RunCancellation } from "./cancellation.ts";
 import { connectCancellationLoader } from "./run-ui.ts";
+// Rule-2 recon planning/evidence helpers (pure; see recon.ts). `dispatchHierarchical()`
+// does not yet dispatch these — that integration is a separate change — but
+// `DispatchTask` below is kept structurally compatible with `ReconTaskPlan` so
+// planned recon tasks can be handed to the existing dispatch path unchanged.
+import type { ReconTaskPlan } from "./recon.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -1536,10 +1541,11 @@ async function failRun(runId: string, error: string): Promise<void> {
 // Subagent dispatch
 // -----------------------------------------------------------------------------
 
-interface DispatchTask {
-	capability: string;
-	task: string;
-	taskId: string;
+// `ReconTaskPlan` (recon.ts) declares exactly the taskId/capability/task shape
+// a Rule-2 recon plan produces; extending it here keeps `DispatchTask` able to
+// accept a planned recon task without a conversion step once dispatch wiring
+// (a separate change) starts calling `planReconTasks()`.
+interface DispatchTask extends ReconTaskPlan {
 	retryOf?: string;
 	retryCount?: number;
 }
