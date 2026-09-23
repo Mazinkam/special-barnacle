@@ -90,6 +90,23 @@ def test_ingest_reports_per_file_progress_to_stderr_when_not_quiet(tmp_path, mon
     assert json.loads(captured.out)['emitted'] == 1
 
 
+def test_progress_output_survives_empty_session_log_without_runtime(tmp_path, monkeypatch, capsys):
+    """An empty log yields runtime=None in its summary; progress rendering must not abort the batch."""
+    root = tmp_path / 'state'
+    empty = tmp_path / 'empty.jsonl'
+    empty.write_text('', encoding='utf-8')
+    session = humain_terminal_log(tmp_path / 'session.jsonl')
+    monkeypatch.setattr(cli, 'ROOT', root)
+    monkeypatch.setattr('sys.argv', ['orchestrator', 'ingest', str(empty), str(session), '--granularity', 'session'])
+
+    cli.main()
+
+    captured = capsys.readouterr()
+    assert '[1/2]' in captured.err and '[2/2]' in captured.err
+    assert json.loads(captured.out)['emitted'] == 1
+    assert len(load_jsonl(root / 'metrics.jsonl')) == 1
+
+
 def test_partial_batch_materializes_success_and_cli_exits_nonzero(tmp_path, monkeypatch, capsys):
     root = tmp_path / 'state'
     session = humain_terminal_log(tmp_path / 'session.jsonl')

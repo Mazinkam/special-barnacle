@@ -148,7 +148,8 @@ def main():
         done=[0]
         def progress(summary):
             done[0]+=1
-            print(f"[{done[0]}/{len(paths)}] {summary['runtime']:16} +{summary['emitted']:<5} dup={summary['duplicates']:<4} ${summary['estimated_cost_usd']:.4f}  {Path(summary['file']).name}",file=sys.stderr,flush=True)
+            runtime_label=str(summary.get('runtime') or '?')
+            print(f"[{done[0]}/{len(paths)}] {runtime_label:16} +{summary.get('emitted',0):<5} dup={summary.get('duplicates',0):<4} ${summary.get('estimated_cost_usd',0.0):.4f}  {Path(summary['file']).name}",file=sys.stderr,flush=True)
         result=process_ingest(paths, state_root=ROOT, runtime=args.runtime,
                               repository=args.repository, dry_run=args.dry_run,
                               granularity=args.granularity,
