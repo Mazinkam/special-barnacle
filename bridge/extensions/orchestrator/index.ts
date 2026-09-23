@@ -89,6 +89,7 @@ import {
 } from "./models.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
 import { BoundedCapture, classifyDispatchOutcome, summarizeStderr } from "./dispatch-outcome.ts";
+import { RunCancellation } from "./cancellation.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -206,6 +207,7 @@ function installDispatchReaper(): void {
 		// `once` + re-raise keeps HT's own handlers intact: we only add cleanup,
 		// we don't change whether the parent exits.
 		process.once(signal, () => {
+			ACTIVE_RUN?.cancel();
 			reap();
 		});
 	}
@@ -725,6 +727,7 @@ class RunSession {
 	private readonly startedAt = Date.now();
 	private tickTimer: ReturnType<typeof setInterval> | undefined;
 	private closed = false;
+	readonly cancellation = new RunCancellation();
 
 	constructor(runId: string, ctx: ExtensionContext, goal: string) {
 		this.runId = runId;
@@ -745,6 +748,14 @@ class RunSession {
 
 	file(name: string): string {
 		return join(this.dir, name);
+	}
+
+	cancel(): void {
+		if (this.cancellation.isCancelled) return;
+		this.phase = "cancelling";
+		this.log("cancellation requested (interrupt)");
+		this.cancellation.cancel();
+		this.render();
 	}
 
 	log(line: string): void {
@@ -912,6 +923,7 @@ async function runSubagentProcess(opts: {
 		cost: 0, contextTokens: 0, turns: 0,
 	};
 	const session = ACTIVE_RUN;
+	session?.cancellation.throwIfCancelled();
 	const taskId = opts.taskId ?? `${opts.agentName}-${Date.now()}`;
 	const safeTaskId = taskId.replace(/[^a-zA-Z0-9._-]+/g, "_");
 	const eventsLog = session ? session.file(`${safeTaskId}.events.jsonl`) : undefined;
@@ -1008,6 +1020,7 @@ async function runSubagentProcess(opts: {
 		let spawnFailed = false;
 		let settled = false;
 		let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+		let removeCancellationListener: (() => void) | undefined;
 		// `--mode json` writes newline-delimited events, NOT plain prose. Callers
 		// need the assistant's text, so accumulate it here; handing them the raw
 		// event stream made triage's JSON.parse fail every single time.
@@ -1027,6 +1040,7 @@ async function runSubagentProcess(opts: {
 			if (settled) return;
 			settled = true;
 			if (timeoutTimer) clearTimeout(timeoutTimer);
+			removeCancellationListener?.();
 			if (typeof proc?.pid === "number") liveDispatchPids.delete(proc.pid);
 			cleanupPrompt();
 			const stderr = stderrCapture.text();
@@ -1146,6 +1160,9 @@ async function runSubagentProcess(opts: {
 		}
 
 		if (typeof proc.pid === "number") liveDispatchPids.add(proc.pid);
+		removeCancellationListener = session?.cancellation.onCancel(() => {
+			if (proc && !settled) killProcessTree(proc);
+		});
 
 		// A stalled child would otherwise block its whole batch forever, freezing
 		// the run instead of failing just that task. Leads that fan out their own
@@ -2594,11 +2611,12 @@ export default function (pi: ExtensionAPI) {
 				if (missingTriage) {
 					session.setPhase(`triage on ${shortName(adapter.implementation_fast?.model ?? "?")}`);
 					triageResult = await triageTask(parsed.goal, cwd, ctx, triageCost, adapter);
+					session.cancellation.throwIfCancelled();
 					if (triageResult) {
 						effectiveTaskClass = triageResult.task_class;
 						effectiveComplexity = triageResult.complexity;
 						effectiveRisk = triageResult.risk;
-						const proceed = await confirmStep(
+						const proceed = await Promise.race([session.cancellation.wait(), confirmStep(
 							ctx,
 							"Triage filled in missing values",
 							`task_class: ${effectiveTaskClass}\n` +
@@ -2607,7 +2625,7 @@ export default function (pi: ExtensionAPI) {
 								`Reasoning: ${triageResult.reasoning}\n\n` +
 								`OK to plan with these values? (Cancel to abort)`,
 							parsed.interactive,
-						);
+						)]);
 						if (!proceed) {
 							const reason = parsed.interactive && !ctx.hasUI
 								? "interactive confirmation unavailable after triage"
@@ -2641,7 +2659,9 @@ export default function (pi: ExtensionAPI) {
 						qualityFloor: parsed.qualityFloor,
 						costAggressiveness: parsed.costAggressiveness,
 					});
+					session.cancellation.throwIfCancelled();
 				} catch (err) {
+					if (session.cancellation.isCancelled) throw err;
 					session.log(`plan failed: ${(err as Error).message}`);
 					await failRun(runId, `plan failed: ${(err as Error).message}`);
 					ctx.ui.notify(`Plan failed: ${(err as Error).message}`, "error");
@@ -2671,12 +2691,13 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(planSummary.join("\n"), "info");
 				session.log(planSummary.join("\n"));
 
-				const proceed = await confirmStep(
+				const proceed = await Promise.race([session.cancellation.wait(), confirmStep(
 					ctx,
-					"Dispatch this plan?",
+					"Dispatch this plan?"
 					`${pipeline}\n\nEach stage runs headless (up to ${Math.round(DISPATCH_TIMEOUT_MS / 60000)} min per dispatch); live progress shows above the editor.`,
 					parsed.interactive,
-				);
+				)]);
+				session.cancellation.throwIfCancelled();
 				if (!proceed) {
 					const reason = parsed.interactive && !ctx.hasUI
 						? "interactive confirmation unavailable before dispatch"
@@ -2721,6 +2742,7 @@ export default function (pi: ExtensionAPI) {
 					adapter,
 					ctx,
 				);
+				session.cancellation.throwIfCancelled();
 
 				for (const r of leadResults) {
 					if (r.exitCode !== 0) {
@@ -2770,6 +2792,7 @@ export default function (pi: ExtensionAPI) {
 						ctx,
 						captureOpts,
 					);
+					session.cancellation.throwIfCancelled();
 					if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
 					if (lastVerification.passed) break;
 
@@ -2810,6 +2833,7 @@ export default function (pi: ExtensionAPI) {
 							},
 							ctx,
 						);
+						session.cancellation.throwIfCancelled();
 						// dispatchParallel returns [] for an empty task list; billing an
 						// absent result wrote an all-"unknown" model_call for a dispatch
 						// that never happened.
@@ -2841,6 +2865,7 @@ export default function (pi: ExtensionAPI) {
 				const verificationSkipped = lastVerification?.skipped ?? false;
 				const passedVerification = dispatchOk && (lastVerification?.passed ?? false);
 
+				session.cancellation.throwIfCancelled();
 				await completeRun(runId, {
 					success_rate: succeededLeads / Math.max(1, leadResults.length),
 					verification_passed: passedVerification,
@@ -2911,15 +2936,21 @@ export default function (pi: ExtensionAPI) {
 				session.log(summary.join("\n"));
 				ctx.ui.notify(summary.join("\n"), passedVerification || (dispatchOk && verificationSkipped) ? "info" : "warning");
 			} catch (err) {
-				// Any uncaught throw used to leave the run half-recorded (no outcome
-				// row) and the UI stuck on the last notify. Record + surface it.
-				const message = (err as Error).stack ?? String(err);
-				session.log(`run crashed: ${message}`);
-				await failRun(runId, `crashed: ${(err as Error).message}`);
-				ctx.ui.notify(
-					`Orchestration crashed: ${(err as Error).message}\nSee ${session.file("run.log")}`,
-					"error",
-				);
+				if (session.cancellation.isCancelled) {
+					session.log("run cancelled by user (Ctrl+C)");
+					await failRun(runId, "cancelled by user (Ctrl+C)");
+					ctx.ui.notify(`Orchestration cancelled. See ${session.file("run.log")}`, "info");
+				} else {
+					// Any uncaught throw used to leave the run half-recorded (no outcome
+					// row) and the UI stuck on the last notify. Record + surface it.
+					const message = (err as Error).stack ?? String(err);
+					session.log(`run crashed: ${message}`);
+					await failRun(runId, `crashed: ${(err as Error).message}`);
+					ctx.ui.notify(
+						`Orchestration crashed: ${(err as Error).message}\nSee ${session.file("run.log")}`,
+						"error",
+					);
+				}
 			} finally {
 				session.close();
 				ACTIVE_RUN = null;
