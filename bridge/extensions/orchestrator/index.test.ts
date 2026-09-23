@@ -793,6 +793,132 @@ describe("changed-file detection around the lead phase", () => {
 		return dir;
 	}
 
+	test("committed work is reported while untouched pre-existing dirty files stay excluded", () => {
+		const dir = initRepo();
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			writeFileSync(join(dir, "old-scratch.md"), "existing\n");
+			const beforeHead = git("rev-parse", "HEAD").toString().trim();
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			writeFileSync(join(dir, "tracked.ts"), "export const a = 2;\n");
+			git("add", "tracked.ts");
+			git("commit", "-q", "-m", "change tracked file");
+			// This is the reported failure: a committed change has no dirty snapshot entry.
+			expect(orchestrator.gitDirtySnapshot(dir)?.has("tracked.ts")).toBe(false);
+			const result = orchestrator.changedFilesSinceRunStart(dir, beforeHead, beforeDirty, ["tracked.ts", "old-scratch.md"]);
+			expect(result.changed).toEqual(["tracked.ts"]);
+			expect(result.phantom).toEqual(["old-scratch.md"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("committed and new dirty files are both reported without duplicates", () => {
+		const dir = initRepo();
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			const beforeHead = git("rev-parse", "HEAD").toString().trim();
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			writeFileSync(join(dir, "tracked.ts"), "export const a = 2;\n");
+			git("add", "tracked.ts");
+			git("commit", "-q", "-m", "change tracked file");
+			writeFileSync(join(dir, "tracked.ts"), "export const a = 3;\n");
+			writeFileSync(join(dir, "new.ts"), "export {};\n");
+			expect(orchestrator.changedFilesSinceRunStart(dir, beforeHead, beforeDirty, []).changed.sort()).toEqual(["new.ts", "tracked.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("committing untouched pre-existing dirty content does not claim it as new work", () => {
+		const dir = initRepo();
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			writeFileSync(join(dir, "tracked.ts"), "existing dirty content\n");
+			const beforeHead = git("rev-parse", "HEAD").toString().trim();
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			git("add", "tracked.ts");
+			git("commit", "-q", "-m", "commit old dirty file");
+			const result = orchestrator.changedFilesSinceRunStart(dir, beforeHead, beforeDirty, ["tracked.ts"]);
+			expect(result.changed).toEqual([]);
+			expect(result.phantom).toEqual(["tracked.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("committing an untouched pre-existing staged rename does not claim either path", () => {
+		const dir = initRepo();
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			git("mv", "tracked.ts", "renamed.ts");
+			const beforeHead = git("rev-parse", "HEAD").toString().trim();
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			git("commit", "-q", "-m", "commit old rename");
+			const result = orchestrator.changedFilesSinceRunStart(dir, beforeHead, beforeDirty, ["tracked.ts", "renamed.ts"]);
+			expect(result.changed).toEqual([]);
+			expect(result.phantom).toEqual(["tracked.ts", "renamed.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("an unborn repository reports files committed in its first commit", () => {
+		const dir = mkdtempSync(join(tmpdir(), "orch-unborn-run-"));
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			git("init", "-q");
+			git("config", "user.email", "t@example.com");
+			git("config", "user.name", "t");
+			git("config", "commit.gpgsign", "false");
+			const beforeHead = orchestrator.gitHead(dir);
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			writeFileSync(join(dir, "new.ts"), "export {};\n");
+			git("add", "new.ts");
+			git("commit", "-q", "-m", "first commit");
+			expect(orchestrator.changedFilesSinceRunStart(dir, beforeHead, beforeDirty, []).changed).toEqual(["new.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("missing start HEAD falls back to claimed files rather than a report-only verdict", () => {
+		const dir = initRepo();
+		try {
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			expect(orchestrator.changedFilesSinceRunStart(dir, null, beforeDirty, ["tracked.ts"]).changed).toEqual(["tracked.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("committed files remain visible if the pre-run dirty snapshot is unavailable", () => {
+		const dir = initRepo();
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			const beforeHead = git("rev-parse", "HEAD").toString().trim();
+			writeFileSync(join(dir, "tracked.ts"), "export const a = 2;\n");
+			git("add", "tracked.ts");
+			git("commit", "-q", "-m", "change tracked file");
+			expect(orchestrator.changedFilesSinceRunStart(dir, beforeHead, null, []).changed).toEqual(["tracked.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a failed history comparison cannot silently mark reported work as report-only", () => {
+		const dir = initRepo();
+		try {
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			// A missing commit can occur after a branch rewrite while leads execute.
+			const result = orchestrator.changedFilesSinceRunStart(dir, "f".repeat(40), beforeDirty, ["tracked.ts"]);
+			expect(result.changed).toEqual(["tracked.ts"]);
+			expect(result.phantom).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("pre-existing untracked scratch file named in lead prose is a phantom, not a change", () => {
 		const dir = initRepo();
 		try {
@@ -869,7 +995,7 @@ describe("changed-file detection around the lead phase", () => {
 			expect(snap).not.toBeNull();
 			expect(snap?.get("inner/")).toBe("<non-file>");
 			expect(snap?.get("renamed.ts")).toMatch(/^[0-9a-f]{40,64}$/);
-			expect(snap?.has("tracked.ts")).toBe(false);
+			expect(snap?.has("tracked.ts")).toBe(true);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
