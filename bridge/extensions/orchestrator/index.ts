@@ -90,7 +90,7 @@ import {
 	userLayerWarnings,
 } from "./models.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
-import { BoundedCapture, classifyDispatchOutcome, summarizeStderr } from "./dispatch-outcome.ts";
+import { BoundedCapture, classifyDispatchOutcome, summarizeStderr, trimEventForLog } from "./dispatch-outcome.ts";
 import { RunCancellation } from "./cancellation.ts";
 import { connectCancellationLoader } from "./run-ui.ts";
 
@@ -186,6 +186,53 @@ function killProcessTree(proc: { pid?: number; kill: (signal?: NodeJS.Signals) =
 		proc.kill("SIGKILL");
 	} catch {
 		/* already gone */
+	}
+}
+
+/** Ensure failures in a child stream listener cannot escape into the TUI. */
+export function guardChildStreamHandler(
+	handlerName: string,
+	handler: () => void,
+	onFailure: {
+		appendStderr: (text: string) => void;
+		kill: () => void;
+		finish: (exitCode: number) => void;
+	},
+): void {
+	try {
+		handler();
+	} catch (error) {
+		let message = "unknown error";
+		try {
+			message = error instanceof Error ? error.message : String(error);
+		} catch {
+			/* a malformed thrown value must not escape the stream listener */
+		}
+		try {
+			onFailure.appendStderr(`\n[orchestrator] ${handlerName} handler failed: ${message}`);
+		} catch {
+			/* avoid a diagnostic failure escaping the stream listener */
+		}
+		try {
+			onFailure.kill();
+		} catch {
+			/* killing a child that already exited is harmless */
+		}
+		try {
+			onFailure.finish(1);
+		} catch {
+			/* the stream listener must never throw */
+		}
+	}
+}
+
+/** Write a JSONL event while omitting recursively repeated worker histories. */
+export function appendTrimmedEventLog(eventsLog: string | undefined, event: unknown): void {
+	if (!eventsLog) return;
+	try {
+		appendFileSync(eventsLog, `${JSON.stringify(trimEventForLog(event))}\n`);
+	} catch {
+		/* per-dispatch diagnostics must not disrupt the child stream */
 	}
 }
 
@@ -628,7 +675,7 @@ interface SubagentProcessResult {
 	stdout: string;
 	/** The LAST assistant text block — the child's final answer. */
 	finalText: string;
-	/** Raw newline-delimited JSON event stream, kept for diagnostics only. */
+	/** Bounded head-and-tail capture of the raw JSON event stream for diagnostics. */
 	rawStdout: string;
 	/** False when the resolved persona had no write/edit tool, so it cannot have changed files. */
 	personaCanMutate: boolean;
@@ -1022,7 +1069,9 @@ async function runSubagentProcess(opts: {
 			SUPACODE_TAB_ID: undefined,
 		};
 		let buffer = "";
-		let rawStdout = "";
+		// Raw child events can recursively include full worker histories. Retain
+		// only diagnostics, never the unbounded stream.
+		const stdoutCapture = new BoundedCapture();
 		// Node can truncate a chatty child's async pipe at 64 KiB, so retain both
 		// the runtime header and the diagnostic tail without unbounded memory use.
 		const stderrCapture = new BoundedCapture();
@@ -1088,7 +1137,7 @@ async function runSubagentProcess(opts: {
 				exitCode: outcome.effectiveExitCode,
 				stdout: assistantTexts.join("\n\n"),
 				finalText,
-				rawStdout,
+				rawStdout: stdoutCapture.text(),
 				personaCanMutate,
 				stderr,
 				model,
@@ -1133,8 +1182,10 @@ async function runSubagentProcess(opts: {
 			try {
 				event = JSON.parse(trimmed);
 			} catch {
+				// Unparseable protocol lines are dropped: they cannot safely be JSONL.
 				return;
 			}
+			appendTrimmedEventLog(eventsLog, event);
 			session?.onChildEvent(taskId, event);
 			if (event.type === "agent_settled") sawAgentSettled = true;
 			if (event.type === "agent_end") sawAgentEnd = true;
@@ -1194,20 +1245,20 @@ async function runSubagentProcess(opts: {
 			finish(124);
 		}, timeoutMs);
 
+		const streamFailure = {
+			appendStderr: (text: string) => stderrCapture.append(text),
+			kill: () => killProcessTree(proc),
+			finish,
+		};
 		proc.stdout?.on("data", (data) => {
-			const chunk = data.toString();
-			rawStdout += chunk;
-			if (eventsLog) {
-				try {
-					appendFileSync(eventsLog, chunk);
-				} catch {
-					/* best-effort */
-				}
-			}
-			buffer += chunk;
-			const lines = buffer.split("\n");
-			buffer = lines.pop() || "";
-			for (const line of lines) processLine(line);
+			guardChildStreamHandler("stdout", () => {
+				const chunk = data.toString();
+				stdoutCapture.append(chunk);
+				buffer += chunk;
+				const lines = buffer.split("\n");
+				buffer = lines.pop() || "";
+				for (const line of lines) processLine(line);
+			}, streamFailure);
 		});
 
 		proc.stderr?.on("data", (data) => {
@@ -1215,8 +1266,10 @@ async function runSubagentProcess(opts: {
 		});
 
 		proc.on("close", (code) => {
-			if (buffer.trim()) processLine(buffer);
-			finish(code ?? 0);
+			guardChildStreamHandler("stdout", () => {
+				if (buffer.trim()) processLine(buffer);
+				finish(code ?? 0);
+			}, streamFailure);
 		});
 
 		proc.on("error", (err) => {

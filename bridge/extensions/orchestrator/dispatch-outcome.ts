@@ -64,6 +64,38 @@ export class BoundedCapture {
 	}
 }
 
+/**
+ * Omit recursive worker histories from the per-dispatch event log. The log
+ * retains the event and all execution metadata so it remains useful without
+ * duplicating nested subagent transcripts on every progress update.
+ */
+export function trimEventForLog(event: unknown): unknown {
+	if (!event || typeof event !== "object" || (event as { type?: unknown }).type !== "tool_execution_update") {
+		return event;
+	}
+	const partialResult = (event as { partialResult?: unknown }).partialResult;
+	if (!partialResult || typeof partialResult !== "object") return event;
+	const details = (partialResult as { details?: unknown }).details;
+	if (!details || typeof details !== "object") return event;
+	const results = (details as { results?: unknown }).results;
+	if (!Array.isArray(results)) return event;
+
+	return {
+		...(event as Record<string, unknown>),
+		partialResult: {
+			...(partialResult as Record<string, unknown>),
+			details: {
+				...(details as Record<string, unknown>),
+				results: results.map((result) => {
+					if (!result || typeof result !== "object") return result;
+					const { messages: _messages, ...trimmedResult } = result as Record<string, unknown>;
+					return trimmedResult;
+				}),
+			},
+		},
+	};
+}
+
 function wasPipeTruncated(stderr: string): boolean {
 	if (stderr.length === 65_536) return true;
 	return stderr.includes("file://") && !/\bNode\.js v\d/.test(stderr) && !/(?:\r?\n)$/.test(stderr);

@@ -39,6 +39,89 @@ describe("/orchestrate argument parsing", () => {
 	});
 });
 
+describe("child stream handler safety", () => {
+	test("converts a stdout handler throw into a failed dispatch", async () => {
+		expect(orchestrator.guardChildStreamHandler).toBeFunction();
+		let stderr = "";
+		let killed = false;
+		const exitCode = await new Promise<number>((resolve) => {
+			orchestrator.guardChildStreamHandler!(
+				"stdout",
+				() => {
+					throw new Error("capture overflow");
+				},
+				{
+					appendStderr: (text: string) => {
+						stderr += text;
+					},
+					kill: () => {
+						killed = true;
+					},
+					finish: resolve,
+				},
+			);
+		});
+
+		expect(exitCode).toBe(1);
+		expect(killed).toBe(true);
+		expect(stderr).toBe("\n[orchestrator] stdout handler failed: capture overflow");
+	});
+
+	test("still fails the dispatch when error formatting fails", async () => {
+		let stderr = "";
+		const exitCode = await new Promise<number>((resolve) => {
+			orchestrator.guardChildStreamHandler!(
+				"stdout",
+				() => {
+					throw { toString: () => { throw new Error("cannot format"); } };
+				},
+				{
+					appendStderr: (text: string) => {
+						stderr += text;
+					},
+					kill: () => {},
+					finish: resolve,
+				},
+			);
+		});
+
+		expect(exitCode).toBe(1);
+		expect(stderr).toBe("\n[orchestrator] stdout handler failed: unknown error");
+	});
+});
+
+describe("dispatch event logging", () => {
+	test("writes tool updates without nested worker histories", () => {
+		expect(orchestrator.appendTrimmedEventLog).toBeFunction();
+		const dir = mkdtempSync(join(tmpdir(), "orch-event-log-test-"));
+		const eventsLog = join(dir, "worker.events.jsonl");
+		try {
+			orchestrator.appendTrimmedEventLog!(eventsLog, {
+				type: "tool_execution_update",
+				partialResult: {
+					details: {
+						results: [{
+							taskId: "worker-1",
+							agent: "worker",
+							usage: { input: 1, output: 2 },
+							messages: [{ role: "assistant", content: "x".repeat(1024 * 1024) }],
+						}],
+					},
+				},
+			});
+
+			const logged = JSON.parse(readFileSync(eventsLog, "utf8"));
+			expect(logged.partialResult.details.results[0]).toEqual({
+				taskId: "worker-1",
+				agent: "worker",
+				usage: { input: 1, output: 2 },
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("RunSession cancellation presentation", () => {
 	test("keeps the cancelled goal and stopped dispatch visible after cleanup", () => {
 		const widgets: unknown[] = [];
