@@ -2853,25 +2853,43 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Step 3: Verification + escalation. We run QA against whatever files
-				// were touched in the lead phase. If QA fails, escalate per policy
-				// Rule 1. The loop is bounded by maxRetries.
-				// `filesChanged` is scraped from the lead's prose, so a report that merely
+				// were touched so far. If QA fails, escalate per policy Rule 1. The loop
+				// is bounded by maxRetries.
+				// `filesChanged` is scraped from dispatch prose, so a report that merely
 				// MENTIONS README.md counted it as changed and sent QA after a phantom.
 				// When the workspace is a git repo, trust the working tree instead: a file
 				// is "changed" only if it is dirty now and its content differs from the
 				// pre-run snapshot (or it was clean then). Pre-existing untracked scratch
-				// files the lead happens to name are therefore not sent to QA.
-				const claimed = new Set(leadResults.flatMap((r) => r.filesChanged));
-				const dirtyAfter = gitDirtySnapshot(cwd);
-				if (!dirtyBefore || !dirtyAfter) {
-					session.log(
-						`git snapshot unavailable (${!dirtyBefore ? "before" : "after"} lead phase); falling back to ${claimed.size} file(s) scraped from lead prose`,
-					);
-				}
-				const { changed: allFiles, phantom } = diffDirtySnapshots(dirtyBefore, dirtyAfter, claimed);
-				if (phantom.length > 0) {
-					session.log(`lead named ${phantom.length} file(s) not modified during this run; ignored: ${phantom.join(", ")}`);
-				}
+				// files a report happens to name are therefore not sent to QA. Every
+				// round diffs against the same pre-run snapshot so the list is the
+				// cumulative set QA must cover. `roundResults` are the dispatches that
+				// just ran (used for the phantom log); `priorResults` widen the prose
+				// fallback when git is unavailable so lead files aren't dropped on retry.
+				let snapshotWarned = false;
+				const changedSince = (
+					label: string,
+					roundResults: DispatchResult[],
+					priorResults: DispatchResult[] = [],
+				): string[] => {
+					const roundClaimed = new Set(roundResults.flatMap((r) => r.filesChanged));
+					const claimed = new Set([...priorResults.flatMap((r) => r.filesChanged), ...roundClaimed]);
+					const dirtyAfter = gitDirtySnapshot(cwd);
+					if ((!dirtyBefore || !dirtyAfter) && !snapshotWarned) {
+						snapshotWarned = true;
+						session.log(
+							`git snapshot unavailable (${!dirtyBefore ? "before" : "after"} ${label}); falling back to file paths scraped from dispatch prose`,
+						);
+					}
+					const { changed, phantom } = diffDirtySnapshots(dirtyBefore, dirtyAfter, claimed);
+					const roundPhantom = phantom.filter((f) => roundClaimed.has(f));
+					if (roundPhantom.length > 0) {
+						session.log(
+							`${label} named ${roundPhantom.length} file(s) not modified during this run; ignored: ${roundPhantom.join(", ")}`,
+						);
+					}
+					return changed;
+				};
+				let allFiles = changedSince("lead phase", leadResults);
 
 				let retries = 0;
 				let lastVerification: VerificationResult | null = null;
@@ -2881,7 +2899,7 @@ export default function (pi: ExtensionAPI) {
 						session.setPhase(
 							retries === 0
 								? `QA on ${allFiles.length} changed file(s) via ${shortName(adapter.qa_agent?.model ?? "?")}`
-								: `QA retry ${retries + 1}/${parsed.maxRetries + 1}`,
+								: `QA retry ${retries + 1}/${parsed.maxRetries + 1} on ${allFiles.length} changed file(s)`,
 						);
 					}
 					lastVerification = await runVerification(
@@ -2913,6 +2931,7 @@ export default function (pi: ExtensionAPI) {
 
 					// Re-run escalations with bumped models (handled by pickModel when
 					// retryCount > 0 via adapter override).
+					const roundStart = escalationResults.length;
 					for (const t of escalationTasks) {
 						const binding = adapter[t.capability] ?? adapter.worker;
 						const escalatedModel = pickModel(
@@ -2944,6 +2963,26 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 					retries++;
+					// The retry may have touched different files than the first lead
+					// pass (or reverted some). Re-QA against the tree as it stands now
+					// rather than the list computed before the loop, so escalation edits
+					// are verified and a stale list can't fail the run forever. This also
+					// runs after the final retry: finalize reports `allFiles`, and the
+					// post-escalation tree is the state worth reporting.
+					const thisRound = escalationResults.slice(roundStart);
+					allFiles = changedSince(`escalation retry ${retries}`, thisRound, [
+						...leadResults,
+						...escalationResults.slice(0, roundStart),
+					]);
+					if (allFiles.length === 0) {
+						// Nothing left to verify, but QA already failed this run. Re-running
+						// against an empty list would return `skipped: true` and record the
+						// run as passed; keep the failed verdict instead.
+						session.log(
+							`escalation retry ${retries} left no files differing from the pre-run tree; keeping the failed verification verdict`,
+						);
+						break;
+					}
 				}
 
 				// Step 4: Finalize.
