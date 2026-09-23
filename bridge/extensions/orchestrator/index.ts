@@ -838,10 +838,10 @@ export class RunSession {
 	private phase = "starting";
 	private renderTimer: ReturnType<typeof setTimeout> | undefined;
 	private readonly startedAt = Date.now();
-	// Wall-clock stamp for the ledger and a monotonic origin for elapsed time. `Date.now()`
-	// can step (NTP, sleep/wake) mid-run, so the duration written to outcomes must never be
-	// derived from two wall-clock reads.
-	private readonly startedAtIso = new Date().toISOString();
+	// The ISO stamp for the ledger is derived from the same wall-clock read as `startedAt`, and
+	// elapsed time uses a monotonic origin: `Date.now()` can step (NTP, sleep/wake) mid-run, so
+	// the duration written to outcomes must never be derived from two wall-clock reads.
+	private readonly startedAtIso = new Date(this.startedAt).toISOString();
 	private readonly startedMono = performance.now();
 	private tickTimer: ReturnType<typeof setInterval> | undefined;
 	private closed = false;

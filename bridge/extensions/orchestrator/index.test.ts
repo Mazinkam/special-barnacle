@@ -503,6 +503,20 @@ describe("RunSession terminal timing", () => {
 		}
 	});
 
+	test("started_at is derived from the session's single wall-clock start read", () => {
+		// Two independent wall-clock reads at construction can disagree; the ISO stamp written to
+		// outcomes must be the same instant the UI's elapsed counter uses.
+		const fixed = Date.UTC(2026, 8, 23, 10, 0, 0, 123);
+		const original = Date.now;
+		try {
+			Date.now = () => fixed;
+			const session = new orchestrator.RunSession!("timing-test-3", fakeCtx() as never, "goal");
+			expect(session.terminalTiming().started_at).toBe(new Date(fixed).toISOString());
+		} finally {
+			Date.now = original;
+		}
+	});
+
 	test("run terminal outcomes carry the timing fields", () => {
 		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 		const complete = source.slice(source.indexOf("async function completeRun("), source.indexOf("async function failRun("));

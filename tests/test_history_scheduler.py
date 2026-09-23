@@ -230,3 +230,17 @@ class EvidenceSampleTests(unittest.TestCase):
         self.assertEqual(route['explanation']['action'], 'fallback_insufficient_history')
         self.assertFalse(route['history_sufficient'])
 
+    def test_topology_fallback_distinguishes_missing_quality_from_no_history(self):
+        rows = self._topology_rows('R1', 'T1', 3, verified=False)
+        stats = build_route_stats(rows, [])
+        self.assertIsNone(stats[0]['verified_cost_usd'])
+        recommendation = recommend_topology(
+            task_class='crud', complexity=3, risk='low', coupling=.5,
+            parallelizable=.5, stats=stats, quality_floor=.9,
+            features={}, min_samples=1,
+        )
+        self.assertEqual(recommendation['fallback_reason'], 'missing_quality_or_cost')
+        self.assertEqual(recommendation['candidates'], [])
+        self.assertEqual(recommendation['comparable_groups'], 1)
+        self.assertEqual(recommendation['skipped_missing_quality_or_cost'], 1)
+        self.assertIsNone(recommendation['empirical'])

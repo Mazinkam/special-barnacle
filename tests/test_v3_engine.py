@@ -47,6 +47,13 @@ class V3EngineTests(unittest.TestCase):
                            'id="interactive"','id="runs"','id="events"'):
                 self.assertIn(anchor,html)
             self.assertIn('prefers-color-scheme',html)
+            self.assertIn('counterfactual', html.lower())
+            self.assertNotIn('<th>Workers</th>', html)
+            self.assertIn('<th>Tasks</th>', html)
+            self.assertIn('<th>Non-impl. share</th>', html)
+            self.assertIn('<th>Rows (decayed)</th>', html)
+            self.assertIn('<th>Verified tasks</th>', html)
+            self.assertIn('verified_task_samples', html)
 
     def test_rendered_payload_contains_no_implausible_metric(self):
         """A generated page must not carry a number no reader could defend.

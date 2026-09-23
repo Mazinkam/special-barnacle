@@ -109,10 +109,12 @@ def recommend_topology(*, task_class: str, complexity: float, risk: str, couplin
     cb = bucket_complexity(complexity)
     comparable = [s for s in stats if s.get('task_class') == task_class and s.get('complexity_bucket') == cb and s.get('risk') == risk and s.get('topology_shape')]
     candidates=[]
+    skipped_missing=0
     for s in comparable:
         quality=s.get('avg_quality_evidence')
         cost=s.get('verified_cost_usd')
         if quality is None or cost is None:
+            skipped_missing+=1
             continue
         verified_tasks=int(s.get('verified_tasks') or 0)
         candidates.append({
@@ -125,10 +127,14 @@ def recommend_topology(*, task_class: str, complexity: float, risk: str, couplin
     feasible=[c for c in candidates if c['feasible']]
     learned=min(feasible,key=lambda x:x['verified_cost_usd'],default=None)
     if learned is not None: fallback_reason=None
-    elif not candidates: fallback_reason='no_comparable_history'
+    elif not comparable: fallback_reason='no_comparable_history'
+    # Comparable groups exist but none carries a verified cost or quality score: a data gap in the
+    # history, not an absence of history. Naming it keeps operators from hunting for missing tags.
+    elif not candidates: fallback_reason='missing_quality_or_cost'
     elif not any(c['meets_quality_floor'] for c in candidates): fallback_reason='below_quality_floor'
     else: fallback_reason='insufficient_history'
-    return {'heuristic':heuristic,'empirical':learned,'candidates':candidates,'min_samples':min_samples,'fallback_reason':fallback_reason}
+    return {'heuristic':heuristic,'empirical':learned,'candidates':candidates,'min_samples':min_samples,'fallback_reason':fallback_reason,
+            'comparable_groups':len(comparable),'skipped_missing_quality_or_cost':skipped_missing}
 
 
 def adaptive_route(*, run_id: str, task_class: str, complexity: float, risk: str, quality_floor: float,

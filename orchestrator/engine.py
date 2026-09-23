@@ -109,6 +109,7 @@ class OrchestrationEngine:
             selected_verification_depth=route['selected']['verification_depth'],
             recommended_capability=route['recommended']['capability'], recommended_effort=route['recommended']['effort'],
             history_sufficient=route['history_sufficient'], historical_samples=route['explanation']['historical_samples'],
+            verified_task_samples=route['explanation']['verified_task_samples'],
             recommended_estimated_verified_cost_usd=route['empirical']['choice'].get('estimated_verified_cost_usd'),
             recommended_estimated_quality_evidence=route['empirical']['choice'].get('estimated_quality_evidence'),
             explored=route['explanation']['explored'], shadow_selected=route['shadow_selected'],

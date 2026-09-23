@@ -40,6 +40,23 @@ class SeparateRowsTests(unittest.TestCase):
         self.assertAlmostEqual(r['cost_known_usd'],.02)
         self.assertEqual(r['excluded_session_ingest_rows'],2)
 
+    def test_session_ingest_alone_never_creates_a_run(self):
+        metrics=[
+            call('ghost','ghost-x',cost_usd=5.0,cost_source='estimated',source='session_ingest'),
+            {'event':'model_call','run_id':'ghost2','role':'interactive_session','cost_usd':7.0},
+            call('real','real-t1',cost_usd=.02,cost_source='reported'),
+        ]
+        runs=by_run(summarize_runs(metrics,[],[]))
+        self.assertEqual(set(runs),{'real'})
+        self.assertEqual(runs['real']['excluded_session_ingest_rows'],0)
+        # A run established by another real stream still reports how many ingest rows were dropped.
+        events=[{'event':'run_started','run_id':'ghost','ts':'2026-09-23T10:00:00+00:00'}]
+        runs=by_run(summarize_runs(metrics,events,[]))
+        self.assertEqual(set(runs),{'real','ghost'})
+        self.assertEqual(runs['ghost']['excluded_session_ingest_rows'],1)
+        self.assertEqual(runs['ghost']['call_rows'],0)
+        self.assertIsNone(runs['ghost']['cost_known_usd'])
+
 
 class MissingDataTests(unittest.TestCase):
     def test_absent_tokens_cost_and_duration_are_unknown_not_zero(self):
@@ -67,6 +84,28 @@ class MissingDataTests(unittest.TestCase):
         self.assertEqual(r['dispatch_duration_ms_total'],1000)
         self.assertEqual(r['duration_missing_calls'],2)
 
+    def test_ht_crash_row_with_zero_estimated_cost_and_zero_tokens_is_unmetered(self):
+        # HT's captureDispatchCost writes this exact shape when a child crashes before any usage
+        # is reported: cost 0, tokens 0, cost_source 'estimated-from-reported-tokens'. Nothing was
+        # measured, so it must land in the unmetered bucket, not as a metered $0 call.
+        crash=call('r12','r12-crash',cost_usd=0,cost_source='estimated-from-reported-tokens',input_tokens=0,output_tokens=0,
+                   cached_input_tokens=0,cache_write_tokens=0,duration_ms=0,result='fail')
+        metrics=[call('r12','r12-a',cost_usd=.05,cost_source='reported',input_tokens=10,output_tokens=5),crash]
+        r=by_run(summarize_runs(metrics,[],[]))['r12']
+        self.assertEqual(r['call_rows'],2)
+        self.assertEqual(r['metered_calls'],1)
+        self.assertEqual(r['unmetered_calls'],1)
+        self.assertFalse(r['cost_complete'])
+        self.assertAlmostEqual(r['cost_known_usd'],.05)
+        self.assertAlmostEqual(r['cost_estimated_usd'],0)
+        self.assertEqual(r['tokens_known_calls'],1)
+        self.assertEqual(r['tokens_missing_calls'],1)
+        # A genuine estimated $0 call that did report tokens stays metered (pricing may be tiny/zero).
+        priced=call('r13','r13-a',cost_usd=0,cost_source='estimated-from-reported-tokens',input_tokens=5,output_tokens=1)
+        r13=by_run(summarize_runs([priced],[],[]))['r13']
+        self.assertEqual(r13['metered_calls'],1)
+        self.assertEqual(r13['tokens_known_calls'],1)
+
     def test_run_with_no_calls_has_no_cost_not_zero_cost(self):
         events=[{'event':'run_started','run_id':'r3','ts':'2026-09-23T10:00:00+00:00'}]
         r=by_run(summarize_runs([],events,[]))['r3']
@@ -84,7 +123,7 @@ class ElapsedTests(unittest.TestCase):
         ]
         outcomes=[{'ts':'2026-09-23T10:01:05+00:00','run_id':'r4','task_id':'run-complete','outcome':'verified','quality':1,
                    'note':json.dumps({'success_rate':1,'verification_passed':True,'retries':0}),
-                   'started_at':'2026-09-23T10:00:00.000Z','finished_at':'2026-09-23T10:01:05.000Z','elapsed_ms':65000}]
+                   'started_at':'2026-09-23T10:00:00.000Z','finished_at':'2026-09-23T10:01:05.000Z','elapsed_ms':65000,'elapsed_source':'monotonic'}]
         r=by_run(summarize_runs(metrics,[],outcomes))['r4']
         self.assertEqual(r['elapsed_ms'],65000)
         self.assertEqual(r['elapsed_source'],'monotonic')
@@ -94,7 +133,16 @@ class ElapsedTests(unittest.TestCase):
         self.assertEqual(r['started_at'],'2026-09-23T10:00:00.000Z')
         self.assertEqual(r['finished_at'],'2026-09-23T10:01:05.000Z')
         self.assertEqual(r['verification'],'passed')
-        self.assertEqual(r['workers'],2)
+        self.assertEqual(r['tasks'],2)
+        self.assertNotIn('workers',r)
+
+    def test_elapsed_ms_without_declared_source_is_reported_not_monotonic(self):
+        outcomes=[{'run_id':'r4b','task_id':'run-complete','outcome':'verified','note':'{}','elapsed_ms':4200}]
+        r=by_run(summarize_runs([],[],outcomes))['r4b']
+        self.assertEqual(r['elapsed_ms'],4200)
+        self.assertEqual(r['elapsed_source'],'reported')
+        events=[{'event':'run_completed','run_id':'r4c','elapsed_ms':100,'elapsed_source':'wall_clock'}]
+        self.assertEqual(by_run(summarize_runs([],events,[]))['r4c']['elapsed_source'],'wall_clock')
 
     def test_elapsed_from_timestamps_when_monotonic_missing(self):
         outcomes=[{'run_id':'r5','task_id':'run-failed','outcome':'fail','note':'crashed',
@@ -172,6 +220,19 @@ class CounterfactualTests(unittest.TestCase):
     def test_no_baseline_means_no_counterfactual_block(self):
         r=by_run(summarize_runs([call('r11','r11-a',cost_usd=.5,cost_source='reported')],[],[]))['r11']
         self.assertIsNone(r['counterfactual'])
+
+
+class OrderingTests(unittest.TestCase):
+    def test_runs_are_ordered_by_earliest_observed_time_not_stream_order(self):
+        metrics=[call('new','new-a',cost_usd=.1,cost_source='reported',ts='2026-09-23T12:00:00+00:00')]
+        outcomes=[{'run_id':'old','task_id':'run-complete','outcome':'verified','note':'{}','ts':'2026-09-22T09:00:00+00:00'}]
+        events=[{'event':'run_started','run_id':'mid','ts':'2026-09-23T10:00:00+00:00'}]
+        self.assertEqual([r['run_id'] for r in summarize_runs(metrics,events,outcomes)],['old','mid','new'])
+        # Ordering never fabricates a duration: `ts` is used for sequence only.
+        self.assertTrue(all(r['elapsed_ms'] is None for r in summarize_runs(metrics,events,outcomes)))
+        # Runs with no timestamp at all keep their first-seen position after the timestamped ones.
+        metrics.append(call('nots','nots-a',cost_usd=.1,cost_source='reported'))
+        self.assertEqual([r['run_id'] for r in summarize_runs(metrics,events,outcomes)][-1],'nots')
 
 
 class CoverageTests(unittest.TestCase):

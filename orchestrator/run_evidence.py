@@ -10,9 +10,17 @@ Rules that keep the numbers honest:
 - A model call, a verification marker, and a routing decision are counted separately;
   they are never pooled into one "samples" figure.
 - Missing cost, tokens, or duration is reported as missing (`None` / unmetered counts),
-  never as zero. Elapsed time is only taken from explicit start/finish/elapsed fields
-  written at the terminal boundary; record `ts` values alone never fabricate a duration.
-- Interactive-session ingestion is excluded even when it carries a `run_id`.
+  never as zero. A call whose cost is "estimated" from zero tokens at $0 measured nothing
+  and is unmetered. Elapsed time is only taken from explicit start/finish/elapsed fields
+  written at the terminal boundary; record `ts` values alone never fabricate a duration,
+  and `elapsed_source` is whatever the writer declared (`'reported'` when it declared none).
+- Interactive-session ingestion is excluded even when it carries a `run_id`, and never
+  establishes a run on its own.
+- Overhead is every metered call outside `IMPLEMENTATION_ROLES` (lead, architect, review,
+  QA, triage...). This is broader than `economics.orchestration_overhead`, which counts a
+  fixed set of coordination roles; the dashboard labels the two differently.
+- Runs are ordered by the earliest `ts` observed across the three streams (sequence only,
+  never duration), so "last N runs" means most recent, not last-appended stream.
 - Everything derived from observed metrics is labelled `actual`; a flat-model repricing
   of the observed tokens is labelled `counterfactual` and never yields a savings delta
   unless every call in the run is priced under both views.
@@ -54,17 +62,31 @@ def _is_verification_row(row: dict) -> bool:
 
 
 def _has_tokens(row: dict) -> bool:
-    return any(_int_or_none(row.get(k)) is not None for k in TOKEN_KEYS)
+    """True only when the row reports a positive token count somewhere; all-zero usage measured nothing."""
+    return any((_int_or_none(row.get(k)) or 0) > 0 for k in TOKEN_KEYS)
+
+
+def _cost_class(row: dict) -> str:
+    """`economics.cost_class` plus one evidence rule: an estimate priced from no tokens is unmetered.
+
+    HT writes `cost_usd=0, cost_source='estimated-from-reported-tokens', *_tokens=0` when a child
+    crashes before reporting usage. The shared classifier keeps that as a metered $0 estimate for
+    legacy attribution; here it must be a coverage gap, or a crashed run looks fully priced.
+    """
+    cls = cost_class(row)
+    if cls == ESTIMATED and row_cost(row) <= 0 and not _has_tokens(row): return UNMETERED
+    return cls
 
 
 def _terminal_fields(record: dict) -> dict[str, Any]:
     """Explicit time fields written by a runtime at its run-terminal boundary."""
-    return {'started_at': record.get('started_at'), 'finished_at': record.get('finished_at'), 'elapsed_ms': _int_or_none(record.get('elapsed_ms'))}
+    return {'started_at': record.get('started_at'), 'finished_at': record.get('finished_at'),
+            'elapsed_ms': _int_or_none(record.get('elapsed_ms')), 'elapsed_source': record.get('elapsed_source') or None}
 
 
 def _elapsed(terminal: dict[str, Any] | None) -> tuple[int | None, str]:
     if not terminal: return None, 'unknown'
-    if terminal.get('elapsed_ms') is not None: return max(0, int(terminal['elapsed_ms'])), 'monotonic'
+    if terminal.get('elapsed_ms') is not None: return max(0, int(terminal['elapsed_ms'])), str(terminal.get('elapsed_source') or 'reported')
     start, finish = _parse_ts(terminal.get('started_at')), _parse_ts(terminal.get('finished_at'))
     if start and finish: return max(0, int((finish - start).total_seconds() * 1000)), 'timestamps'
     return None, 'unknown'
@@ -89,8 +111,8 @@ def _counterfactual(calls: list[dict], baseline_model: str, pricing: dict[str, A
                                 cached_input_tokens=row.get('cached_input_tokens'), cache_write_tokens=row.get('cache_write_tokens'), pricing=pricing)
         if est is None: unpriced += 1
         else: total += float(est['cost_usd']); priced += 1
-    metered_actual = sum(1 for r in calls if cost_class(r) != UNMETERED)
-    actual_known = sum(row_cost(r) for r in calls if cost_class(r) != UNMETERED)
+    metered_actual = sum(1 for r in calls if _cost_class(r) != UNMETERED)
+    actual_known = sum(row_cost(r) for r in calls if _cost_class(r) != UNMETERED)
     comparable = bool(calls) and unpriced == 0 and metered_actual == len(calls)
     reason = None
     if not calls: reason = 'no calls observed'
@@ -116,18 +138,24 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
     excluded: dict[str, int] = defaultdict(int)
     run_ids: list[str] = []
     seen: set[str] = set()
+    first_ts: dict[str, str] = {}
 
-    def touch(rid: Any) -> str | None:
+    def touch(rid: Any, ts: Any = None) -> str | None:
+        """Register a run seen in a real stream. `ts` orders runs; it is never used as a duration."""
         if rid is None: return None
         rid = str(rid)
         if rid not in seen: seen.add(rid); run_ids.append(rid)
+        if ts:
+            ts = str(ts)
+            if rid not in first_ts or ts < first_ts[rid]: first_ts[rid] = ts
         return rid
 
     for row in metrics:
         rid = row.get('run_id')
         if rid is None: continue
-        if is_session_ingest(row): excluded[str(rid)] += 1; touch(rid); continue
-        rid = touch(rid)
+        # Session ingest never establishes a run; the count is only reported if a real stream does.
+        if is_session_ingest(row): excluded[str(rid)] += 1; continue
+        rid = touch(rid, row.get('ts'))
         if row.get('event') == 'adaptive_route_decision': decisions[rid] += 1
         elif is_call_row(row):
             calls[rid].append(row)
@@ -143,7 +171,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
     for e in events:
         rid = e.get('run_id')
         if rid is None: continue
-        rid = touch(rid); kind = e.get('event')
+        rid = touch(rid, e.get('ts')); kind = e.get('event')
         if kind == 'run_started': started_events.setdefault(rid, e)
         elif kind in TERMINAL_EVENTS:
             status[rid] = TERMINAL_EVENTS[kind]; terminal[rid] = {**terminal.get(rid, {}), **{k: v for k, v in _terminal_fields(e).items() if v is not None}}
@@ -157,7 +185,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
     for o in outcomes:
         rid = o.get('run_id')
         if rid is None: continue
-        rid = touch(rid); tid = str(o.get('task_id') or '')
+        rid = touch(rid, o.get('ts')); tid = str(o.get('task_id') or '')
         if any(o.get(k) for k in BAD_OUTCOME_KEYS): delayed_bad[rid] = True
         if tid in TERMINAL_OUTCOME_TASKS:
             status[rid] = TERMINAL_OUTCOME_TASKS[tid]
@@ -169,12 +197,14 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
             passed = o.get('verification') if o.get('verification') is not None else o.get('outcome') == 'verified'
             verification[rid] = 'passed' if passed else 'failed'
 
+    # Earliest observed ts orders runs (stable on first-seen order for ties or missing ts).
+    order = sorted(range(len(run_ids)), key=lambda i: (first_ts.get(run_ids[i]) is None, first_ts.get(run_ids[i]) or '', i))
     result = []
-    for rid in run_ids:
+    for rid in (run_ids[i] for i in order):
         rows = calls[rid]
-        metered = [r for r in rows if cost_class(r) != UNMETERED]
-        reported = sum(row_cost(r) for r in rows if cost_class(r) == REPORTED)
-        estimated = sum(row_cost(r) for r in rows if cost_class(r) == ESTIMATED)
+        metered = [r for r in rows if _cost_class(r) != UNMETERED]
+        reported = sum(row_cost(r) for r in rows if _cost_class(r) == REPORTED)
+        estimated = sum(row_cost(r) for r in rows if _cost_class(r) == ESTIMATED)
         known = reported + estimated if metered else None
         overhead_by_role: dict[str, float] = defaultdict(float)
         implementation = 0.0
@@ -210,7 +240,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
             'cached_input_tokens': sum(_int_or_none(r.get('cached_input_tokens')) or 0 for r in rows) if tokens_known else None,
             'cache_write_tokens': sum(_int_or_none(r.get('cache_write_tokens')) or 0 for r in rows) if tokens_known else None,
             'dispatch_duration_ms_total': sum(known_durations) if known_durations else None, 'duration_missing_calls': len(rows) - len(known_durations),
-            'workers': len({str(r.get('task_id')) for r in rows if r.get('task_id') is not None}),
+            'tasks': len({str(r.get('task_id')) for r in rows if r.get('task_id') is not None}),
             'roles': sorted({_role(r) for r in rows}), 'retries': retries, 'rework_events': rework_events[rid],
             'verification': verdict or 'unknown', 'verification_rows': len(verifications[rid]), 'verified_tasks': len(verified_tasks),
             'decision_rows': decisions[rid], 'other_metric_rows': other_rows[rid], 'excluded_session_ingest_rows': excluded[rid],
