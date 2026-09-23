@@ -1,6 +1,9 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
+import * as childProcess from "node:child_process";
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,7 +14,7 @@ mock.module("@humain/terminal", () => ({
 		onAbort?: () => void;
 		constructor(..._args: unknown[]) {}
 	},
-	discoverAgents: () => [],
+	discoverAgents: () => ({ agents: [] }),
 	renderTaskWithContext: (task: string) => task,
 }));
 
@@ -31,7 +34,15 @@ mock.module("node:child_process", () => {
 
 const testStateRoot = mkdtempSync(join(tmpdir(), "orch-run-session-test-"));
 process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = testStateRoot;
-process.env.CODING_AGENT_ORCHESTRATOR_HOME = testStateRoot;
+process.env.HUMAIN_ORCHESTRATOR_PROFILES_FILE = join(testStateRoot, "profiles.json");
+process.env.HUMAIN_ORCHESTRATOR_ADAPTER_FILE = join(testStateRoot, "adapter.json");
+// Python spawned by the bridge must import THIS worktree's package, never the installed skill
+// checkout, and must write to a temp state root, never the live ~/.local/state root.
+process.env.HUMAIN_ORCHESTRATOR_SKILL_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+process.env.PYTHONDONTWRITEBYTECODE = "1";
+// Main forwards the bridge state root to every Python call, including batches.
+const pythonStateRoot = testStateRoot;
+process.env.CODING_AGENT_ORCHESTRATOR_HOME = pythonStateRoot;
 const orchestrator = await import("./index.ts");
 afterAll(() => {
 	rmSync(testStateRoot, { recursive: true, force: true });
@@ -55,6 +66,31 @@ describe("session ingest hook wiring", () => {
 		await handlers.session_shutdown({}, ctxFor("/sessions/current-shutdown.jsonl"));
 		expect(scheduled).toEqual(["/sessions/current-settled.jsonl"]);
 		expect(flushed).toEqual(["/sessions/current-shutdown.jsonl"]);
+	});
+
+	test("shared shutdown hook bounds a stalled ingest and reports failure without abandoning its drain", async () => {
+		const handlers: Record<string, (...args: any[]) => unknown> = {};
+		let release!: () => void;
+		const pending = new Promise<void>((resolve) => { release = resolve; });
+		const errors: string[] = [];
+		const realTimer = globalThis.setTimeout;
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms: number) =>
+			realTimer(fn, ms === 2000 ? 5 : ms)) as typeof setTimeout);
+		try {
+			orchestrator.registerSessionIngestHooks({
+				on: (event: string, handler: (...args: any[]) => unknown) => { handlers[event] = handler; },
+			} as never, { schedule: () => {}, flush: () => pending }, (message) => errors.push(message));
+			const result = await Promise.race([
+				Promise.resolve(handlers.session_shutdown({}, { sessionManager: { getSessionFile: () => "/session.jsonl" } })).then(() => true),
+				new Promise<boolean>((resolve) => realTimer(() => resolve(false), 100)),
+			]);
+			expect(result).toBe(true);
+			expect(errors).toHaveLength(1);
+			expect(errors[0]).toContain("shutdown ingestion timed out");
+		} finally {
+			release();
+			timer.mockRestore();
+		}
 	});
 
 	test("registered settled hook runs real debounced CLI ingestion and replay refreshes without duplicates", async () => {
@@ -468,6 +504,31 @@ describe("RunSession progress reporting", () => {
 	});
 });
 
+describe("RunSession queued messages with owned diagnostics", () => {
+	test("delivers each batch once and preserves queue/delivery UI and logs through sealing", async () => {
+		const widgets: string[][] = [];
+		const session = new orchestrator.RunSession("message-queue-sealed", {
+			ui: { notify() {}, setStatus() {}, setWidget: (_id: string, lines?: string[]) => { if (lines) widgets.push(lines); } },
+		} as never, "steer the running lead");
+		try {
+			expect(session.enqueueMessage("  verify accessibility  ")).toBe(1);
+			expect(session.enqueueMessage("   ")).toBe(1);
+			expect(widgets.at(-1)?.some((line) => line.includes("1 message queued"))).toBe(true);
+			expect(session.drainMessages("qa")).toEqual(["verify accessibility"]);
+			expect(session.drainMessages("retry")).toEqual([]);
+			expect(session.queuedDepth()).toBe(0);
+			expect(widgets.at(-1)?.some((line) => line.includes("1 message delivered to qa"))).toBe(true);
+			session.close();
+			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(true);
+			const log = readFileSync(session.file("run.log"), "utf8");
+			expect(log).toContain("user message queued (depth=1): verify accessibility");
+			expect(log).toContain("delivered 1 user message(s) to qa");
+		} finally {
+			session.close();
+		}
+	});
+});
+
 describe("RunSession terminal timing", () => {
 	function fakeCtx() {
 		return { ui: { setWidget: () => {}, setStatus: () => {}, notify: mock() } };
@@ -490,6 +551,7 @@ describe("RunSession terminal timing", () => {
 		expect(timing.elapsed_ms).toBeGreaterThanOrEqual(20);
 		expect(timing.elapsed_ms).toBeLessThanOrEqual(after - before + 5);
 		expect(timing.elapsed_source).toBe("monotonic");
+		session.close();
 	});
 
 	test("elapsed_ms is never negative even if the wall clock steps backwards", () => {
@@ -500,6 +562,7 @@ describe("RunSession terminal timing", () => {
 			expect(session.terminalTiming().elapsed_ms).toBe(0);
 		} finally {
 			performance.now = original;
+			session.close();
 		}
 	});
 
@@ -512,6 +575,7 @@ describe("RunSession terminal timing", () => {
 			Date.now = () => fixed;
 			const session = new orchestrator.RunSession!("timing-test-3", fakeCtx() as never, "goal");
 			expect(session.terminalTiming().started_at).toBe(new Date(fixed).toISOString());
+			session.close();
 		} finally {
 			Date.now = original;
 		}
@@ -529,6 +593,196 @@ describe("RunSession terminal timing", () => {
 		const calls = handler.match(/await (?:completeRun|failRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThanOrEqual(6);
 		for (const call of calls) expect(call).toContain("session.terminalTiming()");
+	});
+});
+
+describe("batched telemetry through the Python batch CLI", () => {
+	function rows(file: string): Record<string, unknown>[] {
+		const path = join(pythonStateRoot, file);
+		if (!existsSync(path)) return [];
+		return readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+	}
+	function timing() {
+		return { started_at: new Date().toISOString(), finished_at: new Date().toISOString(), elapsed_ms: 1, elapsed_source: "monotonic" as const };
+	}
+
+	test("record helpers enqueue synchronously without spawning Python", () => {
+		expect(orchestrator.recordQueue).toBeDefined();
+		const before = orchestrator.recordQueue!.stats.batches;
+		const result = orchestrator.recordEvent!("dispatch_started", { run_id: "ht-sync", task_id: "t1" });
+		expect(result).not.toBeInstanceOf(Promise);
+		expect(orchestrator.recordQueue!.stats.batches).toBe(before);
+		expect(orchestrator.recordQueue!.pending).toBeGreaterThanOrEqual(1);
+	});
+
+	test("one dispatch boundary plus run completion is one Python spawn, and the terminal outcome is durable when completeRun resolves", async () => {
+		const runId = `ht-batch-${Date.now()}`;
+		const before = orchestrator.recordQueue!.stats.batches;
+		orchestrator.recordEvent!("dispatch_started", { run_id: runId, task_id: `${runId}-lead-0`, capability: "lead", model: "p/m" });
+		orchestrator.recordEvent!("dispatch_finished", { run_id: runId, task_id: `${runId}-lead-0`, exit_code: 0 });
+		orchestrator.recordModelCall!({ event: "model_call", run_id: runId, task_id: `${runId}-lead-0`, model: "p/m", provider: "p", cost_usd: 0.02, input_tokens: 10, output_tokens: 5, result: "pass" });
+		orchestrator.recordModelCall!({ event: "route_executed", run_id: runId, task_id: `${runId}-lead-0`, executed_model: "p/m", executed_cost_usd: 0.02 });
+		const report = await orchestrator.completeRun!(runId, { success_rate: 1, total_cost_usd: 0.02 }, timing());
+
+		expect(report).toMatchObject({ ok: true, failed: 0 });
+		// The terminal outcome must already be on disk — no delayed terminal status.
+		const outcome = rows("outcomes.jsonl").find((r) => r.run_id === runId && r.task_id === "run-complete");
+		expect(outcome).toBeDefined();
+		expect(outcome).toMatchObject({ outcome: "verified", elapsed_source: "monotonic", agent_runtime: "humain-terminal" });
+		const events = rows("events.jsonl").filter((r) => r.run_id === runId).map((r) => r.event);
+		expect(events).toEqual(["dispatch_started", "dispatch_finished", "run_completed"]);
+		expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("completed");
+		const metrics = rows("metrics.jsonl").filter((r) => r.run_id === runId).map((r) => r.event);
+		expect(metrics).toEqual(["model_call", "route_executed"]);
+		// One successful batch also refreshed the derived views once (ledger checkpoint + dashboard).
+		const ledger = JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8"));
+		expect(ledger.checkpoint.events_replayed).toBeGreaterThanOrEqual(2);
+		expect(existsSync(join(pythonStateRoot, "dashboard.html"))).toBe(true);
+		// Everything above (plus whatever the previous test left pending) went through one `batch` process.
+		expect(orchestrator.recordQueue!.stats.batches - before).toBe(1);
+		expect(orchestrator.recordQueue!.pending).toBe(0);
+	}, 30_000);
+
+	test("cancellation drains the queue: failRun resolves only after the cancelled outcome is durable", async () => {
+		const runId = `ht-cancel-${Date.now()}`;
+		orchestrator.recordEvent!("dispatch_started", { run_id: runId, task_id: `${runId}-lead-0` });
+		const report = await orchestrator.failRun!(runId, "cancelled by user (Esc or Ctrl+C)", timing());
+		expect(report.ok).toBe(true);
+		const outcome = rows("outcomes.jsonl").find((r) => r.run_id === runId);
+		expect(outcome).toMatchObject({ task_id: "run-failed", outcome: "fail", note: "cancelled by user (Esc or Ctrl+C)" });
+		expect(rows("events.jsonl").some((r) => r.run_id === runId)).toBe(true);
+		expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("failed");
+		expect(orchestrator.recordQueue!.pending).toBe(0);
+	}, 30_000);
+
+	test("session shutdown drains records still inside the coalescing window", async () => {
+		const handlers = new Map<string, ((event: unknown, ctx: unknown) => Promise<void>)[]>();
+		const pi = {
+			on: (name: string, fn: (event: unknown, ctx: unknown) => Promise<void>) => {
+				handlers.set(name, [...(handlers.get(name) ?? []), fn]);
+			},
+			registerCommand: () => {},
+		};
+		orchestrator.default(pi as never);
+		const shutdown = handlers.get("session_shutdown") ?? [];
+		expect(shutdown.length).toBeGreaterThanOrEqual(1);
+
+		const runId = `ht-shutdown-${Date.now()}`;
+		orchestrator.recordEvent!("dispatch_plan_confirmed", { run_id: runId, plan_id: "p1" });
+		expect(orchestrator.recordQueue!.pending).toBeGreaterThanOrEqual(1);
+		const ctx = { sessionManager: { getSessionFile: () => undefined } };
+		for (const fn of shutdown) await fn({}, ctx);
+		expect(orchestrator.recordQueue!.pending).toBe(0);
+		expect(rows("events.jsonl").some((r) => r.run_id === runId && r.event === "dispatch_plan_confirmed")).toBe(true);
+	}, 30_000);
+
+	test("a rejected record is surfaced in the terminal report and the run log instead of failing silently", async () => {
+		const runId = `ht-invalid-${Date.now()}`;
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+		try {
+			orchestrator.recordEvent!("dispatch_started", { run_id: runId, task_id: 12 as unknown as string });
+			const report = await orchestrator.completeRun!(runId, { success_rate: 1 }, timing());
+			expect(report.ok).toBe(false);
+			expect(report.failed).toBe(1);
+			expect(report.error).toContain("task_id");
+			expect(warnings.join("\n")).toContain("task_id");
+			// The valid terminal outcome still landed.
+			expect(rows("outcomes.jsonl").some((r) => r.run_id === runId && r.task_id === "run-complete")).toBe(true);
+			expect(rows("events.jsonl").filter((r) => r.run_id === runId).map(r => r.event)).toEqual(["run_completed"]);
+		} finally {
+			console.warn = originalWarn;
+		}
+	}, 30_000);
+
+	test("a record lost in an earlier timer flush is still counted in the terminal report when the final drain succeeds", async () => {
+		const runId = `ht-cumulative-${Date.now()}`;
+		const originalWarn = console.warn;
+		console.warn = () => {};
+		try {
+			await orchestrator.recordQueue!.flush(); // start from an empty queue
+			const baseline = orchestrator.recordQueue!.snapshot();
+			// Mid-run: an invalid record goes out with the coalescing-window flush and is rejected there.
+			orchestrator.recordEvent!("dispatch_started", { run_id: runId, task_id: 12 as unknown as string });
+			const midRun = await orchestrator.recordQueue!.flush();
+			expect(midRun.failed).toBe(1);
+			// Run end: only valid records are left, so the final drain itself is clean.
+			orchestrator.recordEvent!("dispatch_finished", { run_id: runId, task_id: `${runId}-lead-0` });
+			const report = await orchestrator.completeRun!(runId, { success_rate: 1 }, timing(), baseline);
+			expect(report.ok).toBe(false);
+			expect(report.failed).toBe(1);
+			expect(report.acknowledged).toBe(3);
+			expect(report.error).toContain("task_id");
+			expect(orchestrator.telemetryWarning!(report).join("\n")).toMatch(/1 record\(s\) could not be written/);
+			// Without a baseline the report covers the final drain only, which is what the old code showed.
+			orchestrator.recordEvent!("dispatch_started", { run_id: runId, task_id: 13 as unknown as string });
+			await orchestrator.recordQueue!.flush();
+			const finalOnly = await orchestrator.completeRun!(runId, { success_rate: 1 }, timing());
+			expect(finalOnly).toMatchObject({ ok: true, failed: 0 });
+		} finally {
+			console.warn = originalWarn;
+		}
+	}, 30_000);
+
+	test("the run summary distinguishes lost records from durable records whose ledger/dashboard refresh failed", () => {
+		const lost = orchestrator.telemetryWarning!({ ok: false, batches: 1, acknowledged: 0, failed: 2, derivedStale: 0, error: "exit -1: python3: not found" });
+		expect(lost).toHaveLength(1);
+		expect(lost[0]).toMatch(/2 record\(s\) could not be written/);
+		expect(lost[0]).toContain("python3: not found");
+
+		const stale = orchestrator.telemetryWarning!({ ok: true, batches: 3, acknowledged: 5, failed: 0, derivedStale: 5, staleReason: "dashboard refresh failed: disk full" });
+		expect(stale).toHaveLength(1);
+		expect(stale[0]).not.toMatch(/could not be written|lost/);
+		expect(stale[0]).toMatch(/5 record\(s\).*durable/);
+		expect(stale[0]).toMatch(/ledger|dashboard/);
+		expect(stale[0]).toContain("disk full");
+
+		expect(orchestrator.telemetryWarning!({ ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 0 })).toEqual([]);
+		expect(orchestrator.telemetryHealthy!({ ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 0 })).toBe(true);
+		expect(orchestrator.telemetryHealthy!({ ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 1 })).toBe(false);
+		expect(orchestrator.telemetryHealthy!({ ok: false, batches: 1, acknowledged: 0, failed: 1, derivedStale: 0 })).toBe(false);
+	});
+
+	test("a Python executable that does not exist fails the batch promptly with the spawn error, instead of hanging the terminal flush", async () => {
+		const missing = join(testStateRoot, "no-such-python");
+		const result = await orchestrator.runModule!("orchestrator.cli", ["batch", "-"], "[]", { python: missing });
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr).toContain("spawn error");
+		expect(result.stderr).toMatch(/ENOENT|no such file/i);
+
+		// Through the queue: the spawn failure is an ambiguous exit, retried and then reported, never a hang or a throw.
+		const { RecordQueue } = await import("./record-queue.ts");
+		const errors: string[] = [];
+		const q = new RecordQueue({
+			run: (records) => orchestrator.runModule!("orchestrator.cli", ["batch", "-"], JSON.stringify(records), { python: missing }),
+			maxAttempts: 2,
+			delay: async () => {},
+			onError: (m) => errors.push(m),
+		});
+		q.enqueue("outcome", { run_id: "ht-nopython", task_id: "run-complete", outcome: "verified" });
+		const report = await q.flush();
+		expect(report).toMatchObject({ ok: false, failed: 1, acknowledged: 0, batches: 2 });
+		expect(report.error).toMatch(/ENOENT|no such file/i);
+		expect(errors).toHaveLength(1);
+	}, 10_000);
+
+	test("every terminal path in the /orchestrate handler awaits the drained terminal write", () => {
+		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+		const complete = source.slice(source.indexOf("async function completeRun("), source.indexOf("async function failRun("));
+		const fail = source.slice(source.indexOf("async function failRun("), source.indexOf("// Subagent dispatch"));
+		for (const fn of [complete, fail]) expect(fn).toContain("flush()");
+		// Every terminal call reports telemetry cumulatively since the run started, not just the final drain.
+		const handler = source.slice(source.indexOf('pi.registerCommand("orchestrate"'), source.indexOf('pi.registerCommand("orchestrator-models"'));
+		const calls = handler.match(/await (?:completeRun|failRun)\([^;]*?\);/gs) ?? [];
+		expect(calls.length).toBeGreaterThanOrEqual(6);
+		for (const call of calls) expect(call).toContain("session.telemetryBaseline");
+		// Non-terminal records must not block dispatch: no awaited single-record spawns remain.
+		expect(source).not.toMatch(/await recordEvent\(/);
+		expect(source).not.toMatch(/await recordModelCall\(/);
+		expect(source).not.toMatch(/await recordOutcome\(/);
+		// The legacy single-record CLI commands are for other runtimes; the bridge uses `batch`.
+		expect(source).toContain('"batch"');
 	});
 });
 
@@ -723,6 +977,75 @@ describe("runSubagentProcess process/event handling", () => {
 			expect(doneRow).not.toContain("partialText:");
 			expect(doneRow).not.toContain("\\n");
 		} finally {
+			session.close();
+		}
+	});
+
+	test("timed-out progress dispatch retains trailing diagnostics until pipe close without revising its result", async () => {
+		const session = createSession("timed-out-diagnostic-drain");
+		// Model the real gap between kill/early settlement and stdio close deterministically.
+		const child = Object.assign(new EventEmitter(), {
+			stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true,
+		});
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "draining-lead", session,
+				leadTimeouts: { inactivityMs: 100, maxMs: 1000 },
+				spawnChild: () => child as never,
+			});
+			emit({ type: "message_end", message: { role: "assistant", content: "partial work", usage: { input: 10, output: 2, cost: { total: 0.02 } } } });
+			const result = await pending;
+			expect(result.outcome).toBe("timed_out");
+			expect(result.interruption?.partialText).toBe("partial work");
+			expect(result.costUsd).toBe(0.02);
+			expect(result.costReported).toBe(true);
+			session.close(true);
+			const sealing = session.sealDiagnostics(Promise.resolve(true));
+			emit({ type: "agent_settled" });
+			child.stderr.write("trailing teardown diagnostic\n");
+			expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+			child.emit("close", 137);
+			expect(await sealing).toBe(true);
+			const events = readFileSync(session.file("draining-lead.events.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+			expect(events.map((event) => event.type)).toEqual(["message_end", "agent_settled"]);
+			expect(readFileSync(session.file("draining-lead.stderr.log"), "utf8")).toContain("trailing teardown diagnostic");
+			expect(result.outcome).toBe("timed_out");
+			expect(result.usage.turns).toBe(1);
+		} finally {
+			child.emit("close", 137);
+			session.close();
+		}
+	});
+
+	test("cancellation drains already-buffered usage before returning the billed result", async () => {
+		const session = createSession("cancelled-usage-drain");
+		const child = Object.assign(new EventEmitter(), {
+			stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true,
+		});
+		try {
+			let returned = false;
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "usage-drain", session,
+				spawnChild: () => child as never,
+			}).then((result) => { returned = true; return result; });
+			session.cancel();
+			await Promise.resolve();
+			expect(returned).toBe(false);
+			child.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: "buffered work", usage: { input: 10, output: 2, cost: { total: 0.03 } }, stopReason: "stop" } })}\n`);
+			child.stdout.write('{"type":"agent_settled"}\n');
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.outcome).toBe("cancelled");
+			expect(result.exitCode).toBe(137);
+			expect(result.costUsd).toBe(0.03);
+			expect(result.costReported).toBe(true);
+			expect(result.usage.turns).toBe(1);
+			expect(result.interruption?.reason).toBe("cancelled");
+		} finally {
+			child.emit("close", 137);
 			session.close();
 		}
 	});
@@ -1005,6 +1328,7 @@ describe("dispatch records (T6)", () => {
 			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
 			durationMs: 10,
 			costUsd: 0.01,
+			costReported: true,
 			filesChanged: [],
 			...overrides,
 		} as Parameters<typeof orchestrator.dispatchRecordsFor>[1];
@@ -1105,7 +1429,7 @@ describe("dispatch records (T6)", () => {
 	test("the attested-verdict emission is gone from the module, not merely unused", () => {
 		// Guards the deletion itself: a re-added builder would otherwise be reachable from
 		// captureDispatchCost without any test noticing.
-		expect(orchestrator.verificationRecordFor).toBeUndefined();
+		expect(orchestrator).not.toHaveProperty("verificationRecordFor");
 		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 		for (const event of ["task_verified", "task_failed"]) {
 			expect(source).not.toContain(`event: passed ? "${event}"`);
@@ -1340,5 +1664,456 @@ describe("changed-file detection around the lead phase", () => {
 		const result = orchestrator.diffDirtySnapshots(null, new Map(), ["a.ts", "a.ts", "b.ts"]);
 		expect(result.changed).toEqual(["a.ts", "b.ts"]);
 		expect(result.phantom).toEqual([]);
+	});
+});
+
+describe("diagnostic writer ownership and sealing", () => {
+	const ctx = { ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} } };
+	test("terminal drain and all producer closes precede seal; late callbacks cannot reopen diagnostics", async () => {
+		const session = new orchestrator.RunSession("seal-writers", ctx as never, "test");
+		const writer = session.diagnostics.writer();
+		writer.write("task.prompt.md", "prompt");
+		writer.append("task.events.jsonl", "first\n");
+		session.writeDiagnostic("lead-report.md", "report");
+		// A real pipe delivers data after the run's UI has closed, as on timeout/error.
+		const { spawn } = await import("node:child_process");
+		const child = spawn(process.execPath, ["-e", 'setTimeout(() => { process.stdout.write("late\\n"); process.stderr.write("error\\n"); }, 50)']);
+		child.stdout.on("data", data => writer.append("task.events.jsonl", data.toString()));
+		child.stderr.on("data", data => writer.append("task.stderr.log", data.toString()));
+		const drained = new Promise<void>(resolve => child.on("close", () => { writer.close(); resolve(); }));
+		let terminal!: () => void;
+		const terminalDrain = new Promise<boolean>(resolve => { terminal = () => resolve(true); });
+		session.close();
+		const sealing = session.sealDiagnostics(terminalDrain);
+		await drained;
+		expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+		terminal();
+		expect(await sealing).toBe(true);
+		const seal = JSON.parse(readFileSync(session.file(".diagnostics-sealed.json"), "utf8"));
+		expect(seal.files["task.events.jsonl"].raw_bytes).toBe(11);
+		expect(readFileSync(session.file("task.stderr.log"), "utf8")).toBe("error\n");
+		expect(writer.append("task.events.jsonl", "too late")).toBe(false);
+		expect(session.writeDiagnostic("lead-report.md", "overwrite")).toBe(false);
+		orchestrator.appendTrimmedEventLog(session.file("task.events.jsonl"), { type: "late" });
+		expect(readFileSync(session.file("task.events.jsonl"), "utf8")).toBe("first\nlate\n");
+		expect(() => session.diagnostics.writer()).toThrow();
+		expect(() => new orchestrator.RunSession("seal-writers", ctx as never, "reopen")).toThrow();
+		// Consume the actual HT seal with Python, not a hand-built Python-only marker.
+		const recovered = JSON.parse(execFileSync("python3", ["-B", "-c", `
+import json, sys
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from orchestrator.archive import archive_runs, restore_run
+from tempfile import TemporaryDirectory
+from shutil import copytree
+# Archive fixtures must not overwrite the shared bridge/Python telemetry ledger.
+fixture = TemporaryDirectory(); root = Path(fixture.name)
+source = Path(sys.argv[1]); run = root/'runs'/source.name
+copytree(source, run)
+originals = {p.name:p.read_bytes() for p in run.iterdir() if not p.name.startswith('.')}
+now = datetime.now(timezone.utc)
+(root/'outcomes.jsonl').write_text(json.dumps({'run_id':run.name,'task_id':'run-complete','ts':now.isoformat()})+'\\n')
+result = next(e for e in archive_runs(root, execute=True, now=now+timedelta(days=40)) if e['run_id']==run.name)
+assert result['status']=='archived', result
+assert not (run/'task.events.jsonl').exists()
+assert (run/'run.log').read_bytes()==originals['run.log']
+assert restore_run(root,run.name)['status']=='restored'
+assert all((run/n).read_bytes()==data for n,data in originals.items())
+print(json.dumps({'removed':result['raw_bytes_removed'],'ownership':result['ownership']}))
+`, session.dir], { env: { ...process.env, PYTHONPATH: process.env.HUMAIN_ORCHESTRATOR_SKILL_ROOT }, encoding: "utf8" }));
+		expect(recovered.ownership).toBe("sealed");
+		expect(recovered.removed).toBe(29); // prompt 6 + events 11 + stderr 6 + report 6
+	});
+
+	// Removing the cleanup deadline must fail promptly rather than hang this test.
+	for (const lateClose of [false, true]) {
+		test(`seal deadline leaves managed diagnostics archive-ineligible (${lateClose ? "late close" : "lease never closes"})`, async () => {
+			const notices: Array<{ message: string; level: string }> = [];
+			const session = new orchestrator.RunSession(`seal-timeout-${lateClose}`, {
+				ui: { ...ctx.ui, notify: (message: string, level: string) => notices.push({ message, level }) },
+			} as never, "test");
+			const writer = session.diagnostics.writer();
+			writer.append("task.events.jsonl", "before\n");
+			session.close();
+			let expire: (() => void) | undefined;
+			let deadlineMs: number | undefined;
+			const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms: number) => {
+				expire = callback;
+				deadlineMs = ms;
+				return 123;
+			}) as typeof setTimeout);
+			const cleared: unknown[] = [];
+			const clear = spyOn(globalThis, "clearTimeout").mockImplementation(id => { cleared.push(id); });
+			try {
+				let settled: boolean | undefined;
+				const sealing = session.sealDiagnostics(Promise.resolve(true));
+				void sealing.then(result => { settled = result; });
+				expire?.();
+				// Flush promise continuations without relying on a real timeout.
+				for (let i = 0; i < 20; i++) await Promise.resolve();
+				expect(settled).toBe(false);
+				expect(deadlineMs).toBeGreaterThan(0);
+				expect(deadlineMs).toBeLessThanOrEqual(2000);
+				expect(cleared).toContain(123);
+				expect(notices.some(n => n.level === "warning" && /UNSEALED/.test(n.message) && /archive-ineligible/.test(n.message))).toBe(true);
+				expect(existsSync(session.file(".diagnostics-owner.json"))).toBe(true);
+				expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+				expect(() => session.diagnostics.writer()).toThrow();
+				expect(session.writeDiagnostic("task.events.jsonl", "overwrite")).toBe(false);
+				// Deadline does not revoke a producer's lease or lose its trailing bytes.
+				expect(writer.append("task.events.jsonl", "late\n")).toBe(true);
+				if (lateClose) {
+					writer.close();
+					writer.close(); // idempotent close after the abandoned seal attempt
+					expect(writer.append("task.events.jsonl", "after close")).toBe(false);
+				}
+				for (let i = 0; i < 20; i++) await Promise.resolve();
+				expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(false);
+				orchestrator.appendTrimmedEventLog(session.file("task.events.jsonl"), { type: "bypass" });
+				expect(readFileSync(session.file("task.events.jsonl"), "utf8")).toBe("before\nlate\n");
+				expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+				// Exercise the Python archive gate with the real timed-out owner marker.
+				const result = JSON.parse(execFileSync("python3", ["-B", "-c", `
+import json, sys
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from orchestrator.archive import archive_runs
+from tempfile import TemporaryDirectory
+from shutil import copytree
+fixture = TemporaryDirectory(); root = Path(fixture.name)
+source = Path(sys.argv[1]); run = root/'runs'/source.name
+copytree(source, run)
+now = datetime.now(timezone.utc)
+(root/'outcomes.jsonl').write_text(json.dumps({'run_id':run.name,'task_id':'run-complete','ts':now.isoformat()})+'\\n')
+before = {p.name:p.read_bytes() for p in run.iterdir()}
+result = next(e for e in archive_runs(root, execute=True, now=now+timedelta(days=40)) if e['run_id']==run.name)
+assert {p.name:p.read_bytes() for p in run.iterdir()} == before
+print(json.dumps(result))
+`, session.dir], { env: { ...process.env, PYTHONPATH: process.env.HUMAIN_ORCHESTRATOR_SKILL_ROOT }, encoding: "utf8" }));
+				expect(result.status).toBe("skipped");
+				expect(result.reason).toBe("writers_unsealed");
+			} finally {
+				timer.mockRestore();
+				clear.mockRestore();
+			}
+		});
+	}
+
+	test("terminal cleanup releases the TUI and admits the next run despite an open producer", async () => {
+		let handler!: (args: string, context: never) => Promise<void>;
+		const oldTmp = process.env.TMPDIR;
+		try {
+			// Activation's orphan scan must not inspect or remove real persona directories.
+			process.env.TMPDIR = testStateRoot;
+			orchestrator.default({
+				on: () => {},
+				registerCommand: (name: string, command: { handler: typeof handler }) => {
+					if (name === "orchestrate") handler = command.handler;
+				},
+			} as never);
+		} finally {
+			if (oldTmp === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = oldTmp;
+		}
+		const sessions: InstanceType<typeof orchestrator.RunSession>[] = [];
+		const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) {
+			sessions.push(this);
+			this.diagnostics.writer().append("task.events.jsonl", "open pipe\n");
+			// Fail before planning/dispatch: no agent or live service is launched.
+			throw new Error("synthetic pre-dispatch failure");
+		});
+		const realSeal = orchestrator.RunSession.prototype.sealDiagnostics;
+		const seal = spyOn(orchestrator.RunSession.prototype, "sealDiagnostics").mockImplementation(async function (this: InstanceType<typeof orchestrator.RunSession>, terminal) {
+			const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void) => {
+				queueMicrotask(callback); // fake the terminal seal deadline, not dispatch/telemetry timers
+				return 123;
+			}) as typeof setTimeout);
+			try { return await realSeal.call(this, terminal); }
+			finally { timer.mockRestore(); }
+		});
+		const notices: string[] = [];
+		let tuiClosed = 0;
+		let widget: unknown = "active";
+		let status: unknown = "active";
+		const context = {
+			mode: "tui",
+			ui: {
+				notify: (message: string) => notices.push(message),
+				setWidget: (_id: string, value: unknown) => { widget = value; },
+				setStatus: (_id: string, value: unknown) => { status = value; },
+				custom: (factory: (...args: unknown[]) => unknown) => new Promise<void>(done => {
+					factory({}, {}, {}, () => { tuiClosed++; done(); });
+				}),
+			},
+		};
+		try {
+			await handler("synthetic cleanup test --complexity 4", context as never);
+			expect(tuiClosed).toBe(1);
+			expect(widget).toBeUndefined();
+			expect(status).toBeUndefined();
+			await handler("next synthetic run --complexity 4", context as never);
+			expect(tuiClosed).toBe(2);
+			expect(sessions).toHaveLength(2);
+			expect(sessions[0].runId).not.toBe(sessions[1].runId);
+			expect(notices.some(n => n.includes("already running"))).toBe(false);
+			expect(notices.filter(n => n.includes("UNSEALED"))).toHaveLength(2);
+			for (const session of sessions) expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+		} finally {
+			phase.mockRestore();
+			seal.mockRestore();
+		}
+	});
+
+	test("a shutdown failure vetoes an in-flight diagnostic seal before the last producer closes", async () => {
+		const session = new orchestrator.RunSession("seal-shutdown-veto", ctx as never, "test");
+		const writer = session.diagnostics.writer();
+		writer.append("late.events.jsonl", "before\n");
+		session.close();
+		const sealing = session.sealDiagnostics(Promise.resolve(true));
+		const abandoned = session.sealDiagnostics(Promise.resolve(false));
+		writer.append("late.events.jsonl", "after\n");
+		writer.close();
+		expect(await sealing).toBe(false);
+		expect(await abandoned).toBe(false);
+		expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+		expect(readFileSync(session.file("late.events.jsonl"), "utf8")).toBe("before\nafter\n");
+	});
+
+	test("failed terminal drain never seals, even with all writers closed", async () => {
+		const session = new orchestrator.RunSession("seal-failed-drain", ctx as never, "test");
+		session.close();
+		expect(await session.sealDiagnostics(Promise.resolve(false))).toBe(false);
+		expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+	});
+});
+
+describe("final triage and shutdown integration", () => {
+	function activate() {
+		let handler!: (args: string, ctx: never) => Promise<void>;
+		const shutdown: Array<(event: unknown, ctx: never) => Promise<void>> = [];
+		const oldTmp = process.env.TMPDIR;
+		try {
+			process.env.TMPDIR = testStateRoot;
+			orchestrator.default({
+				on: (name: string, fn: typeof shutdown[number]) => { if (name === "session_shutdown") shutdown.push(fn); },
+				registerCommand: (name: string, command: { handler: typeof handler }) => { if (name === "orchestrate") handler = command.handler; },
+			} as never);
+		} finally {
+			if (oldTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = oldTmp;
+		}
+		return { handler, shutdown };
+	}
+	function registry() { return { getAvailable: () => [{ provider: "amazon-bedrock", id: "anthropic.claude-haiku-4-5", name: "Haiku" }] }; }
+	function readRows(name: string): any[] {
+		return readFileSync(join(pythonStateRoot, name), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+	}
+	for (const { model, costs, source, expected } of [
+		{ model: "unknown-final-model", costs: [undefined], source: "unmetered", expected: undefined },
+		{ model: "claude-sonnet-4-5", costs: [undefined], source: "estimated-from-reported-tokens", expected: .0039 },
+		{ model: "claude-sonnet-4-5", costs: [{ total: 0 }], source: "reported", expected: 0 },
+		{ model: "unknown-final-model", costs: [{ total: 0 }], source: "reported", expected: 0 },
+		{ model: "claude-sonnet-4-5", costs: [{ total: -1 }], source: "estimated-from-reported-tokens", expected: .0039 },
+		{ model: "claude-sonnet-4-5", costs: [{ total: "0" }], source: "estimated-from-reported-tokens", expected: .0039 },
+		{ model: "claude-sonnet-4-5", costs: [{ total: .1 }, undefined], source: "estimated-from-reported-tokens", expected: .0078 },
+		{ model: "claude-sonnet-4-5", costs: [undefined, { total: .1 }], source: "estimated-from-reported-tokens", expected: .0078 },
+	]) {
+		test(`malformed triage is billed to the real run with honest pricing: ${model} ${source} ${JSON.stringify(costs)}`, async () => {
+			const { handler } = activate();
+			const notices: string[] = [];
+			let runId = "";
+			const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>, value) {
+				runId = this.runId;
+				if (value.startsWith("planning")) throw new Error("stop after triage; no real worker");
+			});
+			const original = childProcess.spawn;
+			const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
+				if (!args.includes("--mode")) return original(command, args, opts);
+				const events = costs.map(cost => ({ type: "message_end", message: { role: "assistant", model, usage: { input: 1000, cacheRead: 2500, output: 10, cost }, content: [{ type: "text", text: "not JSON" }], stopReason: "stop" } }));
+				return original(process.execPath, ["-e", `${events.map(event => `console.log(${JSON.stringify(JSON.stringify(event))});`).join("")}console.log('{"type":"agent_end"}');`], opts);
+			}) as typeof childProcess.spawn);
+			try {
+				await handler("synthetic triage", { modelRegistry: registry(), ui: { notify: (n: string) => notices.push(n), setWidget() {}, setStatus() {} } } as never);
+				const rows = readRows("metrics.jsonl").filter(row => row.run_id === runId && row.event === "model_call");
+				expect(rows).toHaveLength(1);
+				expect(rows[0].role).toBe("triage");
+				const priced = expected !== undefined;
+				expect(rows[0].cost_source).toBe(source);
+				expect(rows[0].cost_usd).toBe(expected);
+				expect(rows[0].input_tokens).toBe(3500 * costs.length);
+				expect(rows[0].cached_input_tokens).toBe(2500 * costs.length);
+				const executed = readRows("metrics.jsonl").find(row => row.run_id === runId && row.event === "route_executed");
+				expect(executed?.executed_cost_usd).toBe(source === "reported" ? expected : undefined);
+				const html = readFileSync(join(pythonStateRoot, "dashboard.html"), "utf8");
+				const data = JSON.parse(html.split("const D=")[1].split(";const $=")[0]);
+				const run = data.runs.find((r: any) => r.run_id === runId);
+				expect(run.call_rows).toBe(1);
+				expect(run.metered_calls).toBe(priced ? 1 : 0);
+				if (priced) expect(run.overhead_by_role.triage).toBe(rows[0].cost_usd);
+			} finally { phase.mockRestore(); spawn.mockRestore(); }
+		}, 30_000);
+	}
+
+	test("shutdown is bounded even when session ingestion never exits", async () => {
+		const { shutdown } = activate();
+		const original = childProcess.spawn;
+		let child: ReturnType<typeof childProcess.spawn> | undefined;
+		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
+			if (!args.includes("ingest")) return original(command,args,opts);
+			child = original(process.execPath,["-e","setInterval(()=>{},1000)"],opts);
+			return child;
+		}) as typeof childProcess.spawn);
+		const realTimer = globalThis.setTimeout;
+		const timer = spyOn(globalThis,"setTimeout").mockImplementation(((fn: () => void, ms: number) => realTimer(fn, ms === 2000 ? 10 : ms)) as typeof setTimeout);
+		const ctx = { sessionManager: { getSessionFile: () => join(testStateRoot,"synthetic-session.jsonl") } };
+		const draining = (async () => { for (const fn of shutdown) await fn({},ctx as never); return true; })();
+		try {
+			expect(await Promise.race([draining,new Promise<boolean>(resolve=>realTimer(()=>resolve(false),150))])).toBe(true);
+			const status = JSON.parse(readFileSync(join(testStateRoot, "ingest_status.json"), "utf8"));
+			expect(status.status).toBe("error");
+			expect(status.error).toContain("shutdown ingestion timed out");
+		} finally {
+			child?.kill();
+			await draining;
+			timer.mockRestore(); spawn.mockRestore();
+		}
+	});
+
+	test("shutdown deadline leaves a stalled plan unsealed even after late completion", async () => {
+		const { handler, shutdown } = activate();
+		const original = childProcess.spawn;
+		let child: ReturnType<typeof childProcess.spawn> | undefined;
+		let ready!: () => void;
+		const started = new Promise<void>(resolve => { ready = resolve; });
+		let session: InstanceType<typeof orchestrator.RunSession> | undefined;
+		const phase = spyOn(orchestrator.RunSession.prototype,"setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) { session=this; });
+		const spawn = spyOn(childProcess,"spawn").mockImplementation(((command: string,args: string[],opts: object) => {
+			if (!args.includes("plan")) return original(command,args,opts);
+			child=original(process.execPath,["-e","setInterval(()=>{},1000)"],opts); ready(); return child;
+		}) as typeof childProcess.spawn);
+		const ctx={ui:{notify() {},setWidget() {},setStatus() {}},sessionManager:{getSessionFile:()=>undefined}};
+		const running=handler("stalled synthetic plan --complexity 4",ctx as never);
+		const realTimer=globalThis.setTimeout;
+		let timer: ReturnType<typeof spyOn> | undefined;
+		try {
+			await started;
+			timer=spyOn(globalThis,"setTimeout").mockImplementation(((fn:()=>void,ms:number)=>realTimer(fn,ms===2000?10:ms)) as typeof setTimeout);
+			for (const fn of shutdown) await fn({},ctx as never);
+			expect(session?.cancellation.isCancelled).toBe(true);
+			expect(existsSync(session!.file(".diagnostics-sealed.json"))).toBe(false);
+			child?.kill(); await running;
+			expect(existsSync(session!.file(".diagnostics-sealed.json"))).toBe(false);
+		} finally { child?.kill(); await running; timer?.mockRestore(); phase.mockRestore(); spawn.mockRestore(); }
+	});
+
+	test("shutdown captures active escalation usage before cancellation unwinds the retry", async () => {
+		const { handler, shutdown } = activate();
+		const cwd = process.cwd();
+		const repo = mkdtempSync(join(testStateRoot, "escalation-repo-"));
+		execFileSync("git", ["init", "-q", repo]);
+		writeFileSync(join(repo, "work.txt"), "before\n");
+		execFileSync("git", ["-C", repo, "add", "work.txt"]);
+		let session: InstanceType<typeof orchestrator.RunSession> | undefined;
+		const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) { session = this; });
+		let childReady!: () => void;
+		const ready = new Promise<void>(resolve => { childReady = resolve; });
+		const original = childProcess.spawn;
+		let dispatches = 0;
+		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
+			if (!args.includes("--mode")) return original(command, args, opts);
+			dispatches++;
+			const retry = dispatches === 3;
+			const text = dispatches === 2 ? "- unit tests: FAIL" : "Changed work.txt";
+			const event = { type: "message_end", message: { role: "assistant", model: "claude-sonnet-4-5", usage: { input: 1000, output: 10, cost: { total: retry ? .3 : .01 } }, content: [{ type: "text", text }], stopReason: "stop" } };
+			const modify = dispatches === 1 ? 'require("node:fs").writeFileSync("work.txt","after\\n");' : "";
+			const finish = retry ? "setInterval(()=>{},1000);" : 'console.log(\'{"type":"agent_end"}\');';
+			const child = original(process.execPath, ["-e", `${modify}console.log(${JSON.stringify(JSON.stringify(event))});${finish}`], opts);
+			if (retry) child.stdout?.once("data", () => queueMicrotask(childReady));
+			return child;
+		}) as typeof childProcess.spawn);
+		const ctx = { modelRegistry: registry(), ui: { notify() {}, setWidget() {}, setStatus() {} }, sessionManager: { getSessionFile: () => undefined } };
+		process.chdir(repo);
+		const running = handler("synthetic escalation --complexity 3 --risk low", ctx as never);
+		try {
+			await Promise.race([ready, running.then(() => { throw new Error("run ended before escalation usage"); })]);
+			for (const fn of shutdown) await fn({}, ctx as never);
+			const runId = session!.runId;
+			const retryId = `${runId}-lead-0-retry-1`;
+			const calls = readRows("metrics.jsonl").filter(row => row.run_id === runId && row.event === "model_call");
+			expect(calls.filter(row => row.task_id === retryId)).toHaveLength(1);
+			expect(calls.find(row => row.task_id === retryId)?.cost_usd).toBe(.3);
+			expect(calls).toHaveLength(3);
+			expect(readRows("events.jsonl").find(row => row.task_id === retryId && row.event === "dispatch_started")?.retry_of).toBe(`${runId}-lead-0`);
+			expect(readRows("outcomes.jsonl").filter(row => row.run_id === runId && row.task_id === "run-failed")).toHaveLength(1);
+			expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("failed");
+			const data = JSON.parse(readFileSync(join(pythonStateRoot, "dashboard.html"), "utf8").split("const D=")[1].split(";const $=")[0]);
+			expect(data.runs.find((row: any) => row.run_id === runId).cost_known_usd).toBeCloseTo(.32);
+		} finally {
+			session?.cancel();
+			await running;
+			process.chdir(cwd);
+			phase.mockRestore(); spawn.mockRestore();
+		}
+	}, 30_000);
+
+	test("shutdown awaits active child settlement and late terminal telemetry", async () => {
+		const { handler, shutdown } = activate();
+		let runId = "";
+		let childReady!: () => void;
+		const ready = new Promise<void>(r => { childReady = r; });
+		let activeSession: InstanceType<typeof orchestrator.RunSession> | undefined;
+		const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) { runId = this.runId; activeSession = this; });
+		const original = childProcess.spawn;
+		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
+			if (!args.includes("--mode")) return original(command, args, opts);
+			const event = { type: "message_end", message: { role: "assistant", model: "claude-sonnet-4-5", usage: { input: 1000, output: 10, cost: { total: .1 } }, content: [{ type: "text", text: "not JSON" }] } };
+			const child = original(process.execPath, ["-e", `console.log(${JSON.stringify(JSON.stringify(event))});setTimeout(()=>{},30000);`], opts);
+			child.stdout?.once("data", () => { setTimeout(childReady, 10); });
+			return child;
+		}) as typeof childProcess.spawn);
+		const ctx = { modelRegistry: registry(), ui: { notify() {}, setWidget() {}, setStatus() {} }, sessionManager: { getSessionFile: () => undefined } };
+		const running = handler("synthetic shutdown triage", ctx as never);
+		try {
+			await ready;
+			for (const fn of shutdown) await fn({}, ctx as never);
+			expect(readRows("outcomes.jsonl").some(row => row.run_id === runId && row.task_id === "run-failed")).toBe(true);
+			expect(readRows("metrics.jsonl").find(row => row.run_id === runId && row.event === "model_call")?.cost_usd).toBe(.1);
+			expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("failed");
+		} finally {
+			// Also cleans up the pre-fix reproduction, whose shutdown hook did not cancel.
+			activeSession?.cancel();
+			await running;
+			phase.mockRestore(); spawn.mockRestore();
+		}
+	}, 30_000);
+});
+
+describe("archived run diagnostics lookup", () => {
+	test("a readable path is returned unchanged; an archived one names the .gz and the restore command; a missing one says so", () => {
+		const runDir = join(testStateRoot, "runs", "ht-orch-1790000000000-abcdef");
+		mkdirSync(runDir, { recursive: true });
+		const log = join(runDir, "run.log");
+		writeFileSync(log, "2026-08-01T00:00:00Z run started\n");
+		expect(orchestrator.describeRunArtifact(log)).toBe(log);
+
+		const report = join(runDir, "lead-report.md");
+		writeFileSync(`${report}.gz`, "not really gzip, existence is what matters here");
+		writeFileSync(
+			join(runDir, "archive.manifest.json"),
+			JSON.stringify({ format_version: 1, run_id: "ht-orch-1790000000000-abcdef", files: { "lead-report.md": { archive: "lead-report.md.gz", sha256: "00" } } }),
+		);
+		const described = orchestrator.describeRunArtifact(report);
+		expect(described).toContain(report);
+		expect(described).toContain(`${report}.gz`);
+		expect(described).toContain("restore-run ht-orch-1790000000000-abcdef");
+
+		// once restored (or never archived) the plain path wins again
+		writeFileSync(report, "report\n");
+		expect(orchestrator.describeRunArtifact(report)).toBe(report);
+
+		// a .gz without a manifest entry is not ours to describe as archived
+		const stray = join(runDir, "other.stderr.log");
+		writeFileSync(`${stray}.gz`, "x");
+		expect(orchestrator.describeRunArtifact(stray)).toBe(`${stray} (missing)`);
+		expect(orchestrator.describeRunArtifact(join(runDir, "never.txt"))).toBe(`${join(runDir, "never.txt")} (missing)`);
 	});
 });

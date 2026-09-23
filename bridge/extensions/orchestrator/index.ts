@@ -27,6 +27,7 @@
  * skill's history has (recommended, executed, observed) triples to learn from.
  */
 
+import { RunDiagnostics, appendDiagnosticPath, type DiagnosticWriter } from "./run-diagnostics.ts";
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
 	appendFileSync,
@@ -106,6 +107,7 @@ import { RunCancellation } from "./cancellation.ts";
 import { connectCancellationLoader, applyObservation, applyWarnings, createProgressView, formatNestedWorkerRows, formatProgressLine, formatWarningLine } from "./run-ui.ts";
 import type { DispatchProgressView } from "./run-ui.ts";
 import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
+import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -143,6 +145,34 @@ function runsDir(): string {
 	return join(STATE_ROOT.replace(/^~/, homedir()), "runs");
 }
 
+/** Manifest `python3 -m orchestrator.cli archive-runs --execute` leaves next to a run's `<name>.gz` files. */
+const ARCHIVE_MANIFEST = "archive.manifest.json";
+
+/**
+ * Where a run diagnostic can be read *now*. The opt-in `archive-runs --execute` command replaces
+ * the diagnostics of old completed runs with `<name>.gz` + a manifest (`run.log` itself is never
+ * archived), so a path remembered from the progress board or an old notification may no longer
+ * exist as-is. Returns the path unchanged while it is readable; otherwise a lookup/restore hint
+ * instead of a silently broken link.
+ */
+export function describeRunArtifact(path: string): string {
+	if (existsSync(path)) return path;
+	const runDir = dirname(path);
+	const name = basename(path);
+	const archived = join(runDir, `${name}.gz`);
+	let listed = false;
+	try {
+		const manifest = JSON.parse(readFileSync(join(runDir, ARCHIVE_MANIFEST), "utf-8"));
+		listed = manifest?.format_version === 1 && typeof manifest?.files?.[name] === "object";
+	} catch {
+		/* no readable manifest: the file was never archived by us */
+	}
+	if (listed && existsSync(archived)) {
+		return `${path} (archived as ${archived} — read with \`gunzip -c\`, or restore the run with \`python3 -m orchestrator.cli restore-run ${basename(runDir)}\`)`;
+	}
+	return `${path} (missing)`;
+}
+
 // Non-interactive runs (`--mode json -p`, CI, smoke tests) get a no-op UI whose
 // `confirm()` always resolves false. Runs therefore auto-approve by default;
 // `--interactive` explicitly opts in to the confirmation gates.
@@ -158,6 +188,16 @@ const MAX_CONCURRENT_DISPATCHES = positiveIntEnv("HUMAIN_ORCHESTRATOR_MAX_CONCUR
 const MAX_LEADS = positiveIntEnv("HUMAIN_ORCHESTRATOR_MAX_LEADS", 8);
 /** Per-dispatch wall clock for a LEAF dispatch that does its own work directly. */
 const DISPATCH_TIMEOUT_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS", 20 * 60 * 1000);
+
+/**
+ * Telemetry batching. Records written within this window share one Python `batch`
+ * process; a Python start-up costs ~250 ms, so a shorter window buys nothing. The
+ * batch size stays well under Python's 500-record validation limit. Terminal writes
+ * (run complete/fail/cancel/crash, session shutdown) flush immediately regardless.
+ */
+const TELEMETRY_FLUSH_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_TELEMETRY_FLUSH_MS", 500);
+const TELEMETRY_MAX_BATCH = positiveIntEnv("HUMAIN_ORCHESTRATOR_TELEMETRY_BATCH", 100);
+
 
 
 /**
@@ -233,7 +273,7 @@ export function guardChildStreamHandler(
 export function appendTrimmedEventLog(eventsLog: string | undefined, event: unknown): void {
 	if (!eventsLog) return;
 	try {
-		appendFileSync(eventsLog, `${JSON.stringify(trimEventForLog(event))}\n`);
+		appendDiagnosticPath(eventsLog, `${JSON.stringify(trimEventForLog(event))}\n`);
 	} catch {
 		/* per-dispatch diagnostics must not disrupt the child stream */
 	}
@@ -261,6 +301,12 @@ function installDispatchReaper(): void {
 		// we don't change whether the parent exits.
 		process.once(signal, () => {
 			ACTIVE_RUN?.cancel();
+			// Best effort only. A signal handler cannot await, so this merely *starts* a drain of
+			// records still inside the coalescing window; whether the Python child gets to run
+			// before HT exits depends on HT's own shutdown sequencing. Anything it does not
+			// reach is lost with the process. The guaranteed drains are the awaited ones: the
+			// run's terminal path (complete/fail/cancel/crash) and the `session_shutdown` hook.
+			void recordQueue.flush();
 			reap();
 		});
 	}
@@ -673,6 +719,10 @@ function clampTriage(raw: Partial<TriageResult>): TriageResult | null {
 // assistant message_end events with model, input/output tokens, and cost.
 // That path is the one we replicate here.
 
+function reportedCost(total: unknown): number | undefined {
+	return typeof total === "number" && Number.isFinite(total) && total >= 0 ? total : undefined;
+}
+
 interface SubagentProcessResult {
 	exitCode: number;
 	/** Every assistant text block, in order, joined by blank lines. */
@@ -687,6 +737,8 @@ interface SubagentProcessResult {
 	model?: string;
 	usage: SubagentUsageStats;
 	costUsd: number;
+	/** True only when every received usage block explicitly reported a valid cost (including $0). */
+	costReported: boolean;
 	durationMs: number;
 	stopReason?: string;
 	/** Process disposition after considering terminal JSON events. */
@@ -850,12 +902,25 @@ export class RunSession {
 	private queuedMessages: Array<{ text: string; queuedAt: number }> = [];
 	/** History of message batches we've folded into prompts, so the user can see delivery. */
 	private deliveryLog: Array<{ count: number; to: string; ts: number }> = [];
+	readonly diagnostics: RunDiagnostics;
+	private terminalAcknowledged = false;
+	private resolveFinished!: () => void;
+	/** Resolves after the command's producers, terminal telemetry and cleanup have settled. */
+	readonly finished = new Promise<void>(resolve => { this.resolveFinished = resolve; });
+
+	finish(): void { this.resolveFinished(); }
+	/**
+	 * Telemetry counters when this run started. The terminal summary reports every record
+	 * failure since then — including timer flushes that failed mid-run — not just the final drain.
+	 */
+	readonly telemetryBaseline: QueueStats = recordQueue.snapshot();
 
 	constructor(runId: string, ctx: ExtensionContext, goal: string, cwd: string = process.cwd()) {
 		this.runId = runId;
 		this.ctx = ctx;
 		this.goal = goal;
 		this.dir = join(runsDir(), runId);
+		this.diagnostics = new RunDiagnostics(this.dir, runId);
 		this.worktree = detectWorktree(cwd);
 		try {
 			mkdirSync(this.dir, { recursive: true });
@@ -922,6 +987,23 @@ export class RunSession {
 		return join(this.dir, name);
 	}
 
+	writeDiagnostic(name: string, text: string): boolean {
+		return this.diagnostics.write(name, text);
+	}
+
+	acknowledgeTerminal(ok: boolean): void {
+		this.terminalAcknowledged = ok;
+	}
+
+	async sealDiagnostics(terminal = Promise.resolve(this.terminalAcknowledged)): Promise<boolean> {
+		const sealed = await this.diagnostics.seal(terminal);
+		if (!sealed) this.ctx.ui.notify(
+			`Diagnostics remain UNSEALED and archive-ineligible: producer drain/terminal acknowledgement did not complete or sealing failed. Raw diagnostics retained: ${this.dir}`,
+			"warning",
+		);
+		return sealed;
+	}
+
 	/**
 	 * Time fields recorded at the run's terminal boundary (complete/fail/cancel/crash).
 	 * `elapsed_ms` is monotonic and clamped at zero; consumers treat a run without these
@@ -947,7 +1029,7 @@ export class RunSession {
 	log(line: string): void {
 		const stamped = `${new Date().toISOString()} ${line}`;
 		try {
-			appendFileSync(this.file("run.log"), `${stamped}\n`);
+			this.diagnostics.write("run.log", `${stamped}\n`, true);
 		} catch {
 			/* log dir unavailable; the UI still gets the line */
 		}
@@ -1026,7 +1108,7 @@ export class RunSession {
 			case "message_end":
 				if (event.message?.role === "assistant") {
 					d.turns += 1;
-					d.costUsd += event.message?.usage?.cost?.total || 0;
+					d.costUsd += reportedCost(event.message?.usage?.cost?.total) ?? 0;
 					changed = `turn ${d.turns} done (${d.toolCalls} tools)`;
 				}
 				break;
@@ -1285,11 +1367,11 @@ export async function runSubagentProcess(opts: {
 	session?.cancellation.throwIfCancelled();
 	const taskId = opts.taskId ?? `${opts.agentName}-${Date.now()}`;
 	const safeTaskId = taskId.replace(/[^a-zA-Z0-9._-]+/g, "_");
-	const eventsLog = session ? session.file(`${safeTaskId}.events.jsonl`) : undefined;
-	const stderrLog = session ? session.file(`${safeTaskId}.stderr.log`) : undefined;
+	const eventsName = `${safeTaskId}.events.jsonl`;
+	const stderrName = `${safeTaskId}.stderr.log`;
 	if (session) {
 		try {
-			writeFileSync(session.file(`${safeTaskId}.prompt.md`), opts.task);
+			session.writeDiagnostic(`${safeTaskId}.prompt.md`, opts.task);
 		} catch {
 			/* best-effort */
 		}
@@ -1374,6 +1456,7 @@ export async function runSubagentProcess(opts: {
 		const stderrCapture = new BoundedCapture();
 		let model: string | undefined;
 		const usage: SubagentUsageStats = { ...emptyUsage };
+		let costReported = false;
 		let stopReason: string | undefined;
 		let sawAgentSettled = false;
 		let sawAgentEnd = false;
@@ -1430,7 +1513,8 @@ export async function runSubagentProcess(opts: {
 			stderrCapture.append(`\n${interruptionNote}`);
 			return interruptionNote;
 		};
-
+		let diagnosticWriter: DiagnosticWriter | undefined;
+		let stderrPrefix = "";
 		const finish = (processExitCode: number) => {
 			if (settled) return;
 			const cancelled = cancelledByListener || session?.cancellation.isCancelled === true;
@@ -1460,15 +1544,11 @@ export async function runSubagentProcess(opts: {
 				spawnFailed,
 				stderrSummary,
 			});
-			if (stderrLog) {
-				try {
-					const logText = outcome.status === "completed_after_process_error"
-						? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n${stderr}`
-						: stderr;
-					writeFileSync(stderrLog, logText);
-				} catch {
-					/* best-effort */
-				}
+			if (diagnosticWriter) {
+				stderrPrefix = outcome.status === "completed_after_process_error"
+					? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n`
+					: "";
+				diagnosticWriter.write(stderrName, stderrPrefix + stderr);
 			}
 			session?.endDispatch(taskId, outcome.effectiveExitCode, usage.cost, interruptionNote ? summarizeInterruption(interruption!) : outcome.note);
 			resolve({
@@ -1481,6 +1561,7 @@ export async function runSubagentProcess(opts: {
 				model,
 				usage,
 				costUsd: usage.cost,
+				costReported,
 				durationMs: Date.now() - startedAt,
 				stopReason,
 				outcome: outcome.status,
@@ -1499,7 +1580,9 @@ export async function runSubagentProcess(opts: {
 				usage.output += msg.usage.output || 0;
 				usage.cacheRead += msg.usage.cacheRead || 0;
 				usage.cacheWrite += msg.usage.cacheWrite || 0;
-				usage.cost += msg.usage.cost?.total || 0;
+				const cost = reportedCost(msg.usage.cost?.total);
+				costReported = (usage.turns === 1 || costReported) && cost !== undefined;
+				usage.cost += cost ?? 0;
 				usage.contextTokens = msg.usage.totalTokens || usage.contextTokens;
 			}
 			if (msg.stopReason) stopReason = msg.stopReason;
@@ -1516,7 +1599,6 @@ export async function runSubagentProcess(opts: {
 		};
 
 		const processLine = (line: string) => {
-			if (settled) return;
 			const trimmed = line.trim();
 			if (!trimmed) return;
 			let event: any;
@@ -1526,9 +1608,13 @@ export async function runSubagentProcess(opts: {
 				// Unparseable protocol lines are dropped: they cannot safely be JSONL.
 				return;
 			}
-			appendTrimmedEventLog(eventsLog, event);
+			diagnosticWriter?.append(eventsName, `${JSON.stringify(trimEventForLog(event))}\n`);
+			// A timeout/cancellation settles the result before stdio closes. Preserve
+			// trailing diagnostics under the producer lease, but never revive progress
+			// or mutate the already-returned usage/result after that boundary.
+			if (settled) return;
 			const now = Date.now();
-			const observation = progressTracker?.observe(event, now);
+			const observation = cancelledByListener ? undefined : progressTracker?.observe(event, now);
 			session?.onChildEvent(taskId, event);
 			if (event.type === "agent_settled") sawAgentSettled = true;
 			if (event.type === "agent_end") sawAgentEnd = true;
@@ -1568,6 +1654,7 @@ export async function runSubagentProcess(opts: {
 		let proc: ChildProcess | undefined;
 		const spawnChild: ChildSpawner = opts.spawnChild ?? spawn;
 		try {
+			diagnosticWriter = session?.diagnostics.writer();
 			proc = spawnChild(invocation.command, invocation.args, {
 				cwd: opts.cwd,
 				shell: false,
@@ -1584,6 +1671,7 @@ export async function runSubagentProcess(opts: {
 			spawnFailed = true;
 			stderrCapture.append(`\n[orchestrator] spawn threw: ${(err as Error).message}`);
 			finish(1);
+			diagnosticWriter?.close();
 			return;
 		}
 
@@ -1605,7 +1693,7 @@ export async function runSubagentProcess(opts: {
 		}
 
 		handleExpiry = (reason) => {
-			if (settled) return;
+			if (settled || cancelledByListener) return;
 			timedOut = true;
 			timeoutReason = reason;
 			const explanation = progressTracker?.describeExpiry(reason, opts.capability, Date.now()) ?? reason;
@@ -1619,14 +1707,19 @@ export async function runSubagentProcess(opts: {
 		removeCancellationListener = session?.cancellation.onCancel(() => {
 			if (proc && !settled) {
 				cancelledByListener = true;
-				recordInterruption("cancelled");
+				if (timeoutTimer !== undefined) {
+					clearTimeout(timeoutTimer);
+					timeoutTimer = undefined;
+				}
 				killProcessTree(proc);
-				finish(137);
+				// Cancellation stops work now, but close drains usage already in the
+				// pipe before callers bill the result. Shutdown's outer deadline still
+				// bounds this wait and vetoes sealing if a producer never closes.
 			}
 		});
 
 		armTimer = () => {
-			if (settled || !progressTracker) return;
+			if (settled || cancelledByListener || !progressTracker) return;
 			if (timeoutTimer !== undefined) {
 				clearTimeout(timeoutTimer);
 				timeoutTimer = undefined;
@@ -1640,7 +1733,7 @@ export async function runSubagentProcess(opts: {
 			const delay = Math.max(50, Math.min(30_000, check.nextCheckMs));
 			timeoutTimer = setTimeout(() => {
 				timeoutTimer = undefined;
-				if (settled || !progressTracker) return;
+				if (settled || cancelledByListener || !progressTracker) return;
 				const tickNow = Date.now();
 				const tickCheck = progressTracker.check(tickNow);
 				session?.recordProgress(taskId, { kind: "heartbeat", detail: "timer" }, tickCheck, tickNow);
@@ -1649,13 +1742,12 @@ export async function runSubagentProcess(opts: {
 				else armTimer();
 			}, delay);
 		};
-		// A cancellation that fired synchronously above has already settled the
-		// dispatch; never arm a timer after settle. Do NOT return early here: the
-		// stream/error handlers below must still attach so a late 'error' emit on
-		// the child cannot become an uncaught exception.
+		// A cancellation that fired synchronously above is already stopping the
+		// child; never arm another timer. Do NOT return early here: handlers must
+		// still attach to drain usage and catch a late child 'error' event.
 		if (isLead) {
 			armTimer();
-		} else if (!settled) {
+		} else if (!settled && !cancelledByListener) {
 			// Leaf dispatches retain their fixed wall-clock timeout
 			// (HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS); no inactivity rule applies.
 			const leafTimeoutMs = policy.absoluteMs;
@@ -1692,10 +1784,15 @@ export async function runSubagentProcess(opts: {
 		});
 
 		proc.on("close", (code) => {
-			guardChildStreamHandler("stdout", () => {
-				if (buffer.trim()) processLine(buffer);
-				finish(code ?? 0);
-			}, streamFailure);
+			try {
+				guardChildStreamHandler("stdout", () => {
+					if (buffer.trim()) processLine(buffer);
+					finish(code ?? 0);
+				}, streamFailure);
+				// Early settlement on timeout/error is not pipe drain. Keep the lease until close,
+				// and persist stderr that arrived after finish() resolved the dispatch.
+				diagnosticWriter?.write(stderrName, stderrPrefix + stderrCapture.text());
+			} finally { diagnosticWriter?.close(); }
 		});
 
 		proc.on("error", (err) => {
@@ -1709,11 +1806,11 @@ export async function runSubagentProcess(opts: {
 /**
  * Classify the goal with the cheapest capability.
  *
- * `costSink` accumulates what triage spent. Triage is logged under its own
- * synthetic run id (it happens before the real run exists), so without this the
- * command's reported total silently excluded it.
+ * `costSink` accumulates what triage spent. Triage is logged as run overhead under
+ * the same run identifier even when classification fails.
  */
 async function triageTask(
+	runId: string,
 	goal: string,
 	cwd: string,
 	ctx: ExtensionContext,
@@ -1742,43 +1839,16 @@ async function triageTask(
 			label: "triage",
 		});
 		costSink.usd += r?.costUsd ?? 0;
-		if (!r || r.exitCode !== 0) {
-			if (r) {
-				// Surface WHY, instead of the bare "Triage unavailable" the command
-				// used to print. A non-zero exit here is almost always an argv or
-				// provider-auth problem, and stderr names it.
-				console.warn(
-					`[orchestrator] triage exited ${r.exitCode}: ${summarizeStderr(r.stderr || r.rawStdout, 400) || "(no output)"}`,
-				);
-				await captureDispatchCost(
-					{
-						runId: `triage-${Date.now()}`,
-						planId: "triage",
-						taskClass: "triage",
-						complexity: 5,
-						risk: "medium",
-						recommended: {
-							capability: "implementation_fast",
-							effort: "low",
-							verification_depth: "none",
-						},
-						mode: "triage",
-					},
-					{
-						taskId: `triage-${slugGoal(goal)}`,
-						capability: "implementation_fast",
-						model: r.model ?? cheapest.model,
-						exitCode: r.exitCode,
-						stdout: r.stdout,
-						stderr: r.stderr,
-						usage: r.usage,
-						durationMs: r.durationMs,
-						costUsd: r.costUsd,
-						stopReason: r.stopReason,
-						filesChanged: [],
-					},
-				);
-			}
+		// Bill the dispatch before parsing: malformed/empty classifier output still used tokens.
+		await captureDispatchCost(
+			{ runId, planId: "triage", taskClass: "triage", complexity: 5, risk: "medium",
+				recommended: { capability: "implementation_fast", effort: "low", verification_depth: "none" }, mode: "triage" },
+			{ taskId: "triage", capability: "triage", model: r.model ?? cheapest.model,
+				exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, usage: r.usage,
+				durationMs: r.durationMs, costUsd: r.costUsd, costReported: r.costReported, stopReason: r.stopReason, filesChanged: [] },
+		);
+		if (r.exitCode !== 0) {
+			console.warn(`[orchestrator] triage exited ${r.exitCode}: ${summarizeStderr(r.stderr || r.rawStdout, 400) || "(no output)"}`);
 			return null;
 		}
 		// The child's final assistant message is the JSON verdict.
@@ -1799,38 +1869,6 @@ async function triageTask(
 		const clamped = clampTriage(parsed);
 		if (!clamped) return null;
 
-		// Cost-attribution: triage is an interactive_session call, but logged
-		// under task_class="triage" so it\'s auditable separately from the
-		// run itself. The orchestrator\'s ledger picks it up the same way as
-		// any other dispatch through captureDispatchCost.
-		await captureDispatchCost(
-			{
-				runId: `triage-${Date.now()}`,
-				planId: "triage",
-				taskClass: "triage",
-				complexity: clamped.complexity,
-				risk: clamped.risk,
-				recommended: {
-					capability: "implementation_fast",
-					effort: "low",
-					verification_depth: "none",
-				},
-				mode: "triage",
-			},
-			{
-				taskId: `triage-${slugGoal(goal)}`,
-				capability: "implementation_fast",
-				model: r.model ?? cheapest.model,
-				exitCode: r.exitCode,
-				stdout: text,
-				stderr: r.stderr,
-				usage: r.usage,
-				durationMs: r.durationMs,
-				costUsd: r.costUsd,
-				stopReason: r.stopReason,
-				filesChanged: [],
-			},
-		);
 		return clamped;
 	} catch (err) {
 		console.warn(`[orchestrator] triage failed: ${(err as Error).message}`);
@@ -1880,15 +1918,28 @@ function runCli(args: string[], stdin?: string): Promise<CliResult> {
  * Run a Python module under the orchestrator's SKILL_ROOT. We set
  * CODING_AGENT_RUNTIME so the dispatched metrics land under
  * `agent_runtime: "humain-terminal"`, PYTHONPATH so the `orchestrator`
- * package is importable, and CODING_AGENT_ORCHESTRATOR_HOME so Python
- * ingestion and the TypeScript hook reporting layer write to the same state
- * root even when HUMAIN_ORCHESTRATOR_STATE_ROOT is customized.
+ * package is importable, and CODING_AGENT_ORCHESTRATOR_HOME points at the
+ * same state root as the HT hook. `stdin`, when given, is written and closed before the
+ * child runs (the `batch -` command reads its payload from stdin).
+ *
+ * Always resolves exactly once: on `close`, or on a spawn `error` (ENOENT, EACCES,
+ * EAGAIN) in case the runtime never follows it with `close`. A spawn failure is
+ * reported as a negative exit code with the error in `stderr`, which the record
+ * queue treats as ambiguous and replays. `python` is injectable for tests only.
  */
-export function runModule(module: string, args: string[] = []): Promise<CliResult> {
+export function runModule(module: string, args: string[] = [], stdin?: string, options: { python?: string } = {}): Promise<CliResult> {
 	return new Promise((resolve) => {
 		const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
 		const expandedStateRoot = STATE_ROOT.replace(/^~/, homedir());
-		const child = spawn(PYTHON, ["-m", module, ...args], {
+		let stdout = "";
+		let stderr = "";
+		let settled = false;
+		const settle = (exitCode: number) => {
+			if (settled) return;
+			settled = true;
+			resolve({ stdout, stderr, exitCode });
+		};
+		const child = spawn(options.python ?? PYTHON, ["-m", module, ...args], {
 			env: {
 				...process.env,
 				CODING_AGENT_RUNTIME: "humain-terminal",
@@ -1898,13 +1949,17 @@ export function runModule(module: string, args: string[] = []): Promise<CliResul
 			},
 			stdio: ["pipe", "pipe", "pipe"],
 		});
-		let stdout = "";
-		let stderr = "";
 		child.stdout.on("data", (b) => (stdout += b.toString()));
 		child.stderr.on("data", (b) => (stderr += b.toString()));
-		child.on("close", (code) =>
-			resolve({ stdout, stderr, exitCode: code ?? -1 }),
-		);
+		child.on("error", (err) => {
+			stderr += `\n[orchestrator] spawn error: ${err.message}`;
+			settle(-1);
+		});
+		child.on("close", (code) => settle(code ?? -1));
+		// A child that exits before reading its payload closes the pipe under us; that is
+		// reported through the exit code, not as an uncaught EPIPE.
+		child.stdin.on("error", () => {});
+		if (stdin !== undefined) child.stdin.end(stdin);
 	});
 }
 
@@ -1975,33 +2030,40 @@ async function planRun(runId: string, opts: PlanOptions): Promise<PlanResponse> 
 	return JSON.parse(res.stdout.trim());
 }
 
-async function recordEvent(event: string, payload: Record<string, unknown>): Promise<void> {
-	const res = await runModule("orchestrator.cli", ["event", event, JSON.stringify(payload)]);
-	if (res.exitCode !== 0) {
-		console.warn(`[orchestrator] event write failed: ${res.stderr}`);
-	}
+// -----------------------------------------------------------------------------
+// Telemetry: batched event/metric/outcome records
+// -----------------------------------------------------------------------------
+
+/**
+ * One queue for the whole extension. Records are stamped with a stable id at
+ * enqueue time and sent to `orchestrator.cli batch -` in bounded batches; see
+ * record-queue.ts for the coalescing/retry contract. Every failure is logged to
+ * the console and to the active run's log; terminal flushes also return it.
+ * Other runtimes keep using the single-record `event`/`metric`/`outcome` commands.
+ */
+export const recordQueue = new RecordQueue({
+	run: (records) => runModule("orchestrator.cli", ["batch", "-"], JSON.stringify(records)),
+	maxBatch: TELEMETRY_MAX_BATCH,
+	flushDelayMs: TELEMETRY_FLUSH_MS,
+	onError: (message) => {
+		console.warn(`[orchestrator] ${message}`);
+		ACTIVE_RUN?.log(`telemetry: ${message}`);
+	},
+});
+
+/** Queue an event row. Synchronous: progress never waits on a Python process. */
+export function recordEvent(event: string, payload: Record<string, unknown>): void {
+	recordQueue.enqueue("event", { ...payload, event });
 }
 
-async function recordModelCall(metric: Record<string, unknown>): Promise<void> {
-	const res = await runModule("orchestrator.cli", ["metric", JSON.stringify(metric)]);
-	if (res.exitCode !== 0) {
-		console.warn(`[orchestrator] metric write failed: ${res.stderr}`);
-	}
+/** Queue a metric row (model_call / route_executed). */
+export function recordModelCall(metric: Record<string, unknown>): void {
+	recordQueue.enqueue("metric", metric);
 }
 
-async function recordOutcome(outcome: Record<string, unknown>): Promise<void> {
-	const res = await runModule("orchestrator.cli", ["outcome", JSON.stringify(outcome)]);
-	if (res.exitCode !== 0) {
-		console.warn(`[orchestrator] outcome write failed: ${res.stderr}`);
-	}
-}
-
-/** Terminal-boundary time fields written to the run outcome row. */
-export interface RunTiming {
-	started_at: string;
-	finished_at: string;
-	elapsed_ms: number;
-	elapsed_source: "monotonic";
+/** Queue an outcome row. Terminal run outcomes go through completeRun/failRun, which also drain. */
+export function recordOutcome(outcome: Record<string, unknown>): void {
+	recordQueue.enqueue("outcome", outcome);
 }
 
 export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality: number, note: string): Record<string, unknown> {
@@ -2026,12 +2088,37 @@ export function runCompletionOutcomeFor(runId: string, summary: Record<string, u
 	};
 }
 
-async function completeRun(runId: string, summary: Record<string, unknown>, timing?: RunTiming): Promise<void> {
-	await recordOutcome({ ...runCompletionOutcomeFor(runId, summary), ...timing });
+/** Terminal-boundary time fields written to the run outcome row. */
+export interface RunTiming {
+	started_at: string;
+	finished_at: string;
+	elapsed_ms: number;
+	elapsed_source: "monotonic";
 }
 
-async function failRun(runId: string, error: string, timing?: RunTiming): Promise<void> {
-	await recordOutcome({
+/**
+ * Record the run's terminal outcome and drain everything queued for it. Resolves
+ * only once Python has acknowledged the writes (or definitively failed them), so
+ * the terminal status is never delayed behind the coalescing window and the
+ * caller can surface any write failure.
+ *
+ * With `since` (the queue counters when the run started) the report covers every
+ * record failure since then: a timer flush that failed mid-run must not vanish from
+ * the summary just because the final drain went through.
+ */
+export async function completeRun(runId: string, summary: Record<string, unknown>, timing?: RunTiming, since?: QueueStats): Promise<FlushReport> {
+	const session = ACTIVE_RUN?.runId === runId ? ACTIVE_RUN : null;
+	recordEvent("run_completed", { run_id: runId, ...timing });
+	recordOutcome({ ...runCompletionOutcomeFor(runId, summary), ...timing });
+	const report = reportSince(await recordQueue.flush(), since);
+	session?.acknowledgeTerminal(report.ok);
+	return report;
+}
+
+export async function failRun(runId: string, error: string, timing?: RunTiming, since?: QueueStats): Promise<FlushReport> {
+	const session = ACTIVE_RUN?.runId === runId ? ACTIVE_RUN : null;
+	recordEvent("run_failed", { run_id: runId, error, ...timing });
+	recordOutcome({
 		run_id: runId,
 		task_id: "run-failed",
 		outcome: "fail",
@@ -2040,6 +2127,56 @@ async function failRun(runId: string, error: string, timing?: RunTiming): Promis
 		note: error,
 		...timing,
 	});
+	const report = reportSince(await recordQueue.flush(), since);
+	session?.acknowledgeTerminal(report.ok);
+	return report;
+}
+
+/** Widen a final-drain report to everything the queue did since `since` (cumulative for the run). */
+function reportSince(drain: FlushReport, since?: QueueStats): FlushReport {
+	if (!since) return drain;
+	const now = recordQueue.stats;
+	const failed = Math.max(drain.failed, now.failed - since.failed);
+	const derivedStale = Math.max(drain.derivedStale, now.derivedStale - since.derivedStale);
+	const report: FlushReport = {
+		ok: failed === 0,
+		batches: drain.batches,
+		acknowledged: Math.max(drain.acknowledged, now.acknowledged - since.acknowledged),
+		failed,
+		derivedStale,
+	};
+	// Prefer the final drain's own messages; fall back to the queue's last message for
+	// failures that happened in an earlier timer flush.
+	if (failed > 0) report.error = drain.error ?? recordQueue.lastFailure ?? undefined;
+	if (derivedStale > 0) report.staleReason = drain.staleReason ?? recordQueue.lastStaleReason ?? undefined;
+	return report;
+}
+
+/**
+ * Summary lines when telemetry did not fully land; empty when all is well. Lost records
+ * and durable-but-unrefreshed records are different problems and are worded differently.
+ */
+export function telemetryWarning(report: FlushReport): string[] {
+	const lines: string[] = [];
+	if (!report.ok || report.failed > 0) {
+		lines.push(`telemetry: ${report.failed} record(s) could not be written to the ledger — ${report.error ?? "see run.log"}`);
+	}
+	if (report.derivedStale > 0) {
+		lines.push(
+			`telemetry: ${report.derivedStale} record(s) are durable but the ledger/dashboard refresh failed; derived views are stale until the next successful write — ${report.staleReason ?? "see run.log"}`,
+		);
+	}
+	return lines;
+}
+
+/** True when every record landed and the derived views were refreshed. */
+export function telemetryHealthy(report: FlushReport): boolean {
+	return report.ok && report.failed === 0 && report.derivedStale === 0;
+}
+
+/** Surface a failed terminal drain to the operator; silent on success. */
+function warnTelemetry(ctx: ExtensionContext, report: FlushReport): void {
+	for (const line of telemetryWarning(report)) ctx.ui.notify(line, "warning");
 }
 
 // -----------------------------------------------------------------------------
@@ -2064,6 +2201,7 @@ interface DispatchResult {
 	usage: SubagentSingleResult["usage"];
 	durationMs: number;
 	costUsd: number;
+	costReported: boolean;
 	stopReason?: string;
 	outcome?: SubagentProcessResult["outcome"];
 	timeoutReason?: "inactivity" | "absolute";
@@ -2126,7 +2264,8 @@ async function dispatchParallel(
 		// Left unparenthesised this failed to load the whole extension.
 		const shortId =
 			(input._taskId ?? "").replace(`${runId}-`, "") || input._capability || "task";
-		await recordEvent("dispatch_started", {
+		// Queued, not awaited: the child starts now and the record lands in the next batch.
+		recordEvent("dispatch_started", {
 			run_id: runId,
 			task_id: input._taskId,
 			capability: input._capability,
@@ -2151,7 +2290,7 @@ async function dispatchParallel(
 				// granted reviewers write access and dropped tools the personas need.
 				ctx,
 			});
-			await recordEvent("dispatch_finished", {
+			recordEvent("dispatch_finished", {
 				run_id: runId,
 				task_id: input._taskId,
 				capability: input._capability,
@@ -2178,6 +2317,7 @@ async function dispatchParallel(
 				usage: r.usage,
 				durationMs: r.durationMs,
 				costUsd: r.costUsd,
+				costReported: r.costReported,
 				stopReason: r.stopReason,
 				outcome: r.outcome,
 				timeoutReason: r.timeoutReason,
@@ -2200,6 +2340,7 @@ async function dispatchParallel(
 				},
 				durationMs: 0,
 				costUsd: 0,
+				costReported: false,
 				filesChanged: [],
 			};
 		}
@@ -2587,7 +2728,7 @@ async function captureDispatchCost(
 	result: DispatchResult,
 ): Promise<void> {
 	for (const record of dispatchRecordsFor(opts, result)) {
-		await recordModelCall(record);
+		recordModelCall(record);
 	}
 }
 
@@ -2644,7 +2785,7 @@ export function dispatchRecordsFor(
 	// 1. The model_call record HT actually produced. `cost_source: "reported"`
 	//    means the harness reported cost directly; if cost is missing, the
 	//    pricing table resolves it to `estimated`.
-	const hasReportedCost = (result?.costUsd ?? 0) > 0;
+	const hasReportedCost = result?.costReported === true;
 	return [{
 		event: "model_call",
 		run_id: opts.runId,
@@ -2659,12 +2800,12 @@ export function dispatchRecordsFor(
 		model,
 		effort: "standard",
 		verification_depth: "targeted",
-		input_tokens: usage.input ?? 0,
+		// HT input excludes cache reads; the telemetry/pricing contract includes them.
+		input_tokens: (usage.input ?? 0) + (usage.cacheRead ?? 0),
 		cached_input_tokens: usage.cacheRead ?? 0,
 		cache_write_tokens: usage.cacheWrite ?? 0,
 		output_tokens: usage.output ?? 0,
-		cost_usd: result?.costUsd ?? 0,
-		cost_source: hasReportedCost ? "reported" : "estimated-from-reported-tokens",
+		...(hasReportedCost ? { cost_usd: result.costUsd, cost_source: "reported" } : {}),
 		duration_ms: result?.durationMs ?? 0,
 		result: result?.exitCode === 0 ? "pass" : "fail",
 		stop_reason: result?.stopReason,
@@ -2686,8 +2827,8 @@ export function dispatchRecordsFor(
 		executed_model: model,
 		executed_effort: "standard",
 		executed_verification_depth: "targeted",
-		executed_cost_usd: result?.costUsd ?? 0,
-		executed_input_tokens: usage.input ?? 0,
+		...(hasReportedCost ? { executed_cost_usd: result.costUsd } : {}),
+		executed_input_tokens: (usage.input ?? 0) + (usage.cacheRead ?? 0),
 		executed_output_tokens: usage.output ?? 0,
 		executed_passes: result?.exitCode === 0,
 		recommended_capability: opts.recommended.capability,
@@ -2699,7 +2840,6 @@ export function dispatchRecordsFor(
 			opts.recommended.estimated_quality_evidence,
 		adaptive_mode: opts.mode,
 	}];
-
 }
 
 // -----------------------------------------------------------------------------
@@ -2772,7 +2912,7 @@ async function runVerification(
 	const failedChecks = parseFailedChecks(out);
 	const passed = qaResult.exitCode === 0 && failedChecks.length === 0;
 
-	await recordOutcome(qaVerificationOutcomeFor(runId, passed, passed ? 0.95 : 0.0, out.slice(0, 2000)));
+	recordOutcome(qaVerificationOutcomeFor(runId, passed, passed ? 0.95 : 0.0, out.slice(0, 2000)));
 
 	return {
 		passed,
@@ -3210,8 +3350,13 @@ async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Pr
 		ctx.ui.notify(summary.join("\n"), failed > 0 ? "error" : "info");
 		return failed === 0;
 	} finally {
-		session.close();
-		ACTIVE_RUN = null;
+		try {
+			session.close();
+			await session.sealDiagnostics(); // bounded drain; no terminal outcome means no seal
+		} finally {
+			ACTIVE_RUN = null;
+			session.finish();
+		}
 	}
 }
 
@@ -3306,16 +3451,24 @@ export function recordHookFailure(stateRoot: string, detail: string): void {
 	}
 }
 
-/** Register only the settled fast path and awaited shutdown flush. */
+/** Register the settled fast path and an awaited, bounded shutdown flush. */
 export function registerSessionIngestHooks(
 	host: Pick<ExtensionAPI, "on">,
 	scheduler: Pick<SessionIngestScheduler, "schedule" | "flush">,
+	onError: (message: string) => void = () => {},
 ): void {
 	host.on("agent_settled", async (_event, ctx) => {
 		scheduler.schedule(ctx.sessionManager.getSessionFile());
 	});
 	host.on("session_shutdown", async (_event, ctx) => {
-		await scheduler.flush(ctx.sessionManager.getSessionFile());
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const done = await Promise.race([
+				scheduler.flush(ctx.sessionManager.getSessionFile()).then(() => true),
+				new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 2000); }),
+			]);
+			if (!done) onError("shutdown ingestion timed out; retry the session import to refresh durable usage");
+		} finally { if (timer !== undefined) clearTimeout(timer); }
 	});
 }
 
@@ -3330,23 +3483,50 @@ function installSessionIngest(pi: ExtensionAPI): void {
 			// Telemetry must never break the session.
 		}
 	};
+	const onError = (message: string) => {
+		logError(message);
+		recordHookFailure(stateRoot, message);
+	};
 	const scheduler = new SessionIngestScheduler({
-		onError: (message) => {
-			logError(message);
-			recordHookFailure(stateRoot, message);
-		},
+		onError,
 		run: async (sessionFile) => {
 			const res = await runModule("orchestrator.cli", ingestArgs(sessionFile));
 			if (res.exitCode === 0) return { ok: true };
 			return { ok: false, detail: `exit ${res.exitCode}: ${res.stderr.trim().split("\n").slice(-3).join(" | ")}` };
 		},
 	});
-	registerSessionIngestHooks(pi, scheduler);
+	registerSessionIngestHooks(pi, scheduler, onError);
+}
+
+/**
+ * Drain batched telemetry when the session ends, so records still inside the
+ * coalescing window (a run that was cancelled by quitting, a plan that was just
+ * confirmed) are durable before HT exits. Idempotent: flushing an empty queue is a no-op.
+ */
+function installTelemetryDrain(pi: ExtensionAPI): void {
+	pi.on("session_shutdown", async () => {
+		const session = ACTIVE_RUN;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		session?.cancel();
+		try {
+			const drained = await Promise.race([
+				(async () => { await session?.finished; await recordQueue.flush(); return true; })(),
+				new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 2000); }),
+			]);
+			if (!drained) {
+				// Do not pretend the terminal cost is complete or archive-safe on expiry.
+				session?.close(true);
+				if (session) void session.sealDiagnostics(Promise.resolve(false));
+				console.warn("[orchestrator] shutdown drain timed out; late telemetry is unacknowledged, diagnostics remain UNSEALED");
+			}
+		} finally { if (timer !== undefined) clearTimeout(timer); }
+	});
 }
 
 export default function (pi: ExtensionAPI) {
 	reapOrphanedPersonaDirs();
 	installDispatchReaper();
+	installTelemetryDrain(pi);
 	installSessionIngest(pi);
 
 	pi.registerCommand("orchestrate", {
@@ -3435,7 +3615,7 @@ export default function (pi: ExtensionAPI) {
 
 				if (missingTriage) {
 					session.setPhase(`triage on ${shortName(adapter.implementation_fast?.model ?? "?")}`);
-					triageResult = await triageTask(parsed.goal, cwd, ctx, triageCost, adapter);
+					triageResult = await triageTask(runId, parsed.goal, cwd, ctx, triageCost, adapter);
 					session.cancellation.throwIfCancelled();
 					if (triageResult) {
 						effectiveTaskClass = triageResult.task_class;
@@ -3456,7 +3636,7 @@ export default function (pi: ExtensionAPI) {
 								? "interactive confirmation unavailable after triage"
 								: "cancelled by user after triage";
 							session.log(reason);
-							await failRun(runId, reason, session.terminalTiming());
+							warnTelemetry(ctx, await failRun(runId, reason, session.terminalTiming(), session.telemetryBaseline));
 							ctx.ui.notify("Cancelled.", "info");
 							return;
 						}
@@ -3488,7 +3668,7 @@ export default function (pi: ExtensionAPI) {
 				} catch (err) {
 					if (session.cancellation.isCancelled) throw err;
 					session.log(`plan failed: ${(err as Error).message}`);
-					await failRun(runId, `plan failed: ${(err as Error).message}`, session.terminalTiming());
+					warnTelemetry(ctx, await failRun(runId, `plan failed: ${(err as Error).message}`, session.terminalTiming(), session.telemetryBaseline));
 					ctx.ui.notify(`Plan failed: ${(err as Error).message}`, "error");
 					return;
 				}
@@ -3528,7 +3708,7 @@ export default function (pi: ExtensionAPI) {
 						? "interactive confirmation unavailable before dispatch"
 						: "cancelled by user at plan confirmation";
 					session.log(reason);
-					await failRun(runId, reason, session.terminalTiming());
+					warnTelemetry(ctx, await failRun(runId, reason, session.terminalTiming(), session.telemetryBaseline));
 					ctx.ui.notify("Cancelled.", "info");
 					return;
 				}
@@ -3548,7 +3728,7 @@ export default function (pi: ExtensionAPI) {
 					mode: plan.route.mode,
 				};
 
-				await recordEvent("dispatch_plan_confirmed", {
+				recordEvent("dispatch_plan_confirmed", {
 					run_id: runId,
 					plan_id: plan.plan_id,
 					models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
@@ -3680,7 +3860,8 @@ export default function (pi: ExtensionAPI) {
 							},
 							ctx,
 						);
-						session.cancellation.throwIfCancelled();
+						// Capture settled usage before cancellation unwinds this round, just
+						// as the architect, lead and QA paths do.
 						// dispatchParallel returns [] for an empty task list; billing an
 						// absent result wrote an all-"unknown" model_call for a dispatch
 						// that never happened.
@@ -3688,6 +3869,7 @@ export default function (pi: ExtensionAPI) {
 							await captureDispatchCost(captureOpts, retryResult);
 							escalationResults.push(retryResult);
 						}
+						session.cancellation.throwIfCancelled();
 					}
 					retries++;
 					// The retry may have touched different files than the first lead
@@ -3733,7 +3915,7 @@ export default function (pi: ExtensionAPI) {
 				const passedVerification = dispatchOk && (lastVerification?.passed ?? false);
 
 				session.cancellation.throwIfCancelled();
-				await completeRun(runId, {
+				const telemetry = await completeRun(runId, {
 					success_rate: succeededLeads / Math.max(1, leadResults.length),
 					verification_passed: passedVerification,
 					total_cost_usd: totalCost,
@@ -3741,7 +3923,7 @@ export default function (pi: ExtensionAPI) {
 					retries,
 					models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
 					log_dir: session.dir,
-				}, session.terminalTiming());
+				}, session.terminalTiming(), session.telemetryBaseline);
 
 				// The lead's final report is the only place its reasoning, open
 				// questions, and non-file results (audits, package lists, verdicts)
@@ -3760,7 +3942,7 @@ export default function (pi: ExtensionAPI) {
 					});
 				if (leadReports.length > 0) {
 					try {
-						writeFileSync(session.file("lead-report.md"), leadReports.join("\n\n---\n\n"));
+						session.writeDiagnostic("lead-report.md", leadReports.join("\n\n---\n\n"));
 					} catch {
 						/* best-effort */
 					}
@@ -3801,20 +3983,21 @@ export default function (pi: ExtensionAPI) {
 								}`,
 							]),
 					...(reportLines.length > 0
-						? ["", showFullReport ? "lead report:" : "open items from lead:", ...reportLines, ...(reportTruncated ? [`… full report: ${session.file("lead-report.md")}`] : [])]
+						? ["", showFullReport ? "lead report:" : "open items from lead:", ...reportLines, ...(reportTruncated ? [`… full report: ${describeRunArtifact(session.file("lead-report.md"))}`] : [])]
 						: leadReports.length > 0
-							? [`lead report: ${session.file("lead-report.md")}`]
+							? [`lead report: ${describeRunArtifact(session.file("lead-report.md"))}`]
 							: []),
-					`run log: ${session.file("run.log")}`,
+					`run log: ${describeRunArtifact(session.file("run.log"))}`,
 					`ledger: ${STATE_ROOT}/metrics.jsonl`,
+					...telemetryWarning(telemetry),
 				];
 				session.log(summary.join("\n"));
-				ctx.ui.notify(summary.join("\n"), passedVerification || (dispatchOk && verificationSkipped) ? "info" : "warning");
+				ctx.ui.notify(summary.join("\n"), (passedVerification || (dispatchOk && verificationSkipped)) && telemetryHealthy(telemetry) ? "info" : "warning");
 			} catch (err) {
 				if (session.cancellation.isCancelled) {
 					const stopped = session.cancelledDispatches();
 					session.log(`run cancelled by user; stopped dispatches: ${stopped.join(", ") || "none active"}`);
-					await failRun(runId, "cancelled by user (Esc or Ctrl+C)", session.terminalTiming());
+					warnTelemetry(ctx, await failRun(runId, "cancelled by user (Esc or Ctrl+C)", session.terminalTiming(), session.telemetryBaseline));
 					ctx.ui.notify(
 						`Orchestration cancelled. ${stopped.length ? `Stopped: ${stopped.join(", ")}. ` : "No child dispatch was active. "}Progress is retained above the editor; run log: ${session.file("run.log")}`,
 						"info",
@@ -3824,17 +4007,22 @@ export default function (pi: ExtensionAPI) {
 					// row) and the UI stuck on the last notify. Record + surface it.
 					const message = (err as Error).stack ?? String(err);
 					session.log(`run crashed: ${message}`);
-					await failRun(runId, `crashed: ${(err as Error).message}`, session.terminalTiming());
+					warnTelemetry(ctx, await failRun(runId, `crashed: ${(err as Error).message}`, session.terminalTiming(), session.telemetryBaseline));
 					ctx.ui.notify(
 						`Orchestration crashed: ${(err as Error).message}\nSee ${session.file("run.log")}`,
 						"error",
 					);
 				}
 			} finally {
-				session.close(session.cancellation.isCancelled);
-				ACTIVE_RUN = null;
-				closeTui?.();
-				if (tuiCompletion) await tuiCompletion.catch(() => {});
+				try {
+					session.close(session.cancellation.isCancelled);
+					await session.sealDiagnostics();
+				} finally {
+					ACTIVE_RUN = null;
+					session.finish();
+					closeTui?.();
+					if (tuiCompletion) await tuiCompletion.catch(() => {});
+				}
 			}
 		},
 	});
