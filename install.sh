@@ -118,6 +118,7 @@ render_launchd_plist() {
   <key>EnvironmentVariables</key><dict>
     <key>PYTHONPATH</key><string>$SKILL_ROOT</string>
     <key>CODING_AGENT_ORCHESTRATOR_HOME</key><string>$STATE_ROOT</string>
+    <key>HUMAIN_ORCHESTRATOR_INGEST_INTERVAL</key><string>$LAUNCHD_INTERVAL</string>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <key>WorkingDirectory</key><string>$SKILL_ROOT</string>

@@ -124,6 +124,13 @@ const PYTHON = process.env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3";
  * older `orchestrator-adapter.json` is migrated into profile "default" on first
  * load and then ignored.
  */
+// Match absolute paths under common user homes so the bounded Status Contract
+// `error` field never leaks filesystem locations. Mirrors the redaction the
+// Python CLI applies when writing `ingest_status.json`.
+const PATH_RE = /(\/Users\/[^\s|]+|\/home\/[^\s|]+|~\/[^\s|]+)/g;
+function redactPaths(text: string): string {
+	return text.replace(PATH_RE, "<path>");
+}
 const PROFILES_PATH =
 	process.env.HUMAIN_ORCHESTRATOR_PROFILES_FILE ??
 	join(homedir(), ".humain-terminal", "agent", "orchestrator-profiles.json");
@@ -1853,18 +1860,22 @@ function runCli(args: string[], stdin?: string): Promise<CliResult> {
 /**
  * Run a Python module under the orchestrator's SKILL_ROOT. We set
  * CODING_AGENT_RUNTIME so the dispatched metrics land under
- * `agent_runtime: "humain-terminal"` and PYTHONPATH so the `orchestrator`
- * package is importable.
+ * `agent_runtime: "humain-terminal"`, PYTHONPATH so the `orchestrator`
+ * package is importable, and CODING_AGENT_ORCHESTRATOR_HOME so Python
+ * ingestion and the TypeScript hook reporting layer write to the same state
+ * root even when HUMAIN_ORCHESTRATOR_STATE_ROOT is customized.
  */
-function runModule(module: string, args: string[] = []): Promise<CliResult> {
+export function runModule(module: string, args: string[] = []): Promise<CliResult> {
 	return new Promise((resolve) => {
 		const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
+		const expandedStateRoot = STATE_ROOT.replace(/^~/, homedir());
 		const child = spawn(PYTHON, ["-m", module, ...args], {
 			env: {
 				...process.env,
 				CODING_AGENT_RUNTIME: "humain-terminal",
 				CODING_AGENT_REPOSITORY: process.env.CODING_AGENT_REPOSITORY ?? process.cwd(),
 				PYTHONPATH: expandedSkillRoot,
+				CODING_AGENT_ORCHESTRATOR_HOME: expandedStateRoot,
 			},
 			stdio: ["pipe", "pipe", "pipe"],
 		});
@@ -2259,10 +2270,14 @@ export function gitDirtySnapshot(cwd: string): Map<string, string> | null {
 	for (let i = 0; i < entries.length; i++) {
 		const entry = entries[i];
 		if (entry.length < 4) continue;
-		// "XY path"; renames/copies emit the destination here and the source as
-		// the next NUL-terminated record, which we skip.
+		// "XY path"; renames emit destination and source as adjacent records.
+		// Keep the source as a deleted baseline path: committing a rename that
+		// was already staged before the run must not count as new work.
 		paths.push(entry.slice(3));
-		if (entry[0] === "R" || entry[0] === "C" || entry[1] === "R" || entry[1] === "C") i++;
+		if (entry[0] === "R" || entry[1] === "R") {
+			const source = entries[++i];
+			if (source) paths.push(source);
+		} else if (entry[0] === "C" || entry[1] === "C") i++;
 	}
 	const out = new Map<string, string>();
 	const present: string[] = [];
@@ -2319,6 +2334,85 @@ export function diffDirtySnapshots(
 	const changedSet = new Set(changed);
 	const phantom = [...claimedSet].filter((f) => !changedSet.has(f));
 	return { changed, phantom };
+}
+
+/** Starting HEAD for a run; an unborn/non-Git repository has no commit history to compare. */
+export function gitHead(cwd: string): string | null {
+	const result = spawnSync("git", ["rev-parse", "--verify", "HEAD"], {
+		cwd, encoding: "utf-8", timeout: 10_000,
+	});
+	if (result.status === 0 && /^[0-9a-f]{40,64}$/.test(result.stdout.trim())) return result.stdout.trim();
+	// An unborn branch has no HEAD yet, but its first commit must still count.
+	const ref = spawnSync("git", ["symbolic-ref", "--quiet", "HEAD"], { cwd, encoding: "utf-8", timeout: 10_000 });
+	if (ref.status !== 0 || !ref.stdout.trim()) return null;
+	const exists = spawnSync("git", ["show-ref", "--verify", "--quiet", ref.stdout.trim()], { cwd, timeout: 10_000 });
+	if (exists.status !== 1) return null;
+	const empty = spawnSync("git", ["hash-object", "-t", "tree", "--stdin"], {
+		cwd, encoding: "utf-8", input: "", timeout: 10_000,
+	});
+	return empty.status === 0 && /^[0-9a-f]{40,64}$/.test(empty.stdout.trim()) ? empty.stdout.trim() : null;
+}
+
+/** Current worktree content for a path that was already dirty when the run began. */
+function currentFingerprint(root: string, path: string): string | null {
+	let st: ReturnType<typeof lstatSync>;
+	try { st = lstatSync(join(root, path)); } catch { return DELETED_FINGERPRINT; }
+	if (!st.isFile()) return NON_FILE_FINGERPRINT;
+	if (path.includes("\n")) return UNHASHABLE_FINGERPRINT;
+	const hashed = spawnSync("git", ["hash-object", "--stdin-paths"], {
+		cwd: root, encoding: "utf-8", input: `${path}\n`, timeout: 30_000, maxBuffer: GIT_OUTPUT_MAX_BUFFER,
+	});
+	return hashed.status === 0 && /^[0-9a-f]{40,64}$/.test(hashed.stdout.trim()) ? hashed.stdout.trim() : null;
+}
+
+/** Union changes committed during the run with edits that remain dirty at verification time. */
+export function changedFilesSinceRunStart(
+	cwd: string,
+	startHead: string | null,
+	beforeDirty: Map<string, string> | null,
+	claimed: Iterable<string>,
+	afterDirty = gitDirtySnapshot(cwd),
+): { changed: string[]; phantom: string[]; historyUnavailable?: boolean } {
+	const claimedSet = new Set(claimed);
+	const dirty = diffDirtySnapshots(beforeDirty, afterDirty, claimedSet);
+	const changed = new Set(dirty.changed);
+	if (!startHead && beforeDirty && afterDirty) {
+		return { changed: [...new Set([...changed, ...claimedSet])], phantom: [], historyUnavailable: true };
+	}
+	if (startHead) {
+		const history = spawnSync("git", ["diff", "--name-only", "--no-renames", "-z", startHead, "HEAD"], {
+			cwd, encoding: "utf-8", timeout: 30_000, maxBuffer: GIT_OUTPUT_MAX_BUFFER,
+		});
+		if (history.status !== 0) {
+			// History was rewritten or Git failed: use the reported paths rather than
+			// falsely treating an implementation run as report-only.
+			return { changed: [...new Set([...changed, ...claimedSet])], phantom: [], historyUnavailable: true };
+		}
+		const paths = history.stdout.split("\0").filter(Boolean);
+		if (beforeDirty && paths.some((path) => beforeDirty.has(path))) {
+			const top = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf-8", timeout: 10_000 });
+			if (top.status !== 0 || !top.stdout.trim()) {
+				return { changed: [...new Set([...changed, ...claimedSet])], phantom: [], historyUnavailable: true };
+			}
+			for (const path of paths) {
+				const original = beforeDirty.get(path);
+				if (original !== undefined) {
+					const current = currentFingerprint(top.stdout.trim(), path);
+					if (current === null) {
+						return { changed: [...new Set([...changed, ...claimedSet])], phantom: [], historyUnavailable: true };
+					}
+					if (original === current) continue;
+				}
+				changed.add(path);
+			}
+		} else {
+			for (const path of paths) changed.add(path);
+		}
+	}
+	return {
+		changed: [...changed],
+		phantom: [...claimedSet].filter((path) => !changed.has(path)),
+	};
 }
 
 function parseFilesChanged(text: string): string[] {
@@ -3128,8 +3222,78 @@ const MODELS_USAGE = [
  * whose rows are deltas against what is already recorded, so it is safe to run
  * as often as we like and alongside the launchd sweep (install.sh).
  */
+export function recordHookFailure(stateRoot: string, detail: string): void {
+	const root = stateRoot.replace(/^~/, homedir());
+	const statusPath = join(root, "ingest_status.json");
+	const temporaryPath = `${statusPath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+	try {
+		let previous: Record<string, unknown> = {};
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(statusPath, "utf-8"));
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				previous = parsed as Record<string, unknown>;
+			}
+		} catch {
+			// A missing or malformed prior status must not prevent reporting failure.
+		}
+		const safeDetail = redactPaths(String(detail))
+			.replace(/[\u0000-\u001f\u007f]+/g, " ")
+			.trim()
+			.slice(0, 240);
+		const emptyExitDetail = /exit \d+:\s*(.*)$/.exec(safeDetail);
+		const previousError = typeof previous.error === "string"
+			? redactPaths(previous.error)
+					.replace(/[\u0000-\u001f\u007f]+/g, " ")
+					.trim()
+					.slice(0, 240)
+			: "";
+		const error = emptyExitDetail && !emptyExitDetail[1].trim()
+			? previousError || safeDetail || "session ingest failed"
+			: safeDetail || previousError || "session ingest failed";
+		const failureCount = previous.failure_count;
+		const status = {
+			...previous,
+			version: 1,
+			last_attempt_at: new Date().toISOString(),
+			last_success_at: previous.last_success_at ?? null,
+			status: "error",
+			files_scanned: typeof previous.files_scanned === "number" ? previous.files_scanned : 1,
+			emitted: typeof previous.emitted === "number" ? previous.emitted : 0,
+			failure_count: typeof failureCount === "number" && Number.isFinite(failureCount) ? failureCount + 1 : 1,
+			error,
+			sweep_interval_seconds:
+				typeof previous.sweep_interval_seconds === "number" ? previous.sweep_interval_seconds : 900,
+		};
+		mkdirSync(root, { recursive: true });
+		writeFileSync(temporaryPath, `${JSON.stringify(status, null, 2)}\n`, { mode: 0o600 });
+		renameSync(temporaryPath, statusPath);
+	} catch {
+		// Status reporting is best-effort and must never interrupt a terminal session.
+	} finally {
+		try {
+			rmSync(temporaryPath, { force: true });
+		} catch {
+			// Ignore temporary-file cleanup failures.
+		}
+	}
+}
+
+/** Register only the settled fast path and awaited shutdown flush. */
+export function registerSessionIngestHooks(
+	host: Pick<ExtensionAPI, "on">,
+	scheduler: Pick<SessionIngestScheduler, "schedule" | "flush">,
+): void {
+	host.on("agent_settled", async (_event, ctx) => {
+		scheduler.schedule(ctx.sessionManager.getSessionFile());
+	});
+	host.on("session_shutdown", async (_event, ctx) => {
+		await scheduler.flush(ctx.sessionManager.getSessionFile());
+	});
+}
+
 function installSessionIngest(pi: ExtensionAPI): void {
-	const logPath = join(STATE_ROOT.replace(/^~/, homedir()), "ingest-hook.log");
+	const stateRoot = STATE_ROOT.replace(/^~/, homedir());
+	const logPath = join(stateRoot, "ingest-hook.log");
 	const logError = (message: string) => {
 		try {
 			mkdirSync(dirname(logPath), { recursive: true });
@@ -3139,19 +3303,17 @@ function installSessionIngest(pi: ExtensionAPI): void {
 		}
 	};
 	const scheduler = new SessionIngestScheduler({
-		onError: logError,
+		onError: (message) => {
+			logError(message);
+			recordHookFailure(stateRoot, message);
+		},
 		run: async (sessionFile) => {
 			const res = await runModule("orchestrator.cli", ingestArgs(sessionFile));
 			if (res.exitCode === 0) return { ok: true };
 			return { ok: false, detail: `exit ${res.exitCode}: ${res.stderr.trim().split("\n").slice(-3).join(" | ")}` };
 		},
 	});
-	pi.on("agent_settled", async (_event, ctx) => {
-		scheduler.schedule(ctx.sessionManager.getSessionFile());
-	});
-	pi.on("session_shutdown", async (_event, ctx) => {
-		await scheduler.flush(ctx.sessionManager.getSessionFile());
-	});
+	registerSessionIngestHooks(pi, scheduler);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -3368,6 +3530,7 @@ export default function (pi: ExtensionAPI) {
 				});
 
 				const dirtyBefore = gitDirtySnapshot(cwd);
+				const headBefore = gitHead(cwd);
 				const { leadResults, architectResult, escalationResults } = await dispatchHierarchical(
 					cwd,
 					runId,
@@ -3393,10 +3556,9 @@ export default function (pi: ExtensionAPI) {
 				// is bounded by maxRetries.
 				// `filesChanged` is scraped from dispatch prose, so a report that merely
 				// MENTIONS README.md counted it as changed and sent QA after a phantom.
-				// When the workspace is a git repo, trust the working tree instead: a file
-				// is "changed" only if it is dirty now and its content differs from the
-				// pre-run snapshot (or it was clean then). Pre-existing untracked scratch
-				// files a report happens to name are therefore not sent to QA. Every
+				// In a Git workspace, include both commits made since the run began and
+				// dirty files whose content differs from the pre-run snapshot. Pre-existing
+				// untracked scratch files a report merely names are not sent to QA. Every
 				// round diffs against the same pre-run snapshot so the list is the
 				// cumulative set QA must cover. `roundResults` are the dispatches that
 				// just ran (used for the phantom log); `priorResults` widen the prose
@@ -3416,7 +3578,8 @@ export default function (pi: ExtensionAPI) {
 							`git snapshot unavailable (${!dirtyBefore ? "before" : "after"} ${label}); falling back to file paths scraped from dispatch prose`,
 						);
 					}
-					const { changed, phantom } = diffDirtySnapshots(dirtyBefore, dirtyAfter, claimed);
+					const { changed, phantom, historyUnavailable } = changedFilesSinceRunStart(cwd, headBefore, dirtyBefore, claimed, dirtyAfter);
+					if (historyUnavailable) session.log(`${label}: git history unavailable; using claimed file paths`);
 					const roundPhantom = phantom.filter((f) => roundClaimed.has(f));
 					if (roundPhantom.length > 0) {
 						session.log(

@@ -24,7 +24,9 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from datetime import datetime, timezone
+import os
 from pathlib import Path
+import secrets
 from typing import Any
 
 from . import records
@@ -261,11 +263,82 @@ def _verification_task_ids(orchestrated: list[dict], outcomes: list[dict]) -> tu
     return attested, dispatch
 
 
+def build_ingest_status(raw: Any, *, now: datetime) -> dict[str, Any]:
+    """Validate persisted ingest health and derive staleness without trusting its contents."""
+    unknown = {
+        'status': 'unknown', 'last_attempt_at': None, 'last_success_at': None,
+        'emitted': 0, 'failure_count': 0, 'error': None, 'stale_after_seconds': 1800,
+    }
+    if not isinstance(raw, dict):
+        return unknown
+
+    interval = raw.get('sweep_interval_seconds', 900)
+    if isinstance(interval, bool):
+        interval = 900
+    try:
+        interval = int(interval)
+        if interval <= 0:
+            interval = 900
+    except (TypeError, ValueError, OverflowError):
+        interval = 900
+    stale_after = interval * 2
+
+    def parse_timestamp(value: Any) -> datetime | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    attempt_raw = raw.get('last_attempt_at')
+    success_raw = raw.get('last_success_at')
+    attempt = parse_timestamp(attempt_raw)
+    success = parse_timestamp(success_raw) if success_raw is not None else None
+    reported_status = raw.get('status')
+    if (not isinstance(reported_status, str) or reported_status not in {'ok', 'partial', 'error'}
+            or attempt is None or (success_raw is not None and success is None)
+            or (reported_status == 'ok' and success is None)):
+        return {**unknown, 'stale_after_seconds': stale_after}
+
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now_utc = now.astimezone(timezone.utc)
+    status = reported_status
+    # Future success timestamps represent clock skew, not an old successful check.
+    if reported_status == 'ok' and success is not None and (now_utc - success).total_seconds() > stale_after:
+        status = 'stale'
+
+    def safe_count(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    error = raw.get('error')
+    return {
+        'status': status,
+        'last_attempt_at': attempt_raw,
+        'last_success_at': success_raw,
+        'emitted': safe_count(raw.get('emitted')),
+        'failure_count': safe_count(raw.get('failure_count')),
+        'error': error[:500] if isinstance(error, str) else None,
+        'stale_after_seconds': stale_after,
+    }
+
+
 def build_data(root: Path, config: dict | None = None):
     config = config or read_json(Path(__file__).with_name('config.json'), {})
     metrics = load_jsonl(root / 'metrics.jsonl')
     events = load_jsonl(root / 'events.jsonl')
     outcomes = load_jsonl(root / 'outcomes.jsonl')
+    ingest_status = build_ingest_status(read_json(root / 'ingest_status.json', {}),
+                                        now=datetime.now(timezone.utc))
     ingested = [r for r in metrics if is_session_ingest(r)]
     orchestrated = [r for r in metrics if not is_session_ingest(r)]
     total = sum(row_cost(r) for r in orchestrated)
@@ -500,6 +573,7 @@ def build_data(root: Path, config: dict | None = None):
             # consistency with the rest of this function's inputs.
             'flaky': flaky_stats(orchestrated),
             'interactive_sessions': interactive_sessions,
+            'ingest_status': ingest_status,
             'features': feature_inventory(config.get('features', {})), 'adaptive': adaptive[-500:],
             'events': events[-500:], 'metrics': metrics[-2000:]}
 
@@ -509,10 +583,10 @@ def generate_dashboard(state_dir=None, config: dict | None = None):
     root.mkdir(parents=True, exist_ok=True)
     data = build_data(root, config)
     # Auto-refresh so a file:// tab left open does not look frozen between orchestrator dispatches.
-    doc='''<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="30"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orchestrator V3 Dashboard</title><style>
+    doc='''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orchestrator V3 Dashboard</title><style>
 :root{color-scheme:light dark;--bg:#0e1116;--p:#171b22;--b:#2a313c;--t:#edf2f7;--m:#929bab;--a:#7aa7ff;--g:#61c98c;--w:#e9b65e;--r:#e16e6e}@media(prefers-color-scheme:light){:root{--bg:#f6f7f9;--p:#fff;--b:#e2e6ec;--t:#111827;--m:#667085}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1320px;margin:auto;padding:22px}h1{margin:0;font-size:25px}.sub{color:var(--m);margin:4px 0 18px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.card{background:var(--p);border:1px solid var(--b);border-radius:12px;padding:13px;min-width:0}.k{font-size:12px;color:var(--m)}.v{font-size:22px;font-weight:720;margin-top:3px}.section{margin-top:16px}.section h2{font-size:16px;margin:0 0 10px}table{width:100%;border-collapse:collapse}th,td{padding:7px 8px;border-bottom:1px solid var(--b);text-align:left;white-space:nowrap}th{font-size:12px;color:var(--m)}.scroll{overflow:auto}.bar{height:8px;background:var(--b);border-radius:99px;overflow:hidden}.bar i{display:block;height:100%;background:var(--a)}.small{font-size:12px;color:var(--m)}.risk{display:grid;grid-template-columns:1fr 150px;gap:8px;padding:7px 0;border-bottom:1px solid var(--b)}.risk b{text-align:right}.timeline{max-height:320px;overflow:auto}.event{padding:7px 0;border-bottom:1px solid var(--b)}.pill{display:inline-block;padding:2px 7px;border:1px solid var(--b);border-radius:999px;font-size:12px}.on{color:var(--g)}.off{color:var(--m)}.warn{color:var(--w)}@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-</style></head><body><main><h1>Hierarchical Orchestrator V3</h1><div class="sub">Adaptive routing, empirical economics, feature state, delayed outcomes, and risk observability. Counterfactuals remain estimates. Spend is split by provenance: provider-reported, estimated from reported tokens, or unmetered — unmetered work is never shown as $0. A missing measurement renders as — or <span class="pill off">not instrumented</span>, never as a zero.</div><div class="sub" id="freshness"></div><div id="cards" class="grid"></div><div class="sub" id="statsNote"></div>
+</style></head><body><main><h1>Hierarchical Orchestrator V3</h1><div class="sub">Adaptive routing, empirical economics, feature state, delayed outcomes, and risk observability. Counterfactuals remain estimates. Spend is split by provenance: provider-reported, estimated from reported tokens, or unmetered — unmetered work is never shown as $0. A missing measurement renders as — or <span class="pill off">not instrumented</span>, never as a zero.</div><div class="sub" id="freshness"></div><button id="pause-refresh" type="button" aria-pressed="false">Pause auto-refresh</button><div id="cards" class="grid"></div><div class="sub" id="statsNote"></div>
 <div class="section grid" style="grid-template-columns:1.1fr .9fr"><div class="card"><h2>Adaptive routing health</h2><div id="adaptiveHealth"></div></div><div class="card"><h2>Risk observatory</h2><div id="risk"></div></div></div>
 <div class="section card" id="rate-provenance"><h2>Cost rate provenance (estimated spend only)</h2><div id="rates"></div></div>
 <div class="section card"><h2>V3 feature controls</h2><div class="scroll"><table id="features"></table></div></div>
@@ -522,6 +596,7 @@ def generate_dashboard(state_dir=None, config: dict | None = None):
 <div class="section card"><h2>Historical route economics</h2><div class="scroll"><table id="routes"></table></div></div>
 <div class="section card"><h2>Cost by role</h2><div id="roles"></div></div>
 <div class="section card"><h2>Cost by agent runtime</h2><div id="runtimes"></div></div>
+<div class="section card"><h2>Session ingest health</h2><div id="ingest-status"></div></div>
 <div class="section card"><h2>Interactive sessions (ingested, not orchestrated)</h2><div id="interactive"></div></div>
 <div class="section card"><h2>Recent events</h2><div class="timeline" id="events"></div></div>
 <script>const D='''+safe(data)+''';const $=s=>document.querySelector(s);const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -535,7 +610,9 @@ const money=x=>'$'+x.toFixed(4);const pct=x=>(x*100).toFixed(1)+'%';const count=
 const m$=(k,x)=>fmt(k,x,money);const p$=(k,x)=>fmt(k,x,pct);const n$=(k,x)=>fmt(k,x,count);
 // Counts that are genuinely zero when absent (event tallies within a rendered row) stay numeric.
 const n0=x=>Number(x||0);const nz=x=>n0(x).toLocaleString();
-const fmtTs=x=>x?String(x).replace('T',' ').slice(0,19)+' UTC':'—';$('#freshness').textContent=`Rebuilt ${fmtTs(D.generated_at)} · latest event ${fmtTs(D.last_event_ts)} · latest metric ${fmtTs(D.last_metric_ts)} · ${nz(D.event_count)} events, ${nz(D.metric_count)} metric records · page auto-reloads every 30s`;
+const fmtTs=x=>x?String(x).replace('T',' ').slice(0,19)+' UTC':'—';$('#freshness').textContent=`Rebuilt ${fmtTs(D.generated_at)} · latest event ${fmtTs(D.last_event_ts)} · latest metric ${fmtTs(D.last_metric_ts)} · ${nz(D.event_count)} events, ${nz(D.metric_count)} metric records · page auto-reloads every 5s while visible unless paused`;
+const I=D.ingest_status||{status:'unknown',last_attempt_at:null,last_success_at:null,emitted:0,failure_count:0,error:null,stale_after_seconds:1800};
+$('#ingest-status').innerHTML=`<div class="risk"><span>State</span><b>${esc(I.status)}</b></div><div class="risk"><span>Last attempt</span><b>${esc(fmtTs(I.last_attempt_at))}</b></div><div class="risk"><span>Last success</span><b>${esc(fmtTs(I.last_success_at))}</b></div><div class="risk"><span>Rows emitted</span><b>${nz(I.emitted)}</b></div><div class="risk"><span>Failures</span><b>${nz(I.failure_count)}</b></div><div class="risk"><span>Stale after</span><b>${nz(I.stale_after_seconds)}s</b></div>${I.error?`<div class="small warn">${esc(I.error)}</div>`:(I.status==='unknown'?'<div class="small">not reported</div>':'')}`;
 const S=D.summary;const X=S.executed_spend||{};const RP=S.rate_provenance||{};
 // `verified_cost` and `dispatch_pass_cost` share the SAME numerator (`total_cost` — all
 // orchestrated spend, including coordination, review, waste, and tasks that were neither verified
@@ -558,7 +635,18 @@ $('#routes').innerHTML='<thead><tr><th>Task</th><th>Complexity</th><th>Risk</th>
 const R=Object.entries(D.by_role).sort((a,b)=>b[1].cost-a[1].cost),maxR=Math.max(.000001,...R.map(x=>x[1].cost));$('#roles').innerHTML=`<div class="small">Rows are records, not calls: session-aggregate rows each cover many calls, so per-row magnitudes are not per-call magnitudes.</div>`+R.map(([k,v])=>`<div style="display:grid;grid-template-columns:190px 1fr 90px;gap:10px;align-items:center;margin:9px 0"><div><b>${esc(k)}</b><div class="small">${nz(v.rows)} rows · ${nz(v.call_rows)} cost-accountable · ${nz(v.session_rows)} session aggregates${v.covered_calls>v.call_rows?' covering '+nz(v.covered_calls)+' stated calls':''} · ${nz(v.tokens)} tokens</div></div><div class="bar"><i style="width:${(v.cost/maxR*100).toFixed(1)}%"></i></div><div style="text-align:right">${m$('cost',v.cost)}</div></div>`).join('');
 const A=Object.entries(D.by_runtime).sort((a,b)=>b[1].cost-a[1].cost),maxA=Math.max(.000001,...A.map(x=>x[1].cost));$('#runtimes').innerHTML=`<div class="small">Metered + unmetered always reconciles against <em>cost-accountable rows</em>, not against total rows: orchestration events (routing decisions, dispatches) are rows that are not calls.</div>`+A.map(([k,v])=>{const unmetered=n0(v.unmetered_calls),metered=n0(v.metered_calls);const label=metered?m$('cost',v.cost):(unmetered?'<span class="warn">unmetered</span>':m$('cost',v.cost));const detail=[nz(v.rows)+' rows',nz(v.call_rows)+' cost-accountable ('+nz(metered)+' metered + '+nz(unmetered)+' unmetered)',n0(v.session_rows)?nz(v.session_rows)+' session aggregates'+(n0(v.covered_calls)>n0(v.call_rows)?' covering '+nz(v.covered_calls)+' stated calls':' (calls per aggregate unstated)'):null,n0(v.estimated_cost)>0?'est. '+money(n0(v.estimated_cost)):null,n0(v.reported_cost)>0?'reported '+money(n0(v.reported_cost)):null].filter(Boolean).join(' · ');return `<div style="display:grid;grid-template-columns:190px 1fr 130px;gap:10px;align-items:center;margin:9px 0"><div><b>${esc(k)}</b><div class="small">${detail}</div></div><div class="bar"><i style="width:${(v.cost/maxA*100).toFixed(1)}%"></i></div><div style="text-align:right">${label}</div></div>`}).join('');
 $('#events').innerHTML=D.events.slice().reverse().map(e=>`<div class="event"><span class="small">${esc(e.ts||'')}</span> <b>${esc(e.event||'')}</b><div class="small"><code>${esc(JSON.stringify(e).slice(0,600))}</code></div></div>`).join('');
-const IS=D.interactive_sessions||{rows:0,calls:0,cost:0,tokens:0,by_runtime:{},sessions:null};const isRt=Object.entries(IS.by_runtime||{}).sort((a,b)=>b[1].cost-a[1].cost);$('#interactive').innerHTML=`<div class="small">These rows come from interactive-session ingestion, not orchestrated runs, and are excluded from the role/runtime charts above. ${nz(IS.aggregate_rows)} of ${nz(IS.rows)} rows are session aggregates covering many calls each, so cost per call must be divided by <b>calls</b>, never by <b>rows</b>.</div><div class="risk"><span>Ingested rows</span><b>${n$('interactive_rows',IS.rows)}</b></div><div class="risk"><span>Model calls (rows + covered calls)</span><b>${n$('interactive_calls',IS.calls)}</b></div><div class="risk"><span>Cost</span><b class="warn">${m$('interactive_cost',IS.cost)}</b></div><div class="risk"><span>Tokens</span><b>${n$('interactive_tokens',IS.tokens)}</b></div><div class="risk"><span>Distinct sessions</span><b>${n$('interactive_sessions',IS.sessions)}</b></div>`+(isRt.length?isRt.map(([k,v])=>`<div style="display:grid;grid-template-columns:190px 1fr 90px;gap:10px;align-items:center;margin:9px 0"><div><b>${esc(k)}</b><div class="small">${nz(v.rows)} rows · ${nz(v.calls)} calls</div></div><div class="bar"><i style="width:${(v.cost/Math.max(.000001,IS.cost)*100).toFixed(1)}%"></i></div><div style="text-align:right">${m$('cost',v.cost)}</div></div>`).join(''):'<div class="small">No runtime breakdown available.</div>');</script></main></body></html>'''
+const IS=D.interactive_sessions||{rows:0,calls:0,cost:0,tokens:0,by_runtime:{},sessions:null};const isRt=Object.entries(IS.by_runtime||{}).sort((a,b)=>b[1].cost-a[1].cost);$('#interactive').innerHTML=`<div class="small">These rows come from interactive-session ingestion, not orchestrated runs, and are excluded from the role/runtime charts above. ${nz(IS.aggregate_rows)} of ${nz(IS.rows)} rows are session aggregates covering many calls each, so cost per call must be divided by <b>calls</b>, never by <b>rows</b>.</div><div class="risk"><span>Ingested rows</span><b>${n$('interactive_rows',IS.rows)}</b></div><div class="risk"><span>Model calls (rows + covered calls)</span><b>${n$('interactive_calls',IS.calls)}</b></div><div class="risk"><span>Cost</span><b class="warn">${m$('interactive_cost',IS.cost)}</b></div><div class="risk"><span>Tokens</span><b>${n$('interactive_tokens',IS.tokens)}</b></div><div class="risk"><span>Distinct sessions</span><b>${n$('interactive_sessions',IS.sessions)}</b></div>`+(isRt.length?isRt.map(([k,v])=>`<div style="display:grid;grid-template-columns:190px 1fr 90px;gap:10px;align-items:center;margin:9px 0"><div><b>${esc(k)}</b><div class="small">${nz(v.rows)} rows · ${nz(v.calls)} calls</div></div><div class="bar"><i style="width:${(v.cost/Math.max(.000001,IS.cost)*100).toFixed(1)}%"></i></div><div style="text-align:right">${m$('cost',v.cost)}</div></div>`).join(''):'<div class="small">No runtime breakdown available.</div>');
+const pauseButton=$('#pause-refresh');let paused=false;try{paused=localStorage.getItem('orch-pause')==='1';}catch{}
+const syncPauseLabel=()=>{pauseButton.textContent=paused?'Resume auto-refresh':'Pause auto-refresh';pauseButton.setAttribute('aria-pressed',String(paused));};syncPauseLabel();
+pauseButton.addEventListener('click',()=>{paused=!paused;try{localStorage.setItem('orch-pause',paused?'1':'0');}catch{}syncPauseLabel();});
+try{const savedScroll=sessionStorage.getItem('orch-scroll');if(savedScroll!==null){window.scrollTo(0,Number(savedScroll)||0);sessionStorage.removeItem('orch-scroll');}}catch{}
+setInterval(()=>{if(document.visibilityState!=='visible'||paused)return;try{if(localStorage.getItem('orch-pause')==='1')return;}catch{}try{sessionStorage.setItem('orch-scroll',String(window.scrollY));}catch{}window.location.reload();},5000);
+</script></main></body></html>'''
     out = root / 'dashboard.html'
-    out.write_text(doc, encoding='utf-8')
+    tmp = out.with_name(f'.{out.name}.{secrets.token_hex(8)}.tmp')
+    try:
+        tmp.write_text(doc, encoding='utf-8')
+        os.replace(tmp, out)
+    finally:
+        tmp.unlink(missing_ok=True)
     return out

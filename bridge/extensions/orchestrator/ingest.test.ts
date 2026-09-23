@@ -100,6 +100,126 @@ describe("SessionIngestScheduler", () => {
 		expect(s.busy).toBe(false);
 	});
 
+	test("keeps independent ingest streams for distinct session files", async () => {
+		const timers = fakeTimers();
+		const calls: string[] = [];
+		const s = new SessionIngestScheduler({
+			run: async (file) => (calls.push(file), { ok: true }),
+			...timers,
+		});
+		s.schedule("/s/a.jsonl");
+		s.schedule("/s/b.jsonl");
+		expect(timers.pending).toHaveLength(2);
+		timers.fire();
+		await s.flush(null);
+		expect(calls.sort()).toEqual(["/s/a.jsonl", "/s/b.jsonl"]);
+	});
+
+	test("retries transient failures with exponential waits and reports no final error", async () => {
+		const timers = fakeTimers();
+		let attempts = 0;
+		const errors: string[] = [];
+		const waits: number[] = [];
+		const s = new SessionIngestScheduler({
+			run: async () => (++attempts < 3 ? { ok: false } : { ok: true }),
+			onError: (message) => errors.push(message),
+			waitForRetry: async (ms) => {
+				waits.push(ms);
+			},
+			maxAttempts: 3,
+			retryDelayMs: 250,
+			...timers,
+		});
+
+		await s.flush("/s/a.jsonl");
+		expect(attempts).toBe(3);
+		expect(waits).toEqual([250, 500]);
+		expect(errors).toEqual([]);
+	});
+
+	test("reports exactly one error after the final retry, whether failures throw or return false", async () => {
+		const timers = fakeTimers();
+		const attempts: number[] = [];
+		const errors: string[] = [];
+		const waits: number[] = [];
+		const s = new SessionIngestScheduler({
+			run: async () => {
+				attempts.push(attempts.length + 1);
+				if (attempts.length === 1) throw new Error("temporary exception");
+				return { ok: false, detail: "exit 2" };
+			},
+			onError: (message) => errors.push(message),
+			waitForRetry: async (ms) => {
+				waits.push(ms);
+			},
+			maxAttempts: 3,
+			...timers,
+		});
+
+		await s.flush("/s/a.jsonl");
+		expect(attempts).toHaveLength(3);
+		expect(waits).toEqual([250, 500]);
+		expect(errors).toEqual(["ingest /s/a.jsonl: exit 2"]);
+	});
+
+	test("flush waits for the queued rerun after the in-flight ingest", async () => {
+		const timers = fakeTimers();
+		const first = deferred<{ ok: boolean }>();
+		const second = deferred<{ ok: boolean }>();
+		const secondEntered = deferred<void>();
+		let attempts = 0;
+		let flushDone = false;
+		const s = new SessionIngestScheduler({
+			run: () => {
+				attempts++;
+				if (attempts === 1) return first.promise;
+				secondEntered.resolve();
+				return second.promise;
+			},
+			...timers,
+		});
+		s.schedule("/s/a.jsonl");
+		timers.fire();
+		s.schedule("/s/a.jsonl");
+		const flushing = s.flush("/s/a.jsonl").then(() => { flushDone = true; });
+		first.resolve({ ok: true });
+		await secondEntered.promise;
+		expect(attempts).toBe(2);
+		expect(flushDone).toBe(false);
+		second.resolve({ ok: true });
+		await flushing;
+		expect(flushDone).toBe(true);
+	});
+
+	test("flush in the completion microtask cannot lose a rerun", async () => {
+		const timers = fakeTimers();
+		const first = deferred<{ ok: boolean }>();
+		const second = deferred<{ ok: boolean }>();
+		const secondEntered = deferred<void>();
+		let attempts = 0;
+		let flushDone = false;
+		const s = new SessionIngestScheduler({
+			run: () => {
+				attempts++;
+				if (attempts === 1) return first.promise;
+				secondEntered.resolve();
+				return second.promise;
+			},
+			...timers,
+		});
+		const initialFlush = s.flush("/s/a.jsonl");
+		const sameTickFlush = first.promise.then(() => undefined)
+			.then(() => s.flush("/s/a.jsonl"))
+			.then(() => { flushDone = true; });
+		first.resolve({ ok: true });
+		await secondEntered.promise;
+		expect(attempts).toBe(2);
+		expect(flushDone).toBe(false);
+		second.resolve({ ok: true });
+		await Promise.all([initialFlush, sameTickFlush]);
+		expect(flushDone).toBe(true);
+	});
+
 	test("failures are reported, never thrown", async () => {
 		const timers = fakeTimers();
 		const errors: string[] = [];
@@ -108,6 +228,7 @@ describe("SessionIngestScheduler", () => {
 				throw new Error("python exploded");
 			},
 			onError: (m) => errors.push(m),
+			maxAttempts: 1,
 			...timers,
 		});
 		await s.flush("/s/a.jsonl");
@@ -116,6 +237,7 @@ describe("SessionIngestScheduler", () => {
 		const s2 = new SessionIngestScheduler({
 			run: async () => ({ ok: false, detail: "exit 2" }),
 			onError: (m) => errors.push(m),
+			maxAttempts: 1,
 			...timers,
 		});
 		await s2.flush("/s/b.jsonl");

@@ -1,7 +1,9 @@
 from __future__ import annotations
-import argparse,json
+import argparse,json,os,sys
+import re as _re_path
 from pathlib import Path
-from .runtime import EventStore,QualityEvidence,default_state_root,read_json
+from typing import Any, Callable
+from .runtime import EventStore,QualityEvidence,default_state_root,read_json,utc_now,write_json
 from .state import rebuild,load_or_rebuild
 from .dashboard import generate_dashboard
 from .history import load_stats
@@ -12,9 +14,77 @@ from .engine import OrchestrationEngine
 from .ingest import discover_logs, ingest_paths
 from .dynamic_adapter import resolve_adapter
 
+_PATH_RE = _re_path.compile(r"(/Users/[^ \t\n|]+|/home/[^ \t\n|]+|~/[^ \t\n|]+)")
+def _redact_paths(text):
+    return _PATH_RE.sub("<path>", text)
+
 ROOT=default_state_root()
 def cfg(): return read_json(Path(__file__).with_name('config.json'),{})
-def refresh(): rebuild(ROOT); generate_dashboard(ROOT,config=cfg())
+def refresh(state_root: Path = ROOT) -> Path:
+    root = Path(state_root)
+    rebuild(root)
+    return generate_dashboard(root, config=cfg())
+
+
+def make_ingest_status(previous: dict[str, Any], result: dict[str, Any], *,
+                       materialization_error: Exception | None = None) -> dict[str, Any]:
+    failures = result.get('failures') or []
+    status = 'error' if materialization_error is not None else ('partial' if failures else 'ok')
+    error = _redact_paths(str(materialization_error))[:240] if materialization_error is not None else None
+    if error is None and failures:
+        first_detail = str(failures[0].get('error') or 'ingest failed')
+        error = _redact_paths(f"{len(failures)} file(s) failed; first: {first_detail}")[:240]
+
+    interval = os.environ.get('HUMAIN_ORCHESTRATOR_INGEST_INTERVAL')
+    try:
+        sweep_interval_seconds = int(interval) if interval is not None else None
+        if sweep_interval_seconds is not None and sweep_interval_seconds < 0:
+            sweep_interval_seconds = None
+    except (TypeError, ValueError):
+        sweep_interval_seconds = None
+    if sweep_interval_seconds is None:
+        previous_interval = previous.get('sweep_interval_seconds')
+        if isinstance(previous_interval, int) and not isinstance(previous_interval, bool) and previous_interval >= 0:
+            sweep_interval_seconds = previous_interval
+        else:
+            sweep_interval_seconds = 900
+
+    now = utc_now()
+    return {
+        'version': 1,
+        'last_attempt_at': now,
+        'last_success_at': now if status == 'ok' else previous.get('last_success_at'),
+        'status': status,
+        'files_scanned': int(result.get('files_scanned', 0)),
+        'emitted': int(result.get('emitted', 0)),
+        'failure_count': len(failures) + (1 if materialization_error is not None else 0),
+        'error': error,
+        'sweep_interval_seconds': sweep_interval_seconds,
+    }
+
+
+def process_ingest(paths: list[Path], *, state_root: Path, runtime: str | None,
+                   repository: str | None, dry_run: bool, granularity: str,
+                   on_file: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+    paths = list(paths)
+    root = Path(state_root)
+    result = ingest_paths(paths, runtime=runtime, repository=repository, state_root=root,
+                          dry_run=dry_run, granularity=granularity, on_file=on_file,
+                          summarize_files=len(paths) <= 25)
+    result['files_scanned'] = len(paths)
+    if not dry_run:
+        previous = read_json(root / 'ingest_status.json', {})
+        if not isinstance(previous, dict):
+            previous = {}
+        status = make_ingest_status(previous, result)
+        write_json(root / 'ingest_status.json', status)
+        try:
+            refresh(root)
+        except Exception as error:
+            write_json(root / 'ingest_status.json',
+                       make_ingest_status(previous, result, materialization_error=error))
+            raise
+    return result
 
 def main():
     ap=argparse.ArgumentParser(prog='orchestrator'); sp=ap.add_subparsers(dest='cmd',required=True)
@@ -73,7 +143,6 @@ def main():
                       f'{(info.get("output_cost_per_m") or 0):>8.2f}')
         return
     if args.cmd=='ingest':
-        import os,sys as _sys
         if args.discover or args.since_days is not None:
             paths=discover_logs(since_days=args.since_days,runtimes=[args.runtime] if args.runtime else None,include_scratch=args.include_scratch)
         else:
@@ -84,12 +153,17 @@ def main():
         done=[0]
         def progress(summary):
             done[0]+=1
-            if not args.quiet: print(f"[{done[0]}/{len(paths)}] {summary['runtime']:16} +{summary['emitted']:<5} dup={summary['duplicates']:<4} ${summary['estimated_cost_usd']:.4f}  {Path(summary['file']).name}",file=_sys.stderr,flush=True)
-        result=ingest_paths(paths,runtime=args.runtime,repository=args.repository,state_root=ROOT,dry_run=args.dry_run,
-                            granularity=args.granularity,on_file=progress,summarize_files=len(paths)<=25)
-        result['files_scanned']=len(paths)
+            runtime_label=str(summary.get('runtime') or '?')
+            print(f"[{done[0]}/{len(paths)}] {runtime_label:16} +{summary.get('emitted',0):<5} dup={summary.get('duplicates',0):<4} ${summary.get('estimated_cost_usd',0.0):.4f}  {Path(summary['file']).name}",file=sys.stderr,flush=True)
+        result=process_ingest(paths, state_root=ROOT, runtime=args.runtime,
+                              repository=args.repository, dry_run=args.dry_run,
+                              granularity=args.granularity,
+                              on_file=progress if not args.quiet else None)
         print(json.dumps(result,indent=2))
-        if result['emitted'] and not args.dry_run: refresh()
+        if result.get('failures') and not args.dry_run:
+            first_detail = ' '.join(str(result['failures'][0].get('error') or 'ingest failed').split())
+            print(_redact_paths(f"{len(result['failures'])} file(s) failed; first: {first_detail}")[:240], file=sys.stderr, flush=True)
+            raise SystemExit(1)
         return
     if args.cmd=='quality':
         ev=QualityEvidence(**json.loads(args.payload)); print(json.dumps({'hard_gate_pass':ev.hard_gate_pass(),'quality_evidence_score':ev.evidence_score()},indent=2)); return

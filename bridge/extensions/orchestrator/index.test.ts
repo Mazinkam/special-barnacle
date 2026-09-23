@@ -1,9 +1,10 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { SessionIngestScheduler } from "./ingest.ts";
 
 mock.module("@humain/terminal", () => ({
 	BorderedLoader: class {
@@ -14,12 +15,258 @@ mock.module("@humain/terminal", () => ({
 	renderTaskWithContext: (task: string) => task,
 }));
 
+// Capture env that runModule forwards to spawned children. Existing tests rely
+// on real spawn behavior, so the mock forwards to the real implementation
+// outside of capture mode.
+let captureRunModuleEnv = false;
+const capturedRunModuleEnvs: NodeJS.ProcessEnv[] = [];
+mock.module("node:child_process", () => {
+	const real = require("node:child_process");
+	const fakeSpawn = ((command: any, args: any, options: any) => {
+		if (captureRunModuleEnv) capturedRunModuleEnvs.push(options?.env ?? {});
+		return real.spawn(command, args, options);
+	}) as typeof real.spawn;
+	return { ...real, spawn: fakeSpawn };
+});
+
 const testStateRoot = mkdtempSync(join(tmpdir(), "orch-run-session-test-"));
 process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = testStateRoot;
+process.env.CODING_AGENT_ORCHESTRATOR_HOME = testStateRoot;
 const orchestrator = await import("./index.ts");
 afterAll(() => {
 	rmSync(testStateRoot, { recursive: true, force: true });
 });
+
+describe("session ingest hook wiring", () => {
+	test("both lifecycle hooks use the current session file and the supplied scheduler", async () => {
+		const handlers: Record<string, (...args: any[]) => unknown> = {};
+		const scheduled: string[] = [];
+		const flushed: string[] = [];
+		const scheduler = {
+			schedule: (file: string | undefined) => { if (file) scheduled.push(file); },
+			flush: async (file: string | undefined) => { if (file) flushed.push(file); },
+		};
+		orchestrator.registerSessionIngestHooks!({
+			on: (event: string, handler: (...args: any[]) => unknown) => { handlers[event] = handler; },
+		} as never, scheduler as never);
+
+		const ctxFor = (file: string) => ({ sessionManager: { getSessionFile: () => file } });
+		await handlers.agent_settled({}, ctxFor("/sessions/current-settled.jsonl"));
+		await handlers.session_shutdown({}, ctxFor("/sessions/current-shutdown.jsonl"));
+		expect(scheduled).toEqual(["/sessions/current-settled.jsonl"]);
+		expect(flushed).toEqual(["/sessions/current-shutdown.jsonl"]);
+	});
+
+	test("registered settled hook runs real debounced CLI ingestion and replay refreshes without duplicates", async () => {
+		const sessionRoot = mkdtempSync(join(tmpdir(), "orch-hook-session-"));
+		try {
+			const sessionDir = join(sessionRoot, "sessions", "--Users-test-Projects-app--");
+			mkdirSync(sessionDir, { recursive: true });
+			const sessionFile = join(sessionDir, "turn.jsonl");
+			const marker = "MARKER_DO_NOT_LEAK_7f3a";
+			writeFileSync(sessionFile, [
+				{ type: "session", id: "event-session" },
+				{
+					type: "message", id: "assistant-1", timestamp: "2026-09-23T10:00:00Z",
+					message: {
+						role: "assistant", model: "claude-sonnet-5", content: [{ type: "text", text: marker }],
+						usage: { input: 40, output: 8, totalTokens: 48 },
+					},
+				},
+			].map((row) => JSON.stringify(row)).join("\n") + "\n");
+
+			const handlers: Record<string, (...args: any[]) => unknown> = {};
+			const api = new Proxy({
+				on: (event: string, handler: (...args: any[]) => unknown) => { handlers[event] = handler; },
+			}, {
+				get(target, property: string) {
+					return property in target ? target[property as "on"] : () => {};
+				},
+			});
+			orchestrator.default!(api as never);
+			expect(handlers.agent_settled).toBeFunction();
+			const context = { sessionManager: { getSessionFile: () => sessionFile } };
+			const waitForMaterialization = async (previousAttempt?: string) => {
+				const deadline = Date.now() + 10_000;
+				while (Date.now() < deadline) {
+					try {
+						const status = JSON.parse(readFileSync(join(testStateRoot, "ingest_status.json"), "utf8"));
+						if (status.status === "ok" && status.last_attempt_at !== previousAttempt &&
+							statSync(join(testStateRoot, "dashboard.html")).size > 0) return status;
+					} catch {
+						// Wait for the debounced CLI to create its materialized files.
+					}
+					await new Promise((resolve) => setTimeout(resolve, 100));
+				}
+				throw new Error("settled-session ingest did not materialize within 10 seconds");
+			};
+
+			await handlers.agent_settled({}, context);
+			const firstStatus = await waitForMaterialization();
+			const metricsPath = join(testStateRoot, "metrics.jsonl");
+			const metricRows = readFileSync(metricsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+			expect(metricRows).toHaveLength(1);
+			expect(metricRows[0].covers_calls).toBe(1);
+			expect(firstStatus.emitted).toBe(1);
+			expect(readFileSync(join(testStateRoot, "ledger.json"), "utf8")).toBeTruthy();
+			expect(readFileSync(join(testStateRoot, "dashboard.html"), "utf8")).toContain("Session ingest health");
+
+			const beforeReplayDashboard = statSync(join(testStateRoot, "dashboard.html")).mtimeMs;
+			await handlers.agent_settled({}, context);
+			const replayStatus = await waitForMaterialization(firstStatus.last_attempt_at);
+			const dashboardText = readFileSync(join(testStateRoot, "dashboard.html"), "utf8");
+			expect(replayStatus.emitted).toBe(0);
+			expect(replayStatus.status).toBe("ok");
+			expect(statSync(join(testStateRoot, "dashboard.html")).mtimeMs).toBeGreaterThan(beforeReplayDashboard);
+			expect(readFileSync(metricsPath, "utf8").trim().split("\n")).toHaveLength(1);
+			for (const output of [readFileSync(metricsPath, "utf8"),
+				readFileSync(join(testStateRoot, "ingest_status.json"), "utf8"), dashboardText]) {
+				expect(output).not.toContain(marker);
+			}
+		} finally {
+			rmSync(sessionRoot, { recursive: true, force: true });
+		}
+	}, 25_000);
+
+	test("same-session append during an in-flight run is consumed by the queued rerun", async () => {
+		const root = mkdtempSync(join(tmpdir(), "orch-queued-ingest-test-"));
+		const sessionFile = join(root, "session.jsonl");
+		writeFileSync(sessionFile, "initial\n");
+		let releaseFirst!: () => void;
+		let markFirstStarted!: () => void;
+		let markSecondFinished!: () => void;
+		const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+		const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+		const secondFinished = new Promise<void>((resolve) => { markSecondFinished = resolve; });
+		const snapshots: string[] = [];
+		const scheduler = new SessionIngestScheduler({
+			debounceMs: 0,
+			run: async (file) => {
+				snapshots.push(readFileSync(file, "utf8"));
+				if (snapshots.length === 1) {
+					markFirstStarted();
+					await firstGate;
+				} else {
+					markSecondFinished();
+				}
+				return { ok: true };
+			},
+		});
+		const handlers: Record<string, (...args: any[]) => unknown> = {};
+		orchestrator.registerSessionIngestHooks!({
+			on: (event: string, handler: (...args: any[]) => unknown) => { handlers[event] = handler; },
+		} as never, scheduler);
+		const context = { sessionManager: { getSessionFile: () => sessionFile } };
+		try {
+			await handlers.agent_settled({}, context);
+			await firstStarted;
+			writeFileSync(sessionFile, "initial\nappended-during-ingest\n");
+			await handlers.agent_settled({}, context);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(snapshots).toHaveLength(1);
+			releaseFirst();
+			await secondFinished;
+			await scheduler.flush(null);
+			expect(snapshots).toHaveLength(2);
+			expect(snapshots[0]).toBe("initial\n");
+			expect(snapshots[1]).toContain("appended-during-ingest");
+		} finally {
+			releaseFirst();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("empty CLI failure detail falls back to the previous status error", () => {
+		const root = mkdtempSync(join(tmpdir(), "orch-hook-empty-error-test-"));
+		try {
+			writeFileSync(join(root, "ingest_status.json"), JSON.stringify({
+				version: 1,
+				last_success_at: "2025-12-31T23:00:00Z",
+				status: "partial",
+				error: "previous useful failure detail",
+			}));
+			orchestrator.recordHookFailure!(root, "ingest /session.jsonl: exit 2:   ");
+
+			const status = JSON.parse(readFileSync(join(root, "ingest_status.json"), "utf8"));
+			expect(status.error).toBe("previous useful failure detail");
+			expect(status.last_success_at).toBe("2025-12-31T23:00:00Z");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("final hook failure atomically records bounded status and preserves last success", () => {
+		const root = mkdtempSync(join(tmpdir(), "orch-hook-failure-test-"));
+		try {
+			writeFileSync(join(root, "ingest_status.json"), JSON.stringify({
+				version: 1,
+				last_attempt_at: "2026-01-01T00:00:00Z",
+				last_success_at: "2025-12-31T23:00:00Z",
+				status: "ok",
+				files_scanned: 1,
+				emitted: 2,
+				failure_count: 0,
+				error: null,
+				sweep_interval_seconds: 900,
+			}));
+			orchestrator.recordHookFailure!(root, `failed\n${"x".repeat(2000)}`);
+
+			const status = JSON.parse(readFileSync(join(root, "ingest_status.json"), "utf8"));
+			expect(status.status).toBe("error");
+			expect(status.last_success_at).toBe("2025-12-31T23:00:00Z");
+			expect(status.failure_count).toBe(1);
+			expect(status.error.length).toBeLessThanOrEqual(240);
+			expect(status.error).not.toContain("\n");
+			expect(readdirSync(root).sort()).toEqual(["ingest_status.json"]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("recordHookFailure redacts absolute paths and bounds error to 240 chars", () => {
+		const root = mkdtempSync(join(tmpdir(), "orch-hook-redact-test-"));
+		try {
+			orchestrator.recordHookFailure!(root, "ingest failed at /Users/alice/.local/state/foo/bar.jsonl: " + "x".repeat(2000));
+			const status = JSON.parse(readFileSync(join(root, "ingest_status.json"), "utf8"));
+			expect(status.status).toBe("error");
+			expect(status.error.length).toBeLessThanOrEqual(240);
+			expect(status.error).not.toContain("/Users/alice");
+			expect(status.error).toContain("<path>");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("runModule forwards STATE_ROOT as CODING_AGENT_ORCHESTRATOR_HOME", async () => {
+		const customRoot = mkdtempSync(join(tmpdir(), "orch-runmodule-state-"));
+		const previousState = process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT;
+		process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = customRoot;
+		try {
+			// Re-import the module so STATE_ROOT (read at module load time) reflects
+			// the freshly-set HUMAIN_ORCHESTRATOR_STATE_ROOT. The cache-busting query
+			// string forces a fresh module evaluation under Bun's test runner.
+			const fresh = (await import(`./index.ts?propagate=${Date.now()}-${Math.random()}`)) as typeof orchestrator;
+			expect(fresh.runModule).toBeFunction();
+			// Capture the env that `runModule` forwards to its child via the file-level
+			// captureRunModuleEnv seam; restore the flag in `finally` so the rest of the
+			// suite keeps using real spawns.
+			captureRunModuleEnv = true;
+			capturedRunModuleEnvs.length = 0;
+			try {
+				await fresh.runModule!("noop", []);
+			} finally {
+				captureRunModuleEnv = false;
+			}
+			expect(capturedRunModuleEnvs.length).toBeGreaterThan(0);
+			expect(capturedRunModuleEnvs.at(-1)?.CODING_AGENT_ORCHESTRATOR_HOME).toBe(customRoot);
+		} finally {
+			if (previousState === undefined) delete process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT;
+			else process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = previousState;
+			rmSync(customRoot, { recursive: true, force: true });
+		}
+	});
+});
+
 
 describe("/orchestrate argument parsing", () => {
 	test("runs without confirmation unless interactive mode is explicitly requested", () => {
@@ -817,6 +1064,132 @@ describe("changed-file detection around the lead phase", () => {
 		return dir;
 	}
 
+	test("committed work is reported while untouched pre-existing dirty files stay excluded", () => {
+		const dir = initRepo();
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			writeFileSync(join(dir, "old-scratch.md"), "existing\n");
+			const beforeHead = git("rev-parse", "HEAD").toString().trim();
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			writeFileSync(join(dir, "tracked.ts"), "export const a = 2;\n");
+			git("add", "tracked.ts");
+			git("commit", "-q", "-m", "change tracked file");
+			// This is the reported failure: a committed change has no dirty snapshot entry.
+			expect(orchestrator.gitDirtySnapshot(dir)?.has("tracked.ts")).toBe(false);
+			const result = orchestrator.changedFilesSinceRunStart(dir, beforeHead, beforeDirty, ["tracked.ts", "old-scratch.md"]);
+			expect(result.changed).toEqual(["tracked.ts"]);
+			expect(result.phantom).toEqual(["old-scratch.md"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("committed and new dirty files are both reported without duplicates", () => {
+		const dir = initRepo();
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			const beforeHead = git("rev-parse", "HEAD").toString().trim();
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			writeFileSync(join(dir, "tracked.ts"), "export const a = 2;\n");
+			git("add", "tracked.ts");
+			git("commit", "-q", "-m", "change tracked file");
+			writeFileSync(join(dir, "tracked.ts"), "export const a = 3;\n");
+			writeFileSync(join(dir, "new.ts"), "export {};\n");
+			expect(orchestrator.changedFilesSinceRunStart(dir, beforeHead, beforeDirty, []).changed.sort()).toEqual(["new.ts", "tracked.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("committing untouched pre-existing dirty content does not claim it as new work", () => {
+		const dir = initRepo();
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			writeFileSync(join(dir, "tracked.ts"), "existing dirty content\n");
+			const beforeHead = git("rev-parse", "HEAD").toString().trim();
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			git("add", "tracked.ts");
+			git("commit", "-q", "-m", "commit old dirty file");
+			const result = orchestrator.changedFilesSinceRunStart(dir, beforeHead, beforeDirty, ["tracked.ts"]);
+			expect(result.changed).toEqual([]);
+			expect(result.phantom).toEqual(["tracked.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("committing an untouched pre-existing staged rename does not claim either path", () => {
+		const dir = initRepo();
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			git("mv", "tracked.ts", "renamed.ts");
+			const beforeHead = git("rev-parse", "HEAD").toString().trim();
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			git("commit", "-q", "-m", "commit old rename");
+			const result = orchestrator.changedFilesSinceRunStart(dir, beforeHead, beforeDirty, ["tracked.ts", "renamed.ts"]);
+			expect(result.changed).toEqual([]);
+			expect(result.phantom).toEqual(["tracked.ts", "renamed.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("an unborn repository reports files committed in its first commit", () => {
+		const dir = mkdtempSync(join(tmpdir(), "orch-unborn-run-"));
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			git("init", "-q");
+			git("config", "user.email", "t@example.com");
+			git("config", "user.name", "t");
+			git("config", "commit.gpgsign", "false");
+			const beforeHead = orchestrator.gitHead(dir);
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			writeFileSync(join(dir, "new.ts"), "export {};\n");
+			git("add", "new.ts");
+			git("commit", "-q", "-m", "first commit");
+			expect(orchestrator.changedFilesSinceRunStart(dir, beforeHead, beforeDirty, []).changed).toEqual(["new.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("missing start HEAD falls back to claimed files rather than a report-only verdict", () => {
+		const dir = initRepo();
+		try {
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			expect(orchestrator.changedFilesSinceRunStart(dir, null, beforeDirty, ["tracked.ts"]).changed).toEqual(["tracked.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("committed files remain visible if the pre-run dirty snapshot is unavailable", () => {
+		const dir = initRepo();
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			const beforeHead = git("rev-parse", "HEAD").toString().trim();
+			writeFileSync(join(dir, "tracked.ts"), "export const a = 2;\n");
+			git("add", "tracked.ts");
+			git("commit", "-q", "-m", "change tracked file");
+			expect(orchestrator.changedFilesSinceRunStart(dir, beforeHead, null, []).changed).toEqual(["tracked.ts"]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a failed history comparison cannot silently mark reported work as report-only", () => {
+		const dir = initRepo();
+		try {
+			const beforeDirty = orchestrator.gitDirtySnapshot(dir);
+			// A missing commit can occur after a branch rewrite while leads execute.
+			const result = orchestrator.changedFilesSinceRunStart(dir, "f".repeat(40), beforeDirty, ["tracked.ts"]);
+			expect(result.changed).toEqual(["tracked.ts"]);
+			expect(result.phantom).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("pre-existing untracked scratch file named in lead prose is a phantom, not a change", () => {
 		const dir = initRepo();
 		try {
@@ -893,7 +1266,7 @@ describe("changed-file detection around the lead phase", () => {
 			expect(snap).not.toBeNull();
 			expect(snap?.get("inner/")).toBe("<non-file>");
 			expect(snap?.get("renamed.ts")).toMatch(/^[0-9a-f]{40,64}$/);
-			expect(snap?.has("tracked.ts")).toBe(false);
+			expect(snap?.has("tracked.ts")).toBe(true);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

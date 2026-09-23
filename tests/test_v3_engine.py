@@ -31,7 +31,13 @@ class V3EngineTests(unittest.TestCase):
             self.assertIn('Hierarchical Orchestrator V3',html)
             # Freshness must be visible: a generated-at stamp plus the latest event time,
             # and the page must self-reload so a file:// tab does not look frozen.
-            self.assertIn('<meta http-equiv="refresh"',html)
+            self.assertNotIn('<meta http-equiv="refresh"',html)
+            self.assertIn('5000',html)
+            self.assertIn('orch-pause',html)
+            self.assertIn('document.visibilityState',html)
+            self.assertIn("sessionStorage.setItem('orch-scroll'",html)
+            self.assertIn("sessionStorage.removeItem('orch-scroll')",html)
+            self.assertIn('window.scrollTo',html)
             self.assertIn('"generated_at"',html)
             self.assertIn('"last_event_ts"',html)
             self.assertIn('id="freshness"',html)
