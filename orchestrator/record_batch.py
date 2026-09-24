@@ -12,11 +12,14 @@ Legacy JSON checkpoints v1-v4 are discarded, never migrated as trusted data.
 A complete JSON object missing only its newline is recognized before dedup and
 terminated before acknowledgement; malformed fragments are left untouched until
 an append to that stream needs a separator. The ledger catches up to the complete
-event prefix even on an unrelated or duplicate-only batch. Dashboard rendering
-remains outside the writer lock. Public CLI/result/record formats are unchanged.
+event prefix even on an unrelated or duplicate-only batch. `settle_streams` runs
+the same durability step without records, for a reader (session ingestion) that
+must not trust un-fsynced bytes an interrupted append left behind. Dashboard
+rendering remains outside the writer lock. Public CLI/result/record formats are unchanged.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 import sqlite3
@@ -148,15 +151,78 @@ def _append_stream(path: Path, lines: list[bytes], *, prefix: int, tail: str | N
         os.close(fd)
 
 
-def write_batch(root: str | Path | None, records: Any, *, config: dict | None = None, refresh: bool = True) -> dict[str, Any]:
-    """Durably append once per ID; report derived-state failure with same-ID retry guidance."""
+def _sync_pending(root: Path, index: RecordIndex, persisted: dict[str, int], pending: dict[str, list[bytes]],
+                  duplicates: dict[str, int]) -> list[str]:
+    """Append `pending` lines and settle every stream whose complete prefix is not yet known durable.
+
+    A stream needs a sync when it gets new lines, when a duplicate-only retry may be re-acknowledging
+    bytes whose fsync failed, when bytes appeared since the last commit (`size != durable_size`) or
+    when a complete object still lacks its newline. Returns the streams that were touched.
+    """
+    touched: list[str] = []
+    for stream, lines in pending.items():
+        entry = index[stream]; path = root / STREAMS[stream]
+        needs_sync = bool(lines) or duplicates[stream] or entry['size'] != entry['durable_size'] or entry['tail'] == 'complete'
+        if not needs_sync:
+            continue
+        try:
+            entry['size'] = _append_stream(path, lines, prefix=entry['size'], tail=entry['tail'])
+        except OSError as exc:
+            raise BatchAppendError(f'append/fsync of {STREAMS[stream]} failed after persisting {persisted}: {exc}', persisted) from exc
+        persisted[stream] = len(lines)
+        touched.append(stream)
+    return touched
+
+
+def settle_streams(root: str | Path | None, *, lock: bool = True) -> dict[str, Any]:
+    """Make what the streams already contain durable, without appending a record.
+
+    A reader that is about to trust the streams as the record of what exists (session ingestion
+    deciding what is already recorded) calls this first, under the same writer lock: bytes an
+    earlier append wrote before its fsync failed become durable, and a complete object missing
+    only its newline gets terminated, exactly as the next `write_batch` would do. A retry that
+    then finds nothing new to append has still recovered the earlier write instead of vouching
+    for page-cache bytes. Failures raise `BatchAppendError`; a failed receipt after a successful
+    sync is reported (`status`) but the streams are durable.
+    """
+    root = Path(root) if root is not None else default_state_root()
+    root.mkdir(parents=True, exist_ok=True)
+    status = 'ok'; error: str | None = None; touched: list[str] = []
+    with writer_lock(root) if lock else contextlib.nullcontext():
+        try:
+            fsync_directory_ancestry(root)
+            index = RecordIndex(root)
+        except (OSError, sqlite3.Error) as exc:
+            raise BatchAppendError(f'could not make the state root durable or read the index/streams ({exc}); nothing was written', _counts()) from exc
+        with index:
+            touched = _sync_pending(root, index, _counts(), {stream: [] for stream in STREAMS}, _counts())
+            if touched:
+                try:
+                    _write_checkpoint(root, index)
+                except (OSError, sqlite3.Error) as exc:
+                    status = 'checkpoint_failed'
+                    error = f'checkpoint write failed after the streams were made durable: {exc}; the next write rebuilds the index'
+    return {'ok': error is None, 'status': status, 'settled': touched, 'error': error}
+
+
+def write_batch(root: str | Path | None, records: Any, *, config: dict | None = None, refresh: bool = True,
+                lock: bool = True) -> dict[str, Any]:
+    """Durably append once per ID; report derived-state failure with same-ID retry guidance.
+
+    `lock=False` is for a caller that already holds `writer_lock(root)` and must keep its own
+    check/append/checkpoint sequence under that one lock (session ingestion). `flock` is per open
+    file description, so re-acquiring here would deadlock. Such a caller refreshes afterwards,
+    outside its lock: the dashboard render never runs under the writer lock.
+    """
+    if not lock and refresh:
+        raise ValueError('write_batch(lock=False) requires refresh=False; refresh the ledger/dashboard after releasing the lock')
     validated = validate_batch(records)
     root = Path(root) if root is not None else default_state_root()
     root.mkdir(parents=True, exist_ok=True)  # the lock file lives inside; durability of the chain is settled under the lock
     persisted = _counts(); duplicates = _counts(); statuses: list[dict[str, Any]] = []
     built: list[dict[str, Any]] = []
     ledger_updated = False; dashboard_updated = False; error: str | None = None; status = 'ok'
-    with writer_lock(root):
+    with writer_lock(root) if lock else contextlib.nullcontext():
         try:
             # Existence is not durability: whoever created these directories (this call, a concurrent
             # writer that has not synced yet, an attempt whose fsync failed), sync the whole chain
@@ -183,16 +249,7 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
                     statuses.append({'record_id': record_id, 'stream': stream, 'status': 'persisted'})
             except sqlite3.Error as exc:
                 raise BatchAppendError(f'index lookup failed before appending: {exc}', _counts()) from exc
-            for stream, lines in pending.items():
-                entry = index[stream]; path = root / STREAMS[stream]
-                needs_sync = bool(lines) or duplicates[stream] or entry['size'] != entry['durable_size'] or entry['tail'] == 'complete'
-                if not needs_sync:
-                    continue
-                try:
-                    entry['size'] = _append_stream(path, lines, prefix=entry['size'], tail=entry['tail'])
-                except OSError as exc:
-                    raise BatchAppendError(f'append/fsync of {STREAMS[stream]} failed after persisting {persisted}: {exc}', persisted) from exc
-                persisted[stream] = len(lines)
+            _sync_pending(root, index, persisted, pending, duplicates)
             try:
                 for stream, ids in new_ids.items():
                     for record_id in ids:

@@ -154,6 +154,11 @@ _VERIFICATION_WORDS = {
 
 #: Events by which an emitter states a verdict about a task outright. Attested by construction: the
 #: runtime that ran the work is reporting the gate outcome, not a process exit.
+#:
+#: The event name is the *default* verdict, not the whole story. `engine.Engine.verify_task` writes
+#: both outcomes to metrics as `event: 'task_verified'` and carries the real verdict in `result`
+#: (`'verified' | 'fail'`), so a `task_verified` row with `result: 'fail'` is an attested FAILURE —
+#: see `verification_evidence` for how the field and the event are combined.
 _ATTESTING_EVENTS = {'task_verified': VERIFIED, 'task_failed': FAILED}
 
 #: Verdict fields that carry an *attestation*. These are the fields the outcomes stream uses to
@@ -169,6 +174,14 @@ _DISPATCH_KEYS = ('result',)
 #: checked before `result` so that a row carrying both is reported at its strongest: an explicit
 #: verdict about the task outranks the exit status of the attempt that produced it.
 _VERIFICATION_KEYS = _ATTESTED_KEYS + _DISPATCH_KEYS
+
+
+#: Conservative tie-break order for contradictory verdicts: the earliest entry wins. `FAILED`
+#: outranks `PARTIAL` outranks `VERIFIED` because the failure mode this module exists to eliminate is
+#: an *over*-count of verified tasks. Used both within one row (`verification_evidence`, an attesting
+#: event against its own verdict field) and across a task's rows (`resolve_task_verification`).
+_CONSERVATIVE_ORDER = (FAILED, PARTIAL, VERIFIED)
+_CONSERVATIVE_RANK = {state: rank for rank, state in enumerate(_CONSERVATIVE_ORDER)}
 
 
 def _word(value: Any) -> str | None:
@@ -232,6 +245,17 @@ def verification_evidence(row: Mapping[str, Any]) -> VerificationEvidence:
     run-level gate result, not a verdict about the `task_id` field, and is excluded from task-level
     verification counts by design.
 
+    An attesting event does not blind this function to the row's own verdict field.
+    `engine.Engine.verify_task` emits `event: 'task_verified'` for *both* outcomes and states the
+    real verdict in `result` (`'verified' | 'fail'`); reading the event name alone counted every
+    failed gate as a verified task, while `history._verdict` and the dashboard read the field, so
+    the same row was verified in one place and failed in another. The rule: the event names the
+    default verdict, and a recognised verdict field on the same row may move it only toward the
+    conservative side (`_CONSERVATIVE_ORDER`) — `task_verified` + `result: 'fail'` is an attested
+    failure, `task_verified` + `result: 'partial'` is attested partial, while `task_failed` +
+    `result: 'pass'` stays failed (a field never upgrades a stated failure). Strength is `ATTESTED`
+    either way: the emitter that wrote the event is the one that wrote the field.
+
     Unrecognized spellings are skipped, not guessed: a row whose `result` is `pass_with_residuals`
     falls through to `success`, and if nothing is recognized the answer is `NO_VERIFICATION` — "this
     row makes no verification claim" — never `'failed'`. Absence of evidence must not render as
@@ -239,14 +263,23 @@ def verification_evidence(row: Mapping[str, Any]) -> VerificationEvidence:
     """
     if row.get('verification_scope') == 'run':
         return NO_VERIFICATION
-    attested_event = _ATTESTING_EVENTS.get(row.get('event'))
-    if attested_event is not None:
-        return VerificationEvidence(attested_event, ATTESTED)
+    # First recognised verdict field wins; attested keys are ordered before `result`.
+    field_state: str | None = None
+    field_strength: str | None = None
     for key in _VERIFICATION_KEYS:
         if key in row:
-            state = _word(row.get(key))
-            if state is not None:
-                return VerificationEvidence(state, ATTESTED if key in _ATTESTED_KEYS else DISPATCH)
+            field_state = _word(row.get(key))
+            if field_state is not None:
+                field_strength = ATTESTED if key in _ATTESTED_KEYS else DISPATCH
+                break
+    attested_event = _ATTESTING_EVENTS.get(row.get('event'))
+    if attested_event is not None:
+        # The event states the default; its own verdict field may only make it more conservative.
+        if field_state is not None and _CONSERVATIVE_RANK[field_state] < _CONSERVATIVE_RANK[attested_event]:
+            return VerificationEvidence(field_state, ATTESTED)
+        return VerificationEvidence(attested_event, ATTESTED)
+    if field_state is not None:
+        return VerificationEvidence(field_state, field_strength)
     return NO_VERIFICATION
 
 
@@ -273,13 +306,6 @@ def is_dispatch_pass(row: Mapping[str, Any]) -> bool:
     one silently absorbing the other. Use for "dispatch passes", never for "verified tasks".
     """
     return verification_evidence(row) == VerificationEvidence(VERIFIED, DISPATCH)
-
-
-#: Conservative tie-break order for contradictory verdicts *within* one evidence strength: the
-#: earliest entry wins. `FAILED` outranks `PARTIAL` outranks `VERIFIED` because the failure mode this
-#: module exists to eliminate is an *over*-count of verified tasks. See `resolve_task_verification`.
-_CONSERVATIVE_ORDER = (FAILED, PARTIAL, VERIFIED)
-_CONSERVATIVE_RANK = {state: rank for rank, state in enumerate(_CONSERVATIVE_ORDER)}
 
 
 def resolve_task_verification(rows: Iterable[Mapping[str, Any]]) -> VerificationEvidence:

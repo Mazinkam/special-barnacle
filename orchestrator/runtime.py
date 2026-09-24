@@ -128,15 +128,26 @@ def append_jsonl(path: Path, record: dict[str,Any]):
     path.parent.mkdir(parents=True,exist_ok=True)
     with path.open('ab') as f: f.write(encode_jsonl(record))
 
-def iter_jsonl_from(path: Path, offset: int=0):
-    """Yield `(record, end_offset)` for each complete line at or after `offset`.
+@contextmanager
+def open_binary(source):
+    """`source` as a positioned binary reader: a Path is opened (and closed); an open file is used as is.
+
+    A caller that must see one consistent file across several reads (identity, prefix check, scan,
+    fingerprint) opens it once and passes the handle, so a rotation of the *path* in between cannot
+    hand each step a different file.
+    """
+    if hasattr(source,'seek'): yield source; return
+    with Path(source).open('rb') as f: yield f
+
+def iter_jsonl_from(path, offset: int=0):
+    """Yield `(record, end_offset)` for each complete line at or after `offset` of a Path or open binary file.
 
     Blank or malformed *complete* lines yield `(None, end_offset)` so a caller can still advance
     past them; a trailing line without a newline is a torn or in-progress write and is never
     yielded, so `end_offset` values always mark a replayable prefix.
     """
-    if not path.exists(): return
-    with path.open('rb') as f:
+    if not hasattr(path,'seek') and not Path(path).exists(): return
+    with open_binary(path) as f:
         f.seek(offset); pos=offset
         for line in f:
             if not line.endswith(b'\n'): return
@@ -159,14 +170,15 @@ def iter_jsonl(path: Path) -> Iterator[dict[str,Any]]:
 
 TAIL_FINGERPRINT_BYTES=4096
 
-def tail_fingerprint(path: Path, offset: int) -> Optional[str]:
+def tail_fingerprint(path, offset: int) -> Optional[str]:
     """Hash of the last complete line ending exactly at `offset` (None for an empty prefix).
 
     Cheap identity check for a checkpointed prefix: if the bytes before the offset changed (file
-    rewritten, rotated, or offset landing mid-line) the fingerprint no longer matches.
+    rewritten, rotated, or offset landing mid-line) the fingerprint no longer matches. `path` may
+    be an open binary file (see `open_binary`).
     """
     if offset<=0: return None
-    with path.open('rb') as f:
+    with open_binary(path) as f:
         start=max(0,offset-TAIL_FINGERPRINT_BYTES); f.seek(start); chunk=f.read(offset-start)
     if not chunk.endswith(b'\n'): return 'unterminated'
     body=chunk[:-1]; cut=body.rfind(b'\n')
@@ -232,8 +244,13 @@ def meter(payload: dict[str,Any]) -> dict[str,Any]:
     distinguishable downstream. Imported lazily to keep `runtime` free of package cycles.
     """
     from .economics import is_call_row
-    if not is_call_row(payload) or payload.get('cost_source'): return payload
-    if payload.get('cost_usd') is not None: return {**payload,'cost_source':'reported'}
+    if not is_call_row(payload): return payload
+    legacy_placeholder = (payload.get('cost_source') == 'estimated-from-reported-tokens'
+                          and not payload.get('cost_rate_model') and not payload.get('cost_usd'))
+    if payload.get('cost_source') and not legacy_placeholder: return payload
+    if payload.get('cost_usd') is not None and not legacy_placeholder: return {**payload,'cost_source':'reported'}
+    if legacy_placeholder:
+        payload = {k:v for k,v in payload.items() if k not in {'cost_usd', 'cost_source'}}
     from .pricing import estimate_cost_usd
     estimate=estimate_cost_usd(model=payload.get('model'),input_tokens=payload.get('input_tokens'),
                                output_tokens=payload.get('output_tokens'),

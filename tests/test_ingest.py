@@ -304,6 +304,73 @@ class BulkResilienceTests(unittest.TestCase):
                              {'ValueError', 'FileNotFoundError'})
 
 
+class IncrementalContractTests(unittest.TestCase):
+    """The public shape of `ingest_paths`/`ingest_file` survives the checkpointed implementation."""
+
+    def _env(self, root):
+        return patch.dict(os.environ, {'CODING_AGENT_ORCHESTRATOR_HOME': str(root),
+                                       'CODING_AGENT_RUNTIME': 'humain-terminal',
+                                       'CODING_AGENT_REPOSITORY': '/work/forge'})
+
+    def test_return_shape_is_retained_and_per_file_summaries_expose_the_resume_point(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            log = codex_log(Path(d, 'rollout.jsonl'))
+            with self._env(root):
+                first = ingest_paths([log], state_root=root)
+                second = ingest_paths([log], state_root=root)
+            for result in (first, second):
+                self.assertEqual(set(result) >= {'files', 'files_processed', 'failures', 'granularity', 'emitted', 'duplicates',
+                                                 'zero_usage', 'usage_rows', 'estimated_cost_usd', 'unpriced_models',
+                                                 'zero_token_models', 'dry_run'}, True, sorted(result))
+                summary = result['files'][0]
+                self.assertEqual(set(summary) >= {'file', 'runtime', 'granularity', 'usage_rows', 'emitted', 'duplicates',
+                                                  'zero_usage', 'estimated_cost_usd', 'unpriced_models', 'dry_run',
+                                                  'resumed', 'scanned_from'}, True, sorted(summary))
+            self.assertFalse(first['files'][0]['resumed'])
+            self.assertEqual(first['files'][0]['scanned_from'], 0)
+            self.assertTrue(second['files'][0]['resumed'])
+            self.assertEqual(second['files'][0]['scanned_from'], log.stat().st_size)
+            self.assertEqual((second['emitted'], second['duplicates'], second['usage_rows']), (0, 2, 2))
+
+    def test_a_file_is_appended_in_bounded_batches_not_one_write_per_call(self):
+        from orchestrator import ingest as ingest_module
+        from orchestrator.record_batch import MAX_BATCH_RECORDS, write_batch
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            rows = [{'type': 'session', 'id': 'big'}]
+            for i in range(MAX_BATCH_RECORDS + 10):
+                rows.append({'type': 'message', 'id': f'a{i}', 'timestamp': '2026-09-21T10:00:00.000Z',
+                             'message': {'role': 'assistant', 'model': 'claude-sonnet-5',
+                                         'usage': {'input': 1, 'output': 1, 'totalTokens': 2}}})
+            log = Path(d, 'big.jsonl')
+            log.write_text(''.join(json.dumps(r) + '\n' for r in rows), encoding='utf-8')
+            calls = []
+
+            def counting(*args, **kwargs):
+                calls.append(len(args[1]))
+                return write_batch(*args, **kwargs)
+
+            with self._env(root), patch.object(ingest_module, 'write_batch', counting):
+                result = ingest_file(log, state_root=root, runtime=HUMAIN_TERMINAL)
+            self.assertEqual(result['emitted'], MAX_BATCH_RECORDS + 10)
+            self.assertEqual(calls, [MAX_BATCH_RECORDS, 10])
+            self.assertEqual(len(load_jsonl(root / 'metrics.jsonl')), MAX_BATCH_RECORDS + 10)
+
+    def test_ingested_rows_carry_stable_record_ids_so_retries_dedup_in_the_writer(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            log = codex_log(Path(d, 'rollout.jsonl'))
+            with self._env(root):
+                ingest_file(log, state_root=root)
+            rows = load_jsonl(root / 'metrics.jsonl')
+            self.assertEqual([r['record_id'] for r in rows], [r['call_id'] for r in rows])
+            with self._env(root):
+                ingest_file(log, state_root=Path(d, 'other'), granularity='session')
+            aggregate = load_jsonl(Path(d, 'other', 'metrics.jsonl'))[0]
+            self.assertEqual(aggregate['record_id'], aggregate['call_id'])
+
+
 class RepositoryDecodingTests(unittest.TestCase):
     def test_resolves_encoded_paths_including_segments_containing_dashes(self):
         with tempfile.TemporaryDirectory() as d:
@@ -408,6 +475,110 @@ class DedupeHardeningTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertEqual(sum(r['input_tokens'] for r in rows), 200)
             self.assertEqual(sum(r['output_tokens'] for r in rows), 100)
+
+    def test_session_id_drift_emits_new_calls_in_full_even_without_checkpoint(self):
+        # Equal usage is not identity: only old native IDs are paid after a header rewrite.
+        from orchestrator.ingest_checkpoint import checkpoint_path
+
+        for first_granularity in (CALL, SESSION):
+            for second_granularity in (CALL, SESSION):
+                for lose_checkpoint in (False, True):
+                    with self.subTest(first=first_granularity, second=second_granularity,
+                                      lose_checkpoint=lose_checkpoint), tempfile.TemporaryDirectory() as d:
+                        root = Path(d, 'state')
+                        log = Path(d, 'log_sessA.jsonl')
+                        old = {'type': 'message', 'id': 'old-call',
+                               'message': {'role': 'assistant', 'model': 'claude-sonnet-5',
+                                           'usage': {'input': 100, 'output': 50, 'totalTokens': 150}}}
+                        log.write_text(json.dumps(old) + '\n', encoding='utf-8')
+                        with self._env(root):
+                            ingest_file(log, state_root=root, granularity=first_granularity)
+                            if lose_checkpoint:
+                                checkpoint_path(root, log).unlink()
+                            log.write_text(''.join(json.dumps(row) + '\n' for row in [
+                                {'type': 'session', 'id': 'sess-B'}, old, {**old, 'id': 'new-call'}
+                            ]), encoding='utf-8')
+                            second = ingest_file(log, state_root=root, granularity=second_granularity)
+                            retry = ingest_file(log, state_root=root, granularity=second_granularity)
+                            # A later suffix can repeat the drifted call; checkpoint history must
+                            # retain its original paid identity rather than an unpaid alias.
+                            with log.open('a', encoding='utf-8') as handle:
+                                handle.write(json.dumps(old) + '\n')
+                                handle.write(json.dumps({**old, 'id': 'later-call'}) + '\n')
+                            growth = ingest_file(log, state_root=root, granularity=second_granularity)
+                        self.assertEqual(second['emitted'], 1)
+                        self.assertEqual(retry['emitted'], 0)
+                        self.assertEqual(growth['emitted'], 1)
+                        rows = load_jsonl(root / 'metrics.jsonl')
+                        self.assertEqual(sum(covered_calls(row) for row in rows), 3)
+                        self.assertEqual([(row['session_id'], row['input_tokens'], row['output_tokens'])
+                                          for row in rows], [('sessA', 100, 50), ('sess-B', 100, 50),
+                                                             ('sess-B', 100, 50)])
+                        self.assertEqual(rows[-1].get('covers_calls', 1), 1)
+                        self.assertEqual(rows[-1]['source'], 'session_ingest')
+                        self.assertEqual(rows[-1]['ingest_source'], str(log))
+
+    def test_drift_with_totals_only_source_history_is_rejected_before_writing(self):
+        from orchestrator.ingest import SourceConflict
+        from orchestrator.ingest_checkpoint import checkpoint_path
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            log = humain_terminal_log(Path(d, 'log.jsonl'))
+            with self._env(root):
+                ingest_file(log, state_root=root, granularity=SESSION)
+                rows = load_jsonl(root / 'metrics.jsonl')
+                for row in rows:
+                    row.pop('covered_call_ids', None)
+                metrics = root / 'metrics.jsonl'
+                metrics.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+                checkpoint_path(root, log).unlink()
+                log.write_text(log.read_text().replace('sess-1', 'sess-2'), encoding='utf-8')
+                before = metrics.read_bytes()
+                with self.assertRaises(SourceConflict):
+                    ingest_file(log, state_root=root, granularity=SESSION)
+                self.assertEqual(metrics.read_bytes(), before)
+
+    def test_drift_rejects_reused_native_id_with_changed_usage(self):
+        from orchestrator.ingest import SourceConflict
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            log = humain_terminal_log(Path(d, 'log_sessA.jsonl'))
+            # Drift means the original calls had only filename-derived identity, not an
+            # explicit session whose successor is entitled to reuse its native call IDs.
+            original = '\n'.join(log.read_text().splitlines()[1:]) + '\n'
+            log.write_text(original, encoding='utf-8')
+            with self._env(root):
+                ingest_file(log, state_root=root, granularity=SESSION)
+                log.write_text(json.dumps({'type': 'session', 'id': 'sess-B'}) + '\n'
+                               + original.replace('1726', '9999'), encoding='utf-8')
+                before = (root / 'metrics.jsonl').read_bytes()
+                with self.assertRaises(SourceConflict):
+                    ingest_file(log, state_root=root, granularity=SESSION)
+                self.assertEqual((root / 'metrics.jsonl').read_bytes(), before)
+
+    def test_drift_cannot_treat_a_positional_fallback_as_a_native_id(self):
+        from orchestrator.ingest import SourceConflict
+
+        for new_id in (None, '0'):
+            with self.subTest(new_id=new_id), tempfile.TemporaryDirectory() as d:
+                root = Path(d, 'state')
+                log = Path(d, 'log_sessA.jsonl')
+                call = {'type': 'message', 'message': {'role': 'assistant', 'model': 'claude-sonnet-5',
+                                                     'usage': {'input': 100, 'output': 50, 'totalTokens': 150}}}
+                log.write_text(json.dumps(call) + '\n', encoding='utf-8')
+                with self._env(root):
+                    ingest_file(log, state_root=root, granularity=SESSION)
+                    if new_id is not None:
+                        call['id'] = new_id
+                    log.write_text(''.join(json.dumps(row) + '\n' for row in [
+                        {'type': 'session', 'id': 'sess-B'}, call
+                    ]), encoding='utf-8')
+                    before = (root / 'metrics.jsonl').read_bytes()
+                    with self.assertRaises(SourceConflict):
+                        ingest_file(log, state_root=root, granularity=SESSION)
+                    self.assertEqual((root / 'metrics.jsonl').read_bytes(), before)
 
     def test_two_distinct_sessions_in_one_file_each_emit_their_full_totals(self):
         # The reviewer's regression. `read_humain_terminal` assigns `session_id` from the filename

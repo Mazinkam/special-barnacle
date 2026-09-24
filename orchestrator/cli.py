@@ -14,15 +14,41 @@ from .features import FeaturePolicy, feature_inventory
 from .engine import OrchestrationEngine
 from .ingest import discover_logs, ingest_paths
 from .dynamic_adapter import resolve_adapter
+from .archive import archive_runs, restore_run, DEFAULT_OLDER_THAN_DAYS, RESTORE_COMMAND
 
 _PATH_RE = _re_path.compile(r"(/Users/[^ \t\n|]+|/home/[^ \t\n|]+|~/[^ \t\n|]+)")
 def _redact_paths(text):
     return _PATH_RE.sub("<path>", text)
 
+#: Bound for the one-line ingest error kept in `ingest_status.json` and echoed on stderr.
+INGEST_ERROR_LIMIT = 240
+#: Characters of the tail kept when a detail must be shortened. Ingest conflict messages end with the
+#: remedy sentence ("... Switching to --granularity session cannot establish identity ..."), so the
+#: tail carries the actionable part; the head carries what failed.
+_INGEST_ERROR_TAIL = 120
+
+def _bound_error(text: str, limit: int = INGEST_ERROR_LIMIT, tail: int = _INGEST_ERROR_TAIL) -> str:
+    """Return `text` if it fits in `limit`, else its head and tail joined by ` ... ` at exactly `limit`.
+
+    A plain `text[:limit]` dropped the closing guidance of a long conflict message, leaving the hook
+    and launchd logs with the failure but not the fix. Callers redact paths *before* bounding so a
+    cut can never expose a partial path and the bound applies to what is actually printed.
+    """
+    if len(text) <= limit:
+        return text
+    joiner = ' ... '
+    tail = min(tail, (limit - len(joiner)) // 2)
+    return text[:limit - tail - len(joiner)] + joiner + text[-tail:]
+
 ROOT=default_state_root()
 def cfg(): return read_json(Path(__file__).with_name('config.json'),{})
 def refresh(state_root: Path = ROOT) -> Path:
-    """Incrementally catch up the durable ledger and atomically republish the dashboard."""
+    """Catch the ledger up from its durable checkpoint and republish the dashboard; return its path.
+
+    Not a recovery: records reach the streams through the coordinated writer (deduplicated by
+    record id), so an incremental replay is exact and the record-id cache stays trusted. A full
+    `rebuild` (replay from byte 0, cache discarded) remains the explicit `rebuild` command.
+    """
     root = Path(state_root)
     refresh_ledger(root)
     return generate_dashboard(root, config=cfg())
@@ -32,10 +58,10 @@ def make_ingest_status(previous: dict[str, Any], result: dict[str, Any], *,
                        materialization_error: Exception | None = None) -> dict[str, Any]:
     failures = result.get('failures') or []
     status = 'error' if materialization_error is not None else ('partial' if failures else 'ok')
-    error = _redact_paths(str(materialization_error))[:240] if materialization_error is not None else None
+    error = _bound_error(_redact_paths(str(materialization_error))) if materialization_error is not None else None
     if error is None and failures:
         first_detail = str(failures[0].get('error') or 'ingest failed')
-        error = _redact_paths(f"{len(failures)} file(s) failed; first: {first_detail}")[:240]
+        error = _bound_error(_redact_paths(f"{len(failures)} file(s) failed; first: {first_detail}"))
 
     interval = os.environ.get('HUMAIN_ORCHESTRATOR_INGEST_INTERVAL')
     try:
@@ -144,24 +170,59 @@ def main():
     q=sp.add_parser('quality'); q.add_argument('payload')
     c=sp.add_parser('context-put'); c.add_argument('id'); c.add_argument('content'); c.add_argument('--source',required=True); c.add_argument('--status',default='observed'); c.add_argument('--revision')
     cp=sp.add_parser('context-packet'); cp.add_argument('ids'); cp.add_argument('--budget',type=int,default=18000)
-    args=ap.parse_args(); store=EventStore(ROOT); C=cfg(); eng=OrchestrationEngine(ROOT)
+    ar=sp.add_parser('archive-runs',formatter_class=argparse.RawDescriptionHelpFormatter,
+        help='list (dry run) or, with --execute, losslessly gzip the diagnostics of completed runs older than N days',
+        description=(
+            'Archive completed run diagnostics under <state root>/runs/<run_id>/ reversibly.\n\n'
+            'Default is a dry run: prints, per run, whether it is eligible or why it is skipped, each file, its exact\n'
+            '<name>.gz destination, raw bytes and the estimated compressed bytes. Nothing is written, not even a lock file.\n'
+            'With --execute each eligible file is gzip-compressed into a same-directory temporary file, decompressed again\n'
+            'and checked against its SHA-256; digests are committed incrementally to archive.manifest.json.\n'
+            'Only new HT runs with a durable writer seal can replace raw files, after all producers and descriptors drain.\n'
+            'Legacy uncoordinated runs are snapshot-only (zero reclaimed bytes); managed unsealed runs are skipped.\n'
+            'Retries validate/adopt matching orphan gzip files without overwrite. Prior manifest generations and unknown\n'
+            'archives/temporary files are preserved for recovery. Storage reports include manifest overhead.\n\n'
+            'Never archived: active runs and runs without a durable run-complete/run-failed outcome in outcomes.jsonl,\n'
+            'runs completed or modified inside the window, run.log (the progress-board timeline stays readable), and the\n'
+            'authoritative streams events.jsonl / metrics.jsonl / outcomes.jsonl with their ledger/checkpoint/index metadata.\n'
+            'Nothing is deleted by default and no retention timer exists; confirmed sealed raw files are replaced by\n'
+            'verified gzip, not lost audit evidence. Read with `gunzip -c <file>.gz`, or restore with `restore-run <run_id>`.\n'
+            'Exit status 1 if any planned file could not be archived.'))
+    ar.add_argument('--older-than-days',type=float,default=DEFAULT_OLDER_THAN_DAYS,metavar='N',help=f'only runs whose terminal outcome and files are older than N days (default {DEFAULT_OLDER_THAN_DAYS})')
+    ar.add_argument('--execute',action='store_true',help='actually archive; without it this is a dry run that writes nothing')
+    ar.add_argument('--json',action='store_true',help='machine-readable output instead of the table')
+    rr=sp.add_parser('restore-run',formatter_class=argparse.RawDescriptionHelpFormatter,
+        help='restore the archived diagnostics of one run byte-for-byte from its .gz files and manifest',
+        description=(
+            'Restore every archived file of <state root>/runs/<run_id>/ exactly as it was: each .gz is decompressed into a\n'
+            'same-directory temporary file, its SHA-256 and byte count are checked against archive.manifest.json, the\n'
+            'original mtime is restored and the file is atomically installed only if its name is still absent. The .gz and\n'
+            'manifest are retained for recovery. An invalid manifest or symlink is rejected before mutation. A file that\n'
+            'fails verification is reported; existing content is never overwritten, even if a writer creates the file\n'
+            'during restore. --dry-run only lists the archived files and their .gz paths.'))
+    rr.add_argument('run_id',help='run directory name under <state root>/runs (as shown in the progress board log path)')
+    rr.add_argument('--dry-run',action='store_true',help='list what would be restored without writing')
+    rr.add_argument('--json',action='store_true',help='machine-readable output')
+    args=ap.parse_args(); C=cfg()
+    # A dry run must leave the state root untouched (not even created), so the root and its streams are
+    # only ensured for commands that write or read them; the engine is built where a command needs it.
+    # The archive commands never touch the streams at all, so they do not create them either.
+    if not (args.cmd=='ingest' and args.dry_run) and args.cmd not in ('archive-runs','restore-run'): EventStore(ROOT)
+    def eng(): return OrchestrationEngine(ROOT)
     if args.cmd=='init':
         # One coordinated write: durable append -> incremental ledger -> atomic dashboard, instead of
         # an append followed by a full history replay that also discards the record-id cache. A
         # rejected or interrupted write is reported exactly like `batch` (JSON body, exit 1/2/3,
         # `retry == 'same_ids'`), so callers can resubmit `init` safely instead of parsing a traceback.
-        code, body = _write([single_record('event', {'schema_version': 3}, event='orchestrator_initialized')])
-        if code != EXIT_OK:
-            print(json.dumps(body))
-            raise SystemExit(code)
-        print('Initialized V3 state')
-        return
+        code,body=_write([single_record('event',{'schema_version':3},event='orchestrator_initialized')])
+        if code!=EXIT_OK: print(json.dumps(body)); raise SystemExit(code)
+        print('Initialized V3 state'); return
     if args.cmd=='status': print(json.dumps(load_or_rebuild(ROOT),indent=2)); return
     if args.cmd=='dashboard': print(generate_dashboard(ROOT,config=C)); return
     if args.cmd=='rebuild': print(json.dumps(rebuild(ROOT),indent=2)); generate_dashboard(ROOT,config=C); return
     if args.cmd=='features':
         f=FeaturePolicy(C.get('features',{})).resolve(); print(json.dumps(feature_inventory(f),indent=2)); return
-    if args.cmd=='recommend-policy': print(json.dumps(eng.recommend_policy(),indent=2)); return
+    if args.cmd=='recommend-policy': print(json.dumps(eng().recommend_policy(),indent=2)); return
     if args.cmd=='event': raise SystemExit(_single('event',args.payload,event=args.event))
     if args.cmd=='metric': raise SystemExit(_single('metric',args.payload))
     if args.cmd=='outcome': raise SystemExit(_single('outcome',args.payload))
@@ -173,12 +234,12 @@ def main():
         overrides={}
         if args.quality_floor is not None: overrides['quality_floor']=args.quality_floor
         if args.cost_aggressiveness is not None: overrides['cost_aggressiveness']=args.cost_aggressiveness
-        plan=eng.plan_run(run_id=args.run_id,task_class=args.task_class,complexity=args.complexity,risk=args.risk,user_overrides=overrides)
+        plan=eng().plan_run(run_id=args.run_id,task_class=args.task_class,complexity=args.complexity,risk=args.risk,user_overrides=overrides)
         print(json.dumps(plan['route'],indent=2)); return
     if args.cmd=='plan':
-        print(json.dumps(eng.plan_run(run_id=args.run_id,task_class=args.task_class,complexity=args.complexity,risk=args.risk,coupling=args.coupling,parallelizable=args.parallelizable,repo_revision=args.repo_revision),indent=2)); return
+        print(json.dumps(eng().plan_run(run_id=args.run_id,task_class=args.task_class,complexity=args.complexity,risk=args.risk,coupling=args.coupling,parallelizable=args.parallelizable,repo_revision=args.repo_revision),indent=2)); return
     if args.cmd=='simulate-policy':
-        print(json.dumps(eng.simulate_policy(candidate_quality_floor=args.quality_floor,candidate_cost_aggressiveness=args.cost_aggressiveness),indent=2)); return
+        print(json.dumps(eng().simulate_policy(candidate_quality_floor=args.quality_floor,candidate_cost_aggressiveness=args.cost_aggressiveness),indent=2)); return
     if args.cmd=='topology': print(json.dumps(topology_for(args.complexity,args.coupling,args.parallelizable,args.risk),indent=2)); return
     if args.cmd=='resolve-adapter':
         a = resolve_adapter(model_family=args.model_family)
@@ -215,13 +276,68 @@ def main():
                               granularity=args.granularity,
                               on_file=progress if not args.quiet else None)
         print(json.dumps(result,indent=2))
+        # Failures (unreadable log, granularity conflict, interrupted append) are actionable: one bounded,
+        # path-redacted line on stderr even with --quiet, so the HT hook log and the launchd log show them
+        # without unbounded or identifying detail; the full list is in the JSON body on stdout. Bounding
+        # keeps the message tail, where the conflict remedy (`--granularity session`) lives. The
+        # ledger/dashboard refresh and ingest_status.json were already handled by `process_ingest`.
         if result.get('failures') and not args.dry_run:
             first_detail = ' '.join(str(result['failures'][0].get('error') or 'ingest failed').split())
-            print(_redact_paths(f"{len(result['failures'])} file(s) failed; first: {first_detail}")[:240], file=sys.stderr, flush=True)
-            raise SystemExit(1)
+            print(_bound_error(_redact_paths(f"{len(result['failures'])} file(s) failed; first: {first_detail}")), file=sys.stderr, flush=True)
+            raise SystemExit(EXIT_INVALID)
         return
     if args.cmd=='quality':
         ev=QualityEvidence(**json.loads(args.payload)); print(json.dumps({'hard_gate_pass':ev.hard_gate_pass(),'quality_evidence_score':ev.evidence_score()},indent=2)); return
     if args.cmd=='context-put': print(json.dumps(ContextRegistry(ROOT).put(args.id,args.content,source=args.source,status=args.status,repo_revision=args.revision),indent=2)); return
     if args.cmd=='context-packet': print(json.dumps(ContextRegistry(ROOT).packet([x.strip() for x in args.ids.split(',') if x.strip()],args.budget),indent=2)); return
+    if args.cmd=='archive-runs': raise SystemExit(_archive_runs_command(args))
+    if args.cmd=='restore-run': raise SystemExit(_restore_run_command(args))
+
+def _fmt_bytes(n:int)->str: return f'{n:,}'
+
+def _archive_runs_command(args)->int:
+    try: entries=archive_runs(ROOT,older_than_days=args.older_than_days,execute=args.execute)
+    except (ValueError,OSError) as exc: print(f'archive-runs: {exc}',file=sys.stderr); return EXIT_INVALID
+    planned=[e for e in entries if e['files']]
+    skipped=[e for e in entries if e['status']=='skipped']
+    summary={'executed':args.execute,'older_than_days':args.older_than_days,'state_root':str(ROOT),'runs':entries,
+             'originals_retained':all(e.get('originals_retained',True) for e in planned),
+             'reclaimed_bytes':max(0,-sum(e.get('storage_delta_bytes',0) for e in planned)),
+             'storage_delta_bytes':sum(e.get('storage_delta_bytes',0) for e in planned),
+             'raw_bytes_removed':sum(e.get('raw_bytes_removed',0) for e in planned),
+             'eligible_runs':len(planned),'skipped_runs':len(skipped),
+             'eligible_raw_bytes':sum(e['raw_bytes'] for e in planned),
+             'eligible_estimated_compressed_bytes':sum(e['estimated_compressed_bytes'] for e in planned),
+             'archived_files':sum(1 for e in planned for f in e['files'] if f['status']=='archived'),
+             'archived_raw_bytes':sum(f['raw_bytes'] for e in planned for f in e['files'] if f['status']=='archived'),
+             'compressed_bytes':sum(e.get('compressed_bytes',0) for e in planned),
+             'not_archived_files':sum(1 for e in planned for f in e['files'] if f['status']!='archived')}
+    failed=args.execute and summary['not_archived_files']>0
+    if args.json: print(json.dumps(summary,indent=2,default=str)); return EXIT_INVALID if failed else EXIT_OK
+    if not args.execute: print(f'DRY RUN — nothing written. Re-run with --execute to archive. (runs under {ROOT/"runs"}, older than {args.older_than_days:g} days)')
+    for e in entries:
+        if e['status']=='skipped' and not e['files']: print(f"skipped  {e['run_id']}  {e['reason']}: {e['detail']}"); continue
+        size=f"{_fmt_bytes(e['raw_bytes'])} raw bytes -> "+(f"{_fmt_bytes(e['compressed_bytes'])} compressed" if args.execute else f"~{_fmt_bytes(e['estimated_compressed_bytes'])} estimated compressed")
+        print(f"{e['status']:<8} {e['run_id']}  {len(e['files'])} file(s)  {size}  [{e['detail']}]")
+        for f in e['files']:
+            note=f"  ({f['status']}: {f['reason']} — {f['detail']})" if f.get('reason') else ''
+            print(f"    {f['name']} -> {f['destination']}  {_fmt_bytes(f['raw_bytes'])} bytes{note}")
+    verb='archived' if args.execute else 'eligible'
+    print(f"Total: {summary['eligible_runs']} run(s) {verb}, {_fmt_bytes(summary['archived_raw_bytes'] if args.execute else summary['eligible_raw_bytes'])} raw bytes, "
+          f"{_fmt_bytes(summary['compressed_bytes']) if args.execute else '~'+_fmt_bytes(summary['eligible_estimated_compressed_bytes'])} {'compressed' if args.execute else 'estimated compressed'} bytes; "
+          f"{summary['skipped_runs']} run(s) skipped. {summary['raw_bytes_removed']} raw bytes removed; "
+          f"{summary['reclaimed_bytes']} net logical bytes reclaimed (including recovery metadata); "
+          f"storage delta {summary['storage_delta_bytes']:+d} bytes. Unsealed originals retained; no audit evidence is freed.")
+    if failed: print(f"{summary['not_archived_files']} planned file(s) were not archived; see the notes above. Recovery copies are retained.",file=sys.stderr)
+    return EXIT_INVALID if failed else EXIT_OK
+
+def _restore_run_command(args)->int:
+    try: result=restore_run(ROOT,args.run_id,execute=not args.dry_run)
+    except (ValueError,OSError) as exc: print(f'restore-run: {exc}',file=sys.stderr); return EXIT_INVALID
+    if args.json: print(json.dumps(result,indent=2,default=str)); return EXIT_OK if not result['errors'] else EXIT_INVALID
+    print(result['message'])
+    for name in result.get('would_restore',[]):
+        info=result['files'][name]; print(f"    {name} <- {info['archive_path']}  {_fmt_bytes(info['raw_bytes'])} bytes  sha256 {info['sha256'][:16]}…")
+    for err in result['errors']: print(f"    FAILED {err['name']}: {err['reason']} — {err['detail']}",file=sys.stderr)
+    return EXIT_OK if not result['errors'] else EXIT_INVALID
 if __name__=='__main__': main()
