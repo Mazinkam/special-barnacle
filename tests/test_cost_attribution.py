@@ -6,7 +6,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator.dashboard import build_data
-from orchestrator.economics import ESTIMATED, REPORTED, UNMETERED, cost_attribution, cost_class, is_call_row
+from orchestrator.economics import ESTIMATED, REPORTED, UNMETERED, cost_attribution, cost_class, has_reported_tokens, is_call_row
+from orchestrator import run_evidence
 from orchestrator.pricing import estimate_cost_usd, rate_for
 from orchestrator.runtime import EventStore
 
@@ -31,6 +32,40 @@ class CostClassTests(unittest.TestCase):
 
     def test_cost_without_provenance_is_never_promoted_to_reported(self):
         self.assertEqual(cost_class({'cost_usd': 2.0}), ESTIMATED)
+
+    def test_zero_estimate_from_zero_tokens_is_unmetered(self):
+        # HT's captureDispatchCost writes exactly this when a child crashes before reporting usage:
+        # an "estimate" priced from nothing measured nothing, so it is a coverage gap, not $0 spend.
+        crash = {'event': 'model_call', 'cost_usd': 0, 'cost_source': 'estimated-from-reported-tokens',
+                 'input_tokens': 0, 'output_tokens': 0, 'cached_input_tokens': 0, 'cache_write_tokens': 0}
+        self.assertEqual(cost_class(crash), UNMETERED)
+        self.assertEqual(cost_class({'cost_usd': 0, 'cost_source': 'estimated-from-reported-tokens'}), UNMETERED)
+        # String token fields (JSONL written by hand) must not be mistaken for positive usage.
+        self.assertEqual(cost_class({**crash, 'input_tokens': '0'}), UNMETERED)
+
+    def test_zero_cost_with_reported_tokens_stays_metered(self):
+        # A genuinely free call that did report usage was measured; keep it distinct from a gap.
+        self.assertEqual(cost_class({'cost_usd': 0, 'cost_source': 'estimated-from-reported-tokens',
+                                     'input_tokens': 5, 'output_tokens': 1, 'cost_rate_model':'free-model'}), ESTIMATED)
+        self.assertEqual(cost_class({'cost_usd': 0, 'cost_source': 'estimated-from-reported-tokens',
+                                     'input_tokens': 0, 'cache_write_tokens': 12, 'cost_rate_model':'free-model'}), ESTIMATED)
+        self.assertEqual(cost_class({'cost_usd': 0, 'cost_source': 'reported', 'input_tokens': 5, 'output_tokens': 1}), REPORTED)
+
+    def test_reported_zero_without_tokens_is_still_unmetered(self):
+        # 'reported' $0 with no usage is a stronger claim than the evidence supports (unchanged behaviour).
+        self.assertEqual(cost_class({'cost_usd': 0, 'cost_source': 'reported'}), UNMETERED)
+
+    def test_has_reported_tokens_requires_a_positive_count(self):
+        self.assertTrue(has_reported_tokens({'input_tokens': 1}))
+        self.assertTrue(has_reported_tokens({'cache_write_tokens': '7'}))
+        self.assertFalse(has_reported_tokens({'input_tokens': 0, 'output_tokens': 0}))
+        self.assertFalse(has_reported_tokens({'input_tokens': None, 'output_tokens': 'n/a'}))
+        self.assertFalse(has_reported_tokens({}))
+
+    def test_run_evidence_uses_the_shared_classifier(self):
+        # One classifier: run_evidence must not carry its own cost-class or token-presence rule.
+        self.assertFalse(hasattr(run_evidence, '_cost_class'))
+        self.assertFalse(hasattr(run_evidence, '_has_tokens'))
 
 
 class AttributionTests(unittest.TestCase):
@@ -141,7 +176,51 @@ class DashboardAttributionTests(unittest.TestCase):
             self.assertAlmostEqual(data['by_runtime']['claude-code']['estimated_cost'], 1.0)
             # a row using the legacy `runtime` key must not pool into 'unknown'
             self.assertNotIn('unknown', data['by_runtime'])
-            self.assertEqual(data['by_runtime']['humain-terminal']['calls'], 2)
+            # `rows` counts every orchestrated record for the runtime (the `tasks_accepted` metric row
+            # included); `call_rows` counts only those accountable for cost. The old single `calls`
+            # key conflated the two and rendered '309 calls · 110 metered · 16 unmetered'.
+            ht = data['by_runtime']['humain-terminal']
+            self.assertEqual(ht['rows'], 2)
+            self.assertEqual(ht['call_rows'], 1)
+            # the ambiguous `calls` key is gone: it used to mean rows
+            self.assertNotIn('calls', ht)
+            for name, rt in data['by_runtime'].items():
+                self.assertEqual(rt['metered_calls'] + rt['unmetered_calls'], rt['call_rows'],
+                                 f'{name} does not reconcile')
+
+    def test_summary_cards_and_run_table_agree_on_an_ht_crash_row(self):
+        # Regression: run evidence classified the HT crash shape as unmetered while the summary
+        # cards (economics.cost_class) still counted it metered, so the two disagreed on coverage.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'metrics.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in [
+                {'event': 'model_call', 'run_id': 'r1', 'task_id': 'r1-a', 'agent_runtime': 'humain-terminal',
+                 'role': 'worker', 'cost_usd': .05, 'cost_source': 'reported', 'input_tokens': 10, 'output_tokens': 5},
+                {'event': 'model_call', 'run_id': 'r1', 'task_id': 'r1-crash', 'agent_runtime': 'humain-terminal',
+                 'role': 'worker', 'cost_usd': 0, 'cost_source': 'estimated-from-reported-tokens',
+                 'input_tokens': 0, 'cached_input_tokens': 0, 'cache_write_tokens': 0, 'output_tokens': 0,
+                 'duration_ms': 0, 'result': 'fail'},
+            ]), encoding='utf-8')
+            data = build_data(root, config={})
+            run = data['runs'][0]
+            summary = data['summary']
+            by_runtime = data['by_runtime']['humain-terminal']
+            self.assertEqual(run['unmetered_calls'], 1)
+            self.assertEqual(run['metered_calls'], 1)
+            self.assertFalse(run['cost_complete'])
+            # cards == table
+            self.assertEqual(summary['unmetered_calls'], run['unmetered_calls'])
+            self.assertEqual(summary['call_rows'], run['call_rows'])
+            self.assertAlmostEqual(summary['cost_coverage'], run['cost_coverage'])
+            self.assertAlmostEqual(summary['reported_cost'], run['cost_reported_usd'])
+            self.assertAlmostEqual(summary['estimated_cost'], run['cost_estimated_usd'])
+            self.assertEqual(summary['runs_fully_priced'], 0)
+            self.assertEqual(data['run_evidence']['unmetered_calls'], summary['unmetered_calls'])
+            # runtime card
+            self.assertEqual(by_runtime['unmetered_calls'], 1)
+            self.assertEqual(by_runtime['metered_calls'], 1)
+            self.assertAlmostEqual(by_runtime['reported_cost'], .05)
+            self.assertAlmostEqual(by_runtime['estimated_cost'], 0.0)
 
     def test_session_ingest_rows_are_isolated_from_orchestrated_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -161,6 +240,9 @@ class DashboardAttributionTests(unittest.TestCase):
             self.assertNotIn('claude-code', data['by_runtime'])
             self.assertNotIn('codex', data['by_runtime'])
             self.assertAlmostEqual(data['summary']['total_cost'], 3.0)
+            # no row carries `covers_calls`, so rows and calls agree here; they are still reported
+            # as separate fields because session aggregates make them differ 13-fold on live data.
+            self.assertEqual(data['interactive_sessions']['rows'], 2)
             self.assertEqual(data['interactive_sessions']['calls'], 2)
             self.assertAlmostEqual(data['interactive_sessions']['cost'], 7.0)
 

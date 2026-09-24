@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .runtime import EventStore, Policy, QualityEvidence, default_state_root, read_json, stable_hash
-from .state import rebuild
+from .state import refresh_ledger
 from .history import load_stats
 from .method import default_efforts
 from .adaptive import adaptive_route, recommend_topology, should_canary
@@ -58,15 +58,16 @@ class OrchestrationEngine:
         decay = features.get('historical_learning',{}).get('decay_half_life_days') if features.get('historical_learning',{}).get('decay_old_results',False) else None
         stats = load_stats(self.state_root, history_cfg.get("complexity_bucket_width", 2), decay)
 
+        min_samples=int(features.get('historical_learning',{}).get('minimum_samples',history_cfg.get('min_samples_for_empirical_route',12)))
         route = adaptive_route(
             run_id=run_id, task_class=task_class, complexity=complexity, risk=risk,
             quality_floor=qf, cost_aggressiveness=ca, stats=stats, features=features,
             default_efforts=default_efforts(),
-            min_samples=int(features.get('historical_learning',{}).get('minimum_samples',history_cfg.get('min_samples_for_empirical_route',12)))
+            min_samples=min_samples
         )
         topo_rec = recommend_topology(
             task_class=task_class, complexity=complexity, risk=risk, coupling=coupling,
-            parallelizable=parallelizable, stats=stats, quality_floor=qf, features=features
+            parallelizable=parallelizable, stats=stats, quality_floor=qf, features=features, min_samples=min_samples
         )
         topology=topo_rec['heuristic']
         routing_cfg=features.get('adaptive_routing',{})
@@ -109,6 +110,8 @@ class OrchestrationEngine:
             selected_verification_depth=route['selected']['verification_depth'],
             recommended_capability=route['recommended']['capability'], recommended_effort=route['recommended']['effort'],
             history_sufficient=route['history_sufficient'], historical_samples=route['explanation']['historical_samples'],
+            verified_task_samples=route['explanation']['verified_task_samples'],
+            run_samples=route['explanation']['run_samples'], call_samples=route['explanation']['call_samples'], min_samples=min_samples,
             recommended_estimated_verified_cost_usd=route['empirical']['choice'].get('estimated_verified_cost_usd'),
             recommended_estimated_quality_evidence=route['empirical']['choice'].get('estimated_quality_evidence'),
             explored=route['explanation']['explored'], shadow_selected=route['shadow_selected'],
@@ -180,5 +183,7 @@ class OrchestrationEngine:
         generate_dashboard(self.state_root, config=self.config)
 
     def _refresh(self) -> None:
-        rebuild(self.state_root)
+        # Normal lifecycle boundaries catch up from the durable event prefix; only an
+        # explicit recovery rebuild should discard the exact-ID cache used by the next append.
+        refresh_ledger(self.state_root)
         generate_dashboard(self.state_root, config=self.config)

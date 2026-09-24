@@ -44,7 +44,16 @@ def estimate_cost_usd(*, model: str | None = None, input_tokens: Any = None, out
                       cached_input_tokens: Any = None, cache_write_tokens: Any = None,
                       pricing: dict[str, Any] | None = None,
                       config: dict[str, Any] | None = None) -> Optional[dict[str, Any]]:
-    """Return {'cost_usd', 'cost_source', 'cost_rate_model'} or None when not estimable."""
+    """Return {'cost_usd', 'cost_source', 'cost_rate_model', 'cost_rate_source', 'cost_rate_verified_on'}
+    or None when not estimable.
+
+    `cost_rate_source`/`cost_rate_verified_on` carry the rate table entry's provenance (`source`,
+    `verified_on` in `config.json`) through to the emitted record, so a consumer can tell a rate
+    confirmed by the provider of record from one read off a local model catalog without opening
+    `config.json`. Neither field is required on a rate entry: an entry with no provenance yields
+    `cost_rate_source=None`/`cost_rate_verified_on=None` rather than raising, because most of the
+    existing entries in `config.json` predate this field and must keep pricing correctly.
+    """
     pricing = load_pricing(config) if pricing is None else pricing
     if pricing.get('enabled') is False:
         return None
@@ -80,4 +89,6 @@ def estimate_cost_usd(*, model: str | None = None, input_tokens: Any = None, out
         'cost_usd': round(cost, 6),
         'cost_source': 'estimated-from-reported-tokens',
         'cost_rate_model': rate.get('id') or model,
+        'cost_rate_source': rate.get('source'),
+        'cost_rate_verified_on': rate.get('verified_on'),
     }

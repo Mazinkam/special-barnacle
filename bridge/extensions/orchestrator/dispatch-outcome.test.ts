@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { BoundedCapture, classifyDispatchOutcome, summarizeStderr } from "./dispatch-outcome.ts";
+import { BoundedCapture, classifyDispatchOutcome, summarizeStderr, trimEventForLog } from "./dispatch-outcome.ts";
 
 const recoveredInput = {
 	exitCode: 1,
@@ -19,6 +19,14 @@ describe("classifyDispatchOutcome", () => {
 			status: "completed_after_process_error",
 			effectiveExitCode: 0,
 			note: "completed; process exited 1 after settle: Error: teardown failed",
+		});
+	});
+
+	test("cancellation cannot recover a settled stop result", () => {
+		expect(classifyDispatchOutcome({ ...recoveredInput, cancelled: true })).toEqual({
+			status: "cancelled",
+			effectiveExitCode: 137,
+			note: "Error: teardown failed",
 		});
 	});
 
@@ -93,4 +101,48 @@ describe("BoundedCapture", () => {
 		expect(capture.text()).toBe("ABCD\n[orchestrator] … 2 bytes elided …\nGHIJKL");
 	});
 
+	test("keeps retained text bounded after more than 100 MiB of input", () => {
+		const capture = new BoundedCapture(8 * 1024, 56 * 1024);
+		const chunk = "x".repeat(1024 * 1024);
+		for (let index = 0; index < 200; index++) capture.append(chunk);
+
+		expect(capture.elidedBytes).toBeGreaterThan(100 * 1024 * 1024);
+		expect(capture.text().length).toBeLessThanOrEqual(65 * 1024);
+	});
+});
+
+describe("trimEventForLog", () => {
+	test("removes nested worker histories while preserving tool execution metadata", () => {
+		const event = {
+			type: "tool_execution_update",
+			partialResult: {
+				details: {
+					results: [{
+						taskId: "worker-1",
+						agent: "worker",
+						model: "provider/model",
+						exitCode: 0,
+						usage: { input: 4, output: 2 },
+						messages: [{ role: "assistant", content: "very large worker history" }],
+					}],
+				},
+			},
+		};
+
+		expect(trimEventForLog(event)).toEqual({
+			type: "tool_execution_update",
+			partialResult: {
+				details: {
+					results: [{
+						taskId: "worker-1",
+						agent: "worker",
+						model: "provider/model",
+						exitCode: 0,
+						usage: { input: 4, output: 2 },
+					}],
+				},
+			},
+		});
+		expect(event.partialResult.details.results[0]).toHaveProperty("messages");
+	});
 });

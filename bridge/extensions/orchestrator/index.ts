@@ -17,7 +17,7 @@
  *   5. spawn subagent via HT subagent tool   -> dispatchHierarchical
  *   6. record every model call              -> captureDispatchCost
  *   7. run deterministic verification       -> runVerification
- *   8. build QualityEvidence + verify_task   -> verifyTask
+ *   8. QA gate verdict (the only verdict)   -> runVerification + recordOutcome
  *   9. escalate only the failing subproblem -> escalateIfNeeded
  *  10. complete_run / fail_run              -> completeRun / failRun + recordOutcome
  *
@@ -27,10 +27,12 @@
  * skill's history has (recommended, executed, observed) triples to learn from.
  */
 
-import { type ChildProcess, spawn, type SpawnOptions, spawnSync } from "node:child_process";
+import { RunDiagnostics, appendDiagnosticPath, type DiagnosticWriter } from "./run-diagnostics.ts";
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
 	appendFileSync,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
@@ -89,9 +91,23 @@ import {
 	userLayerWarnings,
 } from "./models.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
-import { BoundedCapture, classifyDispatchOutcome, summarizeStderr } from "./dispatch-outcome.ts";
+import { BoundedCapture, classifyDispatchOutcome, summarizeStderr, trimEventForLog } from "./dispatch-outcome.ts";
+import {
+	DispatchProgressTracker,
+	ORCHESTRATING_CAPABILITIES,
+	buildInterruptionReport,
+	renderInterruptionReport,
+	summarizeInterruption,
+	resolveDispatchTimeoutPolicy,
+	applyLeadTimeoutOverride,
+	type DispatchTimeoutPolicy,
+	type InterruptionReport,
+} from "./dispatch-progress.ts";
 import { RunCancellation } from "./cancellation.ts";
-import { connectCancellationLoader } from "./run-ui.ts";
+import { connectCancellationLoader, applyObservation, applyWarnings, createProgressView, formatNestedWorkerRows, formatProgressLine, formatWarningLine } from "./run-ui.ts";
+import type { DispatchProgressView } from "./run-ui.ts";
+import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
+import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.ts";
 // Rule-2 recon planning/evidence helpers (pure; see recon.ts). `dispatchHierarchical()`
 // dispatches these as ordinary parent-owned tasks through the existing
 // `dispatchParallel()` path. `DispatchTask` below is declared independently;
@@ -117,6 +133,13 @@ const PYTHON = process.env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3";
  * older `orchestrator-adapter.json` is migrated into profile "default" on first
  * load and then ignored.
  */
+// Match absolute paths under common user homes so the bounded Status Contract
+// `error` field never leaks filesystem locations. Mirrors the redaction the
+// Python CLI applies when writing `ingest_status.json`.
+const PATH_RE = /(\/Users\/[^\s|]+|\/home\/[^\s|]+|~\/[^\s|]+)/g;
+function redactPaths(text: string): string {
+	return text.replace(PATH_RE, "<path>");
+}
 const PROFILES_PATH =
 	process.env.HUMAIN_ORCHESTRATOR_PROFILES_FILE ??
 	join(homedir(), ".humain-terminal", "agent", "orchestrator-profiles.json");
@@ -127,6 +150,34 @@ const LEGACY_ADAPTER_PATH =
 /** Where per-run logs land: `<STATE_ROOT>/runs/<runId>/`. */
 function runsDir(): string {
 	return join(STATE_ROOT.replace(/^~/, homedir()), "runs");
+}
+
+/** Manifest `python3 -m orchestrator.cli archive-runs --execute` leaves next to a run's `<name>.gz` files. */
+const ARCHIVE_MANIFEST = "archive.manifest.json";
+
+/**
+ * Where a run diagnostic can be read *now*. The opt-in `archive-runs --execute` command replaces
+ * the diagnostics of old completed runs with `<name>.gz` + a manifest (`run.log` itself is never
+ * archived), so a path remembered from the progress board or an old notification may no longer
+ * exist as-is. Returns the path unchanged while it is readable; otherwise a lookup/restore hint
+ * instead of a silently broken link.
+ */
+export function describeRunArtifact(path: string): string {
+	if (existsSync(path)) return path;
+	const runDir = dirname(path);
+	const name = basename(path);
+	const archived = join(runDir, `${name}.gz`);
+	let listed = false;
+	try {
+		const manifest = JSON.parse(readFileSync(join(runDir, ARCHIVE_MANIFEST), "utf-8"));
+		listed = manifest?.format_version === 1 && typeof manifest?.files?.[name] === "object";
+	} catch {
+		/* no readable manifest: the file was never archived by us */
+	}
+	if (listed && existsSync(archived)) {
+		return `${path} (archived as ${archived} — read with \`gunzip -c\`, or restore the run with \`python3 -m orchestrator.cli restore-run ${basename(runDir)}\`)`;
+	}
+	return `${path} (missing)`;
 }
 
 // Non-interactive runs (`--mode json -p`, CI, smoke tests) get a no-op UI whose
@@ -146,16 +197,14 @@ const MAX_LEADS = positiveIntEnv("HUMAIN_ORCHESTRATOR_MAX_LEADS", 8);
 const DISPATCH_TIMEOUT_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS", 20 * 60 * 1000);
 
 /**
- * Capabilities that fan out their own subagents instead of doing the work
- * themselves. Their wall clock must exceed the sum of the children they wait on,
- * so they get a separate, larger budget: a lead that dispatches three reviewers
- * was being killed at the leaf timeout while its children were still running.
+ * Telemetry batching. Records written within this window share one Python `batch`
+ * process; a Python start-up costs ~250 ms, so a shorter window buys nothing. The
+ * batch size stays well under Python's 500-record validation limit. Terminal writes
+ * (run complete/fail/cancel/crash, session shutdown) flush immediately regardless.
  */
-const ORCHESTRATING_CAPABILITIES = new Set(["lead", "architect", "technical_lead"]);
-const LEAD_DISPATCH_TIMEOUT_MS = positiveIntEnv(
-	"HUMAIN_ORCHESTRATOR_LEAD_TIMEOUT_MS",
-	Math.max(90 * 60 * 1000, DISPATCH_TIMEOUT_MS * 4),
-);
+const TELEMETRY_FLUSH_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_TELEMETRY_FLUSH_MS", 500);
+const TELEMETRY_MAX_BATCH = positiveIntEnv("HUMAIN_ORCHESTRATOR_TELEMETRY_BATCH", 100);
+
 
 /**
  * Bounds the aggregate parent-owned recon evidence packet handed to every
@@ -170,11 +219,11 @@ const RECON_EVIDENCE_MAX_CHARS = positiveIntEnv(
 	METHOD.rules.pre_implementation_recon.evidence_packet_max_tokens * CHARS_PER_TOKEN_ESTIMATE,
 );
 
-function dispatchTimeoutFor(capability: string | undefined): number {
-	return capability && ORCHESTRATING_CAPABILITIES.has(capability)
-		? LEAD_DISPATCH_TIMEOUT_MS
-		: DISPATCH_TIMEOUT_MS;
-}
+// `dispatchTimeoutFor()` + LEAD_DISPATCH_TIMEOUT_MS lived here. Dropped in
+// favour of main's progress-aware lead timeouts (`cb9f51e`): a flat per-
+// capability ceiling is exactly what that change replaced, and
+// ORCHESTRATING_CAPABILITIES now drives `opts.leadTimeouts` in
+// runSubagentProcess instead.
 
 /**
  * PIDs of dispatched children that are still running. Children are spawned
@@ -208,6 +257,53 @@ function killProcessTree(proc: { pid?: number; kill: (signal?: NodeJS.Signals) =
 	}
 }
 
+/** Ensure failures in a child stream listener cannot escape into the TUI. */
+export function guardChildStreamHandler(
+	handlerName: string,
+	handler: () => void,
+	onFailure: {
+		appendStderr: (text: string) => void;
+		kill: () => void;
+		finish: (exitCode: number) => void;
+	},
+): void {
+	try {
+		handler();
+	} catch (error) {
+		let message = "unknown error";
+		try {
+			message = error instanceof Error ? error.message : String(error);
+		} catch {
+			/* a malformed thrown value must not escape the stream listener */
+		}
+		try {
+			onFailure.appendStderr(`\n[orchestrator] ${handlerName} handler failed: ${message}`);
+		} catch {
+			/* avoid a diagnostic failure escaping the stream listener */
+		}
+		try {
+			onFailure.kill();
+		} catch {
+			/* killing a child that already exited is harmless */
+		}
+		try {
+			onFailure.finish(1);
+		} catch {
+			/* the stream listener must never throw */
+		}
+	}
+}
+
+/** Write a JSONL event while omitting recursively repeated worker histories. */
+export function appendTrimmedEventLog(eventsLog: string | undefined, event: unknown): void {
+	if (!eventsLog) return;
+	try {
+		appendDiagnosticPath(eventsLog, `${JSON.stringify(trimEventForLog(event))}\n`);
+	} catch {
+		/* per-dispatch diagnostics must not disrupt the child stream */
+	}
+}
+
 let dispatchReaperInstalled = false;
 
 /** Kill every in-flight dispatch subtree when this process goes down. */
@@ -230,6 +326,12 @@ function installDispatchReaper(): void {
 		// we don't change whether the parent exits.
 		process.once(signal, () => {
 			ACTIVE_RUN?.cancel();
+			// Best effort only. A signal handler cannot await, so this merely *starts* a drain of
+			// records still inside the coalescing window; whether the Python child gets to run
+			// before HT exits depends on HT's own shutdown sequencing. Anything it does not
+			// reach is lost with the process. The guaranteed drains are the awaited ones: the
+			// run's terminal path (complete/fail/cancel/crash) and the `session_shutdown` hook.
+			void recordQueue.flush();
 			reap();
 		});
 	}
@@ -237,8 +339,9 @@ function installDispatchReaper(): void {
 
 const PERSONA_TMP_PREFIX = "orch-agent-";
 /**
- * Age after which an unclaimed persona temp dir is considered orphaned. Must stay
- * comfortably above DISPATCH_TIMEOUT_MS so a live dispatch is never reaped.
+ * Age after which an unclaimed persona temp dir is considered orphaned. Leads may
+ * run up to the absolute ceiling (6h by default), but each prompt file is read
+ * once when its child starts, so the TTL only needs to cover spawn.
  */
 const PERSONA_TMP_TTL_MS = Math.max(2 * 60 * 60 * 1000, DISPATCH_TIMEOUT_MS * 6);
 
@@ -655,15 +758,13 @@ function clampTriage(raw: Partial<TriageResult>): TriageResult | null {
 // assistant message_end events with model, input/output tokens, and cost.
 // That path is the one we replicate here.
 
-/**
- * Injectable process-creation seam for `runSubagentProcess`. Only the
- * `(command, args, options) => ChildProcess` overload is ever used at the one
- * call site, so the seam is typed to exactly that call shape — the real
- * `spawn` satisfies it structurally, and tests can supply a plain function
- * without fighting `spawn`'s overload set (which otherwise infers `args` as
- * `readonly string[] | SpawnOptions`).
- */
-type ChildSpawner = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
+// The `ChildSpawner` seam this branch added here is deliberately NOT duplicated:
+// main declares a byte-identical alias further down (`cc9836d`), which is the
+// shape `f2ddaa6` adopted precisely so this merge would converge. Two aliases
+// would be a duplicate-identifier error; the one below serves both call sites.
+function reportedCost(total: unknown): number | undefined {
+	return typeof total === "number" && Number.isFinite(total) && total >= 0 ? total : undefined;
+}
 
 interface SubagentProcessResult {
 	exitCode: number;
@@ -671,7 +772,7 @@ interface SubagentProcessResult {
 	stdout: string;
 	/** The LAST assistant text block — the child's final answer. */
 	finalText: string;
-	/** Raw newline-delimited JSON event stream, kept for diagnostics only. */
+	/** Bounded head-and-tail capture of the raw JSON event stream for diagnostics. */
 	rawStdout: string;
 	/** False when the resolved persona had no write/edit tool, so it cannot have changed files. */
 	personaCanMutate: boolean;
@@ -679,10 +780,14 @@ interface SubagentProcessResult {
 	model?: string;
 	usage: SubagentUsageStats;
 	costUsd: number;
+	/** True only when every received usage block explicitly reported a valid cost (including $0). */
+	costReported: boolean;
 	durationMs: number;
 	stopReason?: string;
 	/** Process disposition after considering terminal JSON events. */
-	outcome: "completed" | "completed_after_process_error" | "failed" | "timed_out";
+	outcome: "completed" | "completed_after_process_error" | "failed" | "timed_out" | "cancelled";
+	timeoutReason?: "inactivity" | "absolute";
+	interruption?: InterruptionReport;
 	/** Raw child exit code before terminal-result recovery. */
 	processExitCode: number;
 	/** Teardown error retained alongside a valid settled result. */
@@ -726,9 +831,18 @@ interface DispatchProgress {
 	turns: number;
 	toolCalls: number;
 	lastActivity: string;
+	/** Last few activity strings, newest at the end; rendered as a dim sub-line. */
+	activityTail: string[];
 	costUsd: number;
 	status: "running" | "done" | "failed" | "cancelled";
+	/** Nesting depth (0 = top-level dispatch, 1 = child of a lead, …). */
+	depth: number;
+	progress: DispatchProgressView;
+	lastLoggedProgressDetail?: string;
+	lastLoggedProgressAt?: number;
 }
+
+const MAX_ACTIVITY_TAIL = 4;
 
 function fmtElapsed(ms: number): string {
 	const s = Math.max(0, Math.round(ms / 1000));
@@ -751,6 +865,52 @@ function shortArgs(toolName: string, args: unknown): string {
 }
 
 /**
+ * Detect the git worktree the orchestrator is running in. Cheap: two short
+ * `git` invocations cached at session start. Returns null when `cwd` is not
+ * inside a git worktree so callers can fall back gracefully.
+ */
+export interface WorktreeInfo {
+	root: string;
+	branch: string;
+	shortBranch: string;
+	name: string;
+}
+
+function detectWorktree(cwd: string): WorktreeInfo | null {
+	try {
+		const rootR = spawnSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
+			encoding: "utf-8", timeout: 5000,
+		});
+		if (rootR.status !== 0 || !rootR.stdout.trim()) return null;
+		const root = rootR.stdout.trim();
+		const branchR = spawnSync("git", ["-C", cwd, "branch", "--show-current"], {
+			encoding: "utf-8", timeout: 5000,
+		});
+		const branch = branchR.status === 0 ? branchR.stdout.trim() : "";
+		return {
+			root,
+			branch,
+			shortBranch: branch || "(detached)",
+			name: basename(root),
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** Braille-pattern spinner frames, ticked by the run's existing 1s interval. */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+function spinnerFrame(now: number): string {
+	return SPINNER_FRAMES[Math.floor(now / 80) % SPINNER_FRAMES.length];
+}
+
+/** Hard cap on buffered user messages so a chatty operator can't blow context. */
+const MAX_QUEUED_MESSAGES = 10;
+/** Soft per-message cap in characters; longer messages are truncated in the
+ *  prompt but preserved in full in run.log. */
+const MAX_MESSAGE_CHARS = 1500;
+
+/**
  * One /orchestrate invocation. Owns the widget/status lines the user sees while
  * children run, and the on-disk log under `<STATE_ROOT>/runs/<runId>/`:
  *
@@ -767,19 +927,44 @@ export class RunSession {
 	readonly ctx: ExtensionContext;
 	readonly goal: string;
 	readonly dir: string;
+	/** Git worktree the run is operating in (null when cwd isn't git-tracked). */
+	readonly worktree: WorktreeInfo | null;
 	private readonly dispatches = new Map<string, DispatchProgress>();
 	private phase = "starting";
 	private renderTimer: ReturnType<typeof setTimeout> | undefined;
 	private readonly startedAt = Date.now();
+	// The ISO stamp for the ledger is derived from the same wall-clock read as `startedAt`, and
+	// elapsed time uses a monotonic origin: `Date.now()` can step (NTP, sleep/wake) mid-run, so
+	// the duration written to outcomes must never be derived from two wall-clock reads.
+	private readonly startedAtIso = new Date(this.startedAt).toISOString();
+	private readonly startedMono = performance.now();
 	private tickTimer: ReturnType<typeof setInterval> | undefined;
 	private closed = false;
 	readonly cancellation = new RunCancellation();
+	/** User messages queued while a run is live; drained at the next dispatch boundary. */
+	private queuedMessages: Array<{ text: string; queuedAt: number }> = [];
+	/** History of message batches we've folded into prompts, so the user can see delivery. */
+	private deliveryLog: Array<{ count: number; to: string; ts: number }> = [];
+	readonly diagnostics: RunDiagnostics;
+	private terminalAcknowledged = false;
+	private resolveFinished!: () => void;
+	/** Resolves after the command's producers, terminal telemetry and cleanup have settled. */
+	readonly finished = new Promise<void>(resolve => { this.resolveFinished = resolve; });
 
-	constructor(runId: string, ctx: ExtensionContext, goal: string) {
+	finish(): void { this.resolveFinished(); }
+	/**
+	 * Telemetry counters when this run started. The terminal summary reports every record
+	 * failure since then — including timer flushes that failed mid-run — not just the final drain.
+	 */
+	readonly telemetryBaseline: QueueStats = recordQueue.snapshot();
+
+	constructor(runId: string, ctx: ExtensionContext, goal: string, cwd: string = process.cwd()) {
 		this.runId = runId;
 		this.ctx = ctx;
 		this.goal = goal;
 		this.dir = join(runsDir(), runId);
+		this.diagnostics = new RunDiagnostics(this.dir, runId);
+		this.worktree = detectWorktree(cwd);
 		try {
 			mkdirSync(this.dir, { recursive: true });
 		} catch (err) {
@@ -787,13 +972,93 @@ export class RunSession {
 		}
 		this.log(`run ${runId} started`);
 		this.log(`goal: ${goal}`);
+		if (this.worktree) {
+			this.log(`worktree: ${this.worktree.root} [${this.worktree.shortBranch}]`);
+		}
 		// Elapsed counters must tick even when a child is silent — a frozen board
 		// is indistinguishable from a hung run, which is the complaint that led here.
 		this.tickTimer = setInterval(() => this.render(), 1000);
 	}
 
+	/**
+	 * Append a user message to be delivered to the next dispatched task. Returns
+	 * the new queue depth. We drain on dispatch — never mid-flight — because
+	 * the subprocess protocol (humain-terminal --mode json --no-session) has no
+	 * stdin injection channel.
+	 */
+	enqueueMessage(text: string): number {
+		const trimmed = text.trim();
+		if (!trimmed) return this.queuedMessages.length;
+		const capped = trimmed.length > MAX_MESSAGE_CHARS
+			? `${trimmed.slice(0, MAX_MESSAGE_CHARS)}…`
+			: trimmed;
+		if (this.queuedMessages.length >= MAX_QUEUED_MESSAGES) {
+			this.queuedMessages.shift();
+		}
+		this.queuedMessages.push({ text: capped, queuedAt: Date.now() });
+		this.log(`user message queued (depth=${this.queuedMessages.length}): ${capped.slice(0, 200)}`);
+		this.render();
+		return this.queuedMessages.length;
+	}
+
+	/**
+	 * Atomically return queued messages and clear the queue, recording the
+	 * delivery in the run's delivery log. Returns [] when nothing queued.
+	 */
+	drainMessages(recipient: string): string[] {
+		if (this.queuedMessages.length === 0) return [];
+		const msgs = this.queuedMessages.map((m) => m.text);
+		this.deliveryLog.push({
+			count: msgs.length,
+			to: recipient,
+			ts: Date.now(),
+		});
+		// Keep the delivery log bounded.
+		if (this.deliveryLog.length > 20) this.deliveryLog.splice(0, this.deliveryLog.length - 20);
+		this.queuedMessages.length = 0;
+		this.log(`delivered ${msgs.length} user message(s) to ${recipient}`);
+		this.render();
+		return msgs;
+	}
+
+	/** Number of currently queued (undelivered) messages. */
+	queuedDepth(): number {
+		return this.queuedMessages.length;
+	}
+
 	file(name: string): string {
 		return join(this.dir, name);
+	}
+
+	writeDiagnostic(name: string, text: string): boolean {
+		return this.diagnostics.write(name, text);
+	}
+
+	acknowledgeTerminal(ok: boolean): void {
+		this.terminalAcknowledged = ok;
+	}
+
+	async sealDiagnostics(terminal = Promise.resolve(this.terminalAcknowledged)): Promise<boolean> {
+		const sealed = await this.diagnostics.seal(terminal);
+		if (!sealed) this.ctx.ui.notify(
+			`Diagnostics remain UNSEALED and archive-ineligible: producer drain/terminal acknowledgement did not complete or sealing failed. Raw diagnostics retained: ${this.dir}`,
+			"warning",
+		);
+		return sealed;
+	}
+
+	/**
+	 * Time fields recorded at the run's terminal boundary (complete/fail/cancel/crash).
+	 * `elapsed_ms` is monotonic and clamped at zero; consumers treat a run without these
+	 * fields as "duration unknown", never as zero.
+	 */
+	terminalTiming(): RunTiming {
+		return {
+			started_at: this.startedAtIso,
+			finished_at: new Date().toISOString(),
+			elapsed_ms: Math.max(0, Math.round(performance.now() - this.startedMono)),
+			elapsed_source: "monotonic",
+		};
 	}
 
 	cancel(): void {
@@ -807,7 +1072,7 @@ export class RunSession {
 	log(line: string): void {
 		const stamped = `${new Date().toISOString()} ${line}`;
 		try {
-			appendFileSync(this.file("run.log"), `${stamped}\n`);
+			this.diagnostics.write("run.log", `${stamped}\n`, true);
 		} catch {
 			/* log dir unavailable; the UI still gets the line */
 		}
@@ -820,52 +1085,85 @@ export class RunSession {
 		this.render();
 	}
 
-	startDispatch(taskId: string, label: string, model: string): void {
+	startDispatch(taskId: string, label: string, model: string, depth: number = 0): void {
+		const now = Date.now();
 		this.dispatches.set(taskId, {
 			taskId,
 			label,
 			model,
-			startedAt: Date.now(),
+			startedAt: now,
 			turns: 0,
 			toolCalls: 0,
 			lastActivity: "starting",
+			activityTail: ["starting"],
 			costUsd: 0,
 			status: "running",
+			depth,
+			progress: createProgressView(now),
 		});
-		this.log(`dispatch ${taskId} → ${label} on ${model}`);
+		this.log(`dispatch ${taskId} → ${label} on ${model} (depth=${depth})`);
 		this.render();
+	}
+
+	recordProgress(taskId: string, observation: ProgressObservation, check: TimeoutCheck, now = Date.now()): void {
+		const dispatch = this.dispatches.get(taskId);
+		if (!dispatch) return;
+		applyObservation(dispatch.progress, observation, now);
+		applyWarnings(dispatch.progress, check.warnings, now, (warning) => this.log(`  ${taskId} ${warning}`));
+		const detail = observation.detail.replace(/\s+/g, " ").trim();
+		if (
+			observation.kind === "progress" &&
+			detail !== "tool execution completed" &&
+			dispatch.lastLoggedProgressDetail !== detail &&
+			(detail.startsWith("nested worker progress") || dispatch.lastLoggedProgressAt === undefined || now - dispatch.lastLoggedProgressAt >= 60_000)
+		) {
+			dispatch.lastLoggedProgressDetail = detail;
+			dispatch.lastLoggedProgressAt = now;
+			this.log(`  ${taskId} progress: ${detail}`);
+		}
+		this.scheduleRender();
 	}
 
 	/** Feed a parsed `--mode json` event from a child. */
 	onChildEvent(taskId: string, event: any): void {
 		const d = this.dispatches.get(taskId);
 		if (!d) return;
+		// Nested worker counts/turns are derived by render() from the single
+		// de-duplicated progress view, never from raw event snapshots.
+		let changed: string | null = null;
 		switch (event?.type) {
 			case "tool_execution_start": {
 				d.toolCalls += 1;
 				const detail = shortArgs(event.toolName, event.args);
-				d.lastActivity = `${event.toolName}${detail ? ` ${detail}` : ""}`;
-				this.log(`  ${taskId} tool#${d.toolCalls} ${d.lastActivity}`);
+				changed = `${event.toolName}${detail ? ` ${detail}` : ""}`;
+				this.log(`  ${taskId} tool#${d.toolCalls} ${changed}`);
 				break;
 			}
 			case "tool_execution_end":
 				if (event.isError) {
-					d.lastActivity = `${event.toolName} ✗`;
+					changed = `${event.toolName} ✗`;
 					this.log(`  ${taskId} tool ${event.toolName} returned error`);
 				}
 				break;
 			case "message_start":
-				if (event.message?.role === "assistant") d.lastActivity = "thinking";
+				if (event.message?.role === "assistant") changed = "thinking";
 				break;
 			case "message_end":
 				if (event.message?.role === "assistant") {
 					d.turns += 1;
-					d.costUsd += event.message?.usage?.cost?.total || 0;
-					d.lastActivity = `turn ${d.turns} done`;
+					d.costUsd += reportedCost(event.message?.usage?.cost?.total) ?? 0;
+					changed = `turn ${d.turns} done (${d.toolCalls} tools)`;
 				}
 				break;
 			default:
 				return;
+		}
+		if (changed) {
+			d.lastActivity = changed;
+			d.activityTail.push(changed);
+			if (d.activityTail.length > MAX_ACTIVITY_TAIL) {
+				d.activityTail.splice(0, d.activityTail.length - MAX_ACTIVITY_TAIL);
+			}
 		}
 		this.scheduleRender();
 	}
@@ -899,32 +1197,134 @@ export class RunSession {
 
 	render(): void {
 		if (this.closed) return;
+		const now = Date.now();
 		const running = [...this.dispatches.values()].filter((d) => d.status === "running");
 		const done = [...this.dispatches.values()].filter((d) => d.status !== "running");
+		const failed = done.filter((d) => d.status === "failed").length;
 		const cancelled = done.filter((d) => d.status === "cancelled").length;
-		const elapsed = fmtElapsed(Date.now() - this.startedAt);
+		const elapsed = fmtElapsed(now - this.startedAt);
+		const totalCost = this.totalCost();
+		const worktree = this.worktree;
+
+		// Compact status line for the bar: phase + headline numbers. The phase is
+		// most important when terminal (cancelled, failed) — keeping it visible
+		// here means the user can see the verdict in the status bar even after
+		// the widget has been closed.
+		const wtShort = worktree ? ` · ${worktree.shortBranch} @ ${worktree.name}` : "";
 		this.ctx.ui.setStatus(
 			"orchestrator",
-			`orch ${elapsed} · ${this.phase} · ${running.length} running · ${cancelled} cancelled · $${this.totalCost().toFixed(3)}`,
+			`orch ${this.phase} · ${elapsed} · ${running.length} running · ${failed} failed${wtShort} · $${totalCost.toFixed(3)}`,
 		);
+
+		const lines: string[] = [];
+		// Title bar: run id, phase, elapsed, total cost, worktree.
+		const titleWt = worktree
+			? `  ${worktree.shortBranch} @ ${worktree.root}`
+			: "";
+		lines.push(
+			`▶ /orchestrate  ${this.runId}  ·  ${this.phase}  ·  ${elapsed}  ·  $${totalCost.toFixed(4)}${titleWt}`,
+		);
+		// Goal line: keep first 80 + last 40 chars so the user can recognize long goals.
 		const goal = this.goal.replace(/\s+/g, " ").trim();
-		const lines: string[] = [
-			`▶ /orchestrate ${elapsed} — ${this.phase} — $${this.totalCost().toFixed(4)} — log: ${this.file("run.log")}`,
-			`Goal: ${goal.length > 120 ? `${goal.slice(0, 117)}…` : goal}`,
-		];
-		for (const d of running) {
+		if (goal.length <= 120) {
+			lines.push(`  Goal: ${goal}`);
+		} else {
+			lines.push(`  Goal: ${goal.slice(0, 80)} … ${goal.slice(-40)}`);
+		}
+		// Rollup line only when at least one task has finished.
+		if (done.length > 0) {
 			lines.push(
-				`  ● ${d.label.padEnd(22)} ${shortName(d.model).padEnd(28)} ${fmtElapsed(Date.now() - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  ${d.lastActivity}`,
+				`  ${running.length} running  ${done.length} done  ${failed} failed  ${cancelled} cancelled`,
 			);
 		}
-		for (const d of done.slice(-6)) {
-			const mark = d.status === "done" ? "✓" : d.status === "cancelled" ? "⏹" : "✗";
-			lines.push(
-				`  ${mark} ${d.label.padEnd(22)} ${shortName(d.model).padEnd(28)} ${fmtElapsed((d.endedAt ?? Date.now()) - d.startedAt).padStart(6)}  t${d.turns} tools${d.toolCalls}  $${d.costUsd.toFixed(4)} ${d.lastActivity}`,
-			);
+
+		// Running section.
+		if (running.length > 0) {
+			lines.push("");
+			lines.push(`  ▸ running (${running.length})`);
+			for (const d of running) {
+				lines.push(this.formatRunningRow(d, now));
+				this.appendActivityTail(lines, d);
+				const indent = "  ".repeat(2 + d.depth);
+				const progressLine = formatProgressLine(d.progress, now, indent);
+				if (progressLine) lines.push(progressLine);
+				const warningLine = formatWarningLine(d.progress, now, indent);
+				if (warningLine) lines.push(warningLine);
+				lines.push(...formatNestedWorkerRows(d.progress, now, d.depth));
+			}
 		}
-		if (done.length > 6) lines.push(`  … ${done.length - 6} earlier dispatch(es) in run.log`);
+
+		// Completed section — tail of most recent 6.
+		if (done.length > 0) {
+			lines.push("");
+			lines.push(`  ▸ completed (${done.length})`);
+			const tail = done.slice(-6);
+			for (const d of tail) lines.push(this.formatDoneRow(d, now));
+			if (done.length > 6) {
+				lines.push(`    … ${done.length - 6} earlier in run.log`);
+			}
+		}
+
+		// Message queue indicator — only when there is something queued.
+		if (this.queuedMessages.length > 0) {
+			lines.push("");
+			lines.push(
+				`  ↳ ${this.queuedMessages.length} message${this.queuedMessages.length === 1 ? "" : "s"} queued for next dispatch — /omsg <text>`,
+			);
+		} else {
+			// Most recent delivery within the last 5 minutes — confirms the agent saw it.
+			const lastDelivery = this.deliveryLog[this.deliveryLog.length - 1];
+			if (lastDelivery && now - lastDelivery.ts < 5 * 60 * 1000) {
+				const ago = fmtElapsed(now - lastDelivery.ts);
+				lines.push(
+					`  ✓ ${lastDelivery.count} message${lastDelivery.count === 1 ? "" : "s"} delivered to ${lastDelivery.to} — ${ago} ago`,
+				);
+			}
+		}
+
+		lines.push("");
+		lines.push(`  ↯ updated ${new Date(now).toISOString().slice(11, 19)} UTC · log: ${this.file("run.log")}`);
 		this.ctx.ui.setWidget("orchestrator", lines);
+	}
+
+	private formatRunningRow(d: DispatchProgress, now: number): string {
+		const indent = "  ".repeat(1 + d.depth);
+		const spin = spinnerFrame(now);
+		const model = shortName(d.model).padEnd(20);
+		const elapsed = fmtElapsed(now - d.startedAt).padStart(7);
+		const turns = `t${d.turns}`.padStart(4);
+		const tools = `⚙${d.toolCalls}`.padStart(5);
+		const cost = `$${d.costUsd.toFixed(4)}`.padStart(9);
+		const idleMs = now - d.progress.lastProgressAt;
+		const idle = idleMs > 60_000 ? `  idle ${fmtElapsed(idleMs)}` : "";
+		return `${indent}${spin} ${d.label.padEnd(20)}  ${model}  ${elapsed}  ${turns} ${tools}  ${cost}${idle}`;
+	}
+
+	private appendActivityTail(lines: string[], d: DispatchProgress): void {
+		const indent = "  ".repeat(2 + d.depth);
+		const tail = d.activityTail.slice(0, -1);
+		if (tail.length > 0) lines.push(`${indent}↳ ${tail.join(" · ")}`.slice(0, 120));
+		const nestedWorkers = d.progress.nested.size;
+		const nestedTurns = [...d.progress.nested.values()].reduce((total, worker) => total + worker.turns, 0);
+		if (nestedWorkers > 0) {
+			lines.push(`${indent}${nestedWorkers} worker${nestedWorkers === 1 ? "" : "s"} (${nestedTurns} turns)`);
+		}
+	}
+
+	private formatDoneRow(d: DispatchProgress, now: number): string {
+		const indent = "  ".repeat(1 + d.depth);
+		const mark = d.status === "done" ? "✓" : d.status === "cancelled" ? "⏹" : "✗";
+		const model = shortName(d.model).padEnd(20);
+		const elapsed = fmtElapsed((d.endedAt ?? now) - d.startedAt).padStart(7);
+		const turns = `t${d.turns}`.padStart(4);
+		const tools = `⚙${d.toolCalls}`.padStart(5);
+		const cost = `$${d.costUsd.toFixed(4)}`.padStart(9);
+		// Surface the captured note for failed and cancelled dispatches so the
+		// user can see "exit 1", "cancelled by user", or the stderr summary at a
+		// glance. For normal completions the ✓ mark already conveys status.
+		const note =
+			d.status !== "done" && d.lastActivity ? `  ${d.lastActivity}` : "";
+		return `${indent}${mark} ${d.label.padEnd(20)}  ${model}  ${elapsed}  ${turns} ${tools}  ${cost}${note}`;
 	}
 
 	close(preserveCancelled = false): void {
@@ -955,6 +1355,19 @@ const NO_PERSONA = "__no_persona__";
 let ACTIVE_RUN: RunSession | null = null;
 
 /**
+ * Narrow, single-signature shape for the child launcher seam. `spawn` itself
+ * is a heavily overloaded function (stdio-shape-dependent return types,
+ * options-optional variants, ...); assigning that whole overload set to an
+ * optional property makes both the default (`spawn`) and a test's injected
+ * function fight the overload resolver. Only the
+ * `(command, args, options) => ChildProcess` overload is ever used at the one
+ * call site below, so the seam is typed to exactly that call shape — the real
+ * `spawn` satisfies it structurally, and tests can supply a plain function
+ * without fighting the overload set.
+ */
+type ChildSpawner = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
+
+/**
  * Spawn Pi as a one-shot subagent and parse its JSON event stream for the
  * assistant `message_end`, which carries `model`, `usage`, and `cost.total`.
  * This is the same on-the-wire protocol the human-facing subagent tool uses
@@ -975,24 +1388,44 @@ export async function runSubagentProcess(opts: {
 	label?: string;
 	/** Selects the wall clock: orchestrating capabilities wait on their own children. */
 	capability?: string;
-}, spawnProcess: ChildSpawner = spawn): Promise<SubagentProcessResult> {
+	/** Nesting depth for the widget (0 = top-level, 1 = child of a lead, etc.). */
+	depth?: number;
+	/** Test seam for deterministic progress/absolute timeout coverage. */
+	leadTimeouts?: { inactivityMs: number; maxMs: number };
+	/** Optional owning session; production callers use the active run. */
+	session?: RunSession;
+	/**
+	 * Test seam only: replaces the real child launcher. Defaults to node's
+	 * `spawn`; production callers never set this. Lets tests exercise the real
+	 * stream/event/close handling below against a deterministic local fixture
+	 * instead of the actual `humain-terminal --mode json` binary.
+	 */
+	/*
+	 * This branch previously added a second positional parameter
+	 * (`spawnProcess: ChildSpawner = spawn`) for the same purpose. Converged on
+	 * `spawnChild` instead of shipping two seams for one job: it is the one
+	 * main's suite already exercises, and keeping it inside the options object
+	 * means the next seam does not grow the signature again.
+	 */
+	spawnChild?: ChildSpawner;
+}): Promise<SubagentProcessResult> {
 	const emptyUsage: SubagentUsageStats = {
 		input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
 		cost: 0, contextTokens: 0, turns: 0,
 	};
-	const session = ACTIVE_RUN;
+	const session = opts.session ?? ACTIVE_RUN;
 	session?.cancellation.throwIfCancelled();
 	const taskId = opts.taskId ?? `${opts.agentName}-${Date.now()}`;
 	const safeTaskId = taskId.replace(/[^a-zA-Z0-9._-]+/g, "_");
-	const eventsLog = session ? session.file(`${safeTaskId}.events.jsonl`) : undefined;
-	const stderrLog = session ? session.file(`${safeTaskId}.stderr.log`) : undefined;
+	const eventsName = `${safeTaskId}.events.jsonl`;
+	const stderrName = `${safeTaskId}.stderr.log`;
 	if (session) {
 		try {
-			writeFileSync(session.file(`${safeTaskId}.prompt.md`), opts.task);
+			session.writeDiagnostic(`${safeTaskId}.prompt.md`, opts.task);
 		} catch {
 			/* best-effort */
 		}
-		session.startDispatch(taskId, opts.label ?? opts.agentName, opts.model);
+		session.startDispatch(taskId, opts.label ?? opts.agentName, opts.model, opts.depth ?? 0);
 	}
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
@@ -1065,20 +1498,34 @@ export async function runSubagentProcess(opts: {
 			SUPACODE_TAB_ID: undefined,
 		};
 		let buffer = "";
-		let rawStdout = "";
+		// Raw child events can recursively include full worker histories. Retain
+		// only diagnostics, never the unbounded stream.
+		const stdoutCapture = new BoundedCapture();
 		// Node can truncate a chatty child's async pipe at 64 KiB, so retain both
 		// the runtime header and the diagnostic tail without unbounded memory use.
 		const stderrCapture = new BoundedCapture();
 		let model: string | undefined;
 		const usage: SubagentUsageStats = { ...emptyUsage };
+		let costReported = false;
 		let stopReason: string | undefined;
 		let sawAgentSettled = false;
 		let sawAgentEnd = false;
 		let timedOut = false;
+		let cancelledByListener = false;
+		let timeoutReason: "inactivity" | "absolute" | undefined;
+		let interruption: InterruptionReport | undefined;
 		let spawnFailed = false;
 		let settled = false;
 		let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 		let removeCancellationListener: (() => void) | undefined;
+		let progressTracker: DispatchProgressTracker | undefined;
+		let isLead = false;
+		let dispatchStartedAt = startedAt;
+		let toolCalls = 0;
+		let assistantTurns = 0;
+		let interruptionNote: string | undefined;
+		let armTimer: () => void = () => {};
+		let handleExpiry: (reason: "inactivity" | "absolute") => void = () => {};
 		// `--mode json` writes newline-delimited events, NOT plain prose. Callers
 		// need the assistant's text, so accumulate it here; handing them the raw
 		// event stream made triage's JSON.parse fail every single time.
@@ -1094,10 +1541,40 @@ export async function runSubagentProcess(opts: {
 			promptDir = undefined;
 		};
 
+		const recordInterruption = (reason: InterruptionReport["reason"]): string => {
+			if (interruptionNote) return interruptionNote;
+			const now = Date.now();
+			// The tracker is created only after a successful spawn; a cancellation
+			// racing a synchronous spawn failure still needs an honest note.
+			if (!progressTracker) {
+				progressTracker = new DispatchProgressTracker(resolveDispatchTimeoutPolicy(opts.capability, process.env), dispatchStartedAt);
+			}
+			interruption = buildInterruptionReport({
+				taskId,
+				reason,
+				startedAt: dispatchStartedAt,
+				now,
+				turns: assistantTurns,
+				toolCalls,
+				partialText: assistantTexts[assistantTexts.length - 1] ?? "",
+				tracker: progressTracker,
+			});
+			interruptionNote = renderInterruptionReport(interruption);
+			stderrCapture.append(`\n${interruptionNote}`);
+			return interruptionNote;
+		};
+		let diagnosticWriter: DiagnosticWriter | undefined;
+		let stderrPrefix = "";
 		const finish = (processExitCode: number) => {
 			if (settled) return;
+			const cancelled = cancelledByListener || session?.cancellation.isCancelled === true;
+			cancelledByListener = cancelled;
+			if (cancelled) session?.log(recordInterruption("cancelled"));
 			settled = true;
-			if (timeoutTimer) clearTimeout(timeoutTimer);
+			if (timeoutTimer !== undefined) {
+				clearTimeout(timeoutTimer);
+				timeoutTimer = undefined;
+			}
 			removeCancellationListener?.();
 			if (typeof proc?.pid === "number") liveDispatchPids.delete(proc.pid);
 			cleanupPrompt();
@@ -1113,34 +1590,34 @@ export async function runSubagentProcess(opts: {
 				hasFinalText: Boolean(finalText),
 				lastStopReason: stopReason,
 				timedOut,
+				cancelled,
 				spawnFailed,
 				stderrSummary,
 			});
-			if (stderrLog) {
-				try {
-					const logText = outcome.status === "completed_after_process_error"
-						? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n${stderr}`
-						: stderr;
-					writeFileSync(stderrLog, logText);
-				} catch {
-					/* best-effort */
-				}
+			if (diagnosticWriter) {
+				stderrPrefix = outcome.status === "completed_after_process_error"
+					? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n`
+					: "";
+				diagnosticWriter.write(stderrName, stderrPrefix + stderr);
 			}
-			session?.endDispatch(taskId, outcome.effectiveExitCode, usage.cost, outcome.note);
+			session?.endDispatch(taskId, outcome.effectiveExitCode, usage.cost, interruptionNote ? summarizeInterruption(interruption!) : outcome.note);
 			resolve({
 				exitCode: outcome.effectiveExitCode,
 				stdout: assistantTexts.join("\n\n"),
 				finalText,
-				rawStdout,
+				rawStdout: stdoutCapture.text(),
 				personaCanMutate,
 				stderr,
 				model,
 				usage,
 				costUsd: usage.cost,
+				costReported,
 				durationMs: Date.now() - startedAt,
 				stopReason,
 				outcome: outcome.status,
 				processExitCode,
+				timeoutReason,
+				interruption,
 				postCompletionError: outcome.status === "completed_after_process_error" ? outcome.note : undefined,
 			});
 		};
@@ -1153,7 +1630,9 @@ export async function runSubagentProcess(opts: {
 				usage.output += msg.usage.output || 0;
 				usage.cacheRead += msg.usage.cacheRead || 0;
 				usage.cacheWrite += msg.usage.cacheWrite || 0;
-				usage.cost += msg.usage.cost?.total || 0;
+				const cost = reportedCost(msg.usage.cost?.total);
+				costReported = (usage.turns === 1 || costReported) && cost !== undefined;
+				usage.cost += cost ?? 0;
 				usage.contextTokens = msg.usage.totalTokens || usage.contextTokens;
 			}
 			if (msg.stopReason) stopReason = msg.stopReason;
@@ -1176,8 +1655,16 @@ export async function runSubagentProcess(opts: {
 			try {
 				event = JSON.parse(trimmed);
 			} catch {
+				// Unparseable protocol lines are dropped: they cannot safely be JSONL.
 				return;
 			}
+			diagnosticWriter?.append(eventsName, `${JSON.stringify(trimEventForLog(event))}\n`);
+			// A timeout/cancellation settles the result before stdio closes. Preserve
+			// trailing diagnostics under the producer lease, but never revive progress
+			// or mutate the already-returned usage/result after that boundary.
+			if (settled) return;
+			const now = Date.now();
+			const observation = cancelledByListener ? undefined : progressTracker?.observe(event, now);
 			session?.onChildEvent(taskId, event);
 			if (event.type === "agent_settled") sawAgentSettled = true;
 			if (event.type === "agent_end") sawAgentEnd = true;
@@ -1186,7 +1673,25 @@ export async function runSubagentProcess(opts: {
 			// `agent_end` repeat the same assistant messages, so ignoring them
 			// keeps usage from being double-counted.
 			if (event.type === "message_end" && event.message?.role === "assistant") {
+				assistantTurns += 1;
 				absorbAssistantMessage(event.message);
+			}
+			if (progressTracker && observation) {
+				if (event.type === "tool_execution_start") toolCalls += 1;
+				const check = progressTracker.check(now);
+				session?.recordProgress(taskId, observation, {
+					...check,
+					warnings: isLead ? check.warnings : [],
+				}, now);
+				if (isLead) {
+					for (const warning of check.warnings) stderrCapture.append(`\n${warning.text}`);
+					if (check.expired) handleExpiry(check.expired);
+					else if (observation.kind === "progress") {
+						if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+						timeoutTimer = undefined;
+						armTimer();
+					}
+				}
 			}
 		};
 
@@ -1197,8 +1702,10 @@ export async function runSubagentProcess(opts: {
 		// Optional so `finish()` can run from the synchronous-spawn-throw path,
 		// where no child was ever created.
 		let proc: ChildProcess | undefined;
+		const spawnChild: ChildSpawner = opts.spawnChild ?? spawn;
 		try {
-			proc = spawnProcess(invocation.command, invocation.args, {
+			diagnosticWriter = session?.diagnostics.writer();
+			proc = spawnChild(invocation.command, invocation.args, {
 				cwd: opts.cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
@@ -1214,43 +1721,115 @@ export async function runSubagentProcess(opts: {
 			spawnFailed = true;
 			stderrCapture.append(`\n[orchestrator] spawn threw: ${(err as Error).message}`);
 			finish(1);
+			diagnosticWriter?.close();
 			return;
 		}
 
 		if (typeof proc.pid === "number") liveDispatchPids.add(proc.pid);
-		removeCancellationListener = session?.cancellation.onCancel(() => {
-			if (proc && !settled) killProcessTree(proc);
-		});
+		dispatchStartedAt = Date.now();
+		// Policy is resolved per dispatch (env read now, not at module load) so
+		// operators and tests can change limits without reloading the extension.
+		// `leadTimeouts` is a test seam that only applies to orchestrating capabilities.
+		const timeoutOverride = ORCHESTRATING_CAPABILITIES.has(opts.capability ?? "") ? opts.leadTimeouts : undefined;
+		const policy: DispatchTimeoutPolicy = applyLeadTimeoutOverride(
+			resolveDispatchTimeoutPolicy(opts.capability, process.env),
+			timeoutOverride,
+		);
+		isLead = policy.mode === "lead";
+		progressTracker = new DispatchProgressTracker(policy, dispatchStartedAt);
+		for (const note of policy.notes) {
+			stderrCapture.append(`\n[orchestrator] timeout configuration: ${note}`);
+			session?.log(`dispatch ${taskId} timeout configuration: ${note}`);
+		}
 
-		// A stalled child would otherwise block its whole batch forever, freezing
-		// the run instead of failing just that task. Leads that fan out their own
-		// subagents get a larger budget than leaf workers.
-		const timeoutMs = dispatchTimeoutFor(opts.capability);
-		timeoutTimer = setTimeout(() => {
-			if (settled) return;
+		handleExpiry = (reason) => {
+			if (settled || cancelledByListener) return;
 			timedOut = true;
-			stderrCapture.append(
-				`\n[orchestrator] dispatch timed out after ${Math.round(timeoutMs / 60000)}min ` +
-					`(capability=${opts.capability ?? "unknown"}); killing process group`,
-			);
+			timeoutReason = reason;
+			const explanation = progressTracker?.describeExpiry(reason, opts.capability, Date.now()) ?? reason;
+			stderrCapture.append(`\n[orchestrator] ${reason} timeout: ${explanation}`);
+			const report = recordInterruption(reason === "inactivity" ? "inactivity_timeout" : "absolute_timeout");
+			session?.log(report);
 			if (proc) killProcessTree(proc);
 			finish(124);
-		}, timeoutMs);
+		};
 
-		proc.stdout?.on("data", (data) => {
-			const chunk = data.toString();
-			rawStdout += chunk;
-			if (eventsLog) {
-				try {
-					appendFileSync(eventsLog, chunk);
-				} catch {
-					/* best-effort */
+		removeCancellationListener = session?.cancellation.onCancel(() => {
+			if (proc && !settled) {
+				cancelledByListener = true;
+				if (timeoutTimer !== undefined) {
+					clearTimeout(timeoutTimer);
+					timeoutTimer = undefined;
 				}
+				// Drain already-buffered usage before billing, but do not depend on
+				// close: a detached descendant can hold inherited pipes open forever.
+				// Keep this inside shutdown's 2s budget. finish() is idempotent and
+				// clears the timer; only real close releases the diagnostic lease, so
+				// an undrained producer still prevents sealing after we settle.
+				timeoutTimer = setTimeout(() => finish(137), 1000);
+				killProcessTree(proc);
 			}
-			buffer += chunk;
-			const lines = buffer.split("\n");
-			buffer = lines.pop() || "";
-			for (const line of lines) processLine(line);
+		});
+
+		armTimer = () => {
+			if (settled || cancelledByListener || !progressTracker) return;
+			if (timeoutTimer !== undefined) {
+				clearTimeout(timeoutTimer);
+				timeoutTimer = undefined;
+			}
+			const now = Date.now();
+			const check = progressTracker.peek(now);
+			if (check.expired) {
+				handleExpiry(check.expired);
+				return;
+			}
+			const delay = Math.max(50, Math.min(30_000, check.nextCheckMs));
+			timeoutTimer = setTimeout(() => {
+				timeoutTimer = undefined;
+				if (settled || cancelledByListener || !progressTracker) return;
+				const tickNow = Date.now();
+				const tickCheck = progressTracker.check(tickNow);
+				session?.recordProgress(taskId, { kind: "heartbeat", detail: "timer" }, tickCheck, tickNow);
+				for (const warning of tickCheck.warnings) stderrCapture.append(`\n${warning.text}`);
+				if (tickCheck.expired) handleExpiry(tickCheck.expired);
+				else armTimer();
+			}, delay);
+		};
+		// A cancellation that fired synchronously above is already stopping the
+		// child; never arm another execution deadline. Do NOT return early here: handlers must
+		// still attach to drain usage and catch a late child 'error' event.
+		if (isLead) {
+			armTimer();
+		} else if (!settled && !cancelledByListener) {
+			// Leaf dispatches retain their fixed wall-clock timeout
+			// (HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS); no inactivity rule applies.
+			const leafTimeoutMs = policy.absoluteMs;
+			timeoutTimer = setTimeout(() => {
+				if (settled) return;
+				timedOut = true;
+				stderrCapture.append(
+					`\n[orchestrator] dispatch timed out after ${Math.round(leafTimeoutMs / 60000)}min ` +
+						`(capability=${opts.capability ?? "unknown"}); killing process group`,
+				);
+				if (proc) killProcessTree(proc);
+				finish(124);
+			}, leafTimeoutMs);
+		}
+
+		const streamFailure = {
+			appendStderr: (text: string) => stderrCapture.append(text),
+			kill: () => killProcessTree(proc),
+			finish,
+		};
+		proc.stdout?.on("data", (data) => {
+			guardChildStreamHandler("stdout", () => {
+				const chunk = data.toString();
+				stdoutCapture.append(chunk);
+				buffer += chunk;
+				const lines = buffer.split("\n");
+				buffer = lines.pop() || "";
+				for (const line of lines) processLine(line);
+			}, streamFailure);
 		});
 
 		proc.stderr?.on("data", (data) => {
@@ -1258,8 +1837,15 @@ export async function runSubagentProcess(opts: {
 		});
 
 		proc.on("close", (code) => {
-			if (buffer.trim()) processLine(buffer);
-			finish(code ?? 0);
+			try {
+				guardChildStreamHandler("stdout", () => {
+					if (buffer.trim()) processLine(buffer);
+					finish(code ?? 0);
+				}, streamFailure);
+				// Early settlement on timeout/error is not pipe drain. Keep the lease until close,
+				// and persist stderr that arrived after finish() resolved the dispatch.
+				diagnosticWriter?.write(stderrName, stderrPrefix + stderrCapture.text());
+			} finally { diagnosticWriter?.close(); }
 		});
 
 		proc.on("error", (err) => {
@@ -1273,11 +1859,11 @@ export async function runSubagentProcess(opts: {
 /**
  * Classify the goal with the cheapest capability.
  *
- * `costSink` accumulates what triage spent. Triage is logged under its own
- * synthetic run id (it happens before the real run exists), so without this the
- * command's reported total silently excluded it.
+ * `costSink` accumulates what triage spent. Triage is logged as run overhead under
+ * the same run identifier even when classification fails.
  */
 async function triageTask(
+	runId: string,
 	goal: string,
 	cwd: string,
 	ctx: ExtensionContext,
@@ -1306,43 +1892,16 @@ async function triageTask(
 			label: "triage",
 		});
 		costSink.usd += r?.costUsd ?? 0;
-		if (!r || r.exitCode !== 0) {
-			if (r) {
-				// Surface WHY, instead of the bare "Triage unavailable" the command
-				// used to print. A non-zero exit here is almost always an argv or
-				// provider-auth problem, and stderr names it.
-				console.warn(
-					`[orchestrator] triage exited ${r.exitCode}: ${summarizeStderr(r.stderr || r.rawStdout, 400) || "(no output)"}`,
-				);
-				await captureDispatchCost(
-					{
-						runId: `triage-${Date.now()}`,
-						planId: "triage",
-						taskClass: "triage",
-						complexity: 5,
-						risk: "medium",
-						recommended: {
-							capability: "implementation_fast",
-							effort: "low",
-							verification_depth: "none",
-						},
-						mode: "triage",
-					},
-					{
-						taskId: `triage-${slugGoal(goal)}`,
-						capability: "implementation_fast",
-						model: r.model ?? cheapest.model,
-						exitCode: r.exitCode,
-						stdout: r.stdout,
-						stderr: r.stderr,
-						usage: r.usage,
-						durationMs: r.durationMs,
-						costUsd: r.costUsd,
-						stopReason: r.stopReason,
-						filesChanged: [],
-					},
-				);
-			}
+		// Bill the dispatch before parsing: malformed/empty classifier output still used tokens.
+		await captureDispatchCost(
+			{ runId, planId: "triage", taskClass: "triage", complexity: 5, risk: "medium",
+				recommended: { capability: "implementation_fast", effort: "low", verification_depth: "none" }, mode: "triage" },
+			{ taskId: "triage", capability: "triage", model: r.model ?? cheapest.model,
+				exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, usage: r.usage,
+				durationMs: r.durationMs, costUsd: r.costUsd, costReported: r.costReported, stopReason: r.stopReason, filesChanged: [] },
+		);
+		if (r.exitCode !== 0) {
+			console.warn(`[orchestrator] triage exited ${r.exitCode}: ${summarizeStderr(r.stderr || r.rawStdout, 400) || "(no output)"}`);
 			return null;
 		}
 		// The child's final assistant message is the JSON verdict.
@@ -1363,38 +1922,6 @@ async function triageTask(
 		const clamped = clampTriage(parsed);
 		if (!clamped) return null;
 
-		// Cost-attribution: triage is an interactive_session call, but logged
-		// under task_class="triage" so it\'s auditable separately from the
-		// run itself. The orchestrator\'s ledger picks it up the same way as
-		// any other dispatch through captureDispatchCost.
-		await captureDispatchCost(
-			{
-				runId: `triage-${Date.now()}`,
-				planId: "triage",
-				taskClass: "triage",
-				complexity: clamped.complexity,
-				risk: clamped.risk,
-				recommended: {
-					capability: "implementation_fast",
-					effort: "low",
-					verification_depth: "none",
-				},
-				mode: "triage",
-			},
-			{
-				taskId: `triage-${slugGoal(goal)}`,
-				capability: "implementation_fast",
-				model: r.model ?? cheapest.model,
-				exitCode: r.exitCode,
-				stdout: text,
-				stderr: r.stderr,
-				usage: r.usage,
-				durationMs: r.durationMs,
-				costUsd: r.costUsd,
-				stopReason: r.stopReason,
-				filesChanged: [],
-			},
-		);
 		return clamped;
 	} catch (err) {
 		console.warn(`[orchestrator] triage failed: ${(err as Error).message}`);
@@ -1443,28 +1970,49 @@ function runCli(args: string[], stdin?: string): Promise<CliResult> {
 /**
  * Run a Python module under the orchestrator's SKILL_ROOT. We set
  * CODING_AGENT_RUNTIME so the dispatched metrics land under
- * `agent_runtime: "humain-terminal"` and PYTHONPATH so the `orchestrator`
- * package is importable.
+ * `agent_runtime: "humain-terminal"`, PYTHONPATH so the `orchestrator`
+ * package is importable, and CODING_AGENT_ORCHESTRATOR_HOME points at the
+ * same state root as the HT hook. `stdin`, when given, is written and closed before the
+ * child runs (the `batch -` command reads its payload from stdin).
+ *
+ * Always resolves exactly once: on `close`, or on a spawn `error` (ENOENT, EACCES,
+ * EAGAIN) in case the runtime never follows it with `close`. A spawn failure is
+ * reported as a negative exit code with the error in `stderr`, which the record
+ * queue treats as ambiguous and replays. `python` is injectable for tests only.
  */
-function runModule(module: string, args: string[] = []): Promise<CliResult> {
+export function runModule(module: string, args: string[] = [], stdin?: string, options: { python?: string } = {}): Promise<CliResult> {
 	return new Promise((resolve) => {
 		const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
-		const child = spawn(PYTHON, ["-m", module, ...args], {
+		const expandedStateRoot = STATE_ROOT.replace(/^~/, homedir());
+		let stdout = "";
+		let stderr = "";
+		let settled = false;
+		const settle = (exitCode: number) => {
+			if (settled) return;
+			settled = true;
+			resolve({ stdout, stderr, exitCode });
+		};
+		const child = spawn(options.python ?? PYTHON, ["-m", module, ...args], {
 			env: {
 				...process.env,
 				CODING_AGENT_RUNTIME: "humain-terminal",
 				CODING_AGENT_REPOSITORY: process.env.CODING_AGENT_REPOSITORY ?? process.cwd(),
 				PYTHONPATH: expandedSkillRoot,
+				CODING_AGENT_ORCHESTRATOR_HOME: expandedStateRoot,
 			},
 			stdio: ["pipe", "pipe", "pipe"],
 		});
-		let stdout = "";
-		let stderr = "";
 		child.stdout.on("data", (b) => (stdout += b.toString()));
 		child.stderr.on("data", (b) => (stderr += b.toString()));
-		child.on("close", (code) =>
-			resolve({ stdout, stderr, exitCode: code ?? -1 }),
-		);
+		child.on("error", (err) => {
+			stderr += `\n[orchestrator] spawn error: ${err.message}`;
+			settle(-1);
+		});
+		child.on("close", (code) => settle(code ?? -1));
+		// A child that exits before reading its payload closes the pipe under us; that is
+		// reported through the exit code, not as an uncaught EPIPE.
+		child.stdin.on("error", () => {});
+		if (stdin !== undefined) child.stdin.end(stdin);
 	});
 }
 
@@ -1535,45 +2083,153 @@ async function planRun(runId: string, opts: PlanOptions): Promise<PlanResponse> 
 	return JSON.parse(res.stdout.trim());
 }
 
-async function recordEvent(event: string, payload: Record<string, unknown>): Promise<void> {
-	const res = await runModule("orchestrator.cli", ["event", event, JSON.stringify(payload)]);
-	if (res.exitCode !== 0) {
-		console.warn(`[orchestrator] event write failed: ${res.stderr}`);
-	}
+// -----------------------------------------------------------------------------
+// Telemetry: batched event/metric/outcome records
+// -----------------------------------------------------------------------------
+
+/**
+ * One queue for the whole extension. Records are stamped with a stable id at
+ * enqueue time and sent to `orchestrator.cli batch -` in bounded batches; see
+ * record-queue.ts for the coalescing/retry contract. Every failure is logged to
+ * the console and to the active run's log; terminal flushes also return it.
+ * Other runtimes keep using the single-record `event`/`metric`/`outcome` commands.
+ */
+export const recordQueue = new RecordQueue({
+	run: (records) => runModule("orchestrator.cli", ["batch", "-"], JSON.stringify(records)),
+	maxBatch: TELEMETRY_MAX_BATCH,
+	flushDelayMs: TELEMETRY_FLUSH_MS,
+	onError: (message) => {
+		console.warn(`[orchestrator] ${message}`);
+		ACTIVE_RUN?.log(`telemetry: ${message}`);
+	},
+});
+
+/** Queue an event row. Synchronous: progress never waits on a Python process. */
+export function recordEvent(event: string, payload: Record<string, unknown>): void {
+	recordQueue.enqueue("event", { ...payload, event });
 }
 
-async function recordModelCall(metric: Record<string, unknown>): Promise<void> {
-	const res = await runModule("orchestrator.cli", ["metric", JSON.stringify(metric)]);
-	if (res.exitCode !== 0) {
-		console.warn(`[orchestrator] metric write failed: ${res.stderr}`);
-	}
+/** Queue a metric row (model_call / route_executed). */
+export function recordModelCall(metric: Record<string, unknown>): void {
+	recordQueue.enqueue("metric", metric);
 }
 
-async function recordOutcome(outcome: Record<string, unknown>): Promise<void> {
-	const res = await runModule("orchestrator.cli", ["outcome", JSON.stringify(outcome)]);
-	if (res.exitCode !== 0) {
-		console.warn(`[orchestrator] outcome write failed: ${res.stderr}`);
-	}
+/** Queue an outcome row. Terminal run outcomes go through completeRun/failRun, which also drain. */
+export function recordOutcome(outcome: Record<string, unknown>): void {
+	recordQueue.enqueue("outcome", outcome);
 }
 
-async function completeRun(runId: string, summary: Record<string, unknown>): Promise<void> {
-	await recordOutcome({
+export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality: number, note: string): Record<string, unknown> {
+	return {
+		run_id: runId,
+		task_id: `${runId}-qa`,
+		outcome: passed ? "verified" : "fail",
+		verification_scope: "run",
+		quality,
+		note,
+	};
+}
+
+export function runCompletionOutcomeFor(runId: string, summary: Record<string, unknown>): Record<string, unknown> {
+	return {
 		run_id: runId,
 		task_id: "run-complete",
-		outcome: "verified",
+		outcome: summary.verification_passed === false ? "fail" : "verified",
+		verification_scope: "run",
 		quality: summary.success_rate ?? 0,
 		note: JSON.stringify(summary),
-	});
+	};
 }
 
-async function failRun(runId: string, error: string): Promise<void> {
-	await recordOutcome({
+/** Terminal-boundary time fields written to the run outcome row. */
+export interface RunTiming {
+	started_at: string;
+	finished_at: string;
+	elapsed_ms: number;
+	elapsed_source: "monotonic";
+}
+
+/**
+ * Record the run's terminal outcome and drain everything queued for it. Resolves
+ * only once Python has acknowledged the writes (or definitively failed them), so
+ * the terminal status is never delayed behind the coalescing window and the
+ * caller can surface any write failure.
+ *
+ * With `since` (the queue counters when the run started) the report covers every
+ * record failure since then: a timer flush that failed mid-run must not vanish from
+ * the summary just because the final drain went through.
+ */
+export async function completeRun(runId: string, summary: Record<string, unknown>, timing?: RunTiming, since?: QueueStats): Promise<FlushReport> {
+	const session = ACTIVE_RUN?.runId === runId ? ACTIVE_RUN : null;
+	recordEvent("run_completed", { run_id: runId, ...timing });
+	recordOutcome({ ...runCompletionOutcomeFor(runId, summary), ...timing });
+	const report = reportSince(await recordQueue.flush(), since);
+	session?.acknowledgeTerminal(report.ok);
+	return report;
+}
+
+export async function failRun(runId: string, error: string, timing?: RunTiming, since?: QueueStats): Promise<FlushReport> {
+	const session = ACTIVE_RUN?.runId === runId ? ACTIVE_RUN : null;
+	recordEvent("run_failed", { run_id: runId, error, ...timing });
+	recordOutcome({
 		run_id: runId,
 		task_id: "run-failed",
 		outcome: "fail",
+		verification_scope: "run",
 		quality: 0,
 		note: error,
+		...timing,
 	});
+	const report = reportSince(await recordQueue.flush(), since);
+	session?.acknowledgeTerminal(report.ok);
+	return report;
+}
+
+/** Widen a final-drain report to everything the queue did since `since` (cumulative for the run). */
+function reportSince(drain: FlushReport, since?: QueueStats): FlushReport {
+	if (!since) return drain;
+	const now = recordQueue.stats;
+	const failed = Math.max(drain.failed, now.failed - since.failed);
+	const derivedStale = Math.max(drain.derivedStale, now.derivedStale - since.derivedStale);
+	const report: FlushReport = {
+		ok: failed === 0,
+		batches: drain.batches,
+		acknowledged: Math.max(drain.acknowledged, now.acknowledged - since.acknowledged),
+		failed,
+		derivedStale,
+	};
+	// Prefer the final drain's own messages; fall back to the queue's last message for
+	// failures that happened in an earlier timer flush.
+	if (failed > 0) report.error = drain.error ?? recordQueue.lastFailure ?? undefined;
+	if (derivedStale > 0) report.staleReason = drain.staleReason ?? recordQueue.lastStaleReason ?? undefined;
+	return report;
+}
+
+/**
+ * Summary lines when telemetry did not fully land; empty when all is well. Lost records
+ * and durable-but-unrefreshed records are different problems and are worded differently.
+ */
+export function telemetryWarning(report: FlushReport): string[] {
+	const lines: string[] = [];
+	if (!report.ok || report.failed > 0) {
+		lines.push(`telemetry: ${report.failed} record(s) could not be written to the ledger — ${report.error ?? "see run.log"}`);
+	}
+	if (report.derivedStale > 0) {
+		lines.push(
+			`telemetry: ${report.derivedStale} record(s) are durable but the ledger/dashboard refresh failed; derived views are stale until the next successful write — ${report.staleReason ?? "see run.log"}`,
+		);
+	}
+	return lines;
+}
+
+/** True when every record landed and the derived views were refreshed. */
+export function telemetryHealthy(report: FlushReport): boolean {
+	return report.ok && report.failed === 0 && report.derivedStale === 0;
+}
+
+/** Surface a failed terminal drain to the operator; silent on success. */
+function warnTelemetry(ctx: ExtensionContext, report: FlushReport): void {
+	for (const line of telemetryWarning(report)) ctx.ui.notify(line, "warning");
 }
 
 // -----------------------------------------------------------------------------
@@ -1613,7 +2269,11 @@ export interface DispatchResult {
 	usage: SubagentSingleResult["usage"];
 	durationMs: number;
 	costUsd: number;
+	costReported: boolean;
 	stopReason?: string;
+	outcome?: SubagentProcessResult["outcome"];
+	timeoutReason?: "inactivity" | "absolute";
+	interruption?: InterruptionReport;
 	filesChanged: string[];
 }
 
@@ -1623,9 +2283,20 @@ export async function dispatchParallel(
 	tasks: DispatchTask[],
 	adapter: Adapter,
 	ctx: ExtensionContext,
+	depth: number = 0,
 	deps = { recordEvent, runProcess: runSubagentProcess },
 ): Promise<DispatchResult[]> {
 	if (tasks.length === 0) return [];
+
+	// Drain queued user messages ONCE at the start of this batch. Every task in
+	// the batch sees the same messages; the next dispatchParallel call picks up
+	// anything that arrived during or after this one. Draining mid-batch would
+	// split messages across two prompts in non-obvious ways.
+	const session = ACTIVE_RUN;
+	const recipient = tasks.length === 1
+		? `${tasks[0].capability}:${tasks[0].taskId.replace(`${runId}-`, "")}`
+		: `${tasks.length} ${tasks[0].capability} tasks`;
+	const userMessages = session ? session.drainMessages(recipient) : [];
 
 	const taskInputs = tasks.map((t) => {
 		// Adapter lookups can return undefined if the dynamic adapter
@@ -1640,7 +2311,7 @@ export async function dispatchParallel(
 			{ model: "unknown" };
 		return {
 			agent: agentNameFor(t.capability),
-			task: formatTaskPrompt(t, runId),
+			task: formatTaskPrompt(t, runId, userMessages),
 			model: binding.model ?? "unknown",
 			effort: binding.effort,
 			tools: t.tools,
@@ -1663,7 +2334,10 @@ export async function dispatchParallel(
 		// Left unparenthesised this failed to load the whole extension.
 		const shortId =
 			(input._taskId ?? "").replace(`${runId}-`, "") || input._capability || "task";
-		await deps.recordEvent("dispatch_started", {
+		// Queued, not awaited: the child starts now and the record lands in the next
+		// batch. Routed through `deps` so tests can observe it; the default binding
+		// is the same `recordEvent`, so the queuing behaviour is unchanged.
+		deps.recordEvent("dispatch_started", {
 			run_id: runId,
 			task_id: input._taskId,
 			capability: input._capability,
@@ -1681,12 +2355,18 @@ export async function dispatchParallel(
 				taskId: input._taskId,
 				label: shortId,
 				capability: input._capability,
-				// Recon overrides a potentially write-capable model persona. Other
-				// tasks retain their persona's allow-list rather than a global default.
+				depth,
+				// Still no *hardcoded* tools override here — that is what previously
+				// granted reviewers write access and stripped tools the personas need.
+				// `input.tools` is per-task and set by exactly one producer,
+				// `planReconTasks()`, which pins recon to read-only. Every other task
+				// leaves it undefined, and runSubagentProcess then falls back to the
+				// persona's own frontmatter allow-list, so persona policy still wins
+				// everywhere it did before.
 				tools: input.tools,
 				ctx,
 			});
-			await deps.recordEvent("dispatch_finished", {
+			deps.recordEvent("dispatch_finished", {
 				run_id: runId,
 				task_id: input._taskId,
 				capability: input._capability,
@@ -1713,7 +2393,11 @@ export async function dispatchParallel(
 				usage: r.usage,
 				durationMs: r.durationMs,
 				costUsd: r.costUsd,
+				costReported: r.costReported,
 				stopReason: r.stopReason,
+				outcome: r.outcome,
+				timeoutReason: r.timeoutReason,
+				interruption: r.interruption,
 				// parseFilesChanged scrapes the child's prose, so a read-only reviewer
 				// or QA agent would "report" every path it merely mentioned.
 				filesChanged: r.personaCanMutate ? parseFilesChanged(r.stdout) : [],
@@ -1732,6 +2416,7 @@ export async function dispatchParallel(
 				},
 				durationMs: 0,
 				costUsd: 0,
+				costReported: false,
 				filesChanged: [],
 			};
 		}
@@ -1761,9 +2446,16 @@ function agentNameFor(capability: string): string {
 	return CAPABILITY_AGENT_ALIASES[capability] ?? `orch-${capability.replace(/_/g, "-")}`;
 }
 
-function formatTaskPrompt(t: DispatchTask, runId: string): string {
+function formatTaskPrompt(
+	t: DispatchTask,
+	runId: string,
+	userMessages: string[] = [],
+): string {
 	const retryNote = t.retryOf
 		? `\n\n[Retry context: this is retry #${(t.retryCount ?? 0) + 1} of a previous failed attempt on task_id=${t.retryOf}. The previous attempt's review/QA feedback is captured in the orchestrator ledger; if you need that context, ask the lead before starting. Per method.json rules.review_after_fix: re-review at or above the original reviewer's tier, never the cheap tier.]`
+		: "";
+	const userNote = userMessages.length > 0
+		? `\n\n[User messages while this run was in progress — ${userMessages.length === 1 ? "1 message" : `${userMessages.length} messages`}, addressed to you]:\n${userMessages.map((m, i) => `  ${i + 1}. ${m}`).join("\n")}\n\nTreat these as high-priority steering from the operator. Adjust your plan and execution accordingly. If a message asks you to stop, finish the current sub-step and report back; do not start new work.`
 		: "";
 	return [
 		`[orchestrator:run_id=${runId}]`,
@@ -1772,6 +2464,7 @@ function formatTaskPrompt(t: DispatchTask, runId: string): string {
 		"",
 		t.task,
 		retryNote,
+		userNote,
 		"",
 		"---",
 		"Output format (required):",
@@ -1782,31 +2475,189 @@ function formatTaskPrompt(t: DispatchTask, runId: string): string {
 		"## Verification",
 		"Checks run + result.",
 		"## Notes / Escalation",
-		"Anything the lead should know.",
+		"Anything the lead should know — reply to any user messages here.",
 	].join("\n");
 }
 
+/** Fingerprint recorded for a dirty path that no longer exists on disk. */
+const DELETED_FINGERPRINT = "<deleted>";
+/** Fingerprint for dirty entries that are not regular files (submodules, nested repos, symlinked dirs). */
+const NON_FILE_FINGERPRINT = "<non-file>";
+/** Fingerprint for paths `git hash-object --stdin-paths` cannot accept (embedded newline). */
+const UNHASHABLE_FINGERPRINT = "<unhashable>";
+/** Generous cap for `git status` / `hash-object` output on large, noisy trees. */
+const GIT_OUTPUT_MAX_BUFFER = 64 * 1024 * 1024;
+
 /**
  * Paths that differ from HEAD (modified, added, deleted, renamed, untracked),
- * repo-relative. `null` when `cwd` is not inside a git work tree, in which case
- * callers fall back to the scraped list.
+ * repo-relative, mapped to a content fingerprint (git blob hash, or
+ * `DELETED_FINGERPRINT`). Two snapshots taken around a run let callers tell a
+ * file that was actually edited apart from one that was already dirty and
+ * merely mentioned in a report. `null` when `cwd` is not inside a git work
+ * tree, in which case callers fall back to the scraped list.
  */
-function gitDirtyFiles(cwd: string): Set<string> | null {
-	const res = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], {
-		cwd,
+export function gitDirtySnapshot(cwd: string): Map<string, string> | null {
+	// `git status` reports paths relative to the repository root, not `cwd`, so
+	// resolve the root once for the filesystem checks below.
+	const top = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf-8", timeout: 10_000 });
+	if (top.status !== 0) return null;
+	const root = top.stdout.trim();
+	if (!root) return null;
+	const status = spawnSync("git", ["status", "--porcelain", "-z", "--untracked-files=all"], {
+		cwd: root,
 		encoding: "utf-8",
 		timeout: 10_000,
+		maxBuffer: GIT_OUTPUT_MAX_BUFFER,
 	});
-	if (res.status !== 0) return null;
-	const out = new Set<string>();
-	for (const line of res.stdout.split("\n")) {
-		if (line.length < 4) continue;
-		// "XY path" or "XY old -> new" for renames; take the destination.
-		const p = line.slice(3);
-		const arrow = p.indexOf(" -> ");
-		out.add(arrow === -1 ? p : p.slice(arrow + 4));
+	if (status.status !== 0) return null;
+	const paths: string[] = [];
+	const entries = status.stdout.split("\0");
+	for (let i = 0; i < entries.length; i++) {
+		const entry = entries[i];
+		if (entry.length < 4) continue;
+		// "XY path"; renames emit destination and source as adjacent records.
+		// Keep the source as a deleted baseline path: committing a rename that
+		// was already staged before the run must not count as new work.
+		paths.push(entry.slice(3));
+		if (entry[0] === "R" || entry[1] === "R") {
+			const source = entries[++i];
+			if (source) paths.push(source);
+		} else if (entry[0] === "C" || entry[1] === "C") i++;
+	}
+	const out = new Map<string, string>();
+	const present: string[] = [];
+	for (const p of paths) {
+		let st: ReturnType<typeof lstatSync> | null = null;
+		try {
+			st = lstatSync(join(root, p));
+		} catch {
+			st = null;
+		}
+		if (!st) out.set(p, DELETED_FINGERPRINT);
+		// `hash-object` refuses directories (submodules, nested repos) and would
+		// abort the whole batch; fingerprint them by kind instead of content.
+		else if (!st.isFile()) out.set(p, NON_FILE_FINGERPRINT);
+		// `--stdin-paths` is newline-delimited and has no -z form.
+		else if (p.includes("\n")) out.set(p, UNHASHABLE_FINGERPRINT);
+		else present.push(p);
+	}
+	if (present.length > 0) {
+		const hashed = spawnSync("git", ["hash-object", "--stdin-paths"], {
+			cwd: root,
+			encoding: "utf-8",
+			input: `${present.join("\n")}\n`,
+			timeout: 30_000,
+			maxBuffer: GIT_OUTPUT_MAX_BUFFER,
+		});
+		if (hashed.status !== 0) return null;
+		const hashes = hashed.stdout.trim().split("\n");
+		if (hashes.length !== present.length) return null;
+		present.forEach((p, idx) => out.set(p, hashes[idx]));
 	}
 	return out;
+}
+
+/**
+ * Decide which files a lead phase actually changed. A path counts when it is
+ * dirty after the run and either was clean before or has different content
+ * now. `claimed` (paths scraped from lead prose) is only used when git
+ * snapshots are unavailable, and to report phantoms — files the lead named
+ * but did not touch. Note a pre-dirty file the lead reverts to HEAD drops out
+ * of `after` and is therefore not reported as changed.
+ */
+export function diffDirtySnapshots(
+	before: Map<string, string> | null,
+	after: Map<string, string> | null,
+	claimed: Iterable<string>,
+): { changed: string[]; phantom: string[] } {
+	const claimedSet = new Set(claimed);
+	if (!before || !after) return { changed: [...claimedSet], phantom: [] };
+	const changed: string[] = [];
+	for (const [path, fingerprint] of after) {
+		if (before.get(path) !== fingerprint) changed.push(path);
+	}
+	const changedSet = new Set(changed);
+	const phantom = [...claimedSet].filter((f) => !changedSet.has(f));
+	return { changed, phantom };
+}
+
+/** Starting HEAD for a run; an unborn/non-Git repository has no commit history to compare. */
+export function gitHead(cwd: string): string | null {
+	const result = spawnSync("git", ["rev-parse", "--verify", "HEAD"], {
+		cwd, encoding: "utf-8", timeout: 10_000,
+	});
+	if (result.status === 0 && /^[0-9a-f]{40,64}$/.test(result.stdout.trim())) return result.stdout.trim();
+	// An unborn branch has no HEAD yet, but its first commit must still count.
+	const ref = spawnSync("git", ["symbolic-ref", "--quiet", "HEAD"], { cwd, encoding: "utf-8", timeout: 10_000 });
+	if (ref.status !== 0 || !ref.stdout.trim()) return null;
+	const exists = spawnSync("git", ["show-ref", "--verify", "--quiet", ref.stdout.trim()], { cwd, timeout: 10_000 });
+	if (exists.status !== 1) return null;
+	const empty = spawnSync("git", ["hash-object", "-t", "tree", "--stdin"], {
+		cwd, encoding: "utf-8", input: "", timeout: 10_000,
+	});
+	return empty.status === 0 && /^[0-9a-f]{40,64}$/.test(empty.stdout.trim()) ? empty.stdout.trim() : null;
+}
+
+/** Current worktree content for a path that was already dirty when the run began. */
+function currentFingerprint(root: string, path: string): string | null {
+	let st: ReturnType<typeof lstatSync>;
+	try { st = lstatSync(join(root, path)); } catch { return DELETED_FINGERPRINT; }
+	if (!st.isFile()) return NON_FILE_FINGERPRINT;
+	if (path.includes("\n")) return UNHASHABLE_FINGERPRINT;
+	const hashed = spawnSync("git", ["hash-object", "--stdin-paths"], {
+		cwd: root, encoding: "utf-8", input: `${path}\n`, timeout: 30_000, maxBuffer: GIT_OUTPUT_MAX_BUFFER,
+	});
+	return hashed.status === 0 && /^[0-9a-f]{40,64}$/.test(hashed.stdout.trim()) ? hashed.stdout.trim() : null;
+}
+
+/** Union changes committed during the run with edits that remain dirty at verification time. */
+export function changedFilesSinceRunStart(
+	cwd: string,
+	startHead: string | null,
+	beforeDirty: Map<string, string> | null,
+	claimed: Iterable<string>,
+	afterDirty = gitDirtySnapshot(cwd),
+): { changed: string[]; phantom: string[]; historyUnavailable?: boolean } {
+	const claimedSet = new Set(claimed);
+	const dirty = diffDirtySnapshots(beforeDirty, afterDirty, claimedSet);
+	const changed = new Set(dirty.changed);
+	if (!startHead && beforeDirty && afterDirty) {
+		return { changed: [...new Set([...changed, ...claimedSet])], phantom: [], historyUnavailable: true };
+	}
+	if (startHead) {
+		const history = spawnSync("git", ["diff", "--name-only", "--no-renames", "-z", startHead, "HEAD"], {
+			cwd, encoding: "utf-8", timeout: 30_000, maxBuffer: GIT_OUTPUT_MAX_BUFFER,
+		});
+		if (history.status !== 0) {
+			// History was rewritten or Git failed: use the reported paths rather than
+			// falsely treating an implementation run as report-only.
+			return { changed: [...new Set([...changed, ...claimedSet])], phantom: [], historyUnavailable: true };
+		}
+		const paths = history.stdout.split("\0").filter(Boolean);
+		if (beforeDirty && paths.some((path) => beforeDirty.has(path))) {
+			const top = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf-8", timeout: 10_000 });
+			if (top.status !== 0 || !top.stdout.trim()) {
+				return { changed: [...new Set([...changed, ...claimedSet])], phantom: [], historyUnavailable: true };
+			}
+			for (const path of paths) {
+				const original = beforeDirty.get(path);
+				if (original !== undefined) {
+					const current = currentFingerprint(top.stdout.trim(), path);
+					if (current === null) {
+						return { changed: [...new Set([...changed, ...claimedSet])], phantom: [], historyUnavailable: true };
+					}
+					if (original === current) continue;
+				}
+				changed.add(path);
+			}
+		} else {
+			for (const path of paths) changed.add(path);
+		}
+	}
+	return {
+		changed: [...changed],
+		phantom: [...claimedSet].filter((path) => !changed.has(path)),
+	};
 }
 
 function parseFilesChanged(text: string): string[] {
@@ -1952,22 +2803,69 @@ async function captureDispatchCost(
 	opts: CaptureOpts,
 	result: DispatchResult,
 ): Promise<void> {
+	for (const record of dispatchRecordsFor(opts, result)) {
+		recordModelCall(record);
+	}
+}
+
+/**
+ * Every metrics row one dispatch is accountable for, as pure data so the whole
+ * set can be asserted without spawning the Python CLI. Exactly two rows — and
+ * deliberately not a third.
+ *
+ * There is no `task_verified` / `task_failed` row here. `records.py` classifies
+ * those events as ATTESTED, its strongest evidence class, meaning "a runtime
+ * states that this task cleared its quality gates". A process exit code cannot
+ * support that claim, and deriving one from it is the exact conflation this
+ * branch exists to remove — it is how `Verified tasks` read 174 when 22 tasks
+ * had a real verdict. Three reasons, all reproducible:
+ *
+ * 1. Redundancy. The dispatch-level signal is already reported twice, honestly:
+ *    `result: 'pass' | 'fail'` on the `model_call` row and `executed_passes` on
+ *    the `route_executed` row. `records.py` reads `result` as DISPATCH strength,
+ *    which is exactly what an exit code is worth.
+ * 2. Ordering. `runVerification` bills its QA dispatch through here BEFORE the
+ *    gate verdict exists (`qaResult.exitCode === 0 && failedChecks.length === 0`
+ *    is computed afterwards). A QA agent that exits 0 while reporting failed
+ *    checks therefore emitted an attested `task_verified` while `recordOutcome`
+ *    wrote `outcome: 'fail'` for the SAME `task_id`.
+ * 3. Attribution. Five of the six call sites dispatch coordination, not
+ *    deliverable tasks: `${runId}-architect`, `${runId}-lead-${i}`,
+ *    `triage-<slug>`, the escalation retry, and the QA pass itself. Attesting
+ *    verification of a synthetic coordination id asserts nothing about work.
+ *
+ * Per-task attestation is not derivable in this bridge, so the gap is left
+ * honest rather than filled with a fabrication (`records.UNINSTRUMENTED_FIELDS`
+ * exists so the dashboard can report exactly that): one QA pass returns ONE
+ * verdict over the union of changed files; `changedSince` flattens that union to
+ * a `string[]` whose task provenance does not survive the git-snapshot
+ * intersection; `failedChecks` names checks (`typecheck`), not tasks; and the
+ * real deliverable tasks are the leads' own workers, which this bridge never
+ * observes (`dispatchHierarchical` returns `workerResults: []`). The one genuine
+ * gate verdict that does exist is written by `runVerification` through
+ * `recordOutcome`, after `failedChecks` is known.
+ */
+export function dispatchRecordsFor(
+	opts: CaptureOpts,
+	result: DispatchResult,
+): Record<string, unknown>[] {
 	// Defensive defaults: every field on `result` may be sparse when HT
 	// returns a partial / cancelled dispatch. Normalize once at the top so
-	// the metric payload below is always well-formed and the split() on
+	// the metric payloads below are always well-formed and the split() on
 	// the model id can't throw.
 	const model = result?.model ?? "unknown";
 	const usage = result?.usage ?? {};
 	const provider = model.includes("/") ? model.split("/")[0] : "unknown";
+	const taskId = result?.taskId ?? `unknown-${opts.runId}`;
 
 	// 1. The model_call record HT actually produced. `cost_source: "reported"`
 	//    means the harness reported cost directly; if cost is missing, the
 	//    pricing table resolves it to `estimated`.
-	const hasReportedCost = (result?.costUsd ?? 0) > 0;
-	await recordModelCall({
+	const hasReportedCost = result?.costReported === true;
+	return [{
 		event: "model_call",
 		run_id: opts.runId,
-		task_id: result?.taskId ?? `unknown-${opts.runId}`,
+		task_id: taskId,
 		task_class: opts.taskClass,
 		complexity: opts.complexity,
 		risk: opts.risk,
@@ -1978,27 +2876,25 @@ async function captureDispatchCost(
 		model,
 		effort: "standard",
 		verification_depth: "targeted",
-		input_tokens: usage.input ?? 0,
+		// HT input excludes cache reads; the telemetry/pricing contract includes them.
+		input_tokens: (usage.input ?? 0) + (usage.cacheRead ?? 0),
 		cached_input_tokens: usage.cacheRead ?? 0,
 		cache_write_tokens: usage.cacheWrite ?? 0,
 		output_tokens: usage.output ?? 0,
-		cost_usd: result?.costUsd ?? 0,
-		cost_source: hasReportedCost ? "reported" : "estimated-from-reported-tokens",
+		...(hasReportedCost ? { cost_usd: result.costUsd, cost_source: "reported" } : {}),
 		duration_ms: result?.durationMs ?? 0,
 		result: result?.exitCode === 0 ? "pass" : "fail",
 		stop_reason: result?.stopReason,
 		files_changed: result?.filesChanged ?? [],
 		plan_id: opts.planId,
-	});
-
-	// 2. The executed-route record. This is the closing half of the
-	//    (recommended, executed, observed) triple: the plan-time
-	//    `adaptive_route_decision` event already has `recommended_*`; this
-	//    event records what was actually dispatched and what it cost.
-	await recordModelCall({
+	}, {
+		// 2. The executed-route record. This is the closing half of the
+		//    (recommended, executed, observed) triple: the plan-time
+		//    `adaptive_route_decision` event already has `recommended_*`; this
+		//    event records what was actually dispatched and what it cost.
 		event: "route_executed",
 		run_id: opts.runId,
-		task_id: result?.taskId ?? `unknown-${opts.runId}`,
+		task_id: taskId,
 		plan_id: opts.planId,
 		task_class: opts.taskClass,
 		complexity: opts.complexity,
@@ -2007,8 +2903,8 @@ async function captureDispatchCost(
 		executed_model: model,
 		executed_effort: "standard",
 		executed_verification_depth: "targeted",
-		executed_cost_usd: result?.costUsd ?? 0,
-		executed_input_tokens: usage.input ?? 0,
+		...(hasReportedCost ? { executed_cost_usd: result.costUsd } : {}),
+		executed_input_tokens: (usage.input ?? 0) + (usage.cacheRead ?? 0),
 		executed_output_tokens: usage.output ?? 0,
 		executed_passes: result?.exitCode === 0,
 		recommended_capability: opts.recommended.capability,
@@ -2019,7 +2915,7 @@ async function captureDispatchCost(
 		recommended_estimated_quality_evidence:
 			opts.recommended.estimated_quality_evidence,
 		adaptive_mode: opts.mode,
-	});
+	}];
 }
 
 // -----------------------------------------------------------------------------
@@ -2092,13 +2988,7 @@ async function runVerification(
 	const failedChecks = parseFailedChecks(out);
 	const passed = qaResult.exitCode === 0 && failedChecks.length === 0;
 
-	await recordOutcome({
-		run_id: runId,
-		task_id: `${runId}-qa`,
-		outcome: passed ? "verified" : "fail",
-		quality: passed ? 0.95 : 0.0,
-		note: out.slice(0, 2000),
-	});
+	recordOutcome(qaVerificationOutcomeFor(runId, passed, passed ? 0.95 : 0.0, out.slice(0, 2000)));
 
 	return {
 		passed,
@@ -2670,8 +3560,13 @@ async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Pr
 		ctx.ui.notify(summary.join("\n"), failed > 0 ? "error" : "info");
 		return failed === 0;
 	} finally {
-		session.close();
-		ACTIVE_RUN = null;
+		try {
+			session.close();
+			await session.sealDiagnostics(); // bounded drain; no terminal outcome means no seal
+		} finally {
+			ACTIVE_RUN = null;
+			session.finish();
+		}
 	}
 }
 
@@ -2710,8 +3605,86 @@ const MODELS_USAGE = [
  * whose rows are deltas against what is already recorded, so it is safe to run
  * as often as we like and alongside the launchd sweep (install.sh).
  */
+export function recordHookFailure(stateRoot: string, detail: string): void {
+	const root = stateRoot.replace(/^~/, homedir());
+	const statusPath = join(root, "ingest_status.json");
+	const temporaryPath = `${statusPath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+	try {
+		let previous: Record<string, unknown> = {};
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(statusPath, "utf-8"));
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				previous = parsed as Record<string, unknown>;
+			}
+		} catch {
+			// A missing or malformed prior status must not prevent reporting failure.
+		}
+		const safeDetail = redactPaths(String(detail))
+			.replace(/[\u0000-\u001f\u007f]+/g, " ")
+			.trim()
+			.slice(0, 240);
+		const emptyExitDetail = /exit \d+:\s*(.*)$/.exec(safeDetail);
+		const previousError = typeof previous.error === "string"
+			? redactPaths(previous.error)
+					.replace(/[\u0000-\u001f\u007f]+/g, " ")
+					.trim()
+					.slice(0, 240)
+			: "";
+		const error = emptyExitDetail && !emptyExitDetail[1].trim()
+			? previousError || safeDetail || "session ingest failed"
+			: safeDetail || previousError || "session ingest failed";
+		const failureCount = previous.failure_count;
+		const status = {
+			...previous,
+			version: 1,
+			last_attempt_at: new Date().toISOString(),
+			last_success_at: previous.last_success_at ?? null,
+			status: "error",
+			files_scanned: typeof previous.files_scanned === "number" ? previous.files_scanned : 1,
+			emitted: typeof previous.emitted === "number" ? previous.emitted : 0,
+			failure_count: typeof failureCount === "number" && Number.isFinite(failureCount) ? failureCount + 1 : 1,
+			error,
+			sweep_interval_seconds:
+				typeof previous.sweep_interval_seconds === "number" ? previous.sweep_interval_seconds : 900,
+		};
+		mkdirSync(root, { recursive: true });
+		writeFileSync(temporaryPath, `${JSON.stringify(status, null, 2)}\n`, { mode: 0o600 });
+		renameSync(temporaryPath, statusPath);
+	} catch {
+		// Status reporting is best-effort and must never interrupt a terminal session.
+	} finally {
+		try {
+			rmSync(temporaryPath, { force: true });
+		} catch {
+			// Ignore temporary-file cleanup failures.
+		}
+	}
+}
+
+/** Register the settled fast path and an awaited, bounded shutdown flush. */
+export function registerSessionIngestHooks(
+	host: Pick<ExtensionAPI, "on">,
+	scheduler: Pick<SessionIngestScheduler, "schedule" | "flush">,
+	onError: (message: string) => void = () => {},
+): void {
+	host.on("agent_settled", async (_event, ctx) => {
+		scheduler.schedule(ctx.sessionManager.getSessionFile());
+	});
+	host.on("session_shutdown", async (_event, ctx) => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const done = await Promise.race([
+				scheduler.flush(ctx.sessionManager.getSessionFile()).then(() => true),
+				new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 2000); }),
+			]);
+			if (!done) onError("shutdown ingestion timed out; retry the session import to refresh durable usage");
+		} finally { if (timer !== undefined) clearTimeout(timer); }
+	});
+}
+
 function installSessionIngest(pi: ExtensionAPI): void {
-	const logPath = join(STATE_ROOT.replace(/^~/, homedir()), "ingest-hook.log");
+	const stateRoot = STATE_ROOT.replace(/^~/, homedir());
+	const logPath = join(stateRoot, "ingest-hook.log");
 	const logError = (message: string) => {
 		try {
 			mkdirSync(dirname(logPath), { recursive: true });
@@ -2720,25 +3693,50 @@ function installSessionIngest(pi: ExtensionAPI): void {
 			// Telemetry must never break the session.
 		}
 	};
+	const onError = (message: string) => {
+		logError(message);
+		recordHookFailure(stateRoot, message);
+	};
 	const scheduler = new SessionIngestScheduler({
-		onError: logError,
+		onError,
 		run: async (sessionFile) => {
 			const res = await runModule("orchestrator.cli", ingestArgs(sessionFile));
 			if (res.exitCode === 0) return { ok: true };
 			return { ok: false, detail: `exit ${res.exitCode}: ${res.stderr.trim().split("\n").slice(-3).join(" | ")}` };
 		},
 	});
-	pi.on("agent_settled", async (_event, ctx) => {
-		scheduler.schedule(ctx.sessionManager.getSessionFile());
-	});
-	pi.on("session_shutdown", async (_event, ctx) => {
-		await scheduler.flush(ctx.sessionManager.getSessionFile());
+	registerSessionIngestHooks(pi, scheduler, onError);
+}
+
+/**
+ * Drain batched telemetry when the session ends, so records still inside the
+ * coalescing window (a run that was cancelled by quitting, a plan that was just
+ * confirmed) are durable before HT exits. Idempotent: flushing an empty queue is a no-op.
+ */
+function installTelemetryDrain(pi: ExtensionAPI): void {
+	pi.on("session_shutdown", async () => {
+		const session = ACTIVE_RUN;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		session?.cancel();
+		try {
+			const drained = await Promise.race([
+				(async () => { await session?.finished; await recordQueue.flush(); return true; })(),
+				new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 2000); }),
+			]);
+			if (!drained) {
+				// Do not pretend the terminal cost is complete or archive-safe on expiry.
+				session?.close(true);
+				if (session) void session.sealDiagnostics(Promise.resolve(false));
+				console.warn("[orchestrator] shutdown drain timed out; late telemetry is unacknowledged, diagnostics remain UNSEALED");
+			}
+		} finally { if (timer !== undefined) clearTimeout(timer); }
 	});
 }
 
 export default function (pi: ExtensionAPI) {
 	reapOrphanedPersonaDirs();
 	installDispatchReaper();
+	installTelemetryDrain(pi);
 	installSessionIngest(pi);
 
 	pi.registerCommand("orchestrate", {
@@ -2827,7 +3825,7 @@ export default function (pi: ExtensionAPI) {
 
 				if (missingTriage) {
 					session.setPhase(`triage on ${shortName(adapter.implementation_fast?.model ?? "?")}`);
-					triageResult = await triageTask(parsed.goal, cwd, ctx, triageCost, adapter);
+					triageResult = await triageTask(runId, parsed.goal, cwd, ctx, triageCost, adapter);
 					session.cancellation.throwIfCancelled();
 					if (triageResult) {
 						effectiveTaskClass = triageResult.task_class;
@@ -2848,7 +3846,7 @@ export default function (pi: ExtensionAPI) {
 								? "interactive confirmation unavailable after triage"
 								: "cancelled by user after triage";
 							session.log(reason);
-							await failRun(runId, reason);
+							warnTelemetry(ctx, await failRun(runId, reason, session.terminalTiming(), session.telemetryBaseline));
 							ctx.ui.notify("Cancelled.", "info");
 							return;
 						}
@@ -2880,7 +3878,7 @@ export default function (pi: ExtensionAPI) {
 				} catch (err) {
 					if (session.cancellation.isCancelled) throw err;
 					session.log(`plan failed: ${(err as Error).message}`);
-					await failRun(runId, `plan failed: ${(err as Error).message}`);
+					warnTelemetry(ctx, await failRun(runId, `plan failed: ${(err as Error).message}`, session.terminalTiming(), session.telemetryBaseline));
 					ctx.ui.notify(`Plan failed: ${(err as Error).message}`, "error");
 					return;
 				}
@@ -2911,7 +3909,7 @@ export default function (pi: ExtensionAPI) {
 				const proceed = await Promise.race([session.cancellation.wait(), confirmStep(
 					ctx,
 					"Dispatch this plan?",
-					`${pipeline}\n\nEach stage runs headless (up to ${Math.round(DISPATCH_TIMEOUT_MS / 60000)} min per dispatch); live progress shows above the editor.`,
+					`${pipeline}\n\nOrchestrating stages use an inactivity limit plus an absolute ceiling (leaf dispatches use a fixed timeout); live progress shows above the editor.`,
 					parsed.interactive,
 				)]);
 				session.cancellation.throwIfCancelled();
@@ -2920,7 +3918,7 @@ export default function (pi: ExtensionAPI) {
 						? "interactive confirmation unavailable before dispatch"
 						: "cancelled by user at plan confirmation";
 					session.log(reason);
-					await failRun(runId, reason);
+					warnTelemetry(ctx, await failRun(runId, reason, session.terminalTiming(), session.telemetryBaseline));
 					ctx.ui.notify("Cancelled.", "info");
 					return;
 				}
@@ -2940,7 +3938,7 @@ export default function (pi: ExtensionAPI) {
 					mode: plan.route.mode,
 				};
 
-				await recordEvent("dispatch_plan_confirmed", {
+				recordEvent("dispatch_plan_confirmed", {
 					run_id: runId,
 					plan_id: plan.plan_id,
 					models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
@@ -2949,8 +3947,12 @@ export default function (pi: ExtensionAPI) {
 					log_dir: session.dir,
 				});
 
-				const dirtyBefore = gitDirtyFiles(cwd);
+				const dirtyBefore = gitDirtySnapshot(cwd);
+				const headBefore = gitHead(cwd);
+				// `workerResults` carries the parent-owned recon dispatches; they must stay
+				// destructured here or the run stops billing them (plan Task 3).
 				const { leadResults, workerResults, architectResult, escalationResults } = await dispatchHierarchical(
+
 					cwd,
 					runId,
 					plan.plan_id,
@@ -2971,23 +3973,43 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Step 3: Verification + escalation. We run QA against whatever files
-				// were touched in the lead phase. If QA fails, escalate per policy
-				// Rule 1. The loop is bounded by maxRetries.
-				// `filesChanged` is scraped from the lead's prose, so a report that merely
+				// were touched so far. If QA fails, escalate per policy Rule 1. The loop
+				// is bounded by maxRetries.
+				// `filesChanged` is scraped from dispatch prose, so a report that merely
 				// MENTIONS README.md counted it as changed and sent QA after a phantom.
-				// When the workspace is a git repo, trust the working tree instead: a file
-				// is "changed" if it is dirty now and was either clean before the run or
-				// is also named by the lead.
-				const claimed = new Set(leadResults.flatMap((r) => r.filesChanged));
-				const dirtyAfter = gitDirtyFiles(cwd);
-				const allFiles =
-					dirtyBefore && dirtyAfter
-						? [...dirtyAfter].filter((f) => !dirtyBefore.has(f) || claimed.has(f))
-						: [...claimed];
-				if (dirtyBefore && dirtyAfter) {
-					const phantom = [...claimed].filter((f) => !dirtyAfter.has(f));
-					if (phantom.length > 0) session.log(`lead named ${phantom.length} file(s) that are not modified in git; ignored: ${phantom.join(", ")}`);
-				}
+				// In a Git workspace, include both commits made since the run began and
+				// dirty files whose content differs from the pre-run snapshot. Pre-existing
+				// untracked scratch files a report merely names are not sent to QA. Every
+				// round diffs against the same pre-run snapshot so the list is the
+				// cumulative set QA must cover. `roundResults` are the dispatches that
+				// just ran (used for the phantom log); `priorResults` widen the prose
+				// fallback when git is unavailable so lead files aren't dropped on retry.
+				let snapshotWarned = false;
+				const changedSince = (
+					label: string,
+					roundResults: DispatchResult[],
+					priorResults: DispatchResult[] = [],
+				): string[] => {
+					const roundClaimed = new Set(roundResults.flatMap((r) => r.filesChanged));
+					const claimed = new Set([...priorResults.flatMap((r) => r.filesChanged), ...roundClaimed]);
+					const dirtyAfter = gitDirtySnapshot(cwd);
+					if ((!dirtyBefore || !dirtyAfter) && !snapshotWarned) {
+						snapshotWarned = true;
+						session.log(
+							`git snapshot unavailable (${!dirtyBefore ? "before" : "after"} ${label}); falling back to file paths scraped from dispatch prose`,
+						);
+					}
+					const { changed, phantom, historyUnavailable } = changedFilesSinceRunStart(cwd, headBefore, dirtyBefore, claimed, dirtyAfter);
+					if (historyUnavailable) session.log(`${label}: git history unavailable; using claimed file paths`);
+					const roundPhantom = phantom.filter((f) => roundClaimed.has(f));
+					if (roundPhantom.length > 0) {
+						session.log(
+							`${label} named ${roundPhantom.length} file(s) not modified during this run; ignored: ${roundPhantom.join(", ")}`,
+						);
+					}
+					return changed;
+				};
+				let allFiles = changedSince("lead phase", leadResults);
 
 				let retries = 0;
 				let lastVerification: VerificationResult | null = null;
@@ -2997,7 +4019,7 @@ export default function (pi: ExtensionAPI) {
 						session.setPhase(
 							retries === 0
 								? `QA on ${allFiles.length} changed file(s) via ${shortName(adapter.qa_agent?.model ?? "?")}`
-								: `QA retry ${retries + 1}/${parsed.maxRetries + 1}`,
+								: `QA retry ${retries + 1}/${parsed.maxRetries + 1} on ${allFiles.length} changed file(s)`,
 						);
 					}
 					lastVerification = await runVerification(
@@ -3029,6 +4051,7 @@ export default function (pi: ExtensionAPI) {
 
 					// Re-run escalations with bumped models (handled by pickModel when
 					// retryCount > 0 via adapter override).
+					const roundStart = escalationResults.length;
 					for (const t of escalationTasks) {
 						const binding = adapter[t.capability] ?? adapter.worker;
 						const escalatedModel = pickModel(
@@ -3050,7 +4073,8 @@ export default function (pi: ExtensionAPI) {
 							},
 							ctx,
 						);
-						session.cancellation.throwIfCancelled();
+						// Capture settled usage before cancellation unwinds this round, just
+						// as the architect, lead and QA paths do.
 						// dispatchParallel returns [] for an empty task list; billing an
 						// absent result wrote an all-"unknown" model_call for a dispatch
 						// that never happened.
@@ -3058,8 +4082,29 @@ export default function (pi: ExtensionAPI) {
 							await captureDispatchCost(captureOpts, retryResult);
 							escalationResults.push(retryResult);
 						}
+						session.cancellation.throwIfCancelled();
 					}
 					retries++;
+					// The retry may have touched different files than the first lead
+					// pass (or reverted some). Re-QA against the tree as it stands now
+					// rather than the list computed before the loop, so escalation edits
+					// are verified and a stale list can't fail the run forever. This also
+					// runs after the final retry: finalize reports `allFiles`, and the
+					// post-escalation tree is the state worth reporting.
+					const thisRound = escalationResults.slice(roundStart);
+					allFiles = changedSince(`escalation retry ${retries}`, thisRound, [
+						...leadResults,
+						...escalationResults.slice(0, roundStart),
+					]);
+					if (allFiles.length === 0) {
+						// Nothing left to verify, but QA already failed this run. Re-running
+						// against an empty list would return `skipped: true` and record the
+						// run as passed; keep the failed verdict instead.
+						session.log(
+							`escalation retry ${retries} left no files differing from the pre-run tree; keeping the failed verification verdict`,
+						);
+						break;
+					}
 				}
 
 				// Step 4: Finalize.
@@ -3085,7 +4130,7 @@ export default function (pi: ExtensionAPI) {
 				const passedVerification = dispatchOk && (lastVerification?.passed ?? false);
 
 				session.cancellation.throwIfCancelled();
-				await completeRun(runId, {
+				const telemetry = await completeRun(runId, {
 					success_rate: succeededLeads / Math.max(1, leadResults.length),
 					verification_passed: passedVerification,
 					total_cost_usd: totalCost,
@@ -3093,18 +4138,26 @@ export default function (pi: ExtensionAPI) {
 					retries,
 					models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
 					log_dir: session.dir,
-				});
+				}, session.terminalTiming(), session.telemetryBaseline);
 
 				// The lead's final report is the only place its reasoning, open
 				// questions, and non-file results (audits, package lists, verdicts)
 				// live. Always write it to disk; show it inline when there are no file
 				// edits to speak for the run, or when the lead raised open items.
 				const leadReports = leadResults
-					.filter((r) => r.stdout.trim())
-					.map((r) => `### ${r.taskId.replace(`${runId}-`, "")}\n\n${r.stdout.trim()}`);
+					.filter((r) => r.stdout.trim() || r.outcome === "timed_out" || r.outcome === "cancelled")
+					.map((r) => {
+						const interrupted = r.outcome === "timed_out" || r.outcome === "cancelled";
+						const reason = r.outcome === "cancelled"
+							? "cancelled"
+							: r.timeoutReason ?? "unknown";
+						const marker = interrupted ? `> UNVERIFIED PARTIAL WORK — ${reason}\n\n` : "";
+						const report = r.stdout.trim() || r.interruption?.partialText || "(no assistant text captured)";
+						return `${marker}### ${r.taskId.replace(`${runId}-`, "")}\n\n${report}`;
+					});
 				if (leadReports.length > 0) {
 					try {
-						writeFileSync(session.file("lead-report.md"), leadReports.join("\n\n---\n\n"));
+						session.writeDiagnostic("lead-report.md", leadReports.join("\n\n---\n\n"));
 					} catch {
 						/* best-effort */
 					}
@@ -3148,20 +4201,21 @@ export default function (pi: ExtensionAPI) {
 								})()}`,
 							]),
 					...(reportLines.length > 0
-						? ["", showFullReport ? "lead report:" : "open items from lead:", ...reportLines, ...(reportTruncated ? [`… full report: ${session.file("lead-report.md")}`] : [])]
+						? ["", showFullReport ? "lead report:" : "open items from lead:", ...reportLines, ...(reportTruncated ? [`… full report: ${describeRunArtifact(session.file("lead-report.md"))}`] : [])]
 						: leadReports.length > 0
-							? [`lead report: ${session.file("lead-report.md")}`]
+							? [`lead report: ${describeRunArtifact(session.file("lead-report.md"))}`]
 							: []),
-					`run log: ${session.file("run.log")}`,
+					`run log: ${describeRunArtifact(session.file("run.log"))}`,
 					`ledger: ${STATE_ROOT}/metrics.jsonl`,
+					...telemetryWarning(telemetry),
 				];
 				session.log(summary.join("\n"));
-				ctx.ui.notify(summary.join("\n"), passedVerification || (dispatchOk && verificationSkipped) ? "info" : "warning");
+				ctx.ui.notify(summary.join("\n"), (passedVerification || (dispatchOk && verificationSkipped)) && telemetryHealthy(telemetry) ? "info" : "warning");
 			} catch (err) {
 				if (session.cancellation.isCancelled) {
 					const stopped = session.cancelledDispatches();
 					session.log(`run cancelled by user; stopped dispatches: ${stopped.join(", ") || "none active"}`);
-					await failRun(runId, "cancelled by user (Esc or Ctrl+C)");
+					warnTelemetry(ctx, await failRun(runId, "cancelled by user (Esc or Ctrl+C)", session.terminalTiming(), session.telemetryBaseline));
 					ctx.ui.notify(
 						`Orchestration cancelled. ${stopped.length ? `Stopped: ${stopped.join(", ")}. ` : "No child dispatch was active. "}Progress is retained above the editor; run log: ${session.file("run.log")}`,
 						"info",
@@ -3171,17 +4225,22 @@ export default function (pi: ExtensionAPI) {
 					// row) and the UI stuck on the last notify. Record + surface it.
 					const message = (err as Error).stack ?? String(err);
 					session.log(`run crashed: ${message}`);
-					await failRun(runId, `crashed: ${(err as Error).message}`);
+					warnTelemetry(ctx, await failRun(runId, `crashed: ${(err as Error).message}`, session.terminalTiming(), session.telemetryBaseline));
 					ctx.ui.notify(
 						`Orchestration crashed: ${(err as Error).message}\nSee ${session.file("run.log")}`,
 						"error",
 					);
 				}
 			} finally {
-				session.close(session.cancellation.isCancelled);
-				ACTIVE_RUN = null;
-				closeTui?.();
-				if (tuiCompletion) await tuiCompletion.catch(() => {});
+				try {
+					session.close(session.cancellation.isCancelled);
+					await session.sealDiagnostics();
+				} finally {
+					ACTIVE_RUN = null;
+					session.finish();
+					closeTui?.();
+					if (tuiCompletion) await tuiCompletion.catch(() => {});
+				}
 			}
 		},
 	});
@@ -3420,6 +4479,40 @@ export default function (pi: ExtensionAPI) {
 				}
 				ctx.ui.notify(stdout.split("\n").slice(0, 20).join("\n"), "info");
 			});
+		},
+	});
+
+	// Message inbound while a run is live — queued in RunSession and folded
+	// into the prompt of the next dispatched task. Cannot be injected into a
+	// running Pi subprocess (humain-terminal --mode json --no-session has no
+	// stdin channel), so delivery is at the next dispatch boundary.
+	pi.registerCommand("omsg", {
+		description:
+			"Send a message to the running orchestration (queued, delivered to the next dispatched task). " +
+			"Usage: /omsg <text> — the lead will see and respond to it. Use '\\n' for newlines if needed.",
+		handler: async (args, ctx) => {
+			const text = args.trim();
+			if (!text) {
+				ctx.ui.notify("Usage: /omsg <message>  (queues one message for the next dispatch)", "warning");
+				return;
+			}
+			if (!ACTIVE_RUN) {
+				ctx.ui.notify(
+					"No orchestration is running. Start one with /orchestrate <goal> first — " +
+						"messages are only delivered to a live run.",
+					"warning",
+				);
+				return;
+			}
+			// Literal "\n" in the input becomes a real newline so multi-line
+			// instructions paste cleanly from shell history.
+			const normalized = text.replace(/\\n/g, "\n");
+			const depth = ACTIVE_RUN.enqueueMessage(normalized);
+			const preview = normalized.length > 80 ? `${normalized.slice(0, 77)}…` : normalized;
+			ctx.ui.notify(
+				`Queued for next dispatch (depth=${depth}): “${preview}”`,
+				"info",
+			);
 		},
 	});
 }

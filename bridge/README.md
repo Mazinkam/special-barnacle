@@ -56,6 +56,10 @@ After install, restart HT (or `/reload`) to pick up the new commands:
 /cross-review-demo
 ```
 
+## Dispatch timeouts
+
+Orchestrating capabilities (`lead`, `architect`, and `technical_lead`) use a progress-aware inactivity limit plus an absolute ceiling. Set `HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS` to change the no-progress limit (default: 20 minutes), and `HUMAIN_ORCHESTRATOR_LEAD_MAX_TIMEOUT_MS` to change the total runtime ceiling (default: 6 hours). The legacy `HUMAIN_ORCHESTRATOR_LEAD_TIMEOUT_MS` is used as the absolute-ceiling default only when `HUMAIN_ORCHESTRATOR_LEAD_MAX_TIMEOUT_MS` is unset; it no longer sets a fixed lead timeout. Leaf dispatches keep their separate fixed timeout.
+
 ## Editing
 
 Because the runtime paths are symlinks, editing a file under `bridge/` is
