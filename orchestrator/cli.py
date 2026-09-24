@@ -152,7 +152,24 @@ def _single(stream:str,payload_text:str,event:str|None=None)->int:
     except BatchValidationError as exc: print(json.dumps(_failure('invalid',str(exc)))); return EXIT_INVALID
     return write_records([record])
 
-def main():
+def _add_policy_override_flags(subparser):
+    """Add the shared --quality-floor/--cost-aggressiveness override flags.
+
+    Both `route` and `plan` resolve their effective policy from the same config-derived
+    defaults, with these two flags as optional per-invocation overrides (see how `route`
+    and `plan` build `overrides`/`user_overrides` in `main()`). Defining them once keeps
+    the type, default (None = no override) and absence of extra validation identical on
+    both subparsers, so a flag accepted by one is always accepted by the other.
+    """
+    subparser.add_argument('--quality-floor',type=float,default=None)
+    subparser.add_argument('--cost-aggressiveness',type=float,default=None)
+
+def build_parser():
+    """Construct the argparse parser without executing any command.
+
+    Kept separate from `main()` so tests can call `parse_args` directly against the real
+    parser (catching argument mismatches with the TS bridge) without running a command.
+    """
     ap=argparse.ArgumentParser(prog='orchestrator'); sp=ap.add_subparsers(dest='cmd',required=True)
     sp.add_parser('init'); sp.add_parser('status'); sp.add_parser('dashboard'); sp.add_parser('rebuild'); sp.add_parser('features'); sp.add_parser('recommend-policy')
     e=sp.add_parser('event'); e.add_argument('event'); e.add_argument('payload',nargs='?',default='{}')
@@ -160,8 +177,8 @@ def main():
     o=sp.add_parser('outcome'); o.add_argument('payload')
     b=sp.add_parser('batch',help='append an ordered batch of event/metric/outcome records (JSON array on stdin or as argument) and refresh once')
     b.add_argument('payload',nargs='?',default=None,help="JSON array of {stream, record_id, ...} records, or '-'/omitted to read stdin")
-    r=sp.add_parser('route'); r.add_argument('task_class'); r.add_argument('complexity',type=float); r.add_argument('risk'); r.add_argument('--run-id',default='cli-route'); r.add_argument('--quality-floor',type=float); r.add_argument('--cost-aggressiveness',type=float)
-    p=sp.add_parser('plan'); p.add_argument('run_id'); p.add_argument('task_class'); p.add_argument('complexity',type=float); p.add_argument('risk'); p.add_argument('--coupling',type=float,default=.5); p.add_argument('--parallelizable',type=float,default=.5); p.add_argument('--repo-revision')
+    r=sp.add_parser('route'); r.add_argument('task_class'); r.add_argument('complexity',type=float); r.add_argument('risk'); r.add_argument('--run-id',default='cli-route'); _add_policy_override_flags(r)
+    p=sp.add_parser('plan'); p.add_argument('run_id'); p.add_argument('task_class'); p.add_argument('complexity',type=float); p.add_argument('risk'); p.add_argument('--coupling',type=float,default=.5); p.add_argument('--parallelizable',type=float,default=.5); p.add_argument('--repo-revision'); _add_policy_override_flags(p)
     sim=sp.add_parser('simulate-policy'); sim.add_argument('--quality-floor',type=float,required=True); sim.add_argument('--cost-aggressiveness',type=float,required=True)
     t=sp.add_parser('topology'); t.add_argument('complexity',type=float); t.add_argument('--coupling',type=float,default=.5); t.add_argument('--parallelizable',type=float,default=.5); t.add_argument('--risk',default='medium')
     ing=sp.add_parser('ingest'); ing.add_argument('paths',nargs='*'); ing.add_argument('--runtime'); ing.add_argument('--repository'); ing.add_argument('--dry-run',action='store_true')
@@ -203,6 +220,23 @@ def main():
     rr.add_argument('run_id',help='run directory name under <state root>/runs (as shown in the progress board log path)')
     rr.add_argument('--dry-run',action='store_true',help='list what would be restored without writing')
     rr.add_argument('--json',action='store_true',help='machine-readable output')
+    return ap
+
+def _format_adapter_table(a: dict) -> str:
+    """Render the `resolve-adapter` capability table; a `None` field (e.g. a model with no known
+    provider) renders as `-` instead of breaking the `:<N` format spec.
+    """
+    lines=[f'{"capability":<24} {"tier":<12} {"provider":<20} {"model":<35} {"in$/M":>8} {"out$/M":>8}', '-'*110]
+    for cap, info in sorted(a.items()):
+        if cap.startswith('_'): continue
+        tier=info.get('tier') or '-'; provider=info.get('provider') or '-'; model=info.get('model') or '-'
+        lines.append(f'{cap:<24} {tier:<12} {provider:<20} '
+                      f'{model:<35} {(info.get("input_cost_per_m") or 0):>8.2f} '
+                      f'{(info.get("output_cost_per_m") or 0):>8.2f}')
+    return '\n'.join(lines)
+
+def main():
+    ap=build_parser()
     args=ap.parse_args(); C=cfg()
     # A dry run must leave the state root untouched (not even created), so the root and its streams are
     # only ensured for commands that write or read them; the engine is built where a command needs it.
@@ -237,7 +271,10 @@ def main():
         plan=eng().plan_run(run_id=args.run_id,task_class=args.task_class,complexity=args.complexity,risk=args.risk,user_overrides=overrides)
         print(json.dumps(plan['route'],indent=2)); return
     if args.cmd=='plan':
-        print(json.dumps(eng().plan_run(run_id=args.run_id,task_class=args.task_class,complexity=args.complexity,risk=args.risk,coupling=args.coupling,parallelizable=args.parallelizable,repo_revision=args.repo_revision),indent=2)); return
+        overrides={}
+        if args.quality_floor is not None: overrides['quality_floor']=args.quality_floor
+        if args.cost_aggressiveness is not None: overrides['cost_aggressiveness']=args.cost_aggressiveness
+        print(json.dumps(eng().plan_run(run_id=args.run_id,task_class=args.task_class,complexity=args.complexity,risk=args.risk,coupling=args.coupling,parallelizable=args.parallelizable,repo_revision=args.repo_revision,user_overrides=overrides),indent=2)); return
     if args.cmd=='simulate-policy':
         print(json.dumps(eng().simulate_policy(candidate_quality_floor=args.quality_floor,candidate_cost_aggressiveness=args.cost_aggressiveness),indent=2)); return
     if args.cmd=='topology': print(json.dumps(topology_for(args.complexity,args.coupling,args.parallelizable,args.risk),indent=2)); return
@@ -250,13 +287,7 @@ def main():
             print(_json.dumps(a, indent=2))
         else:
             # Default: print a compact capability -> provider/model table.
-            print(f'{"capability":<24} {"tier":<12} {"provider":<20} {"model":<35} {"in$/M":>8} {"out$/M":>8}')
-            print('-' * 110)
-            for cap, info in sorted(a.items()):
-                if cap.startswith('_'): continue
-                print(f'{cap:<24} {info["tier"]:<12} {info.get("provider","-"):<20} '
-                      f'{info["model"]:<35} {(info.get("input_cost_per_m") or 0):>8.2f} '
-                      f'{(info.get("output_cost_per_m") or 0):>8.2f}')
+            print(_format_adapter_table(a))
         return
     if args.cmd=='ingest':
         if args.discover or args.since_days is not None:
