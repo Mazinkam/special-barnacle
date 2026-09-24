@@ -53,7 +53,6 @@ import { Type } from "typebox";
 
 import {
 	discoverAgents,
-	BorderedLoader,
 	type ExtensionAPI,
 	type ExtensionContext,
 	renderTaskWithContext,
@@ -114,7 +113,7 @@ import {
 	type InterruptionReport,
 } from "./dispatch-progress.ts";
 import { RunCancellation } from "./cancellation.ts";
-import { connectCancellationLoader, applyObservation, applyWarnings, createProgressView, formatNestedWorkerRows, formatProgressLine, formatWarningLine } from "./run-ui.ts";
+import { applyObservation, applyWarnings, createProgressView, formatNestedWorkerRows, formatProgressLine, formatWarningLine } from "./run-ui.ts";
 import type { DispatchProgressView } from "./run-ui.ts";
 import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
 import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.ts";
@@ -348,7 +347,7 @@ function installDispatchReaper(): void {
 		// `once` + re-raise keeps HT's own handlers intact: we only add cleanup,
 		// we don't change whether the parent exits.
 		process.once(signal, () => {
-			ACTIVE_RUN?.cancel();
+			ACTIVE_RUN?.cancel("signal");
 			// Best effort only. A signal handler cannot await, so this merely *starts* a drain of
 			// records still inside the coalescing window; whether the Python child gets to run
 			// before HT exits depends on HT's own shutdown sequencing. Anything it does not
@@ -871,6 +870,10 @@ interface DispatchProgress {
 	progress: DispatchProgressView;
 	lastLoggedProgressDetail?: string;
 	lastLoggedProgressAt?: number;
+	/** Most recent tool name this dispatch invoked. `lastActivity` gets overwritten by
+	 *  assistant turn summaries ("turn N done (...)"), so it can't answer "what tool is
+	 *  it running now" — this field is set only from tool events and never cleared by them. */
+	lastTool?: string;
 }
 
 const MAX_ACTIVITY_TAIL = 4;
@@ -953,6 +956,41 @@ const MAX_MESSAGE_CHARS = 1500;
  * Before this, the only trace of a run was the aggregate metrics row, so a
  * 20-minute silent dispatch could not be inspected while it ran or after.
  */
+/** Point-in-time snapshot of a live `/orchestrate` run, returned by `RunSession.statusSnapshot()`
+ *  and the `orchestrator_status` tool. Deliberately UI-agnostic (no ANSI, no widget lines) so it
+ *  can be consumed by the LLM (as tool `details`) or a human (via `formatOrchestratorStatus`). */
+export interface OrchestratorStatus {
+	runId: string;
+	phase: string;
+	elapsedMs: number;
+	totalCostUsd: number;
+	dispatches: Array<{
+		label: string;
+		model: string;
+		status: "running" | "done" | "failed" | "cancelled";
+		elapsedMs: number;
+		turns: number;
+		lastTool?: string;
+		costUsd: number;
+	}>;
+	recentLog: string[];
+}
+
+/**
+ * Swallow throws from `ctx.ui` access. `ctx.ui` can become unavailable after the session
+ * that owns it has moved on (shutdown, a later session start racing the tail of this run's
+ * cleanup) — that failure is not this run's problem: the run has already been logged and
+ * recorded, so a UI notify/setWidget/setStatus call failing here must never crash the
+ * terminal or cleanup path.
+ */
+function safeUi(fn: () => void): void {
+	try {
+		fn();
+	} catch {
+		/* ctx.ui is unavailable; the run's outcome is already recorded */
+	}
+}
+
 export class RunSession {
 	readonly runId: string;
 	readonly ctx: ExtensionContext;
@@ -972,6 +1010,16 @@ export class RunSession {
 	private tickTimer: ReturnType<typeof setInterval> | undefined;
 	private closed = false;
 	readonly cancellation = new RunCancellation();
+	/** Reason the run was cancelled, set by `cancel()`. Distinguishes a user-initiated
+	 *  cancel (post a summary message to chat) from a session shutdown (do not). */
+	private _cancelReason: "user" | "shutdown" | "signal" | undefined;
+	get cancelReason(): "user" | "shutdown" | "signal" | undefined {
+		return this._cancelReason;
+	}
+	/** The detached background promise started by the `/orchestrate` handler after its
+	 *  synchronous prelude returns. Set once, right before the handler returns; awaited
+	 *  by `session_shutdown` and by tests that need the run to have fully settled. */
+	runPromise?: Promise<void>;
 	/** Per-dispatch spend cap (method.json rules.dispatch_spend_cap). Replaceable in tests. */
 	spendCaps = new SpendCapTracker();
 	/** User messages queued while a run is live; drained at the next dispatch boundary. */
@@ -1010,7 +1058,7 @@ export class RunSession {
 		}
 		// Elapsed counters must tick even when a child is silent — a frozen board
 		// is indistinguishable from a hung run, which is the complaint that led here.
-		this.tickTimer = setInterval(() => this.render(), 1000);
+		this.tickTimer = setInterval(() => safeUi(() => this.render()), 1000);
 	}
 
 	/**
@@ -1073,10 +1121,10 @@ export class RunSession {
 
 	async sealDiagnostics(terminal = Promise.resolve(this.terminalAcknowledged)): Promise<boolean> {
 		const sealed = await this.diagnostics.seal(terminal);
-		if (!sealed) this.ctx.ui.notify(
+		if (!sealed) safeUi(() => this.ctx.ui.notify(
 			`Diagnostics remain UNSEALED and archive-ineligible: producer drain/terminal acknowledgement did not complete or sealing failed. Raw diagnostics retained: ${this.dir}`,
 			"warning",
-		);
+		));
 		return sealed;
 	}
 
@@ -1094,10 +1142,11 @@ export class RunSession {
 		};
 	}
 
-	cancel(): void {
+	cancel(reason: "user" | "shutdown" | "signal" = "user"): void {
 		if (this.cancellation.isCancelled) return;
+		this._cancelReason = reason;
 		this.phase = "cancelling";
-		this.log("cancellation requested (interrupt)");
+		this.log(`cancellation requested (${reason})`);
 		this.cancellation.cancel();
 		this.render();
 	}
@@ -1114,8 +1163,8 @@ export class RunSession {
 	setPhase(phase: string, notify = true): void {
 		this.phase = phase;
 		this.log(`phase: ${phase}`);
-		if (notify) this.ctx.ui.notify(`[${fmtElapsed(Date.now() - this.startedAt)}] ${phase}`, "info");
-		this.render();
+		if (notify) safeUi(() => this.ctx.ui.notify(`[${fmtElapsed(Date.now() - this.startedAt)}] ${phase}`, "info"));
+		safeUi(() => this.render());
 	}
 
 	startDispatch(taskId: string, label: string, model: string, depth: number = 0): void {
@@ -1167,6 +1216,7 @@ export class RunSession {
 		switch (event?.type) {
 			case "tool_execution_start": {
 				d.toolCalls += 1;
+				d.lastTool = event.toolName;
 				const detail = shortArgs(event.toolName, event.args);
 				changed = `${event.toolName}${detail ? ` ${detail}` : ""}`;
 				this.log(`  ${taskId} tool#${d.toolCalls} ${changed}`);
@@ -1244,9 +1294,11 @@ export class RunSession {
 		// here means the user can see the verdict in the status bar even after
 		// the widget has been closed.
 		const wtShort = worktree ? ` · ${worktree.shortBranch} @ ${worktree.name}` : "";
-		this.ctx.ui.setStatus(
-			"orchestrator",
-			`orch ${this.phase} · ${elapsed} · ${running.length} running · ${failed} failed${wtShort} · $${totalCost.toFixed(3)}`,
+		safeUi(() =>
+			this.ctx.ui.setStatus(
+				"orchestrator",
+				`orch ${this.phase} · ${elapsed} · ${running.length} running · ${failed} failed${wtShort} · $${totalCost.toFixed(3)}`,
+			),
 		);
 
 		const lines: string[] = [];
@@ -1317,7 +1369,7 @@ export class RunSession {
 
 		lines.push("");
 		lines.push(`  ↯ updated ${new Date(now).toISOString().slice(11, 19)} UTC · log: ${this.file("run.log")}`);
-		this.ctx.ui.setWidget("orchestrator", lines);
+		safeUi(() => this.ctx.ui.setWidget("orchestrator", lines));
 	}
 
 	private formatRunningRow(d: DispatchProgress, now: number): string {
@@ -1360,23 +1412,55 @@ export class RunSession {
 		return `${indent}${mark} ${d.label.padEnd(20)}  ${model}  ${elapsed}  ${turns} ${tools}  ${cost}${note}`;
 	}
 
-	close(preserveCancelled = false): void {
+	close(): void {
 		if (this.closed) return;
 		if (this.tickTimer) clearInterval(this.tickTimer);
 		if (this.renderTimer) clearTimeout(this.renderTimer);
-		if (preserveCancelled) {
-			this.phase = "cancelled";
-			this.render();
-		} else {
-			this.ctx.ui.setWidget("orchestrator", undefined);
-			this.ctx.ui.setStatus("orchestrator", undefined);
-		}
+		// Cleared unconditionally, including on cancel: a stale widget/status left behind
+		// after cancellation used to be the only visible trace that a run had ended, but it
+		// also blocked the footer from ever going quiet. `run.log` and the terminal notify
+		// carry the same information without pinning it to the screen forever.
+		safeUi(() => this.ctx.ui.setWidget("orchestrator", undefined));
+		safeUi(() => this.ctx.ui.setStatus("orchestrator", undefined));
 		this.closed = true;
 		this.log(`run ${this.runId} closed after ${fmtElapsed(Date.now() - this.startedAt)}`);
 	}
 
 	cancelledDispatches(): string[] {
 		return [...this.dispatches.values()].filter((d) => d.status === "cancelled").map((d) => d.label);
+	}
+
+	/** Point-in-time status snapshot for the `orchestrator_status` tool and any other
+	 *  out-of-band caller that needs to see run progress without owning the UI widget. */
+	statusSnapshot(logLines = 20): OrchestratorStatus {
+		const now = Date.now();
+		const dispatches = [...this.dispatches.values()].map((d) => ({
+			label: d.label,
+			model: d.model,
+			status: d.status,
+			elapsedMs: (d.endedAt ?? now) - d.startedAt,
+			turns: d.turns,
+			lastTool: d.lastTool,
+			costUsd: d.costUsd,
+		}));
+		const clampedLines = Number.isFinite(logLines) ? Math.max(1, Math.min(200, Math.trunc(logLines))) : 20;
+		let recentLog: string[] = [];
+		try {
+			const text = readFileSync(this.file("run.log"), "utf8");
+			const lines = text.split("\n").filter((l) => l.length > 0);
+			recentLog = lines.slice(-clampedLines);
+		} catch {
+			/* log not written yet, or unreadable; report no lines rather than throw */
+			recentLog = [];
+		}
+		return {
+			runId: this.runId,
+			phase: this.phase,
+			elapsedMs: now - this.startedAt,
+			totalCostUsd: this.totalCost(),
+			dispatches,
+			recentLog,
+		};
 	}
 }
 
@@ -1386,6 +1470,75 @@ const NO_PERSONA = "__no_persona__";
 
 /** The run currently owning the UI. Only one /orchestrate may be live per session. */
 let ACTIVE_RUN: RunSession | null = null;
+
+/** Reads `ACTIVE_RUN` through a function boundary so TS control-flow narrowing (which assumes
+ *  a module-level `let` can't change between two reads in the same function) doesn't hide a
+ *  second, later check as unreachable — it deliberately can: another `/orchestrate` invocation
+ *  may reassign `ACTIVE_RUN` during the `await` between the two checks. */
+function getActiveRun(): RunSession | null {
+	return ACTIVE_RUN;
+}
+
+/** Test seam: the module has no other way to observe the run-scoped singleton. */
+export function activeRunForTest(): RunSession | null {
+	return ACTIVE_RUN;
+}
+
+/** Test seam: lets a test simulate ACTIVE_RUN having been reassigned to a newer run out from
+ *  under a stale one, to exercise the finally-block guard that must not clobber it. Not used
+ *  by production code, which only ever assigns `ACTIVE_RUN` via the guarded paths above. */
+export function setActiveRunForTest(run: RunSession | null): void {
+	ACTIVE_RUN = run;
+}
+
+/** Render an `OrchestratorStatus` snapshot as plain text for chat/tool output. */
+export function formatOrchestratorStatus(s: OrchestratorStatus): string {
+	const lines: string[] = [
+		`Orchestration ${s.runId} — phase: ${s.phase} · elapsed ${fmtElapsed(s.elapsedMs)} · total cost $${s.totalCostUsd.toFixed(4)}`,
+	];
+	if (s.dispatches.length > 0) {
+		lines.push("", "Dispatches:");
+		for (const d of s.dispatches) {
+			lines.push(
+				`  - ${d.label} (${d.model}) [${d.status}] ${fmtElapsed(d.elapsedMs)} · turns ${d.turns}` +
+					`${d.lastTool ? ` · last tool ${d.lastTool}` : ""} · $${d.costUsd.toFixed(4)}`,
+			);
+		}
+	} else {
+		lines.push("", "Dispatches: none yet");
+	}
+	if (s.recentLog.length > 0) {
+		lines.push("", "Recent log:");
+		for (const line of s.recentLog) lines.push(`  ${line}`);
+	}
+	return lines.join("\n");
+}
+
+export function registerOrchestratorStatusTool(pi: ExtensionAPI): void {
+	const parameters = Type.Object({
+		logLines: Type.Optional(Type.Number({ description: "Number of trailing run.log lines to include (clamped to 1..200; default 20)." })),
+	});
+	pi.registerTool({
+		name: "orchestrator_status",
+		label: "Orchestrator Status",
+		description:
+			"Read-only status of the current /orchestrate run, if any: phase, elapsed time, total cost, " +
+			"per-dispatch progress (model, status, turns, last tool call, cost), and recent run.log lines. " +
+			"Does not affect the run.",
+		promptSnippet: "orchestrator_status: check progress of a live /orchestrate run without blocking on it",
+		parameters,
+		async execute(_toolCallId, params) {
+			if (!ACTIVE_RUN) {
+				return { content: [{ type: "text", text: "No orchestrator run is active." }], details: undefined };
+			}
+			const snapshot = ACTIVE_RUN.statusSnapshot(params.logLines ?? 20);
+			return {
+				content: [{ type: "text", text: formatOrchestratorStatus(snapshot) }],
+				details: snapshot,
+			};
+		},
+	});
+}
 
 /**
  * Narrow, single-signature shape for the child launcher seam. `spawn` itself
@@ -2298,7 +2451,7 @@ export function telemetryHealthy(report: FlushReport): boolean {
 
 /** Surface a failed terminal drain to the operator; silent on success. */
 function warnTelemetry(ctx: ExtensionContext, report: FlushReport): void {
-	for (const line of telemetryWarning(report)) ctx.ui.notify(line, "warning");
+	for (const line of telemetryWarning(report)) safeUi(() => ctx.ui.notify(line, "warning"));
 }
 
 // -----------------------------------------------------------------------------
@@ -3965,15 +4118,15 @@ function installTelemetryDrain(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async () => {
 		const session = ACTIVE_RUN;
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		session?.cancel();
+		session?.cancel("shutdown");
 		try {
 			const drained = await Promise.race([
-				(async () => { await session?.finished; await recordQueue.flush(); return true; })(),
+				(async () => { await (session?.runPromise ?? session?.finished); await recordQueue.flush(); return true; })(),
 				new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 2000); }),
 			]);
 			if (!drained) {
 				// Do not pretend the terminal cost is complete or archive-safe on expiry.
-				session?.close(true);
+				session?.close();
 				if (session) void session.sealDiagnostics(Promise.resolve(false));
 				console.warn("[orchestrator] shutdown drain timed out; late telemetry is unacknowledged, diagnostics remain UNSEALED");
 			}
@@ -3981,11 +4134,35 @@ function installTelemetryDrain(pi: ExtensionAPI): void {
 	});
 }
 
+/**
+ * Post a run's terminal outcome to the chat as a custom message, so the user sees it
+ * even though `/orchestrate` returned long before the run settled. `sendMessage` can
+ * throw after the session has moved on (e.g. a later shutdown); that failure is not
+ * this run's problem to surface, so it is swallowed and logged instead.
+ */
+function postRunMessage(
+	pi: ExtensionAPI,
+	runId: string,
+	outcome: "completed" | "failed" | "cancelled",
+	content: string,
+	costUsd: number,
+): void {
+	try {
+		pi.sendMessage(
+			{ customType: "orchestrator-run", content, display: true, details: { runId, outcome, costUsd } },
+			{ triggerTurn: false },
+		);
+	} catch (err) {
+		console.warn(`[orchestrator] could not post run ${runId} summary to chat: ${(err as Error)?.message ?? err}`);
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	reapOrphanedPersonaDirs();
 	installDispatchReaper();
 	installTelemetryDrain(pi);
 	installSessionIngest(pi);
+	registerOrchestratorStatusTool(pi);
 
 	pi.registerCommand("orchestrate", {
 		description:
@@ -4043,23 +4220,35 @@ export default function (pi: ExtensionAPI) {
 
 			const runId = `ht-orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 			const session = new RunSession(runId, ctx, parsed.goal);
+			// Re-check: the first guard above ran before the `await resolveAdapter` a few lines up,
+			// so a second /orchestrate invocation could have raced through that same window and
+			// already claimed ACTIVE_RUN by the time we get here. Losing this race must not let two
+			// sessions both believe they own ACTIVE_RUN, so re-check immediately before the write.
+			if (getActiveRun()) {
+				ctx.ui.notify(
+					`An orchestration is already running (${ACTIVE_RUN!.runId}). Wait for it to finish; its log is ${ACTIVE_RUN!.file("run.log")}.`,
+					"warning",
+				);
+				session.close();
+				await session.sealDiagnostics();
+				session.finish();
+				return;
+			}
 			ACTIVE_RUN = session;
 			CURRENT_RUN_TAGS = { profile: resolved.profileName, policy_id: policyIdFor(resolved.profileName, adapter) };
 			CURRENT_ALIAS_TABLE = resolved.table;
 			session.log(`policy: ${CURRENT_RUN_TAGS.policy_id}`);
 			session.log(`models (profile "${resolved.profileName}"):\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
 			for (const n of resolved.notes) session.log(`note: ${n}`);
-			const cwd = process.cwd();
-			let closeTui: (() => void) | undefined;
-			let tuiCompletion: Promise<void> | undefined;
-			if (ctx.mode === "tui") {
-				tuiCompletion = ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-					const loader = new BorderedLoader(tui, theme, "Orchestrating — press Esc to cancel");
-					closeTui = connectCancellationLoader(loader, () => session.cancel(), () => done());
-					return loader;
-				});
-			}
 
+			// Everything from here on (triage, plan, dispatch, verification, completion)
+			// runs detached from the command handler: /orchestrate returns as soon as this
+			// promise is started, so the session stays responsive (queueing /omsg, checking
+			// orchestrator_status, issuing /orchestrate-cancel) while children run. The
+			// try/catch/finally below is the run's single cleanup point regardless of how
+			// it ends — success, failure, cancellation, or shutdown.
+			const runPromise = (async () => {
+			const cwd = process.cwd();
 			try {
 				// -----------------------------------------------------------------
 				// LLM triage: auto-fill missing task_class / complexity / risk via
@@ -4534,40 +4723,75 @@ export default function (pi: ExtensionAPI) {
 					...telemetryWarning(telemetry),
 				];
 				session.log(summary.join("\n"));
-				ctx.ui.notify(summary.join("\n"), (passedVerification || (dispatchOk && verificationSkipped)) && telemetryHealthy(telemetry) ? "info" : "warning");
+				const summaryText = summary.join("\n");
+				// Whether the run is reported as a success in the notify and in chat must agree:
+				// a run whose verification failed is not "completed" just because dispatch succeeded.
+				const succeeded = (passedVerification || (dispatchOk && verificationSkipped)) && telemetryHealthy(telemetry);
+				safeUi(() => ctx.ui.notify(summaryText, succeeded ? "info" : "warning"));
+				postRunMessage(pi, runId, succeeded ? "completed" : "failed", summaryText, totalCost);
 			} catch (err) {
 				if (session.cancellation.isCancelled) {
 					const stopped = session.cancelledDispatches();
 					session.log(`run cancelled by user; stopped dispatches: ${stopped.join(", ") || "none active"}`);
-					warnTelemetry(ctx, await failRun(runId, "cancelled by user (Esc or Ctrl+C)", session.terminalTiming(), session.telemetryBaseline));
-					ctx.ui.notify(
-						`Orchestration cancelled. ${stopped.length ? `Stopped: ${stopped.join(", ")}. ` : "No child dispatch was active. "}Progress is retained above the editor; run log: ${session.file("run.log")}`,
-						"info",
-					);
+					const cancelReason = session.cancelReason;
+					const cancelNote =
+						cancelReason === "shutdown"
+							? "cancelled (session shutdown)"
+							: cancelReason === "signal"
+								? "cancelled (signal)"
+								: "cancelled by user (/orchestrate-cancel)";
+					warnTelemetry(ctx, await failRun(runId, cancelNote, session.terminalTiming(), session.telemetryBaseline));
+					const cancelText = `Orchestration cancelled. ${stopped.length ? `Stopped: ${stopped.join(", ")}. ` : "No child dispatch was active. "}See ${session.file("run.log")}`;
+					safeUi(() => ctx.ui.notify(cancelText, "info"));
+					// Only a user-initiated cancel (/orchestrate-cancel) has a live session to post
+					// into; a shutdown or signal cancel means the session itself is going away.
+					if (cancelReason === "user") {
+						postRunMessage(pi, runId, "cancelled", cancelText, session.totalCost());
+					}
 				} else {
 					// Any uncaught throw used to leave the run half-recorded (no outcome
 					// row) and the UI stuck on the last notify. Record + surface it.
 					const message = (err as Error).stack ?? String(err);
 					session.log(`run crashed: ${message}`);
 					warnTelemetry(ctx, await failRun(runId, `crashed: ${(err as Error).message}`, session.terminalTiming(), session.telemetryBaseline));
-					ctx.ui.notify(
-						`Orchestration crashed: ${(err as Error).message}\nSee ${session.file("run.log")}`,
-						"error",
-					);
+					const crashText = `Orchestration crashed: ${(err as Error).message}\nSee ${session.file("run.log")}`;
+					safeUi(() => ctx.ui.notify(crashText, "error"));
+					postRunMessage(pi, runId, "failed", crashText, session.totalCost());
 				}
 			} finally {
 				try {
-					session.close(session.cancellation.isCancelled);
+					safeUi(() => session.close());
 					await session.sealDiagnostics();
 				} finally {
-					ACTIVE_RUN = null;
-					CURRENT_RUN_TAGS = {};
-					CURRENT_ALIAS_TABLE = null;
+					// A newer race winner may already have replaced ACTIVE_RUN with its own session
+					// (see the re-check guard above); only clear the run-scoped singletons when they
+					// still belong to this run, so a stale run's finally never nulls out a newer one.
+					if (ACTIVE_RUN === session) {
+						ACTIVE_RUN = null;
+						CURRENT_RUN_TAGS = {};
+						CURRENT_ALIAS_TABLE = null;
+					}
 					session.finish();
-					closeTui?.();
-					if (tuiCompletion) await tuiCompletion.catch(() => {});
 				}
 			}
+			})();
+			session.runPromise = runPromise;
+			runPromise.catch((err) => {
+				console.error(`[orchestrator] run ${runId} background task rejected unexpectedly: ${(err as Error)?.stack ?? err}`);
+			});
+		},
+	});
+
+	pi.registerCommand("orchestrate-cancel", {
+		description: "Cancel the currently running /orchestrate run, if any.",
+		handler: async (_args, ctx) => {
+			if (!ACTIVE_RUN) {
+				ctx.ui.notify("no active run", "info");
+				return;
+			}
+			const runId = ACTIVE_RUN.runId;
+			ACTIVE_RUN.cancel("user");
+			ctx.ui.notify(`Cancelling orchestration ${runId}…`, "info");
 		},
 	});
 
