@@ -1800,6 +1800,64 @@ describe("runSubagentProcess process/event handling", () => {
 		expect(result.postCompletionError).toContain("fixture shutdown failure");
 	});
 
+	test("long minified-bundle-style source line surfaces the sentinel and a stack frame past the 64 KiB pipe boundary (no session)", async () => {
+		// Reproduces HT's real failure mode: an uncaught exception on a source
+		// line long enough to model a minified bundle. Node prints that source
+		// line first, then the error name/message/stack — over a pipe, anything
+		// past ~64 KiB at process exit is silently dropped, so the sentinel and
+		// stack never arrive. See fixtures/long-line-throw.mjs for why the
+		// generated (>300 KB) child script itself is not committed.
+		const { writeLongLineThrowFixture, SENTINEL } = await import("./fixtures/long-line-throw.mjs");
+		const fixtureDir = mkdtempSync(join(tmpdir(), "orch-long-line-fixture-"));
+		const scriptPath = join(fixtureDir, "long-line-throw.mjs");
+		writeLongLineThrowFixture(scriptPath);
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir,
+				agentName: "__no_persona__",
+				task: "do the fixture task",
+				model: "provider/model",
+				ctx: {} as never,
+				spawnChild: (_command, _args, options) => nodeSpawn(process.execPath, [scriptPath], options as never),
+			});
+
+			expect(result.stderr).toContain(SENTINEL);
+			expect(result.stderr).toMatch(/\n\s+at /);
+		} finally {
+			rmSync(fixtureDir, { recursive: true, force: true });
+		}
+	});
+
+	test("long minified-bundle-style source line surfaces the sentinel and a stack frame in the persisted <taskId>.stderr.log (with session)", async () => {
+		const { writeLongLineThrowFixture, SENTINEL } = await import("./fixtures/long-line-throw.mjs");
+		const fixtureDir = mkdtempSync(join(tmpdir(), "orch-long-line-fixture-"));
+		const scriptPath = join(fixtureDir, "long-line-throw.mjs");
+		writeLongLineThrowFixture(scriptPath);
+		const session = createSession("long-line-session");
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir,
+				agentName: "__no_persona__",
+				task: "do the fixture task",
+				model: "provider/model",
+				ctx: {} as never,
+				taskId: "long-line",
+				session,
+				spawnChild: (_command, _args, options) => nodeSpawn(process.execPath, [scriptPath], options as never),
+			});
+
+			expect(result.stderr).toContain(SENTINEL);
+			expect(result.stderr).toMatch(/\n\s+at /);
+
+			const logged = readFileSync(session.file("long-line.stderr.log"), "utf8");
+			expect(logged).toContain(SENTINEL);
+			expect(logged).toMatch(/\n\s+at /);
+		} finally {
+			session.close();
+			rmSync(fixtureDir, { recursive: true, force: true });
+		}
+	});
+
 	test("does not recover a result that never reaches agent_settled", async () => {
 		const result = await orchestrator.runSubagentProcess({
 			cwd: repoDir,
