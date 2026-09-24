@@ -274,6 +274,46 @@ def _verification_task_ids(orchestrated: list[dict], outcomes: list[dict]) -> tu
     return attested, dispatch
 
 
+LEAD_SIZE_ORDER = ('small', 'standard', 'large')
+
+
+def _lead_sizes(orchestrated: list[dict], runs: list[dict]) -> list[dict[str, Any]]:
+    """Lead cost and run verification grouped by the triage-chosen `lead_size` tag.
+
+    Only rows the bridge tagged with `lead_size` count (Phase A onward); a run is
+    attributed to every size it used (an escalated run appears under both).
+    """
+    verdict = {str(r.get('run_id')): r.get('verification') for r in runs}
+    groups: dict[str, dict[str, Any]] = {}
+    for row in orchestrated:
+        size = row.get('lead_size')
+        role = str(row.get('role') or row.get('capability_class') or '')
+        if size not in LEAD_SIZE_ORDER or row.get('event') != 'model_call' or not role.startswith('lead'):
+            continue
+        g = groups.setdefault(size, {'cost': 0.0, 'calls': 0, 'runs': set(), 'self': set()})
+        g['cost'] += row_cost(row)
+        g['calls'] += 1
+        rid = str(row.get('run_id'))
+        g['runs'].add(rid)
+        if row.get('lead_self_implemented'):
+            g['self'].add(rid)
+    out = []
+    for size in LEAD_SIZE_ORDER:
+        g = groups.get(size)
+        if not g:
+            continue
+        verdicts = [verdict.get(rid) for rid in g['runs']]
+        out.append({
+            'lead_size': size, 'runs': len(g['runs']), 'calls': g['calls'], 'cost': g['cost'],
+            'cost_per_run': records.ratio(g['cost'], len(g['runs'])),
+            'verified_pass': sum(v == 'passed' for v in verdicts),
+            'verified_fail': sum(v == 'failed' for v in verdicts),
+            'verification_unknown': sum(v not in ('passed', 'failed') for v in verdicts),
+            'self_implemented': len(g['self']),
+        })
+    return out
+
+
 def build_ingest_status(raw: Any, *, now: datetime) -> dict[str, Any]:
     """Validate persisted ingest health and derive staleness without trusting its contents."""
     unknown = {
@@ -626,6 +666,7 @@ def build_data(root: Path, config: dict | None = None):
                 'retry_rate': retry_samples}),
             'routes': build_route_stats(orchestrated, outcomes), 'outcomes': outsum,
             'run_evidence': run_cov, 'runs': runs[-RECENT_RUNS:],
+            'lead_sizes': _lead_sizes(orchestrated, runs),
             # flaky_stats only matches rows with event=='verification_result'; session-ingest rows
             # are event=='model_call' and never contribute, but we pass `orchestrated` for
             # consistency with the rest of this function's inputs.
@@ -647,7 +688,7 @@ _HEAD='''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" 
 <div class="section card"><h2>Recent adaptive decisions</h2><div class="scroll"><table id="adaptive"></table></div></div>
 <div class="section card"><h2>Policy cohorts</h2><div class="scroll"><table id="policies"></table></div></div>
 <div class="section card"><h2>Daily trend</h2><div class="scroll"><table id="trends"></table></div></div>
-<div class="section card"><h2>Run evidence (actual, by run)</h2><div class="small">Joined by run_id across metrics, events, and outcomes. Known cost is the sum of metered calls only; unmetered calls and missing durations are shown as gaps, never as $0 or 0s. Elapsed time comes from the run's terminal boundary and is tagged with the source the writer declared. Non-impl. share is the fraction of known cost spent outside implementation roles (lead, architect, review, QA, triage) — broader than the "Coordination overhead" card, which counts only coordination roles. Any flat-baseline comparison is a counterfactual estimate, not observed savings.</div><div class="scroll"><table id="runs"></table></div></div>
+<div class="section card"><h2>Lead sizing</h2><div class="small">Lead calls tagged with the triage-chosen size (small → mid tier, standard → premium, large → frontier). Verification is the run verdict; an escalated run counts under each size it used. Self-implemented = the lead reported changed files without dispatching an implementer.</div><div class="scroll"><table id="leadsizes"></table></div></div><div class="section card"><h2>Run evidence (actual, by run)</h2><div class="small">Joined by run_id across metrics, events, and outcomes. Known cost is the sum of metered calls only; unmetered calls and missing durations are shown as gaps, never as $0 or 0s. Elapsed time comes from the run's terminal boundary and is tagged with the source the writer declared. Non-impl. share is the fraction of known cost spent outside implementation roles (lead, architect, review, QA, triage) — broader than the "Coordination overhead" card, which counts only coordination roles. Any flat-baseline comparison is a counterfactual estimate, not observed savings.</div><div class="scroll"><table id="runs"></table></div></div>
 <div class="section card"><h2>Historical route economics</h2><div class="scroll"><table id="routes"></table></div></div>
 <div class="section card"><h2>Cost by role</h2><div id="roles"></div></div>
 <div class="section card"><h2>Cost by agent runtime</h2><div id="runtimes"></div></div>
@@ -698,6 +739,7 @@ pauseButton.addEventListener('click',()=>{paused=!paused;try{localStorage.setIte
 try{const savedScroll=sessionStorage.getItem('orch-scroll');if(savedScroll!==null){window.scrollTo(0,Number(savedScroll)||0);sessionStorage.removeItem('orch-scroll');}}catch{}
 setInterval(()=>{if(document.visibilityState!=='visible'||paused)return;try{if(localStorage.getItem('orch-pause')==='1')return;}catch{}try{sessionStorage.setItem('orch-scroll',String(window.scrollY));}catch{}window.location.reload();},5000);
 const dur=x=>x==null?'<span class="warn">unknown</span>':(Number(x)/1000).toFixed(1)+'s';const knownCost=r=>r.cost_known_usd==null?'<span class="warn">unmetered</span>':m$('cost_known_usd',r.cost_known_usd)+(r.unmetered_calls?` <span class="warn">+${nz(r.unmetered_calls)} unmetered</span>`:'');const cf=r=>r.counterfactual?(r.counterfactual.cost_usd==null?'—':m$('counterfactual',r.counterfactual.cost_usd)+(r.counterfactual.comparable?'':' <span class="warn">(partial)</span>')):'—';
+$('#leadsizes').innerHTML=(D.lead_sizes||[]).length?'<thead><tr><th>Lead size</th><th>Runs</th><th>Calls</th><th>Cost</th><th>Cost / run</th><th>Verified pass</th><th>Verified fail</th><th>Unverified</th><th>Self-implemented</th></tr></thead><tbody>'+D.lead_sizes.map(r=>`<tr><td><b>${esc(r.lead_size)}</b></td><td>${nz(r.runs)}</td><td>${nz(r.calls)}</td><td>${m$('cost',r.cost)}</td><td>${m$('cost_per_run',r.cost_per_run)}</td><td>${nz(r.verified_pass)}</td><td>${nz(r.verified_fail)}</td><td>${nz(r.verification_unknown)}</td><td>${n0(r.self_implemented)?'<span class="warn">'+nz(r.self_implemented)+'</span>':'0'}</td></tr>`).join('')+'</tbody>':'<tbody><tr><td class="small">No lead-sized runs yet (tags start with Phase A).</td></tr></tbody>';
 $('#runs').innerHTML='<thead><tr><th>Run</th><th>Status</th><th>Elapsed (wall)</th><th>Known cost (actual)</th><th>Coverage</th><th>Non-impl. share</th><th>Call rows</th><th>Tasks</th><th>Retries</th><th>Verification</th><th>Delayed bad</th><th>Counterfactual (est.)</th></tr></thead><tbody>'+D.runs.slice().reverse().map(r=>`<tr><td><code>${esc(r.run_id)}</code></td><td>${esc(r.status)}</td><td>${dur(r.elapsed_ms)}${r.elapsed_source&&r.elapsed_source!=='unknown'?` <span class="small">${esc(r.elapsed_source)}</span>`:''}</td><td>${knownCost(r)}</td><td>${p$('cost_coverage',r.cost_coverage)}</td><td>${p$('overhead_ratio',r.overhead_ratio)}</td><td>${nz(r.call_rows)}</td><td>${nz(r.tasks)}</td><td>${nz(r.retries)}</td><td>${esc(r.verification)}</td><td>${r.delayed_bad_outcome==null?'—':(r.delayed_bad_outcome?'yes':'no')}</td><td>${cf(r)}</td></tr>`).join('')+'</tbody>';
 </script></main></body></html>'''
 

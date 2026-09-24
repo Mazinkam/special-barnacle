@@ -793,3 +793,43 @@ class RenderingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LeadSizingTableTests(StreamCase):
+    """Phase A: lead cost and verified outcomes grouped by triage-chosen lead size."""
+
+    def _lead(self, run_id, size, cost, **kw):
+        row = {'event': 'model_call', 'granularity': 'call', 'agent_runtime': 'humain-terminal',
+               'run_id': run_id, 'task_id': f'{run_id}-lead-0', 'role': f'lead_{size}' if size != 'standard' else 'lead',
+               'capability_class': 'lead', 'lead_size': size, 'profile': 'premium', 'policy_id': 'premium-abcd1234',
+               'cost_usd': cost, 'cost_source': 'reported', 'model': 'm', 'input_tokens': 1, 'output_tokens': 1,
+               'ts': '2026-09-24T10:00:00Z'}
+        row.update(kw)
+        return row
+
+    def test_groups_cost_runs_and_verification_by_lead_size(self):
+        metrics = [
+            self._lead('r1', 'small', 0.05),
+            self._lead('r2', 'large', 6.0, lead_self_implemented=True),
+            self._lead('r2', 'large', 1.0),
+            self._lead('r3', 'small', 0.07),
+        ]
+        outcomes = [
+            {'run_id': 'r1', 'task_id': 'r1-qa', 'verification': True, 'outcome': 'verified'},
+            {'run_id': 'r2', 'task_id': 'r2-qa', 'verification': False, 'outcome': 'fail'},
+        ]
+        data = self.build(metrics=metrics, outcomes=outcomes)
+        by = {row['lead_size']: row for row in data['lead_sizes']}
+        self.assertEqual(set(by), {'small', 'large'})
+        self.assertEqual(by['small']['runs'], 2)
+        self.assertAlmostEqual(by['small']['cost'], 0.12)
+        self.assertAlmostEqual(by['small']['cost_per_run'], 0.06)
+        self.assertEqual(by['small']['verified_pass'], 1)
+        self.assertEqual(by['small']['verification_unknown'], 1)
+        self.assertEqual(by['large']['runs'], 1)
+        self.assertAlmostEqual(by['large']['cost'], 7.0)
+        self.assertEqual(by['large']['verified_fail'], 1)
+        self.assertEqual(by['large']['self_implemented'], 1)
+
+    def test_empty_without_lead_size_rows(self):
+        self.assertEqual(self.build(metrics=[per_call(0.1)])['lead_sizes'], [])

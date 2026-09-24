@@ -486,6 +486,7 @@ def reference_build_data(root: Path, config: dict | None = None):
                 'quality': quality_samples, 'avg_quality_evidence': quality_samples, 'retry_rate': retry_samples}),
             'routes': build_route_stats(orchestrated, outcomes), 'outcomes': outsum,
             'run_evidence': run_cov, 'runs': runs[-dashboard.RECENT_RUNS:],
+            'lead_sizes': dashboard._lead_sizes(orchestrated, runs),
             'flaky': flaky_stats(orchestrated),
             'interactive_sessions': interactive_sessions,
             'ingest_status': _ref_ingest_status(root),

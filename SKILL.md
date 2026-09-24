@@ -56,18 +56,18 @@ Runtime state — measured ROI, enforcement readiness, history — lives in `~/.
 
 ### Rule 1: Review after a fix uses at least the original reviewer's tier
 
-A re-review is any review call following a fix-round on the same `task_id`, including explicit `*-rereview` task IDs and any `technical_review`/`security_review` with `retry > 0` that passed. The cheapest model tier (haiku / `implementation_fast`) **MUST NOT** re-review code that has changed since the original review. The minimum tier is `implementation_strong` at standard effort with targeted verification; the re-review model must be at or above the model that produced the original review.
+A re-review is any review call following a fix-round on the same `task_id`, including explicit `*-rereview` task IDs and any `technical_review`/`security_review` with `retry > 0` that passed. The cheap tier (`implementation_fast`, `scout`, `worker`) **MUST NOT** re-review code that has changed since the original review. The minimum tier is `implementation_strong` at standard effort with targeted verification; the re-review model must be at or above the model that produced the original review.
 
-Rationale: after a fix, the code under review has changed. Haiku confirmed 4/4 re-reviews in current data, but downstream tasks proceeded without issue only because the fixes were small. A single regression missed by haiku costs more in rework and escaped defects than the entire haiku re-review savings to date ($0.31 across all runs).
+Rationale: after a fix, the code under review has changed. The cheap tier confirmed 4/4 re-reviews in early data, but downstream tasks proceeded without issue only because the fixes were small. A single regression missed by a cheap re-reviewer costs more in rework and escaped defects than the entire cheap re-review savings to date ($0.31 across all runs).
 
 Escalation by risk:
 
 | Risk | Capability | Model tier min | Verification depth |
 |---|---|---|---|
-| low | `implementation_strong` | sonnet | targeted |
-| medium | `technical_review` | sonnet | targeted |
-| high | `security_review` | opus | full |
-| critical | `security_review` + independent | opus | full |
+| low | `implementation_strong` | mid | targeted |
+| medium | `technical_review` | mid | targeted |
+| high | `security_review` | premium | full |
+| critical | `security_review` + independent | frontier | full |
 
 When the lead agent itself fixes and re-reviews, the re-review must still use a model tier at or above the original reviewer. The lead may delegate the re-review to a peer at the same tier or higher.
 
@@ -85,7 +85,7 @@ Each worker answers one bounded question: affected files, existing tests, recent
 
 Skip recon for `task_class = investigation` or `qa_verification`; those have their own evidence-gathering topology.
 
-Rationale: `implementation_strong`-class tasks with 150K–400K input tokens cost $0.55–$2.38 because the implementer reads raw repository context. A $0.05 sonnet scout pre-digesting that context into a 2K-token evidence packet saves $1+ on the most expensive opus implementer calls and improves focus.
+Rationale: `implementation_strong`-class tasks with 150K–400K input tokens cost $0.55–$2.38 because the implementer reads raw repository context. A cents-level cheap-tier scout pre-digesting that context into a 2K-token evidence packet saves $1+ on the most expensive implementer calls and improves focus.
 
 ### Rule 3: Exploration uses the cheapest sufficient model
 
@@ -99,7 +99,33 @@ Investigation, recon, and digest tasks go to the cheapest capability that can pr
 | Security audit | `security_review` (full), no separate lead | n/a |
 | Spec synthesis | `analysis_strong` | `architect` |
 
-Rationale: the ht-codex-modularization-status run proved this topology — 4 parallel sonnet-5 scouts produced complete evidence packets at near-zero cost, and a single opus-5 synthesis produced the status report. Sending opus to do the investigation itself would have cost 5–10× more.
+Rationale: the ht-codex-modularization-status run proved this topology — 4 parallel mid-tier scouts produced complete evidence packets at near-zero cost, and a single premium synthesis produced the status report. Sending the premium model to do the investigation itself would have cost 5–10× more.
+
+### Rule 4: Lead sizing
+
+Triage classifies complexity and risk; `method.json` `rules.lead_sizing` turns them into a lead size. Orchestration asks for a size, never a model; the active profile binds each size through a tier.
+
+| Size | Complexity band | Capability | Tier |
+|---|---|---|---|
+| small | 1–3 | `lead_small` | mid |
+| standard | 4–6 | `lead` | premium |
+| large | 7–10 | `lead_large` | frontier |
+
+Size = max(complexity band, risk floor). Risk floors: medium ≥ standard, high and critical = large; an unknown risk is treated as medium. `--lead-size small|standard|large` overrides both. A lead that fails verification is retried one size up per retry, capped at large.
+
+Rationale: on 2026-09-24 the frontier lead (fable-5-1) was $90.71 of $184.11 orchestrated spend over 17 runs with 11 verified passes, while sonnet-5 leads cost $1.04 over 21 runs with 19 verified passes.
+
+### Rule 5: The lead delegates
+
+The lead persona has no `write` or `edit` tools. It plans, dispatches `orch-implementation-*` implementers, reviewers and QA, and verifies. A lead that reports changed files without dispatching an implementer is tagged `lead_self_implemented` on its metric row. Every lead report ends with `STATUS: completed|partial|blocked`; when every lead is blocked the run is reported as **BLOCKED**, QA does not run, and the run outcome is `blocked` (neither a pass nor a route failure).
+
+Several leads need the architect's `## Lead assignments` (scope + `depends on`). Dependent leads run in later waves; a lead whose dependency failed or was blocked is not started. Without valid assignments one lead runs with the whole goal.
+
+### Spend cap and provider fallback
+
+`rules.dispatch_spend_cap` sets a USD ceiling per dispatch (`lead_small` $1.50, `lead` $4, `lead_large` $10, `architect` $2, default $1). `warn` notifies once and records `spend_cap_exceeded`; `enforce` also stops the dispatch; `off` disables. It ships as `warn`.
+
+A dispatch on an `openai-codex/*` model that fails with a usage-limit, quota or rate-limit error is retried once on the same model id under `amazon-bedrock` and recorded as `route_degraded`. Both attempts are billed.
 
 ### Compliance tracking
 
@@ -183,9 +209,9 @@ Regenerate `~/.local/state/coding-agent-orchestrator/dashboard.html` after use. 
 
 ### Performance evidence
 
-To evaluate whether the orchestrator is earning its keep, run `scripts/skill_vs_baseline.py`. It reads `metrics.jsonl`, partitions orchestrated work from session-log ingests, reprices orchestrated records at flat single-model baselines (haiku-4-5, sonnet-4-5, opus-4-5), and reports cost, success rate, cost-per-success, retry rate, and waste — for the orchestrator and each bracket. The script is observational: it writes nothing to the stream and does not change the dashboard.
+To evaluate whether the orchestrator is earning its keep, run `scripts/skill_vs_baseline.py`. It reads `metrics.jsonl`, partitions orchestrated work from session-log ingests, reprices orchestrated records at flat single-model baselines, and reports cost, success rate, cost-per-success, retry rate, and waste — for the orchestrator and each bracket. The script is observational: it writes nothing to the stream and does not change the dashboard.
 
-The most recent calibrated numbers live in `policy_overlay.json` under `history.measured_performance` and are refreshed as new orchestrated runs are sampled. The durable finding as of the first measurement: the orchestrator's routing savings come from reviews (routed to haiku / sonnet) paying for `implementation_strong` (routed to opus), with the current mix running materially cheaper per success than a sonnet-4-5 flat baseline at the same token profile. The `policy_overlay.json` `enforcement.measured_roi` block carries the headline ratio.
+The most recent calibrated numbers live in `policy_overlay.json` under `history.measured_performance` and are refreshed as new orchestrated runs are sampled. The durable finding as of the first measurement: the orchestrator's routing savings came from reviews routed to cheaper tiers paying for stronger implementers. That measurement predates the 2026-09-24 finding that a frontier lead doing its own implementation was 49% of orchestrated spend; treat `policy_overlay.json` `enforcement.measured_roi` as historical until it is re-measured on matched cohorts (plan Phase E).
 
 ## Safe defaults
 
@@ -198,6 +224,10 @@ The most recent calibrated numbers live in `policy_overlay.json` under `history.
 - auto merge/deploy: off
 - destructive operations: deny
 - dependency changes: ask
-- re-review minimum tier: mid/sonnet (see Routing policy, `method.json` `rules.review_after_fix`)
+- re-review minimum tier: mid (see Routing policy, `method.json` `rules.review_after_fix`)
+- lead sizing: on (`rules.lead_sizing`); `--lead-size` overrides
+- per-dispatch spend cap: warn (`rules.dispatch_spend_cap`)
+- OpenAI routing: `openai-codex` first, one Bedrock retry on quota errors
+- active profile: `premium` (shipped in `bridge/orchestrator-profiles.json`)
 - pre-implementation recon: required at complexity ≥ 5
 - exploration cheapest sufficient: enforce via topology

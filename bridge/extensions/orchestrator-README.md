@@ -53,8 +53,9 @@ With pre-built parallelism (skip the lead agent and fan out directly):
 ```
 
 Without `--task-class` / `--complexity` / `--risk`, the extension triages via the
-cheapest configured model (gpt-5.6-luna / haiku tier) and confirms the inferred
-values with you before dispatching.
+cheapest configured model (the cheap tier, gpt-6-luna in the shipped profiles) and
+uses the inferred values. Triage also picks the **lead size** (see Lead sizing below);
+pass `--lead-size small|standard|large` to override it.
 
 Show ROI anytime:
 
@@ -69,9 +70,10 @@ Show ROI anytime:
 3. Parent-owned recon (`orchestrator/method.json` Rule 2, `rules.pre_implementation_recon`). For any run whose task class is not exempt, at complexity ≥ `min_complexity` (5), the extension itself dispatches the Rule-2 recon workers **before any lead starts** — 3 workers at complexity 5–6, 4 at 7–8, 5 at 9–10, always derived from `workers_by_complexity` (never from the plan's `topology.workers`). `investigation` and `qa_verification` runs are exempt (`skip_for_task_classes`), and the phase line says so explicitly instead of reporting `0/0`. Recon workers run as `worker_capability` (`implementation_fast`) with a hard read-only tool allow-list (`read,grep,find,ls`) passed via `--tools`, overriding whatever the bound persona would otherwise permit; the prompt forbids editing, committing, pushing, branch switching, stashing, and worktree changes. Each recon worker is a real, billed dispatch with its own progress row, `<taskId>.prompt.md` / `.events.jsonl` / `.stderr.log`, and `dispatch_started` / `dispatch_finished` events (`<runId>-recon-<n>`). Their output is folded into one bounded **Recon evidence** packet (per-worker and aggregate caps from `evidence_packet_max_tokens`, overridable with `HUMAIN_ORCHESTRATOR_RECON_EVIDENCE_MAX_CHARS`, with explicit `truncated` markers) that every lead receives. A failed recon worker is reported as `<taskId> unavailable` with a summarized stderr rather than dropped, and does not stop the other workers; if **every** recon worker fails the packet is prefixed with a `DEGRADED` notice so the lead and operator cannot mistake it for partial coverage. Cancellation (Esc/Ctrl+C) is checked before recon dispatch, after all finished recon workers have been billed, and before any lead is announced — a cancelled run never starts a lead, and already-finished workers are billed exactly once.
 4. Fan-out by topology depth:
    - `depth ≤ 2`: dispatch one `orchestrator-lead` agent.
-   - `depth ≥ 3`: dispatch the architect first, then `leads` orchestrator-lead agents in parallel.
+   - `depth ≥ 3`: dispatch the architect first. With `leads > 1` the architect must return `## Lead assignments` (`Lead N: <scope> (depends on: none|1,2)`); leads then run in dependency **waves**, and a lead whose dependency failed or reported `STATUS: blocked` is not started. Without valid assignments a single lead runs with the whole goal.
+   The lead is sized by triage (`lead_small` / `lead` / `lead_large`) and has no `write`/`edit` tools: it delegates implementation to `orch-implementation-*`.
    Leads may still use HT's `subagent` tool for implementation, review, and QA fan-out, but those nested children run inside the lead's own context window: the bridge has no visibility into them and they are **not** part of this run's authoritative worker accounting. Only the parent-owned recon workers above are counted and billed as workers.
-5. After leads finish, the extension runs `orch-qa-agent` against the union of changed files. Verdict is PASS or FAIL based on parsing `FAIL`/`✗`/`failed` markers from QA output.
+5. After leads finish, the extension runs `orch-qa-agent` against the union of changed files. Verdict is PASS or FAIL based on parsing `FAIL`/`✗`/`failed` markers from QA output. Every lead report ends with `STATUS: completed|partial|blocked`: if every lead is blocked the run is **BLOCKED** and QA does not run. If every lead reports `Files Changed: None`, files git shows as changed during the run are treated as another session's edits (`external_changes_detected`) and excluded from QA.
 6. On FAIL, escalate per `orchestrator/method.json` Rule 1 (`rules.review_after_fix`): re-dispatch reviews at bumped tier (mid → premium for re-reviews; never stay at cheap on retry). Bounded by `--max-retries` (default 2).
 7. Every dispatch writes two records back via `python3 -m orchestrator.cli metric`:
    - `model_call`: the actual model call with tokens + cost. `cost_source: reported` if HT reported a non-zero cost, otherwise `estimated-from-reported-tokens`.
@@ -81,21 +83,33 @@ Show ROI anytime:
 ## Model binding
 
 Models are configured in **one file**, `~/.humain-terminal/agent/orchestrator-profiles.json`,
-as named profiles. Values are short **aliases** (`fable-5-1`, `sonnet`, `haiku`,
-`astra`, `terra`) or explicit `provider/model`. Aliases are derived at runtime from
+as named profiles. `install.sh` installs the shipped `bridge/orchestrator-profiles.json`
+(backing up a differing file to `orchestrator-profiles.json.bak-<UTC>`); nothing is
+written when the extension loads. Values are short **aliases** (`fable-5-1`,
+`opus-5-5`, `sonnet-5`, `gpt-6-sol`, `gpt-6-luna`, `astra`) or explicit `provider/model`. Aliases are derived at runtime from
 the models you actually have configured (`models-store.json`) — there is no static
 table to go stale.
+
+Shipped profiles (`premium` is active):
+
+| Capability | `premium` | `anthropic` | `openai` | `oss` |
+|---|---|---|---|---|
+| cheap tier (scout, worker, implementation_fast) | gpt-6-luna | sonnet-5 @ low | gpt-6-luna | qwen3.8-27b |
+| mid tier (lead_small, implementation_strong, qa, …) | sonnet-5 | sonnet-5 | gpt-6-sol | minimax-m3 |
+| premium tier (lead, architect, security_review, …) | opus-5-5 | opus-5-5 | gpt-6-sol @ high | glm-5.2 |
+| frontier tier (lead_large) | fable-5-1 | fable-5-1 | astra | glm-5.2 |
+| reviews (technical/integration/migration/performance/api-contract) | gpt-6-sol | sonnet-5 | gpt-6-sol | kimi-k3 |
+| security_review | astra | opus-5-5 | gpt-6-sol @ high | glm-5.2 |
 
 ```json
 {
   "version": 1,
-  "active_profile": "default",
+  "active_profile": "premium",
   "provider_preference": ["openai-codex", "amazon-bedrock"],
   "profiles": {
-    "default": {
-      "tiers":        { "premium": "fable-5-1", "mid": "sonnet", "cheap": "haiku" },
-      "capabilities": { "technical_review": "astra", "security_review": "astra" },
-      "effort":       { "technical_review": "high" }
+    "premium": {
+      "tiers": { "cheap": "gpt-6-luna", "mid": "sonnet-5", "premium": "opus-5-5", "frontier": "fable-5-1" },
+      "capabilities": { "technical_review": "gpt-6-sol", "security_review": "astra" }
     }
   }
 }
@@ -103,16 +117,16 @@ table to go stale.
 
 Precedence, highest first — merged capability by capability:
 
-1. `/orchestrate` flags: `--model <capability>=ALIAS`, `--cheap/--mid/--premium ALIAS`, `--effort LEVEL`
+1. `/orchestrate` flags: `--model <capability>=ALIAS`, `--cheap/--mid/--premium/--frontier ALIAS`, `--effort LEVEL`
 2. profile `capabilities` (active profile, or `--profile NAME`)
 3. profile `tiers`
 4. cost-tier resolver (`cli resolve-adapter`, intersects `models-store.json` with `data/humain_node_catalog.json`)
 5. bundled `FALLBACK_ADAPTER`
 
-Tiers: `cheap` = implementation_fast, worker, scout · `mid` = lead, qa_agent,
+Tiers: `cheap` = implementation_fast, worker, scout · `mid` = lead_small, qa_agent,
 implementation_strong, technical_lead, technical_review, analysis_mid,
-integration/migration/performance/api_contract_review · `premium` = architect,
-security_review, analysis_strong. `effort` values are HT thinking levels
+integration/migration/performance/api_contract_review · `premium` = lead, architect,
+security_review, analysis_strong · `frontier` = lead_large. `effort` values are HT thinking levels
 (`off|minimal|low|medium|high|xhigh|max`) and are passed as `--thinking`.
 
 Alias rules: a bare alias that exists on several providers is picked by
@@ -121,8 +135,22 @@ Alias rules: a bare alias that exists on several providers is picked by
 (`fable`, `sonnet`) resolve to the newest undated, `global.` variant. Unknown
 aliases fail with suggestions, **before** anything is dispatched.
 
-The old `orchestrator-adapter.json` is migrated into profile `default` the first
-time it is seen and then ignored.
+The old `orchestrator-adapter.json` is no longer migrated (the migrated `default`
+profile was retired); run `install.sh` to install the shipped profiles.
+
+### Lead sizing, spend cap, provider fallback
+
+- **Lead sizing** (`method.json` `rules.lead_sizing`): complexity 1–3 → `lead_small` (mid),
+  4–6 → `lead` (premium), 7–10 → `lead_large` (frontier); medium risk ≥ standard,
+  high/critical = large. `--lead-size` overrides. A failed verification retries the lead
+  one size up. Each decision is recorded as a `lead_sized` event.
+- **Spend cap** (`rules.dispatch_spend_cap`, ships as `warn`): per-dispatch USD ceilings;
+  `warn` records `spend_cap_exceeded` once, `enforce` also stops the dispatch.
+- **Provider fallback**: an `openai-codex/*` dispatch that fails on a usage/quota/rate limit
+  is retried once on the same model under `amazon-bedrock`, recorded as `route_degraded`.
+- Every `model_call`/`route_executed` row carries `profile`, `policy_id`
+  (`<profile>-<hash of resolved bindings>`) and `lead_size`; the dashboard's **Lead sizing**
+  table groups lead cost and verified outcomes by size.
 
 ```
 /orchestrator-models                       resolved table for the active profile, with sources
