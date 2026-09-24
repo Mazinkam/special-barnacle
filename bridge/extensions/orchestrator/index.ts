@@ -27,14 +27,16 @@
  * skill's history has (recommended, executed, observed) triples to learn from.
  */
 
-import { RunDiagnostics, appendDiagnosticPath, type DiagnosticWriter } from "./run-diagnostics.ts";
+import { RunDiagnostics, appendDiagnosticPath, type ChildStderrFile, type DiagnosticWriter } from "./run-diagnostics.ts";
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
 	appendFileSync,
+	closeSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
@@ -101,7 +103,16 @@ import { classifyRunOutcome, externalChangeFiles, parseLeadStatus } from "./run-
 import { SpendCapTracker, capFor, type SpendCapVerdict } from "./spend-cap.ts";
 import { escalateLeadCapability, isLeadCapability, isLeadSize, leadSizeOf, sizeLead, type LeadSizeDecision } from "./lead-sizing.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
-import { BoundedCapture, classifyDispatchOutcome, summarizeStderr, trimEventForLog } from "./dispatch-outcome.ts";
+import {
+	BoundedCapture,
+	capChildStderrFile,
+	classifyDispatchOutcome,
+	MAX_CHILD_STDERR_DISK_BYTES,
+	readStderrFileBounded,
+	rewriteFileInPlace,
+	summarizeStderr,
+	trimEventForLog,
+} from "./dispatch-outcome.ts";
 import {
 	DispatchProgressTracker,
 	ORCHESTRATING_CAPABILITIES,
@@ -1400,6 +1411,64 @@ let ACTIVE_RUN: RunSession | null = null;
  */
 type ChildSpawner = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
 
+interface StderrTarget {
+	readonly path: string;
+	readonly fd: number;
+	/** Close the caller's copy of the fd. Idempotent. */
+	closeFd(): void;
+	/** Release the write lease/temp file. Idempotent; closes the fd first if not already closed. */
+	release(): void;
+}
+
+/**
+ * Open the destination for a child's stderr as a real file descriptor,
+ * never a pipe. Node prints the offending source line first on an uncaught
+ * exception, then the error's name/message/stack; HT's minified bundle has
+ * source lines up to ~650 KB, and Node's async pipe read can silently drop
+ * everything past its ~64 KiB buffer once the child exits — exactly where
+ * that name/message/stack lives. A real fd has no such loss: the child
+ * writes straight to a file, and the bytes are visible to any other reader
+ * (including this process, after `close`) as soon as the write syscall
+ * returns.
+ *
+ * With a session, the destination is the run's own `<taskId>.stderr.log`,
+ * opened under `RunDiagnostics`' fresh-directory/inode/lease guarantees
+ * (see run-diagnostics.ts) so it participates in the same drain-then-seal
+ * lifecycle as every other diagnostic file. Without a session (e.g. triage,
+ * or a caller that never started a run), it is a private mode-0600 temp file
+ * that the caller must remove via `release()`.
+ */
+function openStderrTarget(session: RunSession | undefined, stderrName: string): StderrTarget {
+	if (session) {
+		try {
+			const backing = session.diagnostics.openChildStderrFile(stderrName);
+			return { path: backing.path, fd: backing.fd, closeFd: backing.closeFd, release: backing.release };
+		} catch {
+			// A reused taskId within one session (unexpected, but not worth failing
+			// the whole dispatch over) or diagnostics already closing/sealed. Fall
+			// back to a private temp file rather than losing the fd-vs-pipe fix.
+		}
+	}
+	const dir = mkdtempSync(join(tmpdir(), "orch-subagent-stderr-"));
+	const path = join(dir, stderrName);
+	const fd = openSync(path, "wx", 0o600);
+	let fdOpen = true;
+	const closeFd = () => {
+		if (!fdOpen) return;
+		fdOpen = false;
+		try { closeSync(fd); } catch { /* already closed */ }
+	};
+	return {
+		path,
+		fd,
+		closeFd,
+		release: () => {
+			closeFd();
+			try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort temp cleanup */ }
+		},
+	};
+}
+
 /**
  * Spawn Pi as a one-shot subagent and parse its JSON event stream for the
  * assistant `message_end`, which carries `model`, `usage`, and `cost.total`.
@@ -1599,6 +1668,11 @@ export async function runSubagentProcess(opts: {
 		};
 		let diagnosticWriter: DiagnosticWriter | undefined;
 		let stderrPrefix = "";
+		let stderrTarget: StderrTarget | undefined;
+		const currentStderrFileBytes = (): number => {
+			if (!stderrTarget) return 0;
+			try { return statSync(stderrTarget.path).size; } catch { return 0; }
+		};
 		const finish = (processExitCode: number) => {
 			if (settled) return;
 			const cancelled = cancelledByListener || session?.cancellation.isCancelled === true;
@@ -1612,7 +1686,14 @@ export async function runSubagentProcess(opts: {
 			removeCancellationListener?.();
 			if (typeof proc?.pid === "number") liveDispatchPids.delete(proc.pid);
 			cleanupPrompt();
-			const stderr = stderrCapture.text();
+			// Real child stderr now lands on a file, not a pipe (see openStderrTarget);
+			// nothing streams it into stderrCapture in real time, so read whatever the
+			// child has written so far — settlement can race the child's own exit on a
+			// timeout/cancel, and the file may still be mid-write at this exact instant.
+			// The 'close' handler below re-reads the final, complete content.
+			const fileBytes = currentStderrFileBytes();
+			const fileText = fileBytes > 0 ? readStderrFileBounded(stderrTarget!.path) : "";
+			const stderr = stderrCapture.text() + (fileText ? `\n${fileText}` : "");
 			const stderrSummary = summarizeStderr(stderr);
 			const finalText = assistantTexts.length > 0 ? assistantTexts[assistantTexts.length - 1] : "";
 			// Only recover a process error after the JSON protocol proved the child
@@ -1632,7 +1713,14 @@ export async function runSubagentProcess(opts: {
 				stderrPrefix = outcome.status === "completed_after_process_error"
 					? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n`
 					: "";
-				diagnosticWriter.write(stderrName, stderrPrefix + stderr);
+				// If the child already has real bytes on disk (a real fd-backed stderr
+				// file), leave that file alone here: it may still be open for writing by
+				// a not-yet-exited child, and overwriting it now would race that write.
+				// The 'close' handler caps and appends our notes once the child has
+				// fully exited. Only the legacy (no real file content) path needs the
+				// full write here, matching pre-fd behavior for test doubles that
+				// bypass stdio entirely and stream stderr straight into stderrCapture.
+				if (fileBytes === 0) diagnosticWriter.write(stderrName, stderrPrefix + stderrCapture.text());
 			}
 			session?.endDispatch(taskId, outcome.effectiveExitCode, usage.cost, interruptionNote ? summarizeInterruption(interruption!) : outcome.note);
 			resolve({
@@ -1754,10 +1842,11 @@ export async function runSubagentProcess(opts: {
 		const spawnChild: ChildSpawner = opts.spawnChild ?? spawn;
 		try {
 			diagnosticWriter = session?.diagnostics.writer();
+			stderrTarget = openStderrTarget(session ?? undefined, stderrName);
 			proc = spawnChild(invocation.command, invocation.args, {
 				cwd: opts.cwd,
 				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["ignore", "pipe", stderrTarget.fd],
 				env,
 				// Make the child a process-group leader so a timeout can kill the
 				// whole tree. A dispatched lead spawns its own subagents, and
@@ -1766,13 +1855,19 @@ export async function runSubagentProcess(opts: {
 				// their output. We never unref(), so we still await this child.
 				detached: true,
 			});
+			// The child has (or, on POSIX, will momentarily) inherit its own copy of
+			// the fd via the underlying fork/exec; ours is no longer needed. Closing
+			// it here does not affect the child's ability to keep writing to the file.
+			stderrTarget.closeFd();
 		} catch (err) {
 			spawnFailed = true;
 			stderrCapture.append(`\n[orchestrator] spawn threw: ${(err as Error).message}`);
 			finish(1);
+			stderrTarget?.release();
 			diagnosticWriter?.close();
 			return;
 		}
+
 
 		if (typeof proc.pid === "number") liveDispatchPids.add(proc.pid);
 		dispatchStartedAt = Date.now();
@@ -1900,6 +1995,9 @@ export async function runSubagentProcess(opts: {
 		});
 
 		proc.stderr?.on("data", (data) => {
+			// Only ever fires for a test double that hands us a real stream (see
+			// openStderrTarget's fallback for anything spawned for real: stdio[2] is
+			// a raw fd there, so `proc.stderr` is null and this listener is inert).
 			stderrCapture.append(data.toString());
 		});
 
@@ -1909,11 +2007,33 @@ export async function runSubagentProcess(opts: {
 					if (buffer.trim()) processLine(buffer);
 					finish(code ?? 0);
 				}, streamFailure);
-				// Early settlement on timeout/error is not pipe drain. Keep the lease until close,
-				// and persist stderr that arrived after finish() resolved the dispatch.
-				diagnosticWriter?.write(stderrName, stderrPrefix + stderrCapture.text());
-			} finally { diagnosticWriter?.close(); }
+				// Early settlement on timeout/error is not pipe drain. Keep the lease until close.
+				const fileBytes = currentStderrFileBytes();
+				if (diagnosticWriter) {
+					if (fileBytes > 0) {
+						// The child wrote directly to the backing file (a real fd, not a
+						// pipe): it already holds the full raw content. Cap it in place if
+						// it grew past the on-disk limit, keeping the tail — that is where
+						// an uncaught exception's actual name/message/stack lives — then
+						// append our own notes rather than overwriting the child's bytes.
+						const capped = capChildStderrFile(stderrTarget!.path, MAX_CHILD_STDERR_DISK_BYTES);
+						if (capped !== undefined) diagnosticWriter.write(stderrName, capped);
+						const notes = `${stderrPrefix}${stderrCapture.text()}`;
+						if (notes) diagnosticWriter.append(stderrName, `\n${notes}`);
+					} else {
+						// Nothing real ever landed in the backing file (a test double that
+						// bypasses stdio entirely): fall back to persisting stderrCapture's
+						// text wholesale, matching the pre-fd behavior exactly, including
+						// any trailing diagnostics that arrived after finish() resolved.
+						diagnosticWriter.write(stderrName, stderrPrefix + stderrCapture.text());
+					}
+				}
+			} finally {
+				stderrTarget?.release();
+				diagnosticWriter?.close();
+			}
 		});
+
 
 		proc.on("error", (err) => {
 			spawnFailed = true;
