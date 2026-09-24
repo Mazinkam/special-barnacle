@@ -33,9 +33,17 @@ export function parseLeadAssignments(architectText: string, leadCount: number): 
 		const deps = DEPS_RE.exec(rest);
 		if (deps) {
 			rest = `${rest.slice(0, deps.index)} ${rest.slice(deps.index + deps[0].length)}`;
-			dependsOn = [...deps[1].matchAll(/\d+/g)].map((d) => Number(d[0]) - 1);
+			// List items like "1", "Lead 2" separated by commas / "and" / "&";
+			// prose items ("see the v3 notes") are ignored, duplicates collapse.
+			const ids = deps[1].split(/,|;|&|\band\b/i)
+				.map((item) => /^\s*(?:lead\s*)?(\d+)\s*$/i.exec(item)?.[1])
+				.filter((d): d is string => d !== undefined)
+				.map((d) => Number(d) - 1);
+			dependsOn = [...new Set(ids)];
 		}
-		const scope = rest.replace(/\s+/g, " ").replace(/\*+/g, "").trim().replace(/^[\s.;,]+|[\s.;,]+$/g, "");
+		// Strip bold markers and list punctuation only at the edges, so glob
+		// patterns like src/**/*.ts inside a scope survive.
+		const scope = rest.replace(/\s+/g, " ").trim().replace(/^[\s*.;,]+|[\s*.;,]+$/g, "");
 		out.push({ index, scope, dependsOn });
 	}
 	if (out.length !== leadCount) return null;

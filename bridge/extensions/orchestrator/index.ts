@@ -1670,6 +1670,13 @@ export async function runSubagentProcess(opts: {
 				usage.contextTokens = msg.usage.totalTokens || usage.contextTokens;
 			}
 			if (msg.stopReason) stopReason = msg.stopReason;
+			// A provider error arrives as a turn with stopReason "error" and an
+			// errorMessage, not on stderr (the child still exits 0 in json mode).
+			// Keep it in the stderr capture so the failure is explainable and the
+			// codex -> Bedrock quota fallback can see it.
+			if ((msg.stopReason === "error" || msg.stopReason === "aborted") && typeof msg.errorMessage === "string" && msg.errorMessage) {
+				stderrCapture.append(`\n[provider ${msg.stopReason}] ${msg.errorMessage}`);
+			}
 			if (Array.isArray(msg.content)) {
 				const text = msg.content
 					.filter((b: any) => b?.type === "text" && typeof b.text === "string")
@@ -2444,7 +2451,7 @@ export async function dispatchParallel(
 			// cancel, or a spend-cap stop (those would re-run finished work), and
 			// only when stderr (not the model's own prose) names the quota.
 			const eligible = r.exitCode !== 0 && r.outcome !== "timed_out" && r.outcome !== "cancelled" &&
-				r.stopReason !== "spend_cap" && !ACTIVE_RUN?.cancellation.isCancelled;
+				r.stopReason !== "spend_cap" && !(session ?? ACTIVE_RUN)?.cancellation.isCancelled;
 			const twin = eligible && table && isQuotaError(r.stderr) ? bedrockFallbackFor(input.model, table) : null;
 			if (twin) {
 				deps.recordEvent("dispatch_finished", {
@@ -2976,7 +2983,10 @@ export function dispatchRecordsFor(
 		agent_runtime: "humain-terminal",
 		provider,
 		model,
-		effort: result?.effort ?? "standard",
+		// `effort` stays in the method's vocabulary (comparable with
+		// recommended_effort); the raw HT thinking level is kept separately.
+		effort: methodEffortFor(result?.effort),
+		...(result?.effort ? { thinking_level: result.effort } : {}),
 		verification_depth: "targeted",
 		// HT input excludes cache reads; the telemetry/pricing contract includes them.
 		input_tokens: (usage.input ?? 0) + (usage.cacheRead ?? 0),
@@ -3005,7 +3015,8 @@ export function dispatchRecordsFor(
 		risk: opts.risk,
 		capability_class: result?.capability ?? "unknown",
 		executed_model: model,
-		executed_effort: result?.effort ?? "standard",
+		executed_effort: methodEffortFor(result?.effort),
+		...(result?.effort ? { executed_thinking_level: result.effort } : {}),
 		executed_verification_depth: "targeted",
 		...(hasReportedCost ? { executed_cost_usd: result.costUsd } : {}),
 		executed_input_tokens: (usage.input ?? 0) + (usage.cacheRead ?? 0),
@@ -3021,6 +3032,17 @@ export function dispatchRecordsFor(
 		adaptive_mode: opts.mode,
 		...runTagFields(),
 	}];
+}
+
+/** HT thinking level -> method.json effort vocabulary (minimal|low|standard|high|maximum). */
+export function methodEffortFor(thinking: string | undefined): string {
+	switch (thinking) {
+		case "off": case "minimal": return "minimal";
+		case "low": return "low";
+		case "high": return "high";
+		case "xhigh": case "max": return "maximum";
+		default: return "standard"; // unset or "medium"
+	}
 }
 
 function sumUsage(a: SubagentUsageStats, b: SubagentUsageStats): SubagentUsageStats {

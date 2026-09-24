@@ -1569,6 +1569,29 @@ describe("runSubagentProcess process/event handling", () => {
 		}
 	});
 
+	test("a provider error turn in json mode (exit 0) fails the dispatch and surfaces errorMessage in stderr", async () => {
+		const session = createSession("provider-error-exit0");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "openai-codex/gpt-6-astra",
+				ctx: {} as never, capability: "security_review", taskId: "quota-sec", session,
+				spawnChild: () => child as never,
+			});
+			emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "You have hit your usage limit. Try again later.", usage: { input: 0, output: 0, cost: { total: 0 } } } });
+			emit({ type: "agent_end", messages: [] });
+			emit({ type: "agent_settled" });
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.exitCode).toBe(1);
+			expect(result.outcome).toBe("failed");
+			expect(result.stderr).toContain("usage limit");
+		} finally {
+			session.close();
+		}
+	});
+
 	test("spend cap warn logs once and lets the dispatch finish", async () => {
 		const { SpendCapTracker } = await import("./spend-cap.ts");
 		const session = createSession("spend-cap-warn");
@@ -3078,3 +3101,18 @@ describe("review fixes (Phase A review)", () => {
 		}
 	});
 });
+
+describe("effort telemetry vocabulary", () => {
+	test("thinking levels map onto method.json efforts", () => {
+		expect(orchestrator.methodEffortFor(undefined)).toBe("standard");
+		expect(orchestrator.methodEffortFor("medium")).toBe("standard");
+		expect(orchestrator.methodEffortFor("low")).toBe("low");
+		expect(orchestrator.methodEffortFor("high")).toBe("high");
+		expect(orchestrator.methodEffortFor("xhigh")).toBe("maximum");
+		expect(orchestrator.methodEffortFor("off")).toBe("minimal");
+		for (const t of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+			expect(METHOD.effort_levels).toContain(orchestrator.methodEffortFor(t));
+		}
+	});
+});
+

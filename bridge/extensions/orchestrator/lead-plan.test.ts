@@ -58,3 +58,16 @@ describe("parseLeadAssignments — natural architect wording (review fixes)", ()
 		expect(a?.map((x) => x.dependsOn)).toEqual([[], [0], [0, 1]]);
 	});
 });
+
+describe("parseLeadAssignments — second review fixes", () => {
+	test("glob asterisks in a scope are kept; bold markers at the edges are stripped", () => {
+		const a = parseLeadAssignments(plan("- **Lead 1:** refactor src/**/*.ts (depends on: none)\n**Lead 2: tests for src/*.ts**"), 2);
+		expect(a?.[0].scope).toBe("refactor src/**/*.ts");
+		expect(a?.[1].scope).toBe("tests for src/*.ts");
+	});
+	test("prose numbers inside the deps parenthesis are not dependencies; duplicates collapse", () => {
+		const a = parseLeadAssignments(plan("Lead 1: a\nLead 2: b (depends on: Lead 1, see the v3 notes)\nLead 3: c (depends on: 1, 1 and 2)"), 3);
+		expect(a?.map((x) => x.dependsOn)).toEqual([[], [0], [0, 1]]);
+	});
+});
+

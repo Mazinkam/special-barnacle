@@ -161,7 +161,15 @@ export function classifyDispatchOutcome(input: DispatchOutcomeInput): DispatchOu
 	if (input.timedOut || input.exitCode === 124) {
 		return { status: "timed_out", effectiveExitCode: input.exitCode, note: input.stderrSummary || undefined };
 	}
-	if (input.exitCode === 0) return { status: "completed", effectiveExitCode: 0 };
+	if (input.exitCode === 0) {
+		// HT's --mode json exits 0 even when the final turn is a provider error
+		// (quota, auth, overload) or an abort; only text mode sets exit 1. The
+		// final stop reason is the authoritative signal.
+		if (input.lastStopReason === "error" || input.lastStopReason === "aborted") {
+			return { status: "failed", effectiveExitCode: 1, note: input.stderrSummary || `final turn ended in ${input.lastStopReason}` };
+		}
+		return { status: "completed", effectiveExitCode: 0 };
+	}
 	if (
 		!input.spawnFailed &&
 		input.sawAgentSettled &&
