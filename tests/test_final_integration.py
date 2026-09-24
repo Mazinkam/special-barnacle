@@ -81,6 +81,17 @@ def test_route_missing_price_is_not_a_free_verified_route():
     assert group['unmetered_call_samples'] == 1
 
 
+def test_duplicate_history_agrees_across_dashboard_and_billing(tmp_path):
+    from orchestrator.economics import cost_attribution
+    row=call(record_id='same')
+    (tmp_path/'metrics.jsonl').write_text((json.dumps(row)+'\n')*2)
+    data=build_data(tmp_path)
+    assert data['summary']['total_cost']==.1
+    assert data['summary']['call_rows']==1
+    assert data['run_evidence']['cost_known_usd']==.1
+    assert cost_attribution([row,row])['reported']['cost']==.1
+
+
 def test_invalid_legacy_ids_remain_distinct_rows():
     evidence=summarize_runs([call(record_id=['bad']), call(record_id={'bad':1})], [], [])[0]
     assert evidence['call_rows']==2
