@@ -17,11 +17,14 @@ After install, restart HT (or `/reload`):
 
 ```
 /reload
-/orchestrate <goal> [--task-class T] [--complexity N] [--risk R] [--cheap P/M] [--mid P/M] [--premium P/M] [--model cap=P/M] [--max-retries N] [--interactive]
+/orchestrate [flags] <goal> [flags]   # e.g. <goal> [--task-class T] [--complexity N] [--risk R] [--cheap P/M] [--mid P/M] [--premium P/M] [--model cap=P/M] [--max-retries N] [--interactive]
 /orchestrator-models [list|set|use|pick|validate --live]
 /orchestrator-roi
 /cross-review-demo
 ```
+
+Flags are read only from before and after the goal text. A `--flag` between goal words is part of the goal and has no effect, so goals may mention flags ("keep --interactive working").
+
 
 `install.sh` also installs a launchd agent (`com.humain.orchestrator-ingest`) that sweeps
 recent HT and Codex session logs into the ledger every 15 minutes. Together with the
@@ -72,7 +75,7 @@ Show ROI anytime:
    - `depth ≤ 2`: dispatch one `orchestrator-lead` agent.
    - `depth ≥ 3`: dispatch the architect first. With `leads > 1` the architect must return `## Lead assignments` (`Lead N: <scope> (depends on: none|1,2)`); leads then run in dependency **waves**, and a lead whose dependency failed or reported `STATUS: blocked` is not started. Without valid assignments a single lead runs with the whole goal.
    The lead is sized by triage (`lead_small` / `lead` / `lead_large`) and has no `write`/`edit` tools: it delegates implementation to `orch-implementation-*`.
-   Leads may still use HT's `subagent` tool for implementation, review, and QA fan-out, but those nested children run inside the lead's own context window: the bridge has no visibility into them and they are **not** part of this run's authoritative worker accounting. Only the parent-owned recon workers above are counted and billed as workers. The `orchestrator-lead` persona therefore forbids leads from dispatching their own `orch-scout` recon round — that would pay for Rule-2 recon twice, invisibly — and `index.test.ts` ("lead persona recon contract") guards the instruction against regression.
+   Leads may still use HT's `subagent` tool for implementation and review fan-out. Those nested children run inside the lead's own context window and are **not** part of this run's authoritative worker accounting: only the parent-owned recon workers above are counted as workers. Their reported cost is still billed: the bridge reads `details.results[].usage.cost` from the lead's `subagent` tool events (`nested-cost.ts`), adds it to the lead's spend-cap total as it grows, shows it in the widget, and includes it in the run's `total cost` (reported separately as "of it in lead subagents"). Leads do not dispatch `orch-qa-agent`; final QA is step 5. The `orchestrator-lead` persona therefore forbids leads from dispatching their own `orch-scout` recon round — that would pay for Rule-2 recon twice, invisibly — and `index.test.ts` ("lead persona recon contract") guards the instruction against regression.
 5. After leads finish, the extension runs `orch-qa-agent` against the union of changed files. Verdict is PASS or FAIL based on parsing `FAIL`/`✗`/`failed` markers from QA output. Every lead report ends with `STATUS: completed|partial|blocked`: if every lead is blocked the run is **BLOCKED** and QA does not run. If every lead reports `Files Changed: None`, files git shows as changed during the run are treated as another session's edits (`external_changes_detected`) and excluded from QA.
 6. On FAIL, escalate per `orchestrator/method.json` Rule 1 (`rules.review_after_fix`): re-dispatch reviews at bumped tier (mid → premium for re-reviews; never stay at cheap on retry). Bounded by `--max-retries` (default 2).
 7. Every dispatch writes two records back via `python3 -m orchestrator.cli metric`:
