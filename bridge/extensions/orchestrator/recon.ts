@@ -35,6 +35,8 @@ export interface ReconTaskPlan {
 	taskId: string;
 	capability: string;
 	task: string;
+	/** Explicit tool boundary, independent of the model capability's persona. */
+	tools: string[];
 }
 
 /** The subset of a completed dispatch result this module needs to build evidence. */
@@ -88,6 +90,7 @@ export function planReconTasks(input: ReconPlanInput): ReconTaskPlan[] {
 		taskId: `${runId}-recon-${index}`,
 		capability: method.worker_capability,
 		task: readOnlyReconPrompt(goal, question),
+		tools: ["read", "grep", "find", "ls"],
 	}));
 }
 
