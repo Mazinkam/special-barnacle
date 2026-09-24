@@ -1925,7 +1925,13 @@ describe("runSubagentProcess process/event handling", () => {
 			}
 
 			const driverPath = join(buildDir, "run-subagent-under-node.js");
+			// `Bun.which("node")` above already requires a real `node` binary on PATH
+			// (this test's whole point is exercising Node's own async-pipe-read
+			// behavior, which bun's runner does not reproduce); a `timeout` here bounds
+			// a hung driver (e.g. a regression that leaves the run's diagnostics lease
+			// open) instead of hanging the whole test run indefinitely.
 			execFileSync(nodeBin, [driverPath, driverRepoDir, scriptPath, "long-line-node", outFile], {
+				timeout: 60_000,
 				env: {
 					...process.env,
 					HUMAIN_ORCHESTRATOR_STATE_ROOT: nodeStateRoot,
@@ -2053,6 +2059,173 @@ describe("runSubagentProcess process/event handling", () => {
 		expect(result.outcome).toBe("failed");
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain("ENOENT");
+	});
+
+	test("BLOCKING 1: a provider-error note is written exactly once when the child emits no stderr", async () => {
+		// Regression for the double-write: finish() sees an empty backing file and
+		// writes the provider-error note into it; the 'close' handler used to
+		// re-stat the file, see the bytes finish() had just written, mistake them
+		// for real child bytes, and append the same note a second time.
+		const session = createSession("provider-error-once");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "openai-codex/gpt-6-astra",
+				ctx: {} as never, capability: "security_review", taskId: "provider-error-once", session,
+				spawnChild: () => child as never,
+			});
+			emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "You have hit your usage limit.", usage: { input: 0, output: 0, cost: { total: 0 } } } });
+			emit({ type: "agent_end", messages: [] });
+			emit({ type: "agent_settled" });
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.outcome).toBe("failed");
+			const log = readFileSync(session.file("provider-error-once.stderr.log"), "utf8");
+			expect((log.match(/usage limit/g) ?? []).length).toBe(1);
+			expect((result.stderr.match(/usage limit/g) ?? []).length).toBe(1);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("BLOCKING 1: a timeout note is written exactly once when the child is silent on stderr", async () => {
+		const session = createSession("timeout-once");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "timeout-once", session,
+				leadTimeouts: { inactivityMs: 50, maxMs: 5000 },
+				spawnChild: () => child as never,
+			});
+			expect(result.outcome).toBe("timed_out");
+			// The real process 'close' event arrives after finish() already settled
+			// (as it does in production: kill() races the OS reporting exit).
+			child.emit("close", 124);
+			await Promise.resolve();
+			const log = readFileSync(session.file("timeout-once.stderr.log"), "utf8");
+			expect((log.match(/UNVERIFIED PARTIAL WORK/g) ?? []).length).toBe(1);
+		} finally {
+			child.emit("close", 137);
+			session.close();
+		}
+	});
+
+	test("the recovered-result warning prefix stays a prefix, in both the returned stderr and stderr.log", async () => {
+		const session = createSession("recovered-prefix");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "recovered-prefix", session,
+				spawnChild: () => child as never,
+			});
+			emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "fixture task completed" }] } });
+			emit({ type: "agent_end", messages: [] });
+			emit({ type: "agent_settled" });
+			// The child completed the JSON protocol cleanly, then the process itself
+			// exits non-zero — the "recovered" path. No real bytes ever land on the
+			// backing fd here (this is a test double), so this exercises finish()'s
+			// own file write (the `fileBytes === 0` branch), matching the scenario
+			// the review comment names.
+			child.emit("close", 1);
+			const result = await pending;
+
+			expect(result.outcome).toBe("completed_after_process_error");
+			const prefix = "[orchestrator] child produced a terminal result";
+			expect(result.stderr.startsWith(prefix)).toBe(true);
+			const log = readFileSync(session.file("recovered-prefix.stderr.log"), "utf8");
+			expect(log.startsWith(prefix)).toBe(true);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("a colliding taskId falls back to a temp file, logs the fallback, and preserves the child's stderr under a non-clobbering name", async () => {
+		const session = createSession("fallback-collision");
+		const child1 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const first = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "dup-task", session,
+				spawnChild: () => child1 as never,
+			});
+			child1.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: "first" } })}\n`);
+			child1.emit("close", 0);
+			await first;
+
+			// A second dispatch under the SAME session reuses the same taskId (an
+			// unexpected but not fatal collision: openChildStderrFile refuses to
+			// reopen an existing name). It gets a REAL child (spawnInlineScript),
+			// not a test double, so real bytes land on the fallback temp file's fd
+			// -- proving the content is actually preserved, not merely absent.
+			const result2 = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "dup-task", session,
+				spawnChild: spawnInlineScript(
+					`process.stderr.write("second dispatch stderr\\n");` +
+						`process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",stopReason:"stop",content:"second"}})+"\\n");`,
+				),
+			});
+			expect(result2.stderr).toContain("second dispatch stderr");
+
+			// The first dispatch's own log is untouched by the collision.
+			const firstLog = readFileSync(session.file("dup-task.stderr.log"), "utf8");
+			expect(firstLog).not.toContain("second dispatch stderr");
+			// The fallback is logged, not silent.
+			expect(readFileSync(session.file("run.log"), "utf8")).toContain("fell back to a private temp file");
+			// The second dispatch's real stderr is preserved in the run's own
+			// diagnostics under a name that cannot collide with dup-task.stderr.log.
+			expect(readFileSync(session.file("dup-task.stderr.log.fallback"), "utf8")).toContain("second dispatch stderr");
+		} finally {
+			session.close();
+		}
+	});
+
+	test("BLOCKING 2: a detached grandchild that escapes the process group and writes after settle does not overwrite earlier content, and seal detects the growth", async () => {
+		const session = createSession("escaped-grandchild");
+		const fixtureDir = mkdtempSync(join(tmpdir(), "orch-escaped-grandchild-"));
+		const scriptPath = join(fixtureDir, "escaped-grandchild.mjs");
+		// The immediate child never settles (so the lead's own absolute timeout
+		// kills it) and spawns its own detached (own-process-group) grandchild that
+		// inherits fd 2 and writes to it only after a delay — by which time the
+		// orchestrator has already settled, written its timeout note into the
+		// file, capped/appended, and released the lease. `detached: true` here is
+		// exactly the escape: `killProcessTree`'s `process.kill(-pid, "SIGKILL")`
+		// only reaches the immediate child's own process group.
+		writeFileSync(scriptPath, [
+			"import { spawn } from \"node:child_process\";",
+			"const grandchild = spawn(process.execPath, [\"-e\",",
+			"  \"setTimeout(()=>{try{require('fs').writeSync(2,'grandchild wrote after settle\\\\n');}catch{}process.exit(0);},500);\"",
+			"], { stdio: [\"ignore\", \"ignore\", 2], detached: true });",
+			"grandchild.unref();",
+			"setInterval(() => {}, 1000);",
+		].join("\n"), "utf8");
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "escaped-grandchild", session,
+				leadTimeouts: { inactivityMs: 100, maxMs: 5000 },
+				spawnChild: (_command, _args, options) => nodeSpawn(process.execPath, [scriptPath], options as never),
+			});
+			expect(result.outcome).toBe("timed_out");
+			const beforeGrandchild = readFileSync(session.file("escaped-grandchild.stderr.log"), "utf8");
+			expect(beforeGrandchild).toContain("UNVERIFIED PARTIAL WORK");
+			// Give the detached grandchild time to write after settle/close/release.
+			await new Promise((resolve) => setTimeout(resolve, 900));
+			const afterGrandchild = readFileSync(session.file("escaped-grandchild.stderr.log"), "utf8");
+			// Earlier content must not have been overwritten at offset 0.
+			expect(afterGrandchild.startsWith(beforeGrandchild)).toBe(true);
+			expect(afterGrandchild).toContain("grandchild wrote after settle");
+			session.close(true);
+			// The file changed after the orchestrator's own final write; seal must veto.
+			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(false);
+		} finally {
+			session.close();
+			rmSync(fixtureDir, { recursive: true, force: true });
+		}
 	});
 });
 

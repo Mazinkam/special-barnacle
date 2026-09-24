@@ -1443,15 +1443,27 @@ function openStderrTarget(session: RunSession | undefined, stderrName: string): 
 		try {
 			const backing = session.diagnostics.openChildStderrFile(stderrName);
 			return { path: backing.path, fd: backing.fd, closeFd: backing.closeFd, release: backing.release };
-		} catch {
+		} catch (err) {
 			// A reused taskId within one session (unexpected, but not worth failing
 			// the whole dispatch over) or diagnostics already closing/sealed. Fall
-			// back to a private temp file rather than losing the fd-vs-pipe fix.
+			// back to a private temp file rather than losing the fd-vs-pipe fix —
+			// but that fallback is otherwise invisible, so log it, and preserve the
+			// child's stderr into the run's own diagnostics on release() below
+			// rather than only ever living in a temp dir nobody archives.
+			const message = `stderr for ${stderrName} fell back to a private temp file: ${(err as Error).message}`;
+			console.warn(`[orchestrator] ${message}`);
+			try { session.log(message); } catch { /* best-effort */ }
 		}
 	}
 	const dir = mkdtempSync(join(tmpdir(), "orch-subagent-stderr-"));
 	const path = join(dir, stderrName);
-	const fd = openSync(path, "wx", 0o600);
+	let fd: number;
+	try {
+		fd = openSync(path, "wx", 0o600);
+	} catch (err) {
+		try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort temp cleanup */ }
+		throw err;
+	}
 	let fdOpen = true;
 	const closeFd = () => {
 		if (!fdOpen) return;
@@ -1464,6 +1476,20 @@ function openStderrTarget(session: RunSession | undefined, stderrName: string): 
 		closeFd,
 		release: () => {
 			closeFd();
+			// The session exists but could not register `stderrName` itself (the
+			// catch above); do not lose the child's stderr — copy the bounded/capped
+			// temp content into the run's own diagnostics under a name that cannot
+			// collide with (and so cannot clobber) whatever the earlier dispatch
+			// already wrote to `stderrName`.
+			if (session) {
+				try {
+					if (existsSync(path)) {
+						const capped = capChildStderrFile(path, MAX_CHILD_STDERR_DISK_BYTES);
+						const content = capped ?? readStderrFileBounded(path);
+						if (content) session.diagnostics.write(`${stderrName}.fallback`, content);
+					}
+				} catch { /* best-effort: the temp file is still removed below either way */ }
+			}
 			try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort temp cleanup */ }
 		},
 	};
@@ -1669,6 +1695,13 @@ export async function runSubagentProcess(opts: {
 		let diagnosticWriter: DiagnosticWriter | undefined;
 		let stderrPrefix = "";
 		let stderrTarget: StderrTarget | undefined;
+		// Decided exactly once, at the moment finish() first runs, from the size the
+		// child itself had written to the backing file *before* any orchestrator note
+		// is written into it. The close handler reuses this same decision instead of
+		// re-stat'ing after finish() has already written into the file: re-stat'ing
+		// there mistook the orchestrator's own just-written notes for real child bytes
+		// and appended the same notes a second time (BLOCKING 1).
+		let settledFileBytes: number | undefined;
 		const currentStderrFileBytes = (): number => {
 			if (!stderrTarget) return 0;
 			try { return statSync(stderrTarget.path).size; } catch { return 0; }
@@ -1692,9 +1725,10 @@ export async function runSubagentProcess(opts: {
 			// timeout/cancel, and the file may still be mid-write at this exact instant.
 			// The 'close' handler below re-reads the final, complete content.
 			const fileBytes = currentStderrFileBytes();
+			if (settledFileBytes === undefined) settledFileBytes = fileBytes;
 			const fileText = fileBytes > 0 ? readStderrFileBounded(stderrTarget!.path) : "";
-			const stderr = stderrCapture.text() + (fileText ? `\n${fileText}` : "");
-			const stderrSummary = summarizeStderr(stderr);
+			const rawStderr = stderrCapture.text() + (fileText ? `\n${fileText}` : "");
+			const stderrSummary = summarizeStderr(rawStderr);
 			const finalText = assistantTexts.length > 0 ? assistantTexts[assistantTexts.length - 1] : "";
 			// Only recover a process error after the JSON protocol proved the child
 			// completed normally; failures before settlement still fail the dispatch.
@@ -1709,10 +1743,15 @@ export async function runSubagentProcess(opts: {
 				spawnFailed,
 				stderrSummary,
 			});
+			stderrPrefix = outcome.status === "completed_after_process_error"
+				? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n`
+				: "";
+			// The prefix belongs at the START of both the returned stderr and the
+			// persisted stderr.log — it is a warning about how to read what follows,
+			// not a trailing note (pre-change behavior; a later refactor accidentally
+			// dropped it from the returned `stderr`, keeping it only in the file write).
+			const stderr = stderrPrefix ? `${stderrPrefix}${rawStderr}` : rawStderr;
 			if (diagnosticWriter) {
-				stderrPrefix = outcome.status === "completed_after_process_error"
-					? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n`
-					: "";
 				// If the child already has real bytes on disk (a real fd-backed stderr
 				// file), leave that file alone here: it may still be open for writing by
 				// a not-yet-exited child, and overwriting it now would race that write.
@@ -1862,9 +1901,14 @@ export async function runSubagentProcess(opts: {
 		} catch (err) {
 			spawnFailed = true;
 			stderrCapture.append(`\n[orchestrator] spawn threw: ${(err as Error).message}`);
-			finish(1);
-			stderrTarget?.release();
-			diagnosticWriter?.close();
+			// A throw from finish() itself (e.g. a diagnostic write failure) must not
+			// leak the fd/lease/temp dir; release/close unconditionally.
+			try {
+				finish(1);
+			} finally {
+				stderrTarget?.release();
+				diagnosticWriter?.close();
+			}
 			return;
 		}
 
@@ -2006,28 +2050,38 @@ export async function runSubagentProcess(opts: {
 				guardChildStreamHandler("stdout", () => {
 					if (buffer.trim()) processLine(buffer);
 					finish(code ?? 0);
-				}, streamFailure);
-				// Early settlement on timeout/error is not pipe drain. Keep the lease until close.
-				const fileBytes = currentStderrFileBytes();
-				if (diagnosticWriter) {
-					if (fileBytes > 0) {
-						// The child wrote directly to the backing file (a real fd, not a
-						// pipe): it already holds the full raw content. Cap it in place if
-						// it grew past the on-disk limit, keeping the tail — that is where
-						// an uncaught exception's actual name/message/stack lives — then
-						// append our own notes rather than overwriting the child's bytes.
-						const capped = capChildStderrFile(stderrTarget!.path, MAX_CHILD_STDERR_DISK_BYTES);
-						if (capped !== undefined) diagnosticWriter.write(stderrName, capped);
-						const notes = `${stderrPrefix}${stderrCapture.text()}`;
-						if (notes) diagnosticWriter.append(stderrName, `\n${notes}`);
-					} else {
-						// Nothing real ever landed in the backing file (a test double that
-						// bypasses stdio entirely): fall back to persisting stderrCapture's
-						// text wholesale, matching the pre-fd behavior exactly, including
-						// any trailing diagnostics that arrived after finish() resolved.
-						diagnosticWriter.write(stderrName, stderrPrefix + stderrCapture.text());
+					// Early settlement on timeout/error is not pipe drain. Keep the lease
+					// until close. Reuse the *settle-time* byte count decided inside
+					// finish() above, not a fresh stat here: finish() may have just written
+					// orchestrator notes into an until-then-empty file, and re-stat'ing
+					// after that would mistake those notes for real child bytes and append
+					// the same notes a second time (BLOCKING 1). capChildStderrFile and the
+					// read-back below run inside this same guarded handler so a throw here
+					// cannot escape as an uncaught exception on the 'close' event.
+					const fileBytes = settledFileBytes ?? 0;
+					if (diagnosticWriter) {
+						if (fileBytes > 0) {
+							// The child wrote directly to the backing file (a real fd, not a
+							// pipe): it already holds the full raw content. Cap it in place if
+							// it grew past the on-disk limit, keeping the tail — that is where
+							// an uncaught exception's actual name/message/stack lives — then
+							// append our own notes rather than overwriting the child's bytes.
+							const capped = capChildStderrFile(stderrTarget!.path, MAX_CHILD_STDERR_DISK_BYTES);
+							if (capped !== undefined) diagnosticWriter.write(stderrName, capped);
+							const notes = `${stderrPrefix}${stderrCapture.text()}`;
+							if (notes) diagnosticWriter.append(stderrName, `\n${notes}`);
+						} else {
+							// Nothing real ever landed in the backing file (a test double that
+							// bypasses stdio entirely): fall back to persisting stderrCapture's
+							// text wholesale, matching the pre-fd behavior exactly, including
+							// any trailing diagnostics that arrived after finish() resolved.
+							// finish() already wrote this same content once (when fileBytes was
+							// 0 at settle time); this re-write is an idempotent overwrite with
+							// identical content, not a duplicate append.
+							diagnosticWriter.write(stderrName, stderrPrefix + stderrCapture.text());
+						}
 					}
-				}
+				}, streamFailure);
 			} finally {
 				stderrTarget?.release();
 				diagnosticWriter?.close();
