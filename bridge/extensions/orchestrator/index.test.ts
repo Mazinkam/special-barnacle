@@ -42,6 +42,18 @@ describe("/orchestrate argument parsing", () => {
 		expect(parsed.interactive).toBe(true);
 		expect(parsed.unknownFlags).toEqual([]);
 	});
+
+	test("normalises --complexity onto the integer 1-10 scale Rule-2 bands use", () => {
+		const parse = orchestrator.parseArgs!;
+		expect(parse("repair flow --complexity 6.5").complexity).toBe(7);
+		expect(parse("repair flow --complexity 12").complexity).toBe(10);
+		expect(parse("repair flow --complexity 0").complexity).toBe(1);
+		expect(parse("repair flow --complexity abc").complexity).toBe(5);
+		// Previously 6.5 matched no workers_by_complexity band and planned zero recon.
+		const tasks = planReconTasks({ method: METHOD.rules.pre_implementation_recon, complexity: parse("repair flow --complexity 6.5").complexity,
+			taskClass: "implementation", goal: "repair flow", runId: "run" });
+		expect(tasks.length).toBeGreaterThan(0);
+	});
 });
 
 describe("RunSession cancellation presentation", () => {

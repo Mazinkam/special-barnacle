@@ -605,14 +605,24 @@ function heuristicTriage(goal: string): TriageResult {
 	};
 }
 
+/**
+ * Normalise any complexity input (triage JSON or the manual `--complexity`
+ * flag) to the integer 1-10 scale method.json's Rule-2 bands are defined on.
+ * Out-of-band values (6.5, 12) otherwise match no `workers_by_complexity`
+ * band, silently plan zero recon workers, and make the no-recon phase line
+ * report a false reason.
+ */
+function clampComplexity(raw: unknown, fallback = 5): number {
+	const n = Number(raw);
+	return Number.isFinite(n) ? Math.max(1, Math.min(10, Math.round(n))) : fallback;
+}
+
 function clampTriage(raw: Partial<TriageResult>): TriageResult | null {
 	if (!raw || typeof raw !== "object") return null;
 	const task_class = VALID_TASK_CLASSES.includes(raw.task_class ?? "")
 		? raw.task_class!
 		: "implementation";
-	const complexity = Number.isFinite(raw.complexity)
-		? Math.max(1, Math.min(10, Math.round(Number(raw.complexity))))
-		: 5;
+	const complexity = clampComplexity(raw.complexity);
 	const risk = VALID_RISKS.includes(raw.risk ?? "") ? raw.risk! : "medium";
 	const reasoning = typeof raw.reasoning === "string" && raw.reasoning.length > 0
 		? raw.reasoning.slice(0, 200)
@@ -2524,7 +2534,7 @@ export function parseArgs(args: string): OrchestrateArgs {
 		const next = tokens[i + 1];
 		switch (t) {
 			case "--task-class": if (next) { out.taskClass = next; i++; } break;
-			case "--complexity": if (next) { out.complexity = Number(next) || 5; i++; } break;
+			case "--complexity": if (next) { out.complexity = clampComplexity(next); i++; } break;
 			case "--risk": if (next) { out.risk = next; i++; } break;
 			case "--quality-floor": if (next) { out.qualityFloor = Number(next); i++; } break;
 			case "--cost-aggressiveness": if (next) { out.costAggressiveness = Number(next); i++; } break;
