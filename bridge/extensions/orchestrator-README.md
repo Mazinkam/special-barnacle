@@ -224,14 +224,22 @@ outcome the old pipe-based path had when a holder kept the pipe open.
 
 A dispatch with no owning run (e.g. triage) has no `<taskId>.stderr.log` to
 write to; its child's stderr instead goes to a private mode-0600 temp file
-(`fs.mkdtemp` under the OS temp dir) that is read back and removed once the
-child exits, on spawn error, and on timeout/cancellation. A dispatch that DOES
-have an owning run can still fall back to that same private temp file if its
-`<taskId>.stderr.log` name unexpectedly collides with an already-open one (a
-duplicate/reused taskId); that fallback is logged (`run.log` and process
-stderr), and the child's stderr is still copied into the run's own
-diagnostics, as `<taskId>.stderr.log.fallback`, rather than being dropped or
-overwriting the original dispatch's log.
+(`fs.mkdtemp` under the OS temp dir). That temp file is read back and removed
+at the same point as the fd-backed `<taskId>.stderr.log` case above: once the
+child's stdio actually closes, not at the moment a timeout/cancellation
+settles the dispatch's result (the process may still be tearing down, and
+could still write, in the gap between the two) — except when `spawn()` itself
+throws synchronously, since no child process (and so no `close` event) can
+ever arrive, and cleanup happens immediately in that one path instead. A
+dispatch that DOES have an owning run can still fall back to that same
+private temp file if its `<taskId>.stderr.log` name unexpectedly collides
+with an already-open one (a duplicate/reused taskId); that fallback is logged
+(`run.log` and process stderr), and every write for that dispatch — the
+child's real stderr and the orchestrator's own notes alike — is routed to a
+reserved name that cannot collide with, and so can never overwrite or
+truncate, the original dispatch's own `<taskId>.stderr.log`: normally
+`<taskId>.stderr.log.fallback`, or `.fallback-2`, `.fallback-3`, ... if that
+name is itself already taken (e.g. a third dispatch reusing the same taskId).
 
 The Python EventStore additionally receives `dispatch_plan_confirmed`,
 `dispatch_started`, and `dispatch_finished` events (with model, cost, exit code,

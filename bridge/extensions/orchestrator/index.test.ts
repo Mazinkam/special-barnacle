@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
@@ -2179,6 +2179,157 @@ describe("runSubagentProcess process/event handling", () => {
 			// The second dispatch's real stderr is preserved in the run's own
 			// diagnostics under a name that cannot collide with dup-task.stderr.log.
 			expect(readFileSync(session.file("dup-task.stderr.log.fallback"), "utf8")).toContain("second dispatch stderr");
+
+			// The collision must not have invalidated the first dispatch's own
+			// release()-time snapshot: sealing the run must still succeed.
+			session.close(true);
+			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(true);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 2 / BLOCKING 1: a taskId collision where the second child is silent leaves the first dispatch's log byte-for-byte untouched, and the run seals", async () => {
+		const session = createSession("collision-silent");
+		const child1 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const first = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "collide-silent", session,
+				spawnChild: () => child1 as never,
+			});
+			child1.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: "first" } })}\n`);
+			child1.stderr.write("first dispatch stderr\n");
+			child1.emit("close", 0);
+			await first;
+			const firstLogBefore = readFileSync(session.file("collide-silent.stderr.log"), "utf8");
+			expect(firstLogBefore).toContain("first dispatch stderr");
+
+			// Second dispatch reuses the same taskId and is completely silent on
+			// stderr (a test double: nothing ever writes to the real backing fd).
+			const child2 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+			const second = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "collide-silent", session,
+				spawnChild: () => child2 as never,
+			});
+			child2.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: "second" } })}\n`);
+			child2.emit("close", 0);
+			await second;
+
+			// The first dispatch's log must not have been truncated to "" (or
+			// otherwise altered) by the second dispatch's collision handling.
+			const firstLogAfter = readFileSync(session.file("collide-silent.stderr.log"), "utf8");
+			expect(firstLogAfter).toBe(firstLogBefore);
+			expect(firstLogAfter.length).toBeGreaterThan(0);
+
+			session.close(true);
+			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(true);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 2 / BLOCKING 1: a taskId collision where the second child times out appends its notes to the fallback file, not the first dispatch's log, and the run seals", async () => {
+		const session = createSession("collision-timeout");
+		const child1 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const first = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "collide-timeout", session,
+				spawnChild: () => child1 as never,
+			});
+			child1.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: "first" } })}\n`);
+			child1.emit("close", 0);
+			await first;
+			const firstLogBefore = readFileSync(session.file("collide-timeout.stderr.log"), "utf8");
+
+			// Second dispatch reuses the same taskId and times out (inactivity):
+			// its interruption note must land on the fallback file, not clobber or
+			// append into the first dispatch's already-sealed-worthy log.
+			const child2 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+			const second = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "collide-timeout", session,
+				leadTimeouts: { inactivityMs: 50, maxMs: 5000 },
+				spawnChild: () => child2 as never,
+			});
+			const result2 = await second;
+			expect(result2.outcome).toBe("timed_out");
+			child2.emit("close", 137);
+			await Promise.resolve();
+
+			const firstLogAfter = readFileSync(session.file("collide-timeout.stderr.log"), "utf8");
+			expect(firstLogAfter).toBe(firstLogBefore);
+			expect(readFileSync(session.file("run.log"), "utf8")).toContain("fell back to a private temp file");
+			const fallback = readFileSync(session.file("collide-timeout.stderr.log.fallback"), "utf8");
+			expect(fallback).toContain("UNVERIFIED PARTIAL WORK");
+
+			session.close(true);
+			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(true);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 2 / BLOCKING 2: a recovered result's persisted stderr.log leads with the warning prefix, then the child's real bytes, not the reverse", async () => {
+		const session = createSession("recovered-real-bytes");
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "recovered-real-bytes", session,
+				// A real Node child (not a test double): stderr bytes land on the
+				// backing fd for real, exercising the `fileBytes > 0` branch of the
+				// close handler, not finish()'s own no-real-bytes-yet write.
+				spawnChild: spawnInlineScript(
+					`const e=[{type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:"done"}]}},{type:"agent_end",messages:[]},{type:"agent_settled"}];` +
+						`for(const x of e)process.stdout.write(JSON.stringify(x)+"\\n");` +
+						`process.stderr.write("teardown boom\\n");process.exitCode=1;`,
+				),
+			});
+
+			expect(result.outcome).toBe("completed_after_process_error");
+			const prefix = "[orchestrator] child produced a terminal result";
+			expect(result.stderr.startsWith(prefix)).toBe(true);
+			const log = readFileSync(session.file("recovered-real-bytes.stderr.log"), "utf8");
+			expect(log.startsWith(prefix)).toBe(true);
+			expect(log).toContain("teardown boom");
+			expect(log.indexOf(prefix)).toBeLessThan(log.indexOf("teardown boom"));
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 2 / WARNING: real bytes written to the backing fd between settle (0 bytes) and close are appended, not truncated away", async () => {
+		const session = createSession("late-bytes-warning");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "late-bytes-warning", session,
+				leadTimeouts: { inactivityMs: 50, maxMs: 5000 },
+				spawnChild: () => child as never,
+			});
+			// Let the inactivity timeout settle the dispatch with 0 bytes observed
+			// on the backing file (the test double never writes to the real fd).
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			// Real bytes now land on the backing file through an independent fd
+			// (O_APPEND-opened, like a genuine child's own duplicate would be),
+			// simulating a child that keeps writing briefly during its own
+			// teardown after the orchestrator has already settled and written
+			// its timeout note.
+			const fd = openSync(session.file("late-bytes-warning.stderr.log"), "a");
+			try { writeSync(fd, "late child bytes after settle\n"); } finally { closeSync(fd); }
+			child.emit("close", 137);
+			const result = await pending;
+
+			expect(result.outcome).toBe("timed_out");
+			const log = readFileSync(session.file("late-bytes-warning.stderr.log"), "utf8");
+			expect(log).toContain("UNVERIFIED PARTIAL WORK");
+			expect(log).toContain("late child bytes after settle");
+			// The orchestrator's own note must remain a prefix; the late bytes are
+			// appended after it, never overwriting it.
+			expect(log.indexOf("UNVERIFIED PARTIAL WORK")).toBeLessThan(log.indexOf("late child bytes after settle"));
 		} finally {
 			session.close();
 		}
