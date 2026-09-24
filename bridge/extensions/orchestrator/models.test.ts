@@ -374,3 +374,29 @@ describe("shipped profiles", () => {
 		expect(r.adapter.lead).toBeUndefined();
 	});
 });
+
+import { classifyModelName, tierOfModel } from "./models.ts";
+
+describe("tierOfModel", () => {
+	const adapter = {
+		scout: { model: "amazon-bedrock/global.openai.gpt-6-luna" },
+		lead_small: { model: "amazon-bedrock/global.openai.gpt-6-sol" },
+		lead: { model: "amazon-bedrock/global.openai.gpt-6-sol", effort: "high" },
+		lead_large: { model: "openai-codex/gpt-6-astra" },
+	};
+	test("highest tier of any capability bound to the model", () => {
+		expect(tierOfModel("amazon-bedrock/global.openai.gpt-6-sol", adapter)).toBe("premium");
+		expect(tierOfModel("openai-codex/gpt-6-astra", adapter)).toBe("frontier");
+		expect(tierOfModel("amazon-bedrock/global.openai.gpt-6-luna", adapter)).toBe("cheap");
+	});
+	test("falls back to name classification for unbound models", () => {
+		expect(tierOfModel("amazon-bedrock/global.anthropic.claude-fable-5-1", {})).toBe("frontier");
+		expect(classifyModelName("amazon-bedrock/global.anthropic.claude-opus-5-5")).toBe("premium");
+		expect(classifyModelName("global.anthropic.claude-sonnet-5")).toBe("mid");
+		expect(classifyModelName("gpt-6-sol")).toBe("mid");
+		expect(classifyModelName("openai-codex/gpt-6-astra")).toBe("frontier");
+		expect(classifyModelName("gpt-6-luna")).toBe("cheap");
+		expect(classifyModelName("humain-node/minimax-m3")).toBe("mid");
+		expect(classifyModelName("mystery-9")).toBe("unknown");
+	});
+});

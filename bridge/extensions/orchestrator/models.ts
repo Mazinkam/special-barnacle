@@ -93,6 +93,35 @@ export function tierOf(capability: string): Tier | undefined {
 	return (Object.keys(TIER_CAPABILITIES) as Tier[]).find((t) => TIER_CAPABILITIES[t].includes(capability));
 }
 
+/**
+ * Name-based tier guess, used only when the resolved adapter does not bind
+ * the model (tierOfModel prefers the adapter). Order matters: frontier and
+ * premium families are checked before the broader mid/cheap tokens.
+ */
+export function classifyModelName(model: string): Tier | "unknown" {
+	const n = (model.includes("/") ? model.slice(model.indexOf("/") + 1) : model).toLowerCase();
+	if (/\bfable\b|\bastra\b/.test(n)) return "frontier";
+	if (/\bopus\b|\bkimi-k3\b|\bultra\b/.test(n)) return "premium";
+	if (/\bsonnet\b|\bsol\b|\bterra\b|\bglm\b|\bminimax\b|\bmistral\b|\bflash\b/.test(n)) return "mid";
+	if (/\bluna\b|\bmini\b|\bnano\b|\blite\b|\bqwen3\.8\b/.test(n)) return "cheap";
+	return "unknown";
+}
+
+/**
+ * A model's tier = the highest tier of any capability the resolved adapter
+ * binds it to (gpt-6-sol bound to both mid and premium capabilities is
+ * premium). Unbound models fall back to classifyModelName.
+ */
+export function tierOfModel(model: string, adapter: Record<string, { model: string }>): Tier | "unknown" {
+	let best = -1;
+	for (const [cap, b] of Object.entries(adapter)) {
+		if (b?.model !== model) continue;
+		const t = tierOf(cap);
+		if (t && tierIndex(t) > best) best = tierIndex(t);
+	}
+	return best >= 0 ? METHOD.tiers[best] : classifyModelName(model);
+}
+
 export function isTier(s: string): s is Tier {
 	return s === "cheap" || s === "mid" || s === "premium" || s === "frontier";
 }
