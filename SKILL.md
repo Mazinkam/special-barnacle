@@ -73,7 +73,7 @@ When the lead agent itself fixes and re-reviews, the re-review must still use a 
 
 ### Rule 2: Pre-implementation recon for complexity ≥ 5
 
-Tasks with `complexity >= 5` get a parallel fan-out of cheap reconnaissance workers before any implementer touches the code. The workers use `analysis_mid` or `implementation_fast` at low/medium effort with targeted verification — they research and summarize, they do not modify source. Worker count scales with complexity:
+Tasks with `complexity >= 5` get a parallel fan-out of cheap reconnaissance workers before any implementer touches the code. The workers use `scout` (the `orch-scout` persona) at low effort with targeted verification — they research and summarize, they do not modify source. The orchestrator extension dispatches this fan-out itself, before any lead starts, so each worker is a billed, observable dispatch; leads receive the resulting packet and must not re-run their own recon. Worker count scales with complexity:
 
 | Complexity | Recon workers |
 |---|---|
@@ -81,11 +81,11 @@ Tasks with `complexity >= 5` get a parallel fan-out of cheap reconnaissance work
 | 7–8 | 4 |
 | 9–10 | 5 |
 
-Each worker answers one bounded question: affected files, existing tests, recent related changes, relevant ADRs, dependency surface, observed constraints. Workers return structured evidence packets capped at 2,000 tokens each. The lead (capability `technical_lead` or `architect`) digests the packets into an implementation plan with task boundaries and ownership.
+Each worker answers one bounded question: affected files, existing tests, established conventions and prior art, dependency surface, risks and edge cases. Workers run under a hard read-only tool allow-list (`read,grep,find,ls`), so questions needing shell access — notably "recent related changes", which requires `git log` — are deliberately out of scope: an unbypassable read-only boundary is worth more than one extra question. `evidence_packet_max_tokens` (2,000) is the **aggregate** cap on the single combined packet handed to each lead, shared equally between the N workers — not 2,000 tokens per worker. The lead (capability `technical_lead` or `architect`) digests the packet into an implementation plan with task boundaries and ownership.
 
 Skip recon for `task_class = investigation` or `qa_verification`; those have their own evidence-gathering topology.
 
-Rationale: `implementation_strong`-class tasks with 150K–400K input tokens cost $0.55–$2.38 because the implementer reads raw repository context. A $0.05 sonnet scout pre-digesting that context into a 2K-token evidence packet saves $1+ on the most expensive opus implementer calls and improves focus.
+Rationale: `implementation_strong`-class tasks with 150K–400K input tokens cost $0.55–$2.38 because the implementer reads raw repository context. Cheap scouts pre-digesting that context into one 2K-token evidence packet save $1+ on the most expensive implementer calls and improve focus.
 
 ### Rule 3: Exploration uses the cheapest sufficient model
 

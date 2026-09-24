@@ -8,7 +8,7 @@ const methodWithRule2: ReconPolicy = {
 		{ min: 7, max: 8, workers: 4 },
 		{ min: 9, max: 10, workers: 5 },
 	],
-	worker_capability: "implementation_fast",
+	worker_capability: "scout",
 	skip_for_task_classes: ["investigation", "qa_verification"],
 };
 
@@ -22,11 +22,7 @@ describe("planReconTasks", () => {
 			runId: "run",
 		});
 		expect(tasks).toHaveLength(3);
-		expect(tasks.map((task) => task.capability)).toEqual([
-			"implementation_fast",
-			"implementation_fast",
-			"implementation_fast",
-		]);
+		expect(tasks.map((task) => task.capability)).toEqual(["scout", "scout", "scout"]);
 		expect(tasks.map((task) => task.task)).toEqual(
 			expect.arrayContaining([
 				expect.stringContaining("Do not edit, commit, push"),

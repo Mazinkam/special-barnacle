@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { planReconTasks } from "./recon.ts";
-import { METHOD } from "./models.ts";
+import { METHOD, TIER_CAPABILITIES } from "./models.ts";
 import type { DispatchResult, DispatchTask } from "./index.ts";
 import { RunCancellation } from "./cancellation.ts";
 
@@ -12,9 +12,14 @@ mock.module("@humain/terminal", () => ({
 		onAbort?: () => void;
 		constructor(..._args: unknown[]) {}
 	},
-	discoverAgents: () => ({ agents: [{
-		name: "orch-implementation-fast", tools: ["read", "write", "edit", "bash"], systemPrompt: "",
-	}] }),
+	// Mirrors the real bridge/agents/ personas the dispatcher resolves by name:
+	// a write-capable implementer, and the read-only scout Rule-2 recon binds to.
+	// orch-scout carries a non-empty body so the --append-system-prompt path (and
+	// its temp-file cleanup) is exercised rather than skipped.
+	discoverAgents: () => ({ agents: [
+		{ name: "orch-implementation-fast", tools: ["read", "write", "edit", "bash"], systemPrompt: "" },
+		{ name: "orch-scout", tools: ["read", "grep", "find", "ls", "bash"], systemPrompt: "scout persona" },
+	] }),
 	renderTaskWithContext: (task: string) => task,
 }));
 
@@ -99,7 +104,7 @@ describe("recon tool boundary", () => {
 			complexity: 5, taskClass: "implementation", goal: "repair flow", runId: "run" });
 		const invocations: string[][] = [];
 		await orchestrator.dispatchParallel(process.cwd(), "run", tasks,
-			{ implementation_fast: { model: "provider/recon-model", effort: "low" } }, {} as never, {
+			{ scout: { model: "provider/recon-model", effort: "low" } }, {} as never, {
 			recordEvent: async () => {},
 			runProcess: (opts) => orchestrator.runSubagentProcess(opts, (_command, args) => {
 				invocations.push([...(args ?? [])]);
@@ -112,6 +117,56 @@ describe("recon tool boundary", () => {
 			expect(args[args.indexOf("--provider") + 1]).toBe("provider");
 			expect(args[args.indexOf("--model") + 1]).toBe("recon-model");
 		}
+	});
+
+	// method.json binds recon to the `scout` capability so the dispatch lands on
+	// the purpose-built read-only `orch-scout` persona rather than an
+	// implementer persona that merely happens to be tool-restricted.
+	test("runs recon under the orch-scout persona at the cheap tier", () => {
+		const policy = METHOD.rules.pre_implementation_recon;
+		expect(policy.worker_capability).toBe("scout");
+		expect(TIER_CAPABILITIES.cheap).toContain(policy.worker_capability);
+	});
+
+	test("passes the orch-scout persona prompt to the recon subprocess", async () => {
+		const tasks = planReconTasks({ method: METHOD.rules.pre_implementation_recon,
+			complexity: 5, taskClass: "implementation", goal: "repair flow", runId: "run" });
+		const personas: string[] = [];
+		await orchestrator.dispatchParallel(process.cwd(), "run", tasks,
+			{ scout: { model: "provider/recon-model", effort: "low" } }, {} as never, {
+			recordEvent: async () => {},
+			runProcess: (opts) => orchestrator.runSubagentProcess(opts, (_command, args) => {
+				const list = [...(args ?? [])];
+				const at = list.indexOf("--append-system-prompt");
+				personas.push(at === -1 ? "(none)" : basename(String(list[at + 1])));
+				throw new Error("test: stop at subprocess creation");
+			}),
+		});
+		expect(personas).toEqual(["orch-scout.md", "orch-scout.md", "orch-scout.md"]);
+	});
+});
+
+// The Rule-2 fan-out is parent-owned and billed. If the lead persona also told
+// leads to dispatch their own `orch-scout` recon, every qualifying run would pay
+// for recon twice and the second round would be invisible to the bridge's worker
+// accounting. Guard the instruction, not just the code.
+describe("lead persona recon contract", () => {
+	const raw = readFileSync(
+		join(import.meta.dir, "..", "..", "agents", "orchestrator-lead.md"),
+		"utf-8",
+	);
+	// Match on prose, not formatting: `**not**` must not be able to slip a
+	// prohibition past these assertions.
+	const leadPersona = raw.replace(/\*/g, "");
+
+	test("does not instruct leads to dispatch their own recon scouts", () => {
+		expect(leadPersona).not.toMatch(/dispatch\s+3[–-]5\s+`?orch-scout/i);
+		expect(leadPersona).toMatch(/do not dispatch your own `orch-scout`/i);
+	});
+
+	test("tells leads recon evidence arrives from the parent", () => {
+		expect(leadPersona).toMatch(/parent-owned/i);
+		expect(leadPersona).toMatch(/Recon evidence/);
 	});
 });
 
@@ -397,7 +452,7 @@ describe("parent-owned recon dispatch seam", () => {
 
 describe("final accounting", () => {
 	const architect = { ...dispatchResult({ taskId: "run-architect", capability: "architect", task: "" }), costUsd: 0.2 };
-	const worker = { ...dispatchResult({ taskId: "run-recon-0", capability: "implementation_fast", task: "" }), costUsd: 0.02 };
+	const worker = { ...dispatchResult({ taskId: "run-recon-0", capability: "scout", task: "" }), costUsd: 0.02 };
 	const lead = { ...dispatchResult({ taskId: "run-lead-0", capability: "lead", task: "" }), costUsd: 0.2 };
 
 	test("includes parent-owned worker results in billed dispatches exactly once", () => {
@@ -421,7 +476,7 @@ describe("final accounting", () => {
 
 	test("summarizes recon workers with counts, cost, and summarized failure diagnostics", () => {
 		const failed = {
-			...dispatchResult({ taskId: "run-recon-1", capability: "implementation_fast", task: "" }, 1),
+			...dispatchResult({ taskId: "run-recon-1", capability: "scout", task: "" }, 1),
 			stderr: `${"noise\n".repeat(50)}Error: provider unavailable\n    at stack frame\n`,
 			costUsd: 0.01,
 		};
