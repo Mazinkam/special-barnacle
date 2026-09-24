@@ -137,6 +137,7 @@ import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.t
 // `const reconTasks: DispatchTask[] = planReconTasks(...)` checks at compile
 // time, so a planned recon task still needs no conversion step.
 import { formatReconEvidence, planReconTasks } from "./recon.ts";
+import { createPythonCli } from "./python-cli.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -149,6 +150,20 @@ const STATE_ROOT =
 	process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT ??
 	"~/.local/state/coding-agent-orchestrator";
 const PYTHON = process.env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3";
+const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
+const expandedStateRoot = STATE_ROOT.replace(/^~/, homedir());
+/**
+ * Extra env every Python spawn gets on top of `python-cli.ts`'s builder
+ * (PYTHONPATH + CODING_AGENT_ORCHESTRATOR_HOME): CODING_AGENT_RUNTIME so
+ * dispatched metrics land under `agent_runtime: "humain-terminal"`, and
+ * CODING_AGENT_REPOSITORY so the skill can attribute a run to the repo it
+ * touched. Read once at module load — see rule 4 in the architecture review
+ * (no `process.env` reads outside a config module).
+ */
+const PYTHON_EXTRA_ENV = {
+	CODING_AGENT_RUNTIME: "humain-terminal",
+	CODING_AGENT_REPOSITORY: process.env.CODING_AGENT_REPOSITORY ?? process.cwd(),
+};
 /**
  * Model configuration lives in one file: `orchestrator-profiles.json`
  * (named profiles of alias -> capability/tier bindings; see models.ts). The
@@ -222,6 +237,37 @@ export function describeRunArtifact(path: string): string {
 function positiveIntEnv(name: string, fallback: number): number {
 	const raw = Number(process.env[name]);
 	return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : fallback;
+}
+
+/** Wall clock for a single Python spawn (see python-cli.ts); a hung Python must not hang a run's terminal path. */
+const PYTHON_TIMEOUT_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_PYTHON_TIMEOUT_MS", 60_000);
+
+/**
+ * The one Python spawner for this extension (C1 in the architecture review):
+ * `loadDynamicAdapter`, `runModule`, `planRun`, the RecordQueue runner, the
+ * session-ingest runner, and the `/orchestrator-roi` handler all build one of
+ * these (never their own `spawn()` call) and go through `.run()`. One env
+ * builder means every caller now consistently gets
+ * `CODING_AGENT_ORCHESTRATOR_HOME`, unlike the old per-call-site `spawn()`s
+ * this replaces.
+ *
+ * Built fresh per call rather than once at module load: `spawn` here is a
+ * bare reference to the `node:child_process` import, re-read at the moment
+ * this function runs. A module-level singleton would instead capture
+ * whatever `spawn` resolved to at import time, permanently missing any
+ * later `spyOn(childProcess, "spawn")` (index.test.ts installs several).
+ * `pythonOverride` is `runModule`'s test-only `python` option.
+ */
+function orchestratorPythonCli(pythonOverride?: string) {
+	return createPythonCli({
+		python: pythonOverride ?? PYTHON,
+		skillRoot: expandedSkillRoot,
+		stateRoot: expandedStateRoot,
+		spawn,
+		defaultTimeoutMs: PYTHON_TIMEOUT_MS,
+		baseEnv: process.env,
+		extraEnv: PYTHON_EXTRA_ENV,
+	});
 }
 
 /** Hard ceiling on concurrent child processes, independent of what a plan asks for. */
@@ -518,30 +564,14 @@ function emptyOverrides(): ModelOverrides {
 
 async function loadDynamicAdapter(): Promise<{ adapter: Adapter; warning?: string }> {
 	try {
-		const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
-		const child = spawn(
-			PYTHON,
-			["-m", "orchestrator.cli", "resolve-adapter", "--explain"],
-			{
-				env: {
-					...process.env,
-					PYTHONPATH: expandedSkillRoot,
-					CODING_AGENT_RUNTIME: "humain-terminal",
-				},
-				stdio: ["pipe", "pipe", "pipe"],
-			},
-		);
-		let stdout = "";
-		let stderr = "";
-		child.stdout.on("data", (b) => (stdout += b.toString()));
-		child.stderr.on("data", (b) => (stderr += b.toString()));
-		const exitCode = await new Promise<number>((resolve) =>
-			child.on("close", (code) => resolve(code ?? -1)),
-		);
-		if (exitCode !== 0) {
-			return { adapter: {}, warning: `resolve-adapter failed (exit ${exitCode}): ${stderr.trim().slice(0, 300)}` };
+		const result = await orchestratorPythonCli().run("orchestrator.cli", ["resolve-adapter", "--explain"]);
+		if (result.code !== 0) {
+			return {
+				adapter: {},
+				warning: `resolve-adapter failed (exit ${result.code ?? "n/a"}): ${(result.error ?? result.stderr).trim().slice(0, 300)}`,
+			};
 		}
-		const resolved = JSON.parse(stdout.trim()) as Record<string, any>;
+		const resolved = JSON.parse(result.stdout.trim()) as Record<string, any>;
 		const out: Adapter = {};
 		for (const [cap, info] of Object.entries(resolved)) {
 			if (!info || typeof info !== "object" || cap.startsWith("_")) continue;
@@ -2502,73 +2532,27 @@ interface CliResult {
 	exitCode: number;
 }
 
-function runCli(args: string[], stdin?: string): Promise<CliResult> {
-	return new Promise((resolve) => {
-		const child = spawn(PYTHON, ["-m", "orchestrator.cli", ...args], {
-			env: {
-				...process.env,
-			},
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-		let stdout = "";
-		let stderr = "";
-		child.stdout.on("data", (b) => (stdout += b.toString()));
-		child.stderr.on("data", (b) => (stderr += b.toString()));
-		child.on("close", (code) =>
-			resolve({ stdout, stderr, exitCode: code ?? -1 }),
-		);
-		if (stdin) child.stdin.write(stdin);
-		child.stdin.end();
-	});
-}
-
 /**
- * Run a Python module under the orchestrator's SKILL_ROOT. We set
- * CODING_AGENT_RUNTIME so the dispatched metrics land under
- * `agent_runtime: "humain-terminal"`, PYTHONPATH so the `orchestrator`
- * package is importable, and CODING_AGENT_ORCHESTRATOR_HOME points at the
- * same state root as the HT hook. `stdin`, when given, is written and closed before the
- * child runs (the `batch -` command reads its payload from stdin).
+ * Run a Python module through `orchestratorPythonCli()`. `python`, when
+ * given, builds a one-off spawner with a different interpreter but every
+ * other setting unchanged; tests use this to exercise a missing interpreter.
+ * The `/orchestrator-roi` handler runs a script (not a module) the same way,
+ * directly against `orchestratorPythonCli().run()`, instead of through this
+ * module-shaped wrapper.
  *
- * Always resolves exactly once: on `close`, or on a spawn `error` (ENOENT, EACCES,
- * EAGAIN) in case the runtime never follows it with `close`. A spawn failure is
- * reported as a negative exit code with the error in `stderr`, which the record
- * queue treats as ambiguous and replays. `python` is injectable for tests only.
+ * Always resolves exactly once — on close, spawn error, or timeout — because
+ * `python-cli.ts`'s `run()` does. A spawn failure or timeout is reported as exit
+ * code -1 with the error in `stderr`, which the record queue treats as
+ * ambiguous and replays.
  */
 export function runModule(module: string, args: string[] = [], stdin?: string, options: { python?: string } = {}): Promise<CliResult> {
-	return new Promise((resolve) => {
-		const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
-		const expandedStateRoot = STATE_ROOT.replace(/^~/, homedir());
-		let stdout = "";
-		let stderr = "";
-		let settled = false;
-		const settle = (exitCode: number) => {
-			if (settled) return;
-			settled = true;
-			resolve({ stdout, stderr, exitCode });
-		};
-		const child = spawn(options.python ?? PYTHON, ["-m", module, ...args], {
-			env: {
-				...process.env,
-				CODING_AGENT_RUNTIME: "humain-terminal",
-				CODING_AGENT_REPOSITORY: process.env.CODING_AGENT_REPOSITORY ?? process.cwd(),
-				PYTHONPATH: expandedSkillRoot,
-				CODING_AGENT_ORCHESTRATOR_HOME: expandedStateRoot,
-			},
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-		child.stdout.on("data", (b) => (stdout += b.toString()));
-		child.stderr.on("data", (b) => (stderr += b.toString()));
-		child.on("error", (err) => {
-			stderr += `\n[orchestrator] spawn error: ${err.message}`;
-			settle(-1);
-		});
-		child.on("close", (code) => settle(code ?? -1));
-		// A child that exits before reading its payload closes the pipe under us; that is
-		// reported through the exit code, not as an uncaught EPIPE.
-		child.stdin.on("error", () => {});
-		if (stdin !== undefined) child.stdin.end(stdin);
-	});
+	return orchestratorPythonCli(options.python)
+		.run(module, args, { stdin })
+		.then((r) => ({
+			stdout: r.stdout,
+			stderr: r.stderr,
+			exitCode: r.code ?? -1,
+		}));
 }
 
 // -----------------------------------------------------------------------------
@@ -5360,29 +5344,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("orchestrator-roi", {
 		description: "Print the skill vs flat-baseline ROI report.",
 		handler: async (_args, ctx) => {
-			const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
-			const child = spawn(
-				PYTHON,
-				["scripts/skill_vs_baseline.py"],
-				{
-					env: {
-						...process.env,
-						PYTHONPATH: expandedSkillRoot,
-					},
-					stdio: ["pipe", "pipe", "pipe"],
-				},
-			);
-			let stdout = "";
-			let stderr = "";
-			child.stdout.on("data", (b) => (stdout += b.toString()));
-			child.stderr.on("data", (b) => (stderr += b.toString()));
-			child.on("close", (code) => {
-				if (code !== 0) {
-					ctx.ui.notify(`ROI report failed: ${stderr}`, "error");
-					return;
-				}
-				ctx.ui.notify(stdout.split("\n").slice(0, 20).join("\n"), "info");
+			const result = await orchestratorPythonCli().run(join(expandedSkillRoot, "scripts/skill_vs_baseline.py"), [], {
+				cwd: expandedSkillRoot,
 			});
+			if (result.code !== 0) {
+				ctx.ui.notify(`ROI report failed: ${result.error ?? result.stderr}`, "error");
+				return;
+			}
+			ctx.ui.notify(result.stdout.split("\n").slice(0, 20).join("\n"), "info");
 		},
 	});
 
