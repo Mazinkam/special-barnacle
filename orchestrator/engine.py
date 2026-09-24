@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .runtime import EventStore, Policy, QualityEvidence, default_state_root, read_json, stable_hash
-from .state import rebuild
+from .state import refresh_ledger
 from .history import load_stats
 from .method import default_efforts
 from .adaptive import adaptive_route, recommend_topology, should_canary
@@ -181,5 +181,7 @@ class OrchestrationEngine:
         generate_dashboard(self.state_root, config=self.config)
 
     def _refresh(self) -> None:
-        rebuild(self.state_root)
+        # Normal lifecycle boundaries catch up from the durable event prefix; only an
+        # explicit recovery rebuild should discard the exact-ID cache used by the next append.
+        refresh_ledger(self.state_root)
         generate_dashboard(self.state_root, config=self.config)

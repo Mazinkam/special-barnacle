@@ -12,7 +12,17 @@ re-suffixed identifiers). For each scale the script:
 2. measures `--repeat` CLI `batch` invocations of a `--batch-size`-record batch (durable append +
    incremental ledger + dashboard) and `--repeat` CLI `dashboard` invocations;
 3. for comparison, measures writing the same records through the legacy one-record commands
-   (`event`/`metric`/`outcome`), i.e. one subprocess per record.
+   (`event`/`metric`/`outcome`), i.e. one subprocess per record;
+4. measures an engine completion followed by a model-call append/refresh, including any cache
+   re-derivation that the completion imposed on the next writer.
+
+Use this SAME driver with `--checkout BEFORE` and `--checkout AFTER` against the same `--source`
+copy for a revision comparison. The target checkout supplies child code; the driver supplies the
+same instrumentation and input-evidence classifier for both. Input sizes, SHA-256 digests and
+billing/duration/verification coverage are captured BEFORE benchmark appends. No measured saving
+here is evidence of real model-cost or quality savings. `--source` should name a frozen COPY, not
+live state. All target mutations are confined to disposable fixtures; state/code-root
+encodings override inherited environment values.
 
 Per measured operation it prints the subprocess count, median elapsed seconds (spawn to reap),
 peak child RSS, throughput, and the bytes the child actually read and wrote:
@@ -36,6 +46,7 @@ arguments; fixture sizes are reported separately (`fixture_bytes`) and are not a
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -45,6 +56,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -182,9 +194,10 @@ def rss_mib(ru_maxrss: int) -> float:
     return ru_maxrss / (1024 ** 2 if sys.platform == 'darwin' else 1024)
 
 
-def cli_env(root: Path) -> dict[str, str]:
+def cli_env(root: Path, checkout: Path = REPO) -> dict[str, str]:
     return {**os.environ, 'CODING_AGENT_ORCHESTRATOR_HOME': str(root), 'CODING_AGENT_RUNTIME': 'benchmark',
-            'CODING_AGENT_REPOSITORY': '/work/forge', 'PYTHONPATH': str(REPO), 'PYTHONDONTWRITEBYTECODE': '1'}
+            'HUMAIN_ORCHESTRATOR_STATE_ROOT': str(root), 'HUMAIN_ORCHESTRATOR_SKILL_ROOT': str(checkout),
+            'CODING_AGENT_REPOSITORY': '/work/forge', 'PYTHONPATH': str(checkout), 'PYTHONDONTWRITEBYTECODE': '1'}
 
 
 def instrumented_argv(program: str, *args: str) -> list[str]:
@@ -233,9 +246,9 @@ def _load_io_report(path: Path) -> dict | None:
     return loaded if isinstance(loaded, dict) else None
 
 
-def run_cli(root: Path, *args: str, stdin: str | None = None) -> ChildRun:
+def run_cli(root: Path, *args: str, stdin: str | None = None, checkout: Path = REPO) -> ChildRun:
     """Run one instrumented CLI subprocess against `root`; a non-zero exit aborts the benchmark."""
-    run = run_child(cli_argv(*args), env=cli_env(root), cwd=str(REPO), stdin=stdin)
+    run = run_child(cli_argv(*args), env=cli_env(root, checkout), cwd=str(checkout), stdin=stdin)
     if run.returncode != 0:
         raise SystemExit(f'CLI {args[0]} failed ({run.returncode}):\n{run.stdout}\n{run.stderr}')
     return run
@@ -304,33 +317,74 @@ def copy_fixture(source: Path, root: Path, scale: int) -> dict[str, int]:
 
 
 def measure(root: Path, scale: int, args: argparse.Namespace, tag: str) -> dict:
+    from orchestrator.economics import cost_attribution
+    from orchestrator.run_evidence import evidence_coverage, summarize_runs
+    from orchestrator.runtime import iter_jsonl
+
     size = args.batch_size
-    cold = run_cli(root, 'batch', json.dumps(batch_records(f'{tag}-warm', size)))
-    batch = [run_cli(root, 'batch', json.dumps(batch_records(f'{tag}-{i}', size))) for i in range(args.repeat)]
-    dash = [run_cli(root, 'dashboard') for _ in range(args.repeat)]
+    checkout = getattr(args, 'checkout', REPO)
+    cli = partial(run_cli, checkout=checkout)
+    # Freeze input accounting before any workload contaminates it with synthetic billing rows.
+    rows = {}; fixture_bytes = {}; digests = {}
+    for name in STREAMS:
+        digest = hashlib.sha256(); count = 0
+        with (root / name).open('rb') as stream:
+            for line in stream:
+                digest.update(line); count += 1
+        rows[name] = count; digests[name] = digest.hexdigest()
+        fixture_bytes[name] = (root / name).stat().st_size
+    evidence = evidence_coverage(summarize_runs(iter_jsonl(root / 'metrics.jsonl'),
+                                               iter_jsonl(root / 'events.jsonl'), iter_jsonl(root / 'outcomes.jsonl')))
+    evidence['priced_call_coverage'] = ((evidence['call_rows'] - evidence['unmetered_calls']) / evidence['call_rows']
+                                        if evidence['call_rows'] else None)
+    billing = cost_attribution(iter_jsonl(root / 'metrics.jsonl'))
+    cold = cli(root, 'batch', json.dumps(batch_records(f'{tag}-warm', size)))
+    batch = [cli(root, 'batch', json.dumps(batch_records(f'{tag}-{i}', size))) for i in range(args.repeat)]
+    dash = [cli(root, 'dashboard') for _ in range(args.repeat)]
     single: list[list[ChildRun]] = []
     for i in range(args.repeat):
         group = []
         for record in batch_records(f'{tag}-single-{i}', size):
             stream = record.pop('stream')
-            if stream == 'event': group.append(run_cli(root, 'event', record.pop('event'), json.dumps(record)))
-            else: group.append(run_cli(root, stream, json.dumps(record)))
+            if stream == 'event': group.append(cli(root, 'event', record.pop('event'), json.dumps(record)))
+            else: group.append(cli(root, stream, json.dumps(record)))
         single.append(group)
+    engine = []
+    program = '''
+import sys
+from orchestrator.engine import OrchestrationEngine
+engine = OrchestrationEngine()
+engine.complete_run(sys.argv[1])
+engine.record_model_call(run_id=sys.argv[1], model='benchmark-unpriced', input_tokens=5)
+'''
+    for i in range(args.repeat):
+        run = run_child(instrumented_argv(program, f'{tag}-engine-{i}'),
+                        env=cli_env(root, checkout), cwd=str(checkout))
+        if run.returncode != 0:
+            raise SystemExit(f'Engine boundary failed ({run.returncode}):\n{run.stdout}\n{run.stderr}')
+        engine.append(run)
     med_batch = statistics.median(r.elapsed_s for r in batch); med_dash = statistics.median(r.elapsed_s for r in dash)
     med_single = statistics.median(sum(r.elapsed_s for r in group) for group in single)
     peak = lambda runs: round(rss_mib(max(r.ru_maxrss for r in runs)), 1)  # noqa: E731
+    median_peak = lambda groups: round(statistics.median(rss_mib(max(r.ru_maxrss for r in g)) for g in groups), 1)  # noqa: E731
     return {
-        'scale': f'{scale}x', 'rows': {n: sum(1 for _ in (root / n).open('rb')) for n in STREAMS},
-        'fixture_bytes': {n: (root / n).stat().st_size for n in STREAMS},  # size on disk, not a measurement of I/O
+        'scale': f'{scale}x', 'rows': rows, 'fixture_bytes': fixture_bytes, 'fixture_sha256': digests,
+        'input_evidence': evidence, 'input_billing_including_sessions': billing,
         'cold_first_batch': {'elapsed_s': round(cold.elapsed_s, 3), 'peak_rss_mib': peak([cold]), 'io': io_summary([[cold]])},
         'batch': {'subprocesses': 1, 'records': size, 'median_s': round(med_batch, 4), 'peak_rss_mib': peak(batch),
+                  'median_peak_rss_mib': median_peak([[r] for r in batch]),
                   'records_per_s': round(size / med_batch, 2), 'io': io_summary([[r] for r in batch])},
         'dashboard': {'subprocesses': 1, 'median_s': round(med_dash, 4), 'peak_rss_mib': peak(dash),
+                      'median_peak_rss_mib': median_peak([[r] for r in dash]),
                       'refreshes_per_s': round(1 / med_dash, 2), 'io': io_summary([[r] for r in dash])},
         'per_record_legacy': {'subprocesses': size, 'records': size, 'median_s': round(med_single, 4),
                               'peak_rss_mib': peak([r for group in single for r in group]), 'records_per_s': round(size / med_single, 2),
-                              'io': io_summary(single)},
-        'total_subprocesses': 1 + 2 * args.repeat + sum(len(group) for group in single),
+                              'median_peak_rss_mib': median_peak(single), 'io': io_summary(single)},
+        'engine_boundary': {'subprocesses': 1, 'records': 2,
+                            'median_s': round(statistics.median(r.elapsed_s for r in engine), 4),
+                            'peak_rss_mib': peak(engine), 'median_peak_rss_mib': median_peak([[r] for r in engine]),
+                            'io': io_summary([[r] for r in engine])},
+        'total_subprocesses': 1 + 3 * args.repeat + sum(len(group) for group in single),
     }
 
 
@@ -356,9 +410,21 @@ def main() -> None:
     ap.add_argument('--scales', default='1,2,4'); ap.add_argument('--repeat', type=int, default=5)
     ap.add_argument('--batch-size', type=int, default=5); ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--source', type=Path, default=None, help='copy this root\'s JSONL streams into the temp fixture instead of synthesizing')
+    ap.add_argument('--checkout', type=Path, default=REPO, help='Python code checkout to measure (same driver for before/after)')
     ap.add_argument('--json', action='store_true', help='print one JSON document instead of a table')
     args = ap.parse_args()
-    scales = [int(s) for s in args.scales.split(',') if s.strip()]
+    try: scales = [int(s) for s in args.scales.split(',') if s.strip()]
+    except ValueError: ap.error('--scales must be comma-separated positive integers')
+    from orchestrator.record_batch import MAX_BATCH_RECORDS
+    if not scales or any(s < 1 for s in scales): ap.error('--scales must be positive')
+    if args.runs < 1 or args.repeat < 1: ap.error('--runs and --repeat must be positive')
+    if not 1 <= args.batch_size <= MAX_BATCH_RECORDS: ap.error(f'--batch-size must be 1..{MAX_BATCH_RECORDS}')
+    args.checkout = args.checkout.expanduser().resolve()
+    if not (args.checkout / 'orchestrator/cli.py').is_file(): ap.error('--checkout must contain orchestrator/cli.py')
+    if args.source is not None:
+        args.source = args.source.expanduser().resolve()
+        if not args.source.is_dir() or not any((args.source / n).is_file() for n in STREAMS):
+            ap.error('--source must be a copied root containing JSONL streams')
     results = []
     with tempfile.TemporaryDirectory(prefix='orchestrator-bench-') as tmp:
         for scale in scales:
@@ -368,11 +434,14 @@ def main() -> None:
             results.append(measure(root, scale, args, tag=f'{scale}x'))
             shutil.rmtree(root, ignore_errors=True)
     meta = {'python': sys.version.split()[0], 'platform': sys.platform, 'repeat': args.repeat, 'batch_size': args.batch_size,
+            'checkout': str(args.checkout), 'driver': str(REPO),
+            'coverage_scope': 'input only; run evidence excludes interactive sessions; billing includes them',
             'fixture': 'copy of ' + str(args.source) if args.source else f'synthetic runs={args.runs} seed={args.seed}',
             'io': {'logical': LOGICAL_SOURCE, 'physical': next((r['batch']['io']['physical']['source'] for r in results if r['batch']['io']['physical']), None)}}
     if args.json:
         print(json.dumps({'meta': meta, 'results': results}, indent=2)); return
     print(f"# refresh benchmark — {meta['fixture']} — python {meta['python']} {meta['platform']} — repeat={args.repeat} batch={args.batch_size}")
+    print(f"# checkout: {meta['checkout']}; use --json for input hashes and billing/duration/verification coverage")
     print(f"# logical bytes: {meta['io']['logical']}; physical bytes: {meta['io']['physical'] or 'unavailable on this platform'}")
     print('# * = partial: some repetitions had a child without a complete I/O report and were excluded from that median')
     print('| scale | metrics rows / fixture MB | op | subprocesses | median s | peak child RSS MiB | throughput | logical MiB read / written | physical MiB read / written |')
@@ -383,6 +452,8 @@ def main() -> None:
         print(f"| {r['scale']} | {rows} | batch ({b['records']} rec) | {b['subprocesses']} | {b['median_s']:.3f} | {b['peak_rss_mib']:.1f} | {b['records_per_s']:.1f} rec/s | {_io_cells(b['io'])} |")
         print(f"| {r['scale']} | {rows} | dashboard | {d['subprocesses']} | {d['median_s']:.3f} | {d['peak_rss_mib']:.1f} | {d['refreshes_per_s']:.2f} refresh/s | {_io_cells(d['io'])} |")
         print(f"| {r['scale']} | {rows} | per-record legacy ({s['records']} rec) | {s['subprocesses']} | {s['median_s']:.3f} | {s['peak_rss_mib']:.1f} | {s['records_per_s']:.1f} rec/s | {_io_cells(s['io'])} |")
+        e = r['engine_boundary']
+        print(f"| {r['scale']} | {rows} | engine boundary + next call | 1 | {e['median_s']:.3f} | {e['peak_rss_mib']:.1f} | — | {_io_cells(e['io'])} |")
         print(f"| {r['scale']} | {rows} | cold first batch | 1 | {c['elapsed_s']:.3f} | {c['peak_rss_mib']:.1f} | — | {_io_cells(c['io'])} |")
 
 

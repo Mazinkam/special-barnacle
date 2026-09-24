@@ -761,13 +761,13 @@ class BenchmarkHarnessTests(SyntheticRootTestCase):
         args = argparse.Namespace(batch_size=2, repeat=1)
         result = self.bench.measure(self.root, 1, args, tag='t')
         self.assertIn('fixture_bytes', result); self.assertNotIn('bytes', result)
-        for op in ('batch', 'dashboard', 'per_record_legacy', 'cold_first_batch'):
+        for op in ('batch', 'dashboard', 'per_record_legacy', 'cold_first_batch', 'engine_boundary'):
             io = result[op]['io']
             self.assertGreater(io['logical']['read_bytes'], 0, op); self.assertGreater(io['logical']['write_bytes'], 0, op)
             self.assertIn('physical', io, op)
         self.assertGreater(result['batch']['io']['logical']['write_bytes'], 0)
         self.assertEqual(result['per_record_legacy']['subprocesses'], 2)
-        self.assertEqual(result['total_subprocesses'], 1 + 2 + 2)
+        self.assertEqual(result['total_subprocesses'], 1 + 3 + 2)
 
 
 if __name__ == '__main__':
