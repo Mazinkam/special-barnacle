@@ -30,12 +30,22 @@ def topology_for(complexity:float,coupling:float=.5,parallelizable:float=.5,risk
     leads=max(2,min(4,round(2+2*parallelizable))); workers=max(leads,min(10,round(c*parallelizable+leads)))
     return {'depth':3 if c<9 else 4,'leads':leads,'workers':workers,'shape':'multi_lead'}
 
+def package_history(stats:list[dict], *, task_class:str, complexity:float, risk:str, package:dict)->dict|None:
+    """One priced cohort supplies both the estimate and its evidence; never borrow samples."""
+    cb=bucket_complexity(complexity)
+    matches=[s for s in stats if s.get('task_class')==task_class and s.get('complexity_bucket')==cb
+             and s.get('risk')==risk and s.get('capability')==package.get('capability')
+             and s.get('effort')==package.get('effort') and s.get('verification_depth')==package.get('verification_depth')
+             and s.get('verified_cost_usd') is not None and s.get('avg_quality_evidence') is not None
+             and not s.get('unmetered_call_samples')]
+    return max(matches,key=lambda s:(s.get('verified_tasks',0),s.get('samples',0)),default=None)
+
+
 def recommend_package(*,task_class:str,complexity:float,risk:str,quality_floor:float,cost_aggressiveness:float,stats:list[dict],min_samples:int=8)->dict[str,Any]:
     cb=bucket_complexity(complexity)
     candidates=[]
     for p in DEFAULT_PACKAGES:
-        matches=[s for s in stats if s.get('task_class')==task_class and s.get('complexity_bucket')==cb and s.get('risk')==risk and s.get('capability')==p.capability and s.get('effort')==p.effort and s.get('verification_depth')==p.verification_depth]
-        hist=max(matches,key=lambda x:x.get('samples',0),default=None)
+        hist=package_history(stats,task_class=task_class,complexity=complexity,risk=risk,package=asdict(p))
         samples=(hist.get('effective_samples',hist.get('samples',0)) if hist else 0)
         cost=(hist.get('verified_cost_usd') if hist else None)
         quality=(hist.get('avg_quality_evidence') if hist else None)

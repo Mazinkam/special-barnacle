@@ -5,7 +5,7 @@ from typing import Any
 import hashlib
 
 from .history import bucket_complexity
-from .scheduler import DEFAULT_PACKAGES, EFFORTS, recommend_package, topology_for
+from .scheduler import DEFAULT_PACKAGES, EFFORTS, recommend_package, topology_for, package_history
 
 
 def _unit_interval(seed: str) -> float:
@@ -71,15 +71,8 @@ def route_evidence(stats: list[dict[str, Any]], *, task_class: str, complexity: 
     Legacy stats that predate the split fields carry no `verified_tasks`; they count as zero
     evidence so the gate stays conservative rather than trusting a row count.
     """
-    cb = bucket_complexity(complexity)
-    matches = [s for s in stats if s.get('task_class') == task_class and s.get('complexity_bucket') == cb and s.get('risk') == risk
-               and s.get('capability') == package.get('capability') and s.get('effort') == package.get('effort')
-               and s.get('verification_depth') == package.get('verification_depth')]
-    return {
-        'verified_tasks': max((int(s.get('verified_tasks') or 0) for s in matches), default=0),
-        'run_samples': max((int(s.get('run_samples') or 0) for s in matches), default=0),
-        'call_samples': max((int(s.get('call_samples') or 0) for s in matches), default=0),
-    }
+    hist = package_history(stats, task_class=task_class, complexity=complexity, risk=risk, package=package) or {}
+    return {key: int(hist.get(key) or 0) for key in ('verified_tasks', 'run_samples', 'call_samples')}
 
 
 def configured_min_samples(features: dict[str, Any], default: int = 12) -> int:
