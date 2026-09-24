@@ -121,6 +121,18 @@ class TestMethod(unittest.TestCase):
         self.assertEqual(cap["mode"], "warn")
         self.assertEqual(cap["usd_by_capability"]["lead_large"], 10.0)
 
+    def test_bad_recon_effort_raises(self):
+        data = json.loads(method.METHOD_PATH.read_text())
+        data["rules"]["exploration_topology"]["recon_effort"] = "medium"
+        with self.assertRaisesRegex(ValueError, "recon_effort"):
+            method._validate(data)
+
+    def test_bad_rule_tier_raises(self):
+        data = json.loads(method.METHOD_PATH.read_text())
+        data["rules"]["dispatch_spend_cap"]["default_tier"] = "bogus"
+        with self.assertRaisesRegex(ValueError, "default_tier"):
+            method._validate(data)
+
     def test_no_haiku_in_family_presets(self):
         from orchestrator.dynamic_adapter import MODEL_FAMILY_PRESETS
         for preset in MODEL_FAMILY_PRESETS.values():

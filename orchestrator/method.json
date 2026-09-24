@@ -82,7 +82,7 @@
       "recon_workers_min": 3,
       "recon_workers_max": 5,
       "recon_capability": "analysis_mid",
-      "recon_effort": "medium",
+      "recon_effort": "standard",
       "recon_verification_depth": "targeted",
       "synthesis_capability": "technical_lead",
       "synthesis_effort": "standard",

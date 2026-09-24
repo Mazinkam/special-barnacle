@@ -4,7 +4,17 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator, Optional
 from contextlib import contextmanager
-import fcntl, hashlib, json, os, secrets
+import fcntl, hashlib, json, logging, os, secrets, sys
+
+_LOGGER = logging.getLogger('orchestrator')
+if not _LOGGER.handlers:
+    # Independent of the caller's logging config: a warning about a corrupt config file must
+    # reach stderr even when nothing else configured logging (e.g. running as `python3 -m
+    # orchestrator.cli`), and it must never land on stdout, which the TS bridge parses as JSON.
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter('%(name)s: %(levelname)s: %(message)s'))
+    _LOGGER.addHandler(_handler)
+_LOGGER.setLevel(logging.WARNING)
 
 
 def utc_now() -> str:
@@ -26,7 +36,9 @@ def stable_hash(value: Any) -> str:
 def read_json(path: Path, default):
     if not path.exists(): return default
     try: return json.loads(path.read_text(encoding='utf-8'))
-    except Exception: return default
+    except Exception as exc:
+        _LOGGER.warning('failed to read %s (%s: %s); using default', path, type(exc).__name__, exc)
+        return default
 
 def fsync_directory(path: Path):
     """Make newly created/replaced directory entries durable on local POSIX filesystems."""

@@ -12,4 +12,8 @@ requires-python = ">=3.10"
 include = ["orchestrator*"]
 
 [tool.setuptools.package-data]
-orchestrator = ["../bridge/**/*.ts", "../bridge/**/*.md", "../install.sh"]
+# Only files that live inside the `orchestrator` package can be shipped in the
+# wheel. The `bridge/` TypeScript sources and `install.sh` live outside the
+# package (repo-root siblings) and are installed from a git checkout via
+# install.sh, not from the wheel -- do not list them here.
+orchestrator = ["*.json"]

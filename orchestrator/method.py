@@ -60,6 +60,27 @@ def _validate(m: dict[str, Any]) -> None:
     cap = m["rules"].get("dispatch_spend_cap")
     if cap and cap["mode"] not in ("off", "warn", "enforce"):
         raise ValueError(f"method.json: dispatch_spend_cap has unknown mode {cap['mode']!r}")
+    _validate_rule_efforts_and_tiers(m["rules"], efforts, tiers)
+
+
+def _validate_rule_efforts_and_tiers(node: Any, efforts: set[str], tiers: set[str], path: str = "rules") -> None:
+    """Recursively check every rules key ending in `_effort`/named `effort` against
+    effort_levels, and every key ending in `_tier`/`_tiers` against tiers."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            cur_path = f"{path}.{key}"
+            if (key == "effort" or key.endswith("_effort")) and isinstance(value, str):
+                if value not in efforts:
+                    raise ValueError(f"method.json: {cur_path} has unknown effort {value!r}")
+            elif key.endswith("_tier") or key.endswith("_tiers"):
+                candidates = value if isinstance(value, list) else [value]
+                for candidate in candidates:
+                    if isinstance(candidate, str) and candidate not in tiers:
+                        raise ValueError(f"method.json: {cur_path} has unknown tier {candidate!r}")
+            _validate_rule_efforts_and_tiers(value, efforts, tiers, cur_path)
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            _validate_rule_efforts_and_tiers(item, efforts, tiers, f"{path}[{i}]")
 
 
 def capabilities() -> list[str]:
