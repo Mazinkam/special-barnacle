@@ -122,13 +122,24 @@ describe("session ingest hook wiring", () => {
 			orchestrator.default!(api as never);
 			expect(handlers.agent_settled).toBeFunction();
 			const context = { sessionManager: { getSessionFile: () => sessionFile } };
+			// `cli.process_ingest` writes ingest_status.json, then `refresh()` renames dashboard.html
+			// into place and finally writes dashboard.version.json, a receipt of each stream's
+			// [st_dev, st_ino, st_size, st_mtime_ns]. A new status alone does not prove the dashboard
+			// was regenerated, so wait until the receipt attests the ingest_status.json we just read.
+			// st_mtime_ns exceeds 2^53, so compare against the raw receipt text with bigint stats.
+			const dashboardAttestsStatus = () => {
+				const statusStat = statSync(join(testStateRoot, "ingest_status.json"), { bigint: true });
+				const expected = `"ingest_status.json":[${statusStat.dev},${statusStat.ino},${statusStat.size},${statusStat.mtimeNs}]`;
+				const receipt = readFileSync(join(testStateRoot, "dashboard.version.json"), "utf8").replace(/\s+/g, "");
+				return receipt.includes(expected) && statSync(join(testStateRoot, "dashboard.html")).size > 0;
+			};
 			const waitForMaterialization = async (previousAttempt?: string) => {
 				const deadline = Date.now() + 10_000;
 				while (Date.now() < deadline) {
 					try {
 						const status = JSON.parse(readFileSync(join(testStateRoot, "ingest_status.json"), "utf8"));
 						if (status.status === "ok" && status.last_attempt_at !== previousAttempt &&
-							statSync(join(testStateRoot, "dashboard.html")).size > 0) return status;
+							dashboardAttestsStatus()) return status;
 					} catch {
 						// Wait for the debounced CLI to create its materialized files.
 					}
