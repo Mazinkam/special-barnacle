@@ -98,6 +98,7 @@ import { bedrockFallbackFor, isQuotaError } from "./provider-fallback.ts";
 import { parseLeadAssignments, planLeadWaves, type LeadAssignment } from "./lead-plan.ts";
 import { classifyRunOutcome, externalChangeFiles, parseLeadStatus } from "./run-outcome.ts";
 import { SpendCapTracker, capFor, type SpendCapVerdict } from "./spend-cap.ts";
+import { NestedCostTracker } from "./nested-cost.ts";
 import { escalateLeadCapability, isLeadCapability, isLeadSize, leadSizeOf, sizeLead, type LeadSizeDecision } from "./lead-sizing.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
 import { BoundedCapture, classifyDispatchOutcome, summarizeStderr, trimEventForLog } from "./dispatch-outcome.ts";
@@ -810,6 +811,8 @@ interface SubagentProcessResult {
 	model?: string;
 	usage: SubagentUsageStats;
 	costUsd: number;
+	/** Spend of `subagent` calls the child made itself (not bridge dispatches); excluded from `costUsd`. */
+	nestedCostUsd?: number;
 	/** True only when every received usage block explicitly reported a valid cost (including $0). */
 	costReported: boolean;
 	durationMs: number;
@@ -864,6 +867,8 @@ interface DispatchProgress {
 	/** Last few activity strings, newest at the end; rendered as a dim sub-line. */
 	activityTail: string[];
 	costUsd: number;
+	/** Running spend of this dispatch's own subagent calls. */
+	nestedCostUsd: number;
 	status: "running" | "done" | "failed" | "cancelled";
 	/** Nesting depth (0 = top-level dispatch, 1 = child of a lead, …). */
 	depth: number;
@@ -1179,6 +1184,7 @@ export class RunSession {
 			lastActivity: "starting",
 			activityTail: ["starting"],
 			costUsd: 0,
+			nestedCostUsd: 0,
 			status: "running",
 			depth,
 			progress: createProgressView(now),
@@ -1259,14 +1265,21 @@ export class RunSession {
 		d.costUsd = costUsd || d.costUsd;
 		d.lastActivity = note ?? (d.status === "cancelled" ? "cancelled by user" : exitCode === 0 ? "finished" : `exit ${exitCode}`);
 		this.log(
-			`dispatch ${taskId} ${d.status} in ${fmtElapsed(d.endedAt - d.startedAt)} — ${d.turns} turns, ${d.toolCalls} tool calls, $${d.costUsd.toFixed(4)}${note ? ` — ${note}` : ""}`,
+			`dispatch ${taskId} ${d.status} in ${fmtElapsed(d.endedAt - d.startedAt)} — ${d.turns} turns, ${d.toolCalls} tool calls, $${d.costUsd.toFixed(4)}${d.nestedCostUsd > 0 ? ` + $${d.nestedCostUsd.toFixed(4)} in subagents` : ""}${note ? ` — ${note}` : ""}`,
 		);
 		this.render();
 	}
 
+	setNestedCost(taskId: string, costUsd: number): void {
+		const d = this.dispatches.get(taskId);
+		if (!d) return;
+		d.nestedCostUsd = costUsd;
+		this.scheduleRender();
+	}
+
 	totalCost(): number {
 		let c = 0;
-		for (const d of this.dispatches.values()) c += d.costUsd;
+		for (const d of this.dispatches.values()) c += d.costUsd + d.nestedCostUsd;
 		return c;
 	}
 
@@ -1379,7 +1392,7 @@ export class RunSession {
 		const elapsed = fmtElapsed(now - d.startedAt).padStart(7);
 		const turns = `t${d.turns}`.padStart(4);
 		const tools = `⚙${d.toolCalls}`.padStart(5);
-		const cost = `$${d.costUsd.toFixed(4)}`.padStart(9);
+		const cost = `$${(d.costUsd + d.nestedCostUsd).toFixed(4)}`.padStart(9);
 		const idleMs = now - d.progress.lastProgressAt;
 		const idle = idleMs > 60_000 ? `  idle ${fmtElapsed(idleMs)}` : "";
 		return `${indent}${spin} ${d.label.padEnd(20)}  ${model}  ${elapsed}  ${turns} ${tools}  ${cost}${idle}`;
@@ -1403,7 +1416,7 @@ export class RunSession {
 		const elapsed = fmtElapsed((d.endedAt ?? now) - d.startedAt).padStart(7);
 		const turns = `t${d.turns}`.padStart(4);
 		const tools = `⚙${d.toolCalls}`.padStart(5);
-		const cost = `$${d.costUsd.toFixed(4)}`.padStart(9);
+		const cost = `$${(d.costUsd + d.nestedCostUsd).toFixed(4)}`.padStart(9);
 		// Surface the captured note for failed and cancelled dispatches so the
 		// user can see "exit 1", "cancelled by user", or the stderr summary at a
 		// glance. For normal completions the ✓ mark already conveys status.
@@ -1692,6 +1705,9 @@ export async function runSubagentProcess(opts: {
 		const stderrCapture = new BoundedCapture();
 		let model: string | undefined;
 		const usage: SubagentUsageStats = { ...emptyUsage };
+		const nestedCost = new NestedCostTracker();
+		/** Own turns plus the child's own subagent calls: what the dispatch has cost so far. */
+		const spentSoFar = () => usage.cost + nestedCost.total();
 		let costReported = false;
 		let stopReason: string | undefined;
 		let sawAgentSettled = false;
@@ -1798,6 +1814,7 @@ export async function runSubagentProcess(opts: {
 				model,
 				usage,
 				costUsd: usage.cost,
+				nestedCostUsd: nestedCost.total(),
 				costReported,
 				durationMs: Date.now() - startedAt,
 				stopReason,
@@ -1845,7 +1862,7 @@ export async function runSubagentProcess(opts: {
 			// (stopReason "stop") is only warned about: killing it would throw away
 			// a finished report to save nothing.
 			if (msg.usage) {
-				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", usage.cost) ?? "ok";
+				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar()) ?? "ok";
 				if (verdict !== "ok") handleSpendCap(verdict === "stop" && msg.stopReason === "stop" ? "warn" : verdict);
 			}
 		};
@@ -1877,6 +1894,11 @@ export async function runSubagentProcess(opts: {
 			if (event.type === "message_end" && event.message?.role === "assistant") {
 				assistantTurns += 1;
 				absorbAssistantMessage(event.message);
+			}
+			if (nestedCost.observe(event)) {
+				session?.setNestedCost(taskId, nestedCost.total());
+				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar()) ?? "ok";
+				if (verdict !== "ok") handleSpendCap(verdict);
 			}
 			if (progressTracker && observation) {
 				if (event.type === "tool_execution_start") toolCalls += 1;
@@ -1960,11 +1982,11 @@ export async function runSubagentProcess(opts: {
 			if (settled || cancelledByListener) return;
 			const capability = opts.capability ?? "unknown";
 			const cap = capFor(capability);
-			const message = `spend cap $${cap.toFixed(2)} for ${capability} exceeded by ${taskId} at $${usage.cost.toFixed(4)}`;
+			const message = `spend cap $${cap.toFixed(2)} for ${capability} exceeded by ${taskId} at $${spentSoFar().toFixed(4)}${nestedCost.total() > 0 ? ` ($${nestedCost.total().toFixed(4)} in its subagents)` : ""}`;
 			session?.log(`${message} (${verdict === "stop" ? "stopping it" : "warn only"})`);
 			recordEvent("spend_cap_exceeded", {
 				run_id: session?.runId, task_id: taskId, capability, model: opts.model,
-				cap_usd: cap, cost_usd: usage.cost, action: verdict,
+				cap_usd: cap, cost_usd: spentSoFar(), nested_cost_usd: nestedCost.total(), action: verdict,
 			});
 			session?.ctx.ui?.notify?.(`${message}${verdict === "stop" ? " — stopping it" : ""}`, "warning");
 			if (verdict !== "stop") return;
@@ -2491,6 +2513,8 @@ export interface DispatchResult {
 	usage: SubagentSingleResult["usage"];
 	durationMs: number;
 	costUsd: number;
+	/** Spend of the dispatch's own `subagent` calls (a lead's implementers/reviewers); not in `costUsd`. */
+	nestedCostUsd?: number;
 	costReported: boolean;
 	stopReason?: string;
 	outcome?: SubagentProcessResult["outcome"];
@@ -2624,6 +2648,7 @@ export async function dispatchParallel(
 					...second,
 					usage: sumUsage(first.usage, second.usage),
 					costUsd: first.costUsd + second.costUsd,
+					nestedCostUsd: (first.nestedCostUsd ?? 0) + (second.nestedCostUsd ?? 0),
 					costReported: first.costReported && second.costReported,
 					durationMs: first.durationMs + second.durationMs,
 				};
@@ -2636,6 +2661,7 @@ export async function dispatchParallel(
 				exit_code: r.exitCode,
 				duration_ms: r.durationMs,
 				cost_usd: r.costUsd,
+				nested_cost_usd: r.nestedCostUsd,
 				turns: r.usage.turns,
 				stop_reason: r.stopReason,
 				log_dir: ACTIVE_RUN?.dir,
@@ -2655,6 +2681,7 @@ export async function dispatchParallel(
 				usage: r.usage,
 				durationMs: r.durationMs,
 				costUsd: r.costUsd,
+				...((r.nestedCostUsd ?? 0) > 0 ? { nestedCostUsd: r.nestedCostUsd } : {}),
 				costReported: r.costReported,
 				stopReason: r.stopReason,
 				outcome: r.outcome,
@@ -3712,7 +3739,7 @@ function modelTableForLead(adapter: Adapter): string[] {
 		row("orch-technical-lead", "technical_lead"),
 		row("orch-technical-review", "technical_review"),
 		row("orch-security-review", "security_review"),
-		row("orch-qa-agent", "qa_agent"),
+		// No orch-qa-agent row: final QA is the orchestrator's own dispatch, not the lead's.
 		row("orch-architect", "architect"),
 	];
 }
@@ -3775,11 +3802,11 @@ export function leadPrompt(
 		"",
 		LEAD_DELEGATION_RULE,
 		"",
-		"Use the subagent tool for implementation, review, and QA work. Nested subagent calls you make run inside your own context: the orchestrator bridge does not see, log, or bill them the way it does the parent-owned recon above, so they are not authoritative worker accounting for this run — only your own final report is. For each nested dispatch:",
-		"- Choose the right agent (orch-worker, orch-implementation-strong, orch-implementation-fast, orch-technical-review, orch-security-review, orch-qa-agent).",
+		"Use the subagent tool for implementation and review work. Nested subagent calls you make run inside your own context: the orchestrator bridge bills their reported cost to your dispatch and counts it toward your spend cap, but does not log them as dispatches the way it does the parent-owned recon above, so they are not authoritative worker accounting for this run — only your own final report is. For each nested dispatch:",
+		"- Choose the right agent (orch-worker, orch-implementation-strong, orch-implementation-fast, orch-technical-review, orch-security-review).",
 		"- Pass a narrowly-scoped task prompt.",
 		"- Pass the `model` for that agent from the routing table below.",
-		"- After implementation is done, run QA via orch-qa-agent. If verification fails, escalate per method.json rules.review_after_fix (Rule 1).",
+		"- After implementation, run the targeted verification commands for each task yourself (read-only). Do not dispatch orch-qa-agent: the orchestrator runs independent QA on the union of changed files after you finish. If your verification or a review fails, escalate per method.json rules.review_after_fix (Rule 1).",
 		"",
 		...modelTableForLead(adapter),
 		"",
@@ -3820,9 +3847,44 @@ interface OrchestrateArgs {
 	unknownFlags: string[];
 }
 
+/**
+ * Flags are honored only in the leading or trailing flag block (`/orchestrate [flags] <goal> [flags]`).
+ * A `--flag` between goal words is prose: it stays in the goal and has no effect. Scanning the whole
+ * string used to let "Keep --interactive confirmations blocking" switch interactive mode on and cut
+ * the words out of the spec the agents received.
+ */
 export function parseArgs(args: string): OrchestrateArgs {
-	const tokens = args.trim().split(/\s+/);
-	const out: OrchestrateArgs = {
+	const tokens = args.trim().split(/\s+/).filter(Boolean);
+	// Pass 1 on a scratch result: find which tokens are flag spans and which are goal words.
+	const spans: Array<{ start: number; end: number; flag: boolean }> = [];
+	const scratch = newOrchestrateArgs();
+	for (let i = 0; i < tokens.length; ) {
+		const end = consumeFlag(tokens, i, scratch);
+		spans.push({ start: i, end: end ?? i + 1, flag: end !== undefined });
+		i = end ?? i + 1;
+	}
+	const firstWord = spans.findIndex((s) => !s.flag);
+	let lastWord = -1;
+	for (let k = spans.length - 1; k >= 0; k--) {
+		if (!spans[k].flag) {
+			lastWord = k;
+			break;
+		}
+	}
+	// Pass 2 on the real result: apply only boundary flags; everything else is goal text.
+	const out = newOrchestrateArgs();
+	const goalTokens: string[] = [];
+	spans.forEach((span, index) => {
+		const boundary = firstWord === -1 || index < firstWord || index > lastWord;
+		if (span.flag && boundary) consumeFlag(tokens, span.start, out);
+		else goalTokens.push(...tokens.slice(span.start, span.end));
+	});
+	out.goal = goalTokens.join(" ");
+	return out;
+}
+
+function newOrchestrateArgs(): OrchestrateArgs {
+	return {
 		goal: "",
 		taskClass: "implementation",
 		complexity: 5,
@@ -3834,8 +3896,15 @@ export function parseArgs(args: string): OrchestrateArgs {
 		models: emptyOverrides(),
 		unknownFlags: [],
 	};
-	const goalTokens: string[] = [];
-	for (let i = 0; i < tokens.length; i++) {
+}
+
+/**
+ * Apply the flag at `tokens[start]` to `out` and return the index after it (and its value),
+ * or undefined when the token is not a flag.
+ */
+function consumeFlag(tokens: string[], start: number, out: OrchestrateArgs): number | undefined {
+	let i = start;
+	{
 		const t = tokens[i];
 		const next = tokens[i + 1];
 		switch (t) {
@@ -3885,13 +3954,12 @@ export function parseArgs(args: string): OrchestrateArgs {
 				break;
 			}
 			default:
-				if (t.startsWith("--")) out.unknownFlags.push(t);
-				else goalTokens.push(t);
+				if (!t.startsWith("--")) return undefined;
+				out.unknownFlags.push(t);
 				break;
 		}
 	}
-	out.goal = goalTokens.join(" ");
-	return out;
+	return i + 1;
 }
 
 /** Goals that ask the agents to come back with questions cannot be honored headlessly. */
@@ -4627,8 +4695,11 @@ export default function (pi: ExtensionAPI) {
 					verificationResults,
 					escalationResults,
 				});
+				// Leads' own subagent calls are billed too: they were the bulk of real spend
+				// (ht-orch-1790256789245-1a3fms: $13.22 nested vs $1.56 reported).
+				const nestedCost = billedResults.reduce((s, r) => s + (r.nestedCostUsd ?? 0), 0);
 				const totalCost =
-					triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0);
+					triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0) + nestedCost;
 				const succeededLeads = leadResults.filter((r) => r.exitCode === 0).length;
 				// A run that dispatched nothing, or whose every lead failed, has not
 				// verified anything — reporting the empty verification suite as PASS is
@@ -4701,7 +4772,7 @@ export default function (pi: ExtensionAPI) {
 					`leads: ${succeededLeads}/${leadResults.length} ${runOutcome === "blocked" ? "blocked" : "succeeded"}${skippedLeads > 0 ? ` (+${skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${retries} · files: ${allFiles.length} changed${externalFiles.length > 0 ? ` (+${externalFiles.length} changed by someone else, not verified)` : ""}`,
 					summarizeReconWorkers(workerResults),
 					`verification: ${verdict}`,
-					`total cost: $${totalCost.toFixed(4)} (${billedResults.length + (triageCost.usd > 0 ? 1 : 0)} dispatches)`,
+					`total cost: $${totalCost.toFixed(4)} (${billedResults.length + (triageCost.usd > 0 ? 1 : 0)} dispatches${nestedCost > 0 ? `; $${nestedCost.toFixed(4)} of it in lead subagents` : ""})`,
 					...(dispatchOk
 						? []
 						: [

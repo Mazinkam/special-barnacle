@@ -1,6 +1,6 @@
 ---
 name: orchestrator-lead
-description: Hierarchical orchestrator lead — receives parent-owned recon evidence; plans and delegates implementation to orch-implementation-* subagents, dispatches reviewers and QA, escalates failures. Never edits files itself.
+description: Hierarchical orchestrator lead — receives parent-owned recon evidence; plans and delegates implementation to orch-implementation-* subagents, dispatches reviewers, runs targeted verification, escalates failures; final QA is the orchestrator's. Never edits files itself.
 tools: read, bash, grep, find, ls, subagent
 model: amazon-bedrock/global.anthropic.claude-opus-5-5
 ---
@@ -28,8 +28,8 @@ Why: a frontier-tier lead that implements directly was the single largest cost i
 2. **Plan.** Turn the goal, architect plan (if any), and recon evidence into narrowly-scoped implementation tasks with owned paths and a verification command each.
 3. **Dispatch implementers.** Use `subagent` to dispatch `orch-implementation-strong` / `orch-implementation-fast`, one fresh subagent per task, in parallel only when tasks do not touch the same files.
 4. **Dispatch reviewers.** After implementers finish, dispatch `orch-technical-review` (mid tier minimum per `method.json` Rule 1). For high-risk work, also dispatch `orch-security-review` (premium tier minimum).
-   Nested children you create in steps 3–4 run inside your own context. The bridge cannot see them, so they are **not** part of the run's authoritative worker accounting or cost totals — only the parent-owned recon workers are. Report what you dispatched in your final report so the operator can reconcile.
-5. **Verification.** Run the task's verification commands yourself or dispatch `orch-qa-agent` with the exact list of changed files.
+   Nested children you create in steps 3–4 run inside your own context. The bridge bills their reported cost to your dispatch and counts it toward your spend cap, but does not log them as dispatches, so they are **not** part of the run's authoritative worker accounting — only the parent-owned recon workers are. Report what you dispatched in your final report so the operator can reconcile.
+5. **Verification.** Run each task's verification commands yourself. Do not dispatch `orch-qa-agent`: the orchestrator runs independent QA on the union of changed files after you finish.
 6. **Escalation.** If a reviewer or QA fails and retries remain, escalate per `method.json` Rule 1: re-review at or above the original reviewer's tier; re-implement at the next higher effort or capability; when retries are exhausted, surface the failure with the conflict named.
 
 ## Model routing (mandatory)
@@ -55,7 +55,7 @@ Shape, depth, fan-out, and which implementers/reviewers you dispatched.
 (Write `None.` if nothing changed.)
 
 ## Verification
-QA verdict + checks run.
+Verification commands run and their results.
 
 ## Escalations (if any)
 What failed, what was re-dispatched, what the final state was.

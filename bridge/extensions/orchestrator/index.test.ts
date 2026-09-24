@@ -674,6 +674,15 @@ describe("leadPrompt recon evidence handoff", () => {
 		expect(prompt).not.toContain("workers fan out inside each lead");
 		expect(prompt).toContain("not authoritative worker accounting");
 	});
+
+	test("leaves final QA to the orchestrator instead of asking the lead to run orch-qa-agent", () => {
+		// Regression: ht-orch-1790256789245-1a3fms ran QA twice (lead's orch-qa-agent, then the bridge's).
+		const prompt = orchestrator.leadPrompt("repair flow", planFixture, undefined, "", 0, 1, adapterFixture);
+		expect(prompt).not.toContain("run QA via orch-qa-agent");
+		expect(prompt).toContain("Do not dispatch orch-qa-agent");
+		expect(prompt).not.toContain("does not see, log, or bill");
+		expect(prompt).not.toMatch(/- orch-qa-agent: model/);
+	});
 });
 
 function dispatchResult(task: DispatchTask, exitCode = 0): DispatchResult {
@@ -1667,6 +1676,41 @@ describe("runSubagentProcess process/event handling", () => {
 			expect(log.match(/exceeded by warned-lead/g) ?? []).toHaveLength(1);
 			expect(log).toContain("warn only");
 		} finally {
+			session.close();
+		}
+	});
+
+	test("a lead's own subagent spend is billed and counts toward its spend cap", async () => {
+		// Regression: ht-orch-1790256789245-1a3fms reported $1.56; the lead's implementer alone cost $10.14.
+		const { SpendCapTracker } = await import("./spend-cap.ts");
+		const session = createSession("nested-spend");
+		session.spendCaps = new SpendCapTracker({ mode: "enforce", usd_by_capability: { lead: 4 }, default_usd: 1 });
+		const kill = mock(() => true);
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill, pid: undefined });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		const nested = (type: string, cost: number) => ({
+			type, toolName: "subagent", toolCallId: "call-1",
+			[type === "tool_execution_end" ? "result" : "partialResult"]: { details: { results: [{ taskId: "impl", usage: { cost } }] } },
+		});
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "nested-lead", session,
+				spawnChild: () => child as never,
+			});
+			emit({ type: "message_end", message: { role: "assistant", content: "plan", usage: { input: 1, output: 1, cost: { total: 0.5 } } } });
+			emit(nested("tool_execution_update", 1.0));
+			emit(nested("tool_execution_update", 2.0)); // cumulative snapshot, not +2
+			expect(session.totalCost()).toBeCloseTo(2.5);
+			emit(nested("tool_execution_update", 3.8)); // $0.50 own + $3.80 nested crosses the $4 lead cap
+			const result = await pending;
+			expect(result.stopReason).toBe("spend_cap");
+			expect(result.costUsd).toBe(0.5);
+			expect(result.nestedCostUsd).toBeCloseTo(3.8);
+			expect(kill).toHaveBeenCalledTimes(1);
+			expect(readFileSync(session.file("run.log"), "utf8")).toContain("($3.8000 in its subagents)");
+		} finally {
+			child.emit("close", 137);
 			session.close();
 		}
 	});
@@ -3285,6 +3329,24 @@ describe("lead sizing wiring (Phase A)", () => {
 		expect(bad.leadSize).toBeUndefined();
 		expect(bad.unknownFlags.join()).toContain("--lead-size huge");
 		expect(orchestrator.parseArgs("do x --lead-size").unknownFlags.join()).toContain("missing value");
+	});
+
+	test("flags named inside the goal prose stay goal text and do not take effect", () => {
+		// Regression: ht-orch-1790256789245-1a3fms. "Keep --interactive confirmations blocking" in the
+		// goal switched interactive mode on (12 min idle at the plan dialog) and was cut out of the spec.
+		const p = orchestrator.parseArgs("Fix X. Keep --interactive confirmations blocking and --risk handling intact. --risk high");
+		expect(p.interactive).toBe(false);
+		expect(p.risk).toBe("high");
+		expect(p.goal).toBe("Fix X. Keep --interactive confirmations blocking and --risk handling intact.");
+		expect(p.unknownFlags).toEqual([]);
+		// Unknown --words inside prose are text, not errors.
+		expect(orchestrator.parseArgs("explain what --frobnicate does").unknownFlags).toEqual([]);
+	});
+
+	test("leading and trailing flags still parse", () => {
+		const p = orchestrator.parseArgs("--risk low --interactive do the thing --complexity 3 --lead-size small");
+		expect(p).toMatchObject({ risk: "low", interactive: true, complexity: 3, leadSize: "small", goal: "do the thing" });
+		expect(orchestrator.parseArgs("do x --bogus").unknownFlags).toEqual(["--bogus"]);
 	});
 
 	test("dispatchReconAndLeads dispatches the sized lead capability", async () => {

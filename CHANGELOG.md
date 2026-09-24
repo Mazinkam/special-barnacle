@@ -24,6 +24,16 @@
 
 ### bridge (HT extension)
 
+- Fixed from run `ht-orch-1790256789245-1a3fms`:
+  - `parseArgs` only reads flags before and after the goal text. A `--flag` between goal words
+    (e.g. "Keep --interactive confirmations blocking") used to turn the flag on, which left that
+    run waiting 12 minutes at the plan dialog, and cut the words out of the agents' spec.
+  - A lead's own `subagent` spend is billed. `nested-cost.ts` reads the reported cost from the
+    lead's `subagent` tool events, the lead's spend cap counts it, and the widget and run total
+    include it. That run reported $1.56; its lead's subagents alone cost $13.22.
+  - Leads no longer dispatch `orch-qa-agent`. The orchestrator's QA already covers the union of
+    changed files, so QA ran twice.
+
 - Session usage is now ingested automatically. The extension ingests the
   current session file on every `agent_settled` (debounced, one in flight) and
   flushes on `session_shutdown`; `install.sh` additionally installs a launchd
