@@ -19,6 +19,10 @@ never overrides a value a runtime (or a prior run of this script) already stated
 Safety posture, matching `scripts/audit_and_clean_metrics.py`:
   * Defaults to a dry run: prints a summary of what *would* change and writes nothing.
   * Writing requires the explicit `--write` flag.
+  * The read and the write happen under the package's writer lock
+    (`orchestrator.runtime.writer_lock`), the same lock `record_batch`/`EventStore` take before
+    appending or checkpointing, so a concurrent append from the running package between this
+    script's read and its replace is never lost.
   * Every write is preceded by a timestamped backup of the untouched file
     (`metrics.pre-stamp-granularity-<UTC>Z.jsonl`), copied before metrics.jsonl is touched.
   * The rewrite itself is atomic: the new stream is written to a temp file in the *same*
@@ -54,6 +58,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from orchestrator.records import CALL, EVENT, SESSION, classify  # noqa: E402
+from orchestrator.runtime import writer_lock  # noqa: E402
 
 
 def _default_state_dir() -> Path:
@@ -128,40 +133,46 @@ def main(argv: list[str]) -> int:
         print(f'error: no metrics stream at {metrics_path}', file=sys.stderr)
         return 1
 
-    records: list[dict] = []
-    bad = 0
-    with metrics_path.open(encoding='utf-8', errors='replace') as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                bad += 1
-    if bad:
-        print(f'warning: {bad} malformed lines skipped', file=sys.stderr)
+    # Hold the package's single writer lock across read→write so a concurrent append from the
+    # running package between this script's read and its atomic replace is never lost. The
+    # existing atomic-replace-via-temp-file already protects against a truncated stream on a
+    # crash mid-write; the lock closes the remaining window where a row appended *between* the
+    # read and the replace would simply be overwritten by the older snapshot this script read.
+    with writer_lock(state_dir):
+        records: list[dict] = []
+        bad = 0
+        with metrics_path.open(encoding='utf-8', errors='replace') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    bad += 1
+        if bad:
+            print(f'warning: {bad} malformed lines skipped', file=sys.stderr)
 
-    rewritten, counts = plan(records)
-    changed = sum(v for k, v in counts.items() if k != 'already_stamped')
+        rewritten, counts = plan(records)
+        changed = sum(v for k, v in counts.items() if k != 'already_stamped')
 
-    print(f'stamp_granularity summary (total {len(records)} rows, state_dir={state_dir}):')
-    print(f'  already stamped: {counts.get("already_stamped", 0)}')
-    print(f'  stamped call:    {counts.get(f"stamped_{CALL}", 0)}')
-    print(f'  stamped session: {counts.get(f"stamped_{SESSION}", 0)}')
-    print(f'  stamped event:   {counts.get(f"stamped_{EVENT}", 0)}')
-    print(f'  total changed:   {changed}')
+        print(f'stamp_granularity summary (total {len(records)} rows, state_dir={state_dir}):')
+        print(f'  already stamped: {counts.get("already_stamped", 0)}')
+        print(f'  stamped call:    {counts.get(f"stamped_{CALL}", 0)}')
+        print(f'  stamped session: {counts.get(f"stamped_{SESSION}", 0)}')
+        print(f'  stamped event:   {counts.get(f"stamped_{EVENT}", 0)}')
+        print(f'  total changed:   {changed}')
 
-    if not write:
-        print()
-        print('dry run: nothing written. Re-run with --write to apply.')
-        return 0
+        if not write:
+            print()
+            print('dry run: nothing written. Re-run with --write to apply.')
+            return 0
 
-    ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    backup = state_dir / f'metrics.pre-stamp-granularity-{ts}.jsonl'
-    shutil.copy2(metrics_path, backup)
+        ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        backup = state_dir / f'metrics.pre-stamp-granularity-{ts}.jsonl'
+        shutil.copy2(metrics_path, backup)
 
-    _write_atomic(metrics_path, rewritten)
+        _write_atomic(metrics_path, rewritten)
 
     print()
     print(f'backup: {backup}')

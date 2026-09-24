@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Audit and clean metrics.jsonl.
 
-Quarantines records that are not model-call events (event != 'model_call',
-or shaped like aggregate telemetry with `metric`/`value`/`unit`). Patches
-records that are clearly model calls missing the `event` discriminator.
-Normalizes non-canonical enum values. Rewrites metrics.jsonl clean and
+Quarantines records that are neither a complete model-call event nor one of the package's own
+non-cost EVENT/SESSION rows (per `orchestrator.records.classify` — `route_executed`,
+`adaptive_route_decision`, `task_verified`, `task_failed`, `verification_result`, `context_packet`,
+`shadow_review`, `decision_invalidated`, and session_ingest aggregates), or shaped like aggregate
+telemetry with `metric`/`value`/`unit`. Patches records that are clearly model calls missing the
+`event` discriminator. Normalizes non-canonical enum values. Rewrites metrics.jsonl clean and
 regenerates the dashboard.
+
+The read→rewrite is done under the package's writer lock (`orchestrator.runtime.writer_lock`) so a
+concurrent append from the running package is never lost, and the rewrite itself is a same-directory
+temp file + fsync + `os.replace`, never a truncating in-place write, so a crash mid-rewrite leaves
+the original stream intact.
 
 Idempotent: re-running it on a clean stream is a no-op (the quarantine file
 will already exist with the same records, the rewrite will produce an
@@ -19,18 +26,29 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Make `orchestrator` importable regardless of cwd/PYTHONPATH when this script is invoked
+# directly, matching how `scripts/stamp_granularity.py` resolves the package.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from orchestrator.records import EVENT, SESSION, classify  # noqa: E402
+from orchestrator.runtime import writer_lock  # noqa: E402
+
 STATE = Path(os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/.local/state/coding-agent-orchestrator"))
 METRICS = STATE / "metrics.jsonl"
 
-# Canonical event discriminator values for the metrics stream.
-# `model_call` is the workhorse. `adaptive_route_decision` and `route_executed`
-# are orchestrator-emitted routing records (also metric-shaped).
+# Canonical event discriminator value for a per-call row. Non-cost EVENT rows
+# (`route_executed`, `adaptive_route_decision`, `task_verified`, ...) and SESSION
+# aggregate rows are recognized structurally via `orchestrator.records.classify`
+# below, rather than by hard-coding a second copy of the event vocabulary here —
+# that copy is exactly what let the previous version of this script quarantine
+# rows the package itself writes (e.g. `task_verified`/`task_failed` events and
+# session aggregates missing a per-call `provider`).
 MODEL_CALL_EVENTS = {"model_call"}
-ROUTING_EVENTS = {"adaptive_route_decision", "route_executed"}
 
 # Canonical verification_depth values (from scheduler.py ComputePackage).
 # Anything outside this set maps to `targeted`.
@@ -70,24 +88,30 @@ def categorize(rec: dict) -> tuple[str, str]:
     event = rec.get("event")
     source = rec.get("source")
 
-    # Already correctly typed as a model-call or routing event.
-    if event in MODEL_CALL_EVENTS or event in ROUTING_EVENTS:
+    # Defer to `orchestrator.records.classify` first: it is the package's own,
+    # single definition of what a SESSION aggregate or a non-cost EVENT row looks
+    # like. A row the package classifies as SESSION or EVENT is a row the package
+    # itself writes to metrics.jsonl (session_ingest aggregates; `route_executed`,
+    # `adaptive_route_decision`, `task_verified`, `task_failed`, `verification_result`,
+    # `context_packet`, `shadow_review`, `decision_invalidated`), so it is always kept
+    # rather than being quarantined by a second, drifted copy of that vocabulary here.
+    granularity = classify(rec)
+    if granularity in (SESSION, EVENT):
+        return ("keep", "")
+
+    # Already correctly typed as a model-call.
+    if event in MODEL_CALL_EVENTS:
         # For model_calls, enforce completeness — a record missing model/provider/role
         # cannot be reliably priced or attributed.
-        if event in MODEL_CALL_EVENTS:
-            missing = [k for k in COMPLETE_MODEL_CALL if not rec.get(k)]
-            if missing:
-                return ("quarantine", f"incomplete_model_call_missing:{','.join(missing)}")
+        missing = [k for k in COMPLETE_MODEL_CALL if not rec.get(k)]
+        if missing:
+            return ("quarantine", f"incomplete_model_call_missing:{','.join(missing)}")
         return ("keep", "")
 
     # Aggregate telemetry leaked into metrics stream. Detected by presence of
-    # `metric`/`value`/`unit` keys, OR by `event` set to a known non-call type.
+    # `metric`/`value`/`unit` keys.
     if "metric" in rec and "value" in rec:
         return ("quarantine", "aggregate_telemetry_leak")
-    if event in {"issue_triage", "investigation", "verification",
-                 "orchestration_telemetry_migration", "orchestration_policy_update",
-                 "implementation"}:
-        return ("quarantine", f"non_model_call_event:{event}")
 
     # Records from session_ingest should always have event=model_call.
     if source == "session_ingest":
@@ -151,64 +175,91 @@ def clean(rec: dict, *, quarantine_reason: str) -> tuple[dict, dict | None]:
     return (out, None)
 
 
+def _write_atomic(target: Path, records: list[dict]) -> None:
+    """Replace `target` with `records`, atomically (temp file + fsync + os.replace).
+
+    Rewriting `target` in place (`open('w')` then writing line by line) truncates the shared
+    metric stream the instant it opens; an interruption before the last line lands destroys data
+    that was never re-written and a crash mid-rewrite leaves a truncated stream for every reader.
+    Writing a sibling temp file in the same directory and `os.replace`ing it means readers always
+    see either the whole old stream or the whole new one.
+    """
+    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(target.parent),
+                                          prefix=f".{target.name}.", suffix=".tmp", delete=False)
+    temp_path = Path(handle.name)
+    try:
+        with handle:
+            for rec in records:
+                handle.write(json.dumps(rec, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 def main() -> int:
     if not METRICS.exists():
         print(f"error: no metrics stream at {METRICS}", file=sys.stderr)
         return 1
 
-    records = []
-    bad = 0
-    with METRICS.open(encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                bad += 1
+    # Hold the package's single writer lock across the whole read→rewrite so a concurrent
+    # `orchestrator` append between this script's read and its atomic replace is never lost —
+    # the same lock `record_batch`/`EventStore` take before appending or checkpointing.
+    with writer_lock(STATE):
+        records = []
+        bad = 0
+        with METRICS.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    bad += 1
 
-    if bad:
-        print(f"warning: {bad} malformed lines skipped", file=sys.stderr)
+        if bad:
+            print(f"warning: {bad} malformed lines skipped", file=sys.stderr)
 
-    kept: list[dict] = []
-    quarantined: list[dict] = []
-    categories: Counter = Counter()
-    reasons: Counter = Counter()
+        kept: list[dict] = []
+        quarantined: list[dict] = []
+        categories: Counter = Counter()
+        reasons: Counter = Counter()
 
-    for rec in records:
-        cat, reason = categorize(rec)
-        categories[cat] += 1
-        if cat == "keep":
-            kept.append(rec)
-        elif cat == "patch":
-            cleaned, q = clean(rec, quarantine_reason="")
-            if cleaned is not None:
-                kept.append(cleaned)
-                reasons["patched:" + reason] += 1
-            else:
+        for rec in records:
+            cat, reason = categorize(rec)
+            categories[cat] += 1
+            if cat == "keep":
+                kept.append(rec)
+            elif cat == "patch":
+                cleaned, q = clean(rec, quarantine_reason="")
+                if cleaned is not None:
+                    kept.append(cleaned)
+                    reasons["patched:" + reason] += 1
+                else:
+                    quarantined.append(q)
+                    reasons["quarantined:" + reason] += 1
+            elif cat == "quarantine":
+                _, q = clean(rec, quarantine_reason=reason)
                 quarantined.append(q)
                 reasons["quarantined:" + reason] += 1
-        elif cat == "quarantine":
-            _, q = clean(rec, quarantine_reason=reason)
-            quarantined.append(q)
-            reasons["quarantined:" + reason] += 1
 
-    # Backup current metrics stream.
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = STATE / f"metrics.pre-cleanup-{ts}.jsonl"
-    shutil.copy2(METRICS, backup)
+        # Backup current metrics stream.
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = STATE / f"metrics.pre-cleanup-{ts}.jsonl"
+        shutil.copy2(METRICS, backup)
 
-    # Write quarantine file.
-    q_path = STATE / f"metrics.quarantine-{ts}.jsonl"
-    with q_path.open("w", encoding="utf-8") as fh:
-        for rec in quarantined:
-            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        # Write quarantine file.
+        q_path = STATE / f"metrics.quarantine-{ts}.jsonl"
+        with q_path.open("w", encoding="utf-8") as fh:
+            for rec in quarantined:
+                fh.write(json.dumps(rec, sort_keys=True) + "\n")
 
-    # Rewrite metrics.jsonl clean.
-    with METRICS.open("w", encoding="utf-8") as fh:
-        for rec in kept:
-            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+        # Rewrite metrics.jsonl clean, atomically, while still holding the lock so nothing can
+        # append between this replace and the lock release.
+        _write_atomic(METRICS, kept)
 
     print(f"audit summary (total {len(records)}):")
     print(f"  kept:        {categories.get('keep', 0)}")
