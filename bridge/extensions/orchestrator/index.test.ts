@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
@@ -12,6 +12,7 @@ import { planReconTasks } from "./recon.ts";
 import { METHOD, TIER_CAPABILITIES, buildAliasTable } from "./models.ts";
 import type { DispatchResult, DispatchTask } from "./index.ts";
 import { RunCancellation } from "./cancellation.ts";
+import { MAX_CHILD_STDERR_DISK_BYTES } from "./dispatch-outcome.ts";
 
 mock.module("@humain/terminal", () => ({
 	BorderedLoader: class {
@@ -1896,6 +1897,172 @@ describe("runSubagentProcess process/event handling", () => {
 		expect(result.postCompletionError).toContain("fixture shutdown failure");
 	});
 
+	test("long minified-bundle-style source line surfaces the sentinel and a stack frame past the 64 KiB pipe boundary (no session)", async () => {
+		// Reproduces HT's real failure mode: an uncaught exception on a source
+		// line long enough to model a minified bundle. Node prints that source
+		// line first, then the error name/message/stack — over a pipe, anything
+		// past ~64 KiB at process exit is silently dropped, so the sentinel and
+		// stack never arrive. See fixtures/long-line-throw.mjs for why the
+		// generated (>300 KB) child script itself is not committed.
+		const { writeLongLineThrowFixture, SENTINEL } = await import("./fixtures/long-line-throw.mjs");
+		const fixtureDir = mkdtempSync(join(tmpdir(), "orch-long-line-fixture-"));
+		const scriptPath = join(fixtureDir, "long-line-throw.mjs");
+		writeLongLineThrowFixture(scriptPath);
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir,
+				agentName: "__no_persona__",
+				task: "do the fixture task",
+				model: "provider/model",
+				ctx: {} as never,
+				spawnChild: (_command, _args, options) => nodeSpawn(process.execPath, [scriptPath], options as never),
+			});
+
+			expect(result.stderr).toContain(SENTINEL);
+			expect(result.stderr).toMatch(/\n\s+at /);
+		} finally {
+			rmSync(fixtureDir, { recursive: true, force: true });
+		}
+	});
+
+	test("long minified-bundle-style source line surfaces the sentinel and a stack frame in the persisted <taskId>.stderr.log (with session)", async () => {
+		const { writeLongLineThrowFixture, SENTINEL } = await import("./fixtures/long-line-throw.mjs");
+		const fixtureDir = mkdtempSync(join(tmpdir(), "orch-long-line-fixture-"));
+		const scriptPath = join(fixtureDir, "long-line-throw.mjs");
+		writeLongLineThrowFixture(scriptPath);
+		const session = createSession("long-line-session");
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir,
+				agentName: "__no_persona__",
+				task: "do the fixture task",
+				model: "provider/model",
+				ctx: {} as never,
+				taskId: "long-line",
+				session,
+				spawnChild: (_command, _args, options) => nodeSpawn(process.execPath, [scriptPath], options as never),
+			});
+
+			expect(result.stderr).toContain(SENTINEL);
+			expect(result.stderr).toMatch(/\n\s+at /);
+
+			const logged = readFileSync(session.file("long-line.stderr.log"), "utf8");
+			expect(logged).toContain(SENTINEL);
+			expect(logged).toMatch(/\n\s+at /);
+		} finally {
+			session.close();
+			rmSync(fixtureDir, { recursive: true, force: true });
+		}
+	});
+
+	test("long minified-bundle-style source line surfaces the sentinel and a stack frame through a real Node parent", async () => {
+		// The two tests above spawn the long-line fixture directly from bun (the
+		// test runner), which happens to drain a fast-exiting child's stderr
+		// pipe in full — they pass on pre-fix code too, so they do not actually
+		// exercise the bug this file's fix commits address. HT's real parent
+		// process is Node, and Node's async pipe read is what silently drops
+		// the tail. This test runs the real `runSubagentProcess` inside a real
+		// `node` child. The outer bun<->node spawn/read below only carries a
+		// small JSON result file, never the megabyte-scale fixture stderr — the
+		// pipe under test is the inner one, between the fixture script and the
+		// bundled driver's real-Node parent.
+		const nodeBin = Bun.which("node");
+		if (!nodeBin) {
+			throw new Error(
+				"`node` binary not found on PATH — this regression test requires a real Node parent process " +
+					"(reproducing bun's own pipe-reading behavior does not exercise HT's actual failure mode).",
+			);
+		}
+
+		const { writeLongLineThrowFixture, SENTINEL } = await import("./fixtures/long-line-throw.mjs");
+		const fixtureDir = mkdtempSync(join(tmpdir(), "orch-long-line-node-fixture-"));
+		const scriptPath = join(fixtureDir, "long-line-throw.mjs");
+		writeLongLineThrowFixture(scriptPath);
+
+		const buildDir = mkdtempSync(join(tmpdir(), "orch-node-driver-build-"));
+		const nodeStateRoot = mkdtempSync(join(tmpdir(), "orch-node-driver-state-"));
+		const driverRepoDir = mkdtempSync(join(tmpdir(), "orch-node-driver-repo-"));
+		const outFile = join(buildDir, "result.json");
+		try {
+			// index.ts imports "@humain/terminal" for the persona/UI helpers, which
+			// only resolves inside HT's own runtime. index.test.ts's `bun:test`
+			// mock.module registers a virtual module for it, but that mock is a
+			// bun:test runtime feature and does not apply to a plain `Bun.build`
+			// bundle later run under real `node`. Stub it at build time instead —
+			// this test's code path (`agentName: "__no_persona__"`) never calls
+			// `discoverAgents`/`BorderedLoader`, so the stubs only need to satisfy
+			// the module's top-level named imports.
+			const build = await Bun.build({
+				entrypoints: [join(fixturesDir, "run-subagent-under-node.ts")],
+				outdir: buildDir,
+				target: "node",
+				format: "esm",
+				plugins: [
+					{
+						name: "stub-humain-terminal",
+						setup(b) {
+							b.onResolve({ filter: /^@humain\/terminal$/ }, () => ({
+								path: "@humain/terminal",
+								namespace: "stub-humain-terminal",
+							}));
+							b.onLoad({ filter: /.*/, namespace: "stub-humain-terminal" }, () => ({
+								contents: `
+									export const discoverAgents = () => ({ agents: [] });
+									export class BorderedLoader { constructor() {} }
+									export const renderTaskWithContext = (task) => task;
+								`,
+								loader: "js",
+							}));
+						},
+					},
+				],
+			});
+			if (!build.success) {
+				throw new Error(`Bun.build of the Node driver failed:\n${build.logs.map((l) => String(l.message ?? l)).join("\n")}`);
+			}
+
+			const driverPath = join(buildDir, "run-subagent-under-node.js");
+			// `Bun.which("node")` above already requires a real `node` binary on PATH
+			// (this test's whole point is exercising Node's own async-pipe-read
+			// behavior, which bun's runner does not reproduce); a `timeout` here bounds
+			// a hung driver (e.g. a regression that leaves the run's diagnostics lease
+			// open) instead of hanging the whole test run indefinitely.
+			execFileSync(nodeBin, [driverPath, driverRepoDir, scriptPath, "long-line-node", outFile], {
+				timeout: 60_000,
+				env: {
+					...process.env,
+					HUMAIN_ORCHESTRATOR_STATE_ROOT: nodeStateRoot,
+					HUMAIN_ORCHESTRATOR_SKILL_ROOT: fileURLToPath(new URL("../../../", import.meta.url)),
+				},
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+
+			const { stderrText, stderrLogPath, stderrLogSize } = JSON.parse(readFileSync(outFile, "utf8")) as {
+				stderrText: string;
+				stderrLogPath: string;
+				stderrLogSize: number;
+			};
+
+			expect(stderrText).toContain(SENTINEL);
+			expect(stderrText).toMatch(/\n\s+at /);
+
+			expect(stderrLogSize).toBeGreaterThan(0);
+			const logged = readFileSync(stderrLogPath, "utf8");
+			expect(logged).toContain(SENTINEL);
+			expect(logged).toMatch(/\n\s+at /);
+		} catch (err) {
+			const stderr = (err as { stderr?: Buffer | string }).stderr;
+			throw new Error(
+				`Node driver failed: ${(err as Error).message}${stderr ? `\n--- driver stderr ---\n${stderr}` : ""}`,
+			);
+		} finally {
+			rmSync(fixtureDir, { recursive: true, force: true });
+			rmSync(buildDir, { recursive: true, force: true });
+			rmSync(nodeStateRoot, { recursive: true, force: true });
+			rmSync(driverRepoDir, { recursive: true, force: true });
+		}
+	});
+
 	test("does not recover a result that never reaches agent_settled", async () => {
 		const result = await orchestrator.runSubagentProcess({
 			cwd: repoDir,
@@ -1989,6 +2156,452 @@ describe("runSubagentProcess process/event handling", () => {
 		expect(result.outcome).toBe("failed");
 		expect(result.exitCode).toBe(1);
 		expect(result.stderr).toContain("ENOENT");
+	});
+
+	test("BLOCKING 1: a provider-error note is written exactly once when the child emits no stderr", async () => {
+		// Regression for the double-write: finish() sees an empty backing file and
+		// writes the provider-error note into it; the 'close' handler used to
+		// re-stat the file, see the bytes finish() had just written, mistake them
+		// for real child bytes, and append the same note a second time.
+		const session = createSession("provider-error-once");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "openai-codex/gpt-6-astra",
+				ctx: {} as never, capability: "security_review", taskId: "provider-error-once", session,
+				spawnChild: () => child as never,
+			});
+			emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "You have hit your usage limit.", usage: { input: 0, output: 0, cost: { total: 0 } } } });
+			emit({ type: "agent_end", messages: [] });
+			emit({ type: "agent_settled" });
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.outcome).toBe("failed");
+			const log = readFileSync(session.file("provider-error-once.stderr.log"), "utf8");
+			expect((log.match(/usage limit/g) ?? []).length).toBe(1);
+			expect((result.stderr.match(/usage limit/g) ?? []).length).toBe(1);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("BLOCKING 1: a timeout note is written exactly once when the child is silent on stderr", async () => {
+		const session = createSession("timeout-once");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "timeout-once", session,
+				leadTimeouts: { inactivityMs: 50, maxMs: 5000 },
+				spawnChild: () => child as never,
+			});
+			expect(result.outcome).toBe("timed_out");
+			// The real process 'close' event arrives after finish() already settled
+			// (as it does in production: kill() races the OS reporting exit).
+			child.emit("close", 124);
+			await Promise.resolve();
+			const log = readFileSync(session.file("timeout-once.stderr.log"), "utf8");
+			expect((log.match(/UNVERIFIED PARTIAL WORK/g) ?? []).length).toBe(1);
+		} finally {
+			child.emit("close", 137);
+			session.close();
+		}
+	});
+
+	test("the recovered-result warning prefix stays a prefix, in both the returned stderr and stderr.log", async () => {
+		const session = createSession("recovered-prefix");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "recovered-prefix", session,
+				spawnChild: () => child as never,
+			});
+			emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "fixture task completed" }] } });
+			emit({ type: "agent_end", messages: [] });
+			emit({ type: "agent_settled" });
+			// The child completed the JSON protocol cleanly, then the process itself
+			// exits non-zero — the "recovered" path. No real bytes ever land on the
+			// backing fd here (this is a test double), so this exercises finish()'s
+			// own file write (the `fileBytes === 0` branch), matching the scenario
+			// the review comment names.
+			child.emit("close", 1);
+			const result = await pending;
+
+			expect(result.outcome).toBe("completed_after_process_error");
+			const prefix = "[orchestrator] child produced a terminal result";
+			expect(result.stderr.startsWith(prefix)).toBe(true);
+			const log = readFileSync(session.file("recovered-prefix.stderr.log"), "utf8");
+			expect(log.startsWith(prefix)).toBe(true);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("a colliding taskId falls back to a temp file, logs the fallback, and preserves the child's stderr under a non-clobbering name", async () => {
+		const session = createSession("fallback-collision");
+		const child1 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const first = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "dup-task", session,
+				spawnChild: () => child1 as never,
+			});
+			child1.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: "first" } })}\n`);
+			child1.emit("close", 0);
+			await first;
+
+			// A second dispatch under the SAME session reuses the same taskId (an
+			// unexpected but not fatal collision: openChildStderrFile refuses to
+			// reopen an existing name). It gets a REAL child (spawnInlineScript),
+			// not a test double, so real bytes land on the fallback temp file's fd
+			// -- proving the content is actually preserved, not merely absent.
+			const result2 = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "dup-task", session,
+				spawnChild: spawnInlineScript(
+					`process.stderr.write("second dispatch stderr\\n");` +
+						`process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",stopReason:"stop",content:"second"}})+"\\n");`,
+				),
+			});
+			expect(result2.stderr).toContain("second dispatch stderr");
+
+			// The first dispatch's own log is untouched by the collision.
+			const firstLog = readFileSync(session.file("dup-task.stderr.log"), "utf8");
+			expect(firstLog).not.toContain("second dispatch stderr");
+			// The fallback is logged, not silent.
+			expect(readFileSync(session.file("run.log"), "utf8")).toContain("fell back to a private temp file");
+			// The second dispatch's real stderr is preserved in the run's own
+			// diagnostics under a name that cannot collide with dup-task.stderr.log.
+			expect(readFileSync(session.file("dup-task.stderr.log.fallback"), "utf8")).toContain("second dispatch stderr");
+
+			// The collision must not have invalidated the first dispatch's own
+			// release()-time snapshot: sealing the run must still succeed.
+			session.close(true);
+			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(true);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 2 / BLOCKING 1: a taskId collision where the second child is silent leaves the first dispatch's log byte-for-byte untouched, and the run seals", async () => {
+		const session = createSession("collision-silent");
+		const child1 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const first = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "collide-silent", session,
+				spawnChild: () => child1 as never,
+			});
+			child1.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: "first" } })}\n`);
+			child1.stderr.write("first dispatch stderr\n");
+			child1.emit("close", 0);
+			await first;
+			const firstLogBefore = readFileSync(session.file("collide-silent.stderr.log"), "utf8");
+			expect(firstLogBefore).toContain("first dispatch stderr");
+
+			// Second dispatch reuses the same taskId and is completely silent on
+			// stderr (a test double: nothing ever writes to the real backing fd).
+			const child2 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+			const second = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "collide-silent", session,
+				spawnChild: () => child2 as never,
+			});
+			child2.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: "second" } })}\n`);
+			child2.emit("close", 0);
+			await second;
+
+			// The first dispatch's log must not have been truncated to "" (or
+			// otherwise altered) by the second dispatch's collision handling.
+			const firstLogAfter = readFileSync(session.file("collide-silent.stderr.log"), "utf8");
+			expect(firstLogAfter).toBe(firstLogBefore);
+			expect(firstLogAfter.length).toBeGreaterThan(0);
+
+			session.close(true);
+			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(true);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 2 / BLOCKING 1: a taskId collision where the second child times out appends its notes to the fallback file, not the first dispatch's log, and the run seals", async () => {
+		const session = createSession("collision-timeout");
+		const child1 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const first = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "collide-timeout", session,
+				spawnChild: () => child1 as never,
+			});
+			child1.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: "first" } })}\n`);
+			child1.emit("close", 0);
+			await first;
+			const firstLogBefore = readFileSync(session.file("collide-timeout.stderr.log"), "utf8");
+
+			// Second dispatch reuses the same taskId and times out (inactivity):
+			// its interruption note must land on the fallback file, not clobber or
+			// append into the first dispatch's already-sealed-worthy log.
+			const child2 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+			const second = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "collide-timeout", session,
+				leadTimeouts: { inactivityMs: 50, maxMs: 5000 },
+				spawnChild: () => child2 as never,
+			});
+			const result2 = await second;
+			expect(result2.outcome).toBe("timed_out");
+			child2.emit("close", 137);
+			await Promise.resolve();
+
+			const firstLogAfter = readFileSync(session.file("collide-timeout.stderr.log"), "utf8");
+			expect(firstLogAfter).toBe(firstLogBefore);
+			expect(readFileSync(session.file("run.log"), "utf8")).toContain("fell back to a private temp file");
+			const fallback = readFileSync(session.file("collide-timeout.stderr.log.fallback"), "utf8");
+			expect(fallback).toContain("UNVERIFIED PARTIAL WORK");
+
+			session.close(true);
+			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(true);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 2 / BLOCKING 2: a recovered result's persisted stderr.log leads with the warning prefix, then the child's real bytes, not the reverse", async () => {
+		const session = createSession("recovered-real-bytes");
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "recovered-real-bytes", session,
+				// A real Node child (not a test double): stderr bytes land on the
+				// backing fd for real, exercising the `fileBytes > 0` branch of the
+				// close handler, not finish()'s own no-real-bytes-yet write.
+				spawnChild: spawnInlineScript(
+					`const e=[{type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:"done"}]}},{type:"agent_end",messages:[]},{type:"agent_settled"}];` +
+						`for(const x of e)process.stdout.write(JSON.stringify(x)+"\\n");` +
+						`process.stderr.write("teardown boom\\n");process.exitCode=1;`,
+				),
+			});
+
+			expect(result.outcome).toBe("completed_after_process_error");
+			const prefix = "[orchestrator] child produced a terminal result";
+			expect(result.stderr.startsWith(prefix)).toBe(true);
+			const log = readFileSync(session.file("recovered-real-bytes.stderr.log"), "utf8");
+			expect(log.startsWith(prefix)).toBe(true);
+			expect(log).toContain("teardown boom");
+			expect(log.indexOf(prefix)).toBeLessThan(log.indexOf("teardown boom"));
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 2 / WARNING: real bytes written to the backing fd between settle (0 bytes) and close are appended, not truncated away", async () => {
+		const session = createSession("late-bytes-warning");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "late-bytes-warning", session,
+				leadTimeouts: { inactivityMs: 50, maxMs: 5000 },
+				spawnChild: () => child as never,
+			});
+			// Let the inactivity timeout settle the dispatch with 0 bytes observed
+			// on the backing file (the test double never writes to the real fd).
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			// Real bytes now land on the backing file through an independent fd
+			// (O_APPEND-opened, like a genuine child's own duplicate would be),
+			// simulating a child that keeps writing briefly during its own
+			// teardown after the orchestrator has already settled and written
+			// its timeout note.
+			const fd = openSync(session.file("late-bytes-warning.stderr.log"), "a");
+			try { writeSync(fd, "late child bytes after settle\n"); } finally { closeSync(fd); }
+			child.emit("close", 137);
+			const result = await pending;
+
+			expect(result.outcome).toBe("timed_out");
+			const log = readFileSync(session.file("late-bytes-warning.stderr.log"), "utf8");
+			expect(log).toContain("UNVERIFIED PARTIAL WORK");
+			expect(log).toContain("late child bytes after settle");
+			// The orchestrator's own note must remain a prefix; the late bytes are
+			// appended after it, never overwriting it.
+			expect(log.indexOf("UNVERIFIED PARTIAL WORK")).toBeLessThan(log.indexOf("late child bytes after settle"));
+			// The late bytes already landed in place on the backing file through the
+			// same O_APPEND fd as everything else in this (non-fallback) log; the
+			// close handler must never re-read and re-append them, or they show up
+			// twice in the sealed log (BLOCKING, review round 3).
+			const occurrences = log.split("late child bytes after settle").length - 1;
+			expect(occurrences).toBe(1);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 3 / BLOCKING: late bytes that push the backing file past the disk cap are capped in place, never unboundedly duplicated", async () => {
+		const session = createSession("late-bytes-over-cap");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "late-bytes-over-cap", session,
+				leadTimeouts: { inactivityMs: 50, maxMs: 5000 },
+				spawnChild: () => child as never,
+			});
+			// Settle at 0 bytes observed on the backing file, exactly like the WARNING
+			// test above, but this time the "late bytes" that land afterward through
+			// the independent O_APPEND fd exceed MAX_CHILD_STDERR_DISK_BYTES on their
+			// own. The close handler must cap the file (bounded head/tail reads via
+			// capChildStderrFile), never allocate a same-sized in-memory buffer for
+			// the whole delta and never duplicate any of it.
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			const tailMarker = "HAO_LATE_BYTES_TAIL_SENTINEL_9c1a";
+			const oversized = "L".repeat(MAX_CHILD_STDERR_DISK_BYTES + 1024) + tailMarker;
+			const fd = openSync(session.file("late-bytes-over-cap.stderr.log"), "a");
+			try { writeSync(fd, oversized); } finally { closeSync(fd); }
+			child.emit("close", 137);
+			const result = await pending;
+
+			expect(result.outcome).toBe("timed_out");
+			const log = readFileSync(session.file("late-bytes-over-cap.stderr.log"), "utf8");
+			expect(log).toContain("UNVERIFIED PARTIAL WORK");
+			// Capped, not duplicated: the sentinel that marks the true end of the
+			// late bytes appears exactly once, and the whole file stays within the
+			// disk cap (plus the small, fixed marker/note overhead).
+			const occurrences = log.split(tailMarker).length - 1;
+			expect(occurrences).toBe(1);
+			expect(Buffer.byteLength(log, "utf8")).toBeLessThanOrEqual(MAX_CHILD_STDERR_DISK_BYTES + 4096);
+			expect(log).toMatch(/bytes elided \(on-disk stderr exceeded the \d+-byte cap\)/);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 3 / WARNING: a recovered result's persisted log reserves room for the prefix when capping oversized real content", async () => {
+		const session = createSession("cap-with-prefix");
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "cap-with-prefix", session,
+				// A real Node child (not a test double) whose stderr fd is oversized
+				// (well past MAX_CHILD_STDERR_DISK_BYTES) before it settles and then
+				// exits non-zero after a terminal result, exercising the
+				// completed_after_process_error prefix together with the cap.
+				spawnChild: spawnInlineScript(
+					`process.stderr.write("B".repeat(${MAX_CHILD_STDERR_DISK_BYTES} + 65536) + "HAO_CAP_PREFIX_TAIL_SENTINEL\\n");` +
+						`const e=[{type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:"done"}]}},{type:"agent_end",messages:[]},{type:"agent_settled"}];` +
+						`for(const x of e)process.stdout.write(JSON.stringify(x)+"\\n");` +
+						`process.exitCode=1;`,
+				),
+			});
+
+			expect(result.outcome).toBe("completed_after_process_error");
+			const prefix = "[orchestrator] child produced a terminal result";
+			expect(result.stderr.startsWith(prefix)).toBe(true);
+			const log = readFileSync(session.file("cap-with-prefix.stderr.log"), "utf8");
+			expect(log.startsWith(prefix)).toBe(true);
+			expect(log).toContain("HAO_CAP_PREFIX_TAIL_SENTINEL");
+			expect(log.split("HAO_CAP_PREFIX_TAIL_SENTINEL").length - 1).toBe(1);
+			// The prefix itself must be reserved room for, not squeezed out by the
+			// content cap: the whole persisted file (prefix + capped content) stays
+			// within MAX_CHILD_STDERR_DISK_BYTES.
+			expect(Buffer.byteLength(log, "utf8")).toBeLessThanOrEqual(MAX_CHILD_STDERR_DISK_BYTES);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 3 / WARNING: a fallback target's persisted log reserves room for both the content cap and the interruption notes", async () => {
+		const session = createSession("cap-with-notes-fallback");
+		const child1 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			// First dispatch reserves the real backing file for this taskId.
+			const first = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "cap-with-notes-fallback", session,
+				spawnChild: () => child1 as never,
+			});
+			child1.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: "first" } })}\n`);
+			child1.emit("close", 0);
+			await first;
+
+			// Second dispatch reuses the same taskId (forcing the collision fallback
+			// to a private temp file) with a real child that writes oversized real
+			// content, then times out via inactivity (producing an interruption
+			// note). Both the cap and the note must be reserved for in the same
+			// persisted-file budget.
+			const tailMarker = "HAO_CAP_NOTES_TAIL_SENTINEL";
+			const second = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "cap-with-notes-fallback", session,
+				leadTimeouts: { inactivityMs: 100, maxMs: 5000 },
+				spawnChild: spawnInlineScript(
+					`process.stderr.write("C".repeat(${MAX_CHILD_STDERR_DISK_BYTES} + 65536) + "${tailMarker}\\n");` +
+						"setInterval(() => {}, 1000);",
+				),
+			});
+			const result = await second;
+			// finish() resolves the promise from the timeout handler, which races the
+			// real process's actual SIGKILL + 'close' event; the close handler's own
+			// diagnosticWriter work (including this test's fallback file) runs after
+			// that event fires, not before the promise settles. Give the real OS
+			// process time to actually exit and 'close' to fire.
+			await new Promise((resolve) => setTimeout(resolve, 500));
+
+			expect(result.outcome).toBe("timed_out");
+			expect(readFileSync(session.file("run.log"), "utf8")).toContain("fell back to a private temp file");
+			const fallback = readFileSync(session.file("cap-with-notes-fallback.stderr.log.fallback"), "utf8");
+			expect(fallback).toContain("UNVERIFIED PARTIAL WORK");
+			expect(fallback).toContain(tailMarker);
+			expect(fallback.split(tailMarker).length - 1).toBe(1);
+			expect(Buffer.byteLength(fallback, "utf8")).toBeLessThanOrEqual(MAX_CHILD_STDERR_DISK_BYTES);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("BLOCKING 2: a detached grandchild that escapes the process group and writes after settle does not overwrite earlier content, and seal detects the growth", async () => {
+		const session = createSession("escaped-grandchild");
+		const fixtureDir = mkdtempSync(join(tmpdir(), "orch-escaped-grandchild-"));
+		const scriptPath = join(fixtureDir, "escaped-grandchild.mjs");
+		// The immediate child never settles (so the lead's own absolute timeout
+		// kills it) and spawns its own detached (own-process-group) grandchild that
+		// inherits fd 2 and writes to it only after a delay — by which time the
+		// orchestrator has already settled, written its timeout note into the
+		// file, capped/appended, and released the lease. `detached: true` here is
+		// exactly the escape: `killProcessTree`'s `process.kill(-pid, "SIGKILL")`
+		// only reaches the immediate child's own process group.
+		writeFileSync(scriptPath, [
+			"import { spawn } from \"node:child_process\";",
+			"const grandchild = spawn(process.execPath, [\"-e\",",
+			"  \"setTimeout(()=>{try{require('fs').writeSync(2,'grandchild wrote after settle\\\\n');}catch{}process.exit(0);},500);\"",
+			"], { stdio: [\"ignore\", \"ignore\", 2], detached: true });",
+			"grandchild.unref();",
+			"setInterval(() => {}, 1000);",
+		].join("\n"), "utf8");
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "escaped-grandchild", session,
+				leadTimeouts: { inactivityMs: 100, maxMs: 5000 },
+				spawnChild: (_command, _args, options) => nodeSpawn(process.execPath, [scriptPath], options as never),
+			});
+			expect(result.outcome).toBe("timed_out");
+			const beforeGrandchild = readFileSync(session.file("escaped-grandchild.stderr.log"), "utf8");
+			expect(beforeGrandchild).toContain("UNVERIFIED PARTIAL WORK");
+			// Give the detached grandchild time to write after settle/close/release.
+			await new Promise((resolve) => setTimeout(resolve, 900));
+			const afterGrandchild = readFileSync(session.file("escaped-grandchild.stderr.log"), "utf8");
+			// Earlier content must not have been overwritten at offset 0.
+			expect(afterGrandchild.startsWith(beforeGrandchild)).toBe(true);
+			expect(afterGrandchild).toContain("grandchild wrote after settle");
+			session.close(true);
+			// The file changed after the orchestrator's own final write; seal must veto.
+			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(false);
+		} finally {
+			session.close();
+			rmSync(fixtureDir, { recursive: true, force: true });
+		}
 	});
 });
 

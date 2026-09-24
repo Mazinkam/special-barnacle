@@ -188,8 +188,61 @@ then `recon: K/N completed; dispatching lead(s)`, or
 | `run.log` | human-readable timeline: phases, every dispatch start/end, every tool call, verdicts |
 | `<taskId>.prompt.md` | the exact prompt sent to that child (recon workers are `<runId>-recon-<n>`, leads `<runId>-lead-<n>`) |
 | `<taskId>.events.jsonl` | the child's raw `--mode json` stream |
-| `<taskId>.stderr.log` | the child's stderr (only written when non-empty) |
+| `<taskId>.stderr.log` | the child's stderr, captured via a real file descriptor rather than a pipe. Created (possibly empty) for every session dispatch, even one that never writes to stderr |
 | `lead-report.md` | the lead(s)' final reports |
+
+Child stderr is opened as a real fd on `stdio[2]`, not a pipe. On an uncaught
+exception Node prints the offending source line first, then the error's
+name/message/stack; HT's minified bundle can have source lines up to ~650 KB,
+and Node's async pipe read can silently drop everything past its ~64 KiB
+buffer once a fast-exiting child closes — exactly where that name/message/stack
+lives. A real fd has no such loss: the child writes straight to the file, and
+the bytes are visible to any other reader (including this process, after
+`close`) as soon as the write syscall returns — there is no `fsync`, so
+"durably" would overstate it.
+
+Each `<taskId>.stderr.log` is capped on disk at 8 MiB (`MAX_CHILD_STDERR_DISK_BYTES`
+in `dispatch-outcome.ts`) — but only once the child's stdio closes. While the
+child is still running its stderr file can grow past the cap; the cap rewrite
+(head + marker + tail) happens once, in the `close` handler, not as a running
+limit enforced during the write. It is generous enough for many multiples of
+one bundled crash dump plus a full head/tail, while keeping each dispatch's
+disk cost small and fixed once the child has exited. The tail is kept, not
+dropped, since that is almost always where the actual error text is. The
+in-memory `stderr` returned to callers stays bounded the same way it always
+has (a small head/tail capture via `BoundedCapture`, headBytes=8 KiB/tailBytes=56
+KiB by default), independent of the on-disk cap.
+
+Because the child is spawned `detached` (its own process group, so a timeout
+can kill the whole subtree), a descendant that itself spawns a further
+detached, own-process-group descendant can escape that kill and keep an
+inherited copy of the stderr fd open indefinitely. The fd is opened with
+`O_APPEND` so any such write can only extend the file, never overwrite earlier
+bytes at an offset a different (already-closed) fd left behind. `RunDiagnostics`
+additionally snapshots the file's size/mtime once the orchestrator itself is
+done writing to it (`openChildStderrFile(...).release()`); if a later `seal()`
+finds the file has changed since that snapshot, the seal is vetoed (returns
+`false`) rather than publishing a file it can no longer vouch for — the same
+outcome the old pipe-based path had when a holder kept the pipe open.
+
+A dispatch with no owning run (e.g. triage) has no `<taskId>.stderr.log` to
+write to; its child's stderr instead goes to a private mode-0600 temp file
+(`fs.mkdtemp` under the OS temp dir). That temp file is read back and removed
+at the same point as the fd-backed `<taskId>.stderr.log` case above: once the
+child's stdio actually closes, not at the moment a timeout/cancellation
+settles the dispatch's result (the process may still be tearing down, and
+could still write, in the gap between the two) — except when `spawn()` itself
+throws synchronously, since no child process (and so no `close` event) can
+ever arrive, and cleanup happens immediately in that one path instead. A
+dispatch that DOES have an owning run can still fall back to that same
+private temp file if its `<taskId>.stderr.log` name unexpectedly collides
+with an already-open one (a duplicate/reused taskId); that fallback is logged
+(`run.log` and process stderr), and every write for that dispatch — the
+child's real stderr and the orchestrator's own notes alike — is routed to a
+reserved name that cannot collide with, and so can never overwrite or
+truncate, the original dispatch's own `<taskId>.stderr.log`: normally
+`<taskId>.stderr.log.fallback`, or `.fallback-2`, `.fallback-3`, ... if that
+name is itself already taken (e.g. a third dispatch reusing the same taskId).
 
 The Python EventStore additionally receives `dispatch_plan_confirmed`,
 `dispatch_started`, and `dispatch_finished` events (with model, cost, exit code,

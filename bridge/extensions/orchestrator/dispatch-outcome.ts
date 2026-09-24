@@ -3,11 +3,27 @@
  * Keeping this separate from the HT extension makes teardown recovery testable
  * without importing terminal runtime APIs.
  */
+import { closeSync, constants, existsSync, fstatSync, openSync, readSync, writeSync } from "node:fs";
 
 const DEFAULT_HEAD_BYTES = 8 * 1024;
 const DEFAULT_TAIL_BYTES = 56 * 1024;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+/**
+ * On-disk cap for a child's real stderr file (see index.ts's
+ * runSubagentProcess: stderr now lands on a file descriptor, not a pipe, so
+ * nothing is silently dropped at Node's ~64 KiB async-pipe boundary). Left
+ * fully unbounded, a chatty or malicious child — or one repeatedly dumping
+ * HT's ~650 KB minified-bundle crash output — could grow a single dispatch's
+ * diagnostic file without limit for the run's lifetime. 8 MiB is generous
+ * enough to hold many multiples of that single-line bundle output plus a
+ * full head/tail, while remaining a small, fixed, and predictable disk cost
+ * per dispatch.
+ */
+export const MAX_CHILD_STDERR_DISK_BYTES = 8 * 1024 * 1024;
+const CAP_HEAD_BYTES = 64 * 1024;
+const CAP_MARKER_RESERVE_BYTES = 512;
 
 function concatBytes(left: Uint8Array<ArrayBufferLike>, right: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBufferLike> {
 	const joined = new Uint8Array(left.length + right.length);
@@ -61,6 +77,97 @@ export class BoundedCapture {
 			`\n[orchestrator] … ${this.elidedBytes} bytes elided …\n` +
 			decoder.decode(this.tail)
 		);
+	}
+}
+
+/**
+ * Stream a (possibly large, up to `MAX_CHILD_STDERR_DISK_BYTES`) child-stderr
+ * file back through `BoundedCapture` so the in-memory summary returned to
+ * callers stays small even though the on-disk file is not. Reads through a
+ * fixed-size buffer with a persistent `TextDecoder` (rather than
+ * `readFileSync` + a single `toString`) so decoding is correct across
+ * multi-byte characters split at a chunk boundary, and so memory use during
+ * the read itself is bounded too.
+ */
+export function readStderrFileBounded(path: string, headBytes?: number, tailBytes?: number): string {
+	if (!existsSync(path)) return "";
+	let fd: number;
+	try {
+		// O_NOFOLLOW: this reopens by path (the caller does not hand us an owned
+		// fd), so refuse to follow a symlink swapped in at that path between the
+		// write side's open and this read.
+		fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	} catch {
+		return "";
+	}
+	try {
+		const capture = new BoundedCapture(headBytes, tailBytes);
+		const streamingDecoder = new TextDecoder();
+		const buffer = Buffer.alloc(64 * 1024);
+		let n: number;
+		while ((n = readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+			capture.append(streamingDecoder.decode(buffer.subarray(0, n), { stream: true }));
+		}
+		capture.append(streamingDecoder.decode());
+		return capture.text();
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function readRange(fd: number, length: number, position: number): Buffer {
+	if (length <= 0) return Buffer.alloc(0);
+	const buffer = Buffer.alloc(length);
+	let offset = 0;
+	while (offset < length) {
+		const n = readSync(fd, buffer, offset, length - offset, position + offset);
+		if (n <= 0) break;
+		offset += n;
+	}
+	return buffer.subarray(0, offset);
+}
+
+/**
+ * If the file at `path` exceeds `maxBytes`, return a head + marker + tail
+ * replacement content that fits within the cap; otherwise return `undefined`
+ * (nothing to rewrite). The tail is kept, not dropped: on an uncaught
+ * exception Node prints the offending source line first, then the actual
+ * error name/message/stack — the useful diagnostic is almost always in the
+ * last bytes written, not the first. Reads with explicit positions so a
+ * file far larger than the cap is never fully loaded into memory.
+ */
+export function capChildStderrFile(
+	path: string,
+	maxBytes: number = MAX_CHILD_STDERR_DISK_BYTES,
+	headBytes: number = CAP_HEAD_BYTES,
+): string | undefined {
+	// O_NOFOLLOW: same symlink-swap defense as readStderrFileBounded above.
+	const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	let size: number;
+	try {
+		size = fstatSync(fd).size;
+		if (size <= maxBytes) return undefined;
+		const clampedHeadBytes = Math.min(headBytes, size);
+		const tailBytes = Math.max(0, maxBytes - clampedHeadBytes - CAP_MARKER_RESERVE_BYTES);
+		const head = readRange(fd, clampedHeadBytes, 0);
+		const tail = readRange(fd, tailBytes, Math.max(head.length, size - tailBytes));
+		const elided = size - head.length - tail.length;
+		const marker = `\n[orchestrator] … ${elided} bytes elided (on-disk stderr exceeded the ${maxBytes}-byte cap) …\n`;
+		return `${head.toString("utf8")}${marker}${tail.toString("utf8")}`;
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** Truncate-and-rewrite `path` in place to `content`. Used for the ephemeral
+ * (no-session) temp-file fallback, which owns the file outright and has no
+ * `RunDiagnostics` inode-checked writer to go through. */
+export function rewriteFileInPlace(path: string, content: string): void {
+	const fd = openSync(path, "w");
+	try {
+		writeSync(fd, content, null, "utf8");
+	} finally {
+		closeSync(fd);
 	}
 }
 

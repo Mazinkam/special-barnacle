@@ -26,6 +26,12 @@ function syncDirectory(dir: string): void {
 	try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
+function assertSafeDiagnosticName(name: string): void {
+	if (!name || basename(name) !== name || /[/\\\0]/.test(name) || name.startsWith(".") || name.endsWith(".gz") || protectedNames.has(name)) {
+		throw new Error(`unsafe diagnostic name: ${name}`);
+	}
+}
+
 function publish(dir: string, name: string, value: unknown): void {
 	const tmp = join(dir, `.${name}.${randomUUID()}.tmp`);
 	const fd = openSync(tmp, "wx", 0o600);
@@ -42,9 +48,41 @@ export interface DiagnosticWriter {
 	close(): void;
 }
 
+/**
+ * A raw, real file descriptor for a child process's stdio slot (e.g.
+ * `stdio[2]`), created/owned under the same fresh-directory, single-owner
+ * guarantees as every other diagnostic file. Node's async pipe reads can
+ * silently drop the tail of a fast-exiting child's stderr (see index.ts's
+ * runSubagentProcess); handing the child a real fd instead avoids that
+ * entirely, at the cost of the caller managing the fd's lifetime explicitly.
+ */
+export interface ChildStderrFile {
+	readonly path: string;
+	readonly fd: number;
+	/** Close the caller's copy of the fd. Idempotent. Call once the child has
+	 * inherited it (or spawning failed) — the child's own duplicate, if any,
+	 * keeps the file writable independently of this call. */
+	closeFd(): void;
+	/** Release the write lease taken for this file, closing the fd first if the
+	 * caller has not already done so. Call once no further diagnostic writes
+	 * (raw child bytes or `writer()` appends) will target this file. */
+	release(): void;
+}
+
 export class RunDiagnostics {
 	private readonly owner;
 	private readonly files = new Map<string, { dev: number; ino: number }>();
+	/**
+	 * Recorded once, at `openChildStderrFile(...).release()` time, for a
+	 * child-stderr file only: the fstat size/mtime the orchestrator itself last
+	 * observed after every write it intended to make. A detached descendant
+	 * that escaped the process group (see index.ts's `killProcessTree`) can
+	 * still hold the same underlying open file description and keep writing
+	 * after that point; `seal()` compares against this snapshot and vetoes the
+	 * seal if the file no longer matches, the way the old pipe path effectively
+	 * did when a holder kept the pipe open.
+	 */
+	private readonly childStderrFinal = new Map<string, { size: number; mtimeMs: number }>();
 	private readonly leases = new Set<symbol>();
 	private accepting = true;
 	private failed = false;
@@ -83,11 +121,78 @@ export class RunDiagnostics {
 		};
 	}
 
+	/**
+	 * Open/create `name` for a child process to write directly (e.g. as
+	 * `stdio[2]`), under a lease like `writer()`. The returned fd is registered
+	 * as this file's owned identity so later `writer().write/append(name, ...)`
+	 * calls (used to append the orchestrator's own notes once the child has
+	 * exited) pass the same inode-unchanged validation as any other diagnostic
+	 * write, instead of bypassing it.
+	 */
+	openChildStderrFile(name: string): ChildStderrFile {
+		if (!this.accepting) throw new Error("diagnostics are closing/sealed; no new writer allowed");
+		assertSafeDiagnosticName(name);
+		if (this.files.has(name)) throw new Error(`diagnostic file already exists: ${name}`);
+		const path = join(this.dir, name);
+		// O_APPEND matters beyond this process's own writes: a detached descendant
+		// that escaped the process group (its own dup of this same fd, inherited
+		// through fork/exec) can keep writing after we believe the run is done.
+		// Without O_APPEND its writes land at that fd's own (possibly stale, e.g.
+		// still 0) offset, which can overwrite bytes a *different* fd (ours, in
+		// writeOwned below) wrote later at that same offset. With O_APPEND every
+		// write through this open file description — including the descendant's —
+		// atomically targets the current end of file, so it can only ever append.
+		const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_APPEND, 0o600);
+		try {
+			const st = fstatSync(fd);
+			if (!st.isFile() || st.nlink !== 1) throw new Error("diagnostic inode changed");
+			this.files.set(name, { dev: st.dev, ino: st.ino });
+		} catch (error) {
+			closeSync(fd);
+			throw error;
+		}
+		const lease = Symbol();
+		this.leases.add(lease);
+		let fdOpen = true;
+		const closeFd = () => {
+			if (!fdOpen) return;
+			fdOpen = false;
+			closeSync(fd);
+		};
+		return {
+			path,
+			fd,
+			closeFd,
+			release: () => {
+				closeFd();
+				// Snapshot the file's current state as "the orchestrator's final,
+				// intended write" — release() is documented as being called once no
+				// further diagnostic writes (raw child bytes or writer() appends)
+				// will target this file. Any later change (a still-writing escaped
+				// descendant) is caught by seal()'s comparison against this snapshot.
+				try {
+					const identity = this.files.get(name);
+					if (identity) {
+						const rfd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+						try {
+							const st = fstatSync(rfd);
+							if (st.isFile() && st.nlink === 1 && st.dev === identity.dev && st.ino === identity.ino) {
+								this.childStderrFinal.set(name, { size: st.size, mtimeMs: st.mtimeMs });
+							}
+						} finally { closeSync(rfd); }
+					}
+				} catch {
+					/* seal() independently re-validates and fails closed if unreadable */
+				}
+				this.leases.delete(lease);
+				if (this.leases.size === 0) this.drained?.();
+			},
+		};
+	}
+
 	private writeOwned(name: string, text: string, append: boolean): boolean {
 		try {
-			if (!name || basename(name) !== name || /[/\\\0]/.test(name) || name.startsWith(".") || name.endsWith(".gz") || protectedNames.has(name)) {
-				throw new Error(`unsafe diagnostic name: ${name}`);
-			}
+			assertSafeDiagnosticName(name);
 			const previous = this.files.get(name);
 			const fd = openSync(join(this.dir, name), constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK |
 				(previous ? 0 : constants.O_CREAT | constants.O_EXCL) | (append ? constants.O_APPEND : 0), 0o600);
@@ -137,6 +242,14 @@ export class RunDiagnostics {
 				try {
 					const st = fstatSync(fd);
 					if (!st.isFile() || st.nlink !== 1 || st.dev !== identity.dev || st.ino !== identity.ino) throw new Error("diagnostic inode changed before seal");
+					// A child-stderr file only: if it grew/changed after the orchestrator's
+					// own last intended write (recorded at openChildStderrFile(...).release()),
+					// an escaped descendant is still writing through the inherited fd. Veto
+					// the seal rather than sha256/publish a file we cannot vouch for.
+					const finalSnapshot = this.childStderrFinal.get(name);
+					if (finalSnapshot && (st.size !== finalSnapshot.size || st.mtimeMs !== finalSnapshot.mtimeMs)) {
+						throw new Error(`child stderr file changed after the orchestrator's final write; seal vetoed: ${name}`);
+					}
 					fsyncSync(fd);
 					const hash = createHash("sha256");
 					let raw_bytes = 0, n: number;

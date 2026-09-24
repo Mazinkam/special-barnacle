@@ -31,12 +31,15 @@ import { RunDiagnostics, appendDiagnosticPath, type DiagnosticWriter } from "./r
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
 	appendFileSync,
+	closeSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
+	readSync,
 	realpathSync,
 	rmSync,
 	statSync,
@@ -101,7 +104,15 @@ import { SpendCapTracker, capFor, type SpendCapVerdict } from "./spend-cap.ts";
 import { NestedCostTracker } from "./nested-cost.ts";
 import { escalateLeadCapability, isLeadCapability, isLeadSize, leadSizeOf, sizeLead, type LeadSizeDecision } from "./lead-sizing.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
-import { BoundedCapture, classifyDispatchOutcome, summarizeStderr, trimEventForLog } from "./dispatch-outcome.ts";
+import {
+	BoundedCapture,
+	capChildStderrFile,
+	classifyDispatchOutcome,
+	MAX_CHILD_STDERR_DISK_BYTES,
+	readStderrFileBounded,
+	summarizeStderr,
+	trimEventForLog,
+} from "./dispatch-outcome.ts";
 import {
 	DispatchProgressTracker,
 	ORCHESTRATING_CAPABILITIES,
@@ -1566,6 +1577,149 @@ export function registerOrchestratorStatusTool(pi: ExtensionAPI): void {
  */
 type ChildSpawner = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
 
+interface StderrTarget {
+	readonly path: string;
+	readonly fd: number;
+	/**
+	 * The diagnostic name every `diagnosticWriter.write/append` call for this
+	 * dispatch must target. Equal to the dispatch's own `<taskId>.stderr.log`
+	 * name in the normal case (where `path` above IS that same diagnostics
+	 * file). In the taskId-collision fallback case, `path` is instead a
+	 * private temp file, and this is a distinct, reserved name (`<name>.fallback`,
+	 * or `.fallback-2`, `.fallback-3`, ... if already taken) so writes for this
+	 * dispatch can never land on — and so can never clobber — the earlier
+	 * dispatch's own `<taskId>.stderr.log`.
+	 */
+	readonly persistName: string;
+	/** Close the caller's copy of the fd. Idempotent. */
+	closeFd(): void;
+	/** Release the write lease/temp file. Idempotent; closes the fd first if not already closed. */
+	release(): void;
+}
+
+/**
+ * Fallback diagnostic names already claimed for a given `RunDiagnostics`
+ * instance, keyed by owner so concurrent taskId collisions within one session
+ * pick distinct escape-hatch names instead of racing each other onto the same
+ * `.fallback` file. Reservation happens synchronously (no `await` between
+ * checking and claiming), so within-process races cannot occur even though
+ * dispatches run concurrently.
+ */
+const reservedFallbackNames = new WeakMap<RunDiagnostics, Set<string>>();
+
+function reserveFallbackName(diagnostics: RunDiagnostics, stderrName: string): string {
+	let reserved = reservedFallbackNames.get(diagnostics);
+	if (!reserved) {
+		reserved = new Set();
+		reservedFallbackNames.set(diagnostics, reserved);
+	}
+	let candidate = `${stderrName}.fallback`;
+	let attempt = 2;
+	while (reserved.has(candidate) || existsSync(join(diagnostics.dir, candidate))) {
+		candidate = `${stderrName}.fallback-${attempt}`;
+		attempt += 1;
+	}
+	reserved.add(candidate);
+	return candidate;
+}
+
+/**
+ * Open the destination for a child's stderr as a real file descriptor,
+ * never a pipe. Node prints the offending source line first on an uncaught
+ * exception, then the error's name/message/stack; HT's minified bundle has
+ * source lines up to ~650 KB, and Node's async pipe read can silently drop
+ * everything past its ~64 KiB buffer once the child exits — exactly where
+ * that name/message/stack lives. A real fd has no such loss: the child
+ * writes straight to a file, and the bytes are visible to any other reader
+ * (including this process, after `close`) as soon as the write syscall
+ * returns.
+ *
+ * With a session, the destination is the run's own `<taskId>.stderr.log`,
+ * opened under `RunDiagnostics`' fresh-directory/inode/lease guarantees
+ * (see run-diagnostics.ts) so it participates in the same drain-then-seal
+ * lifecycle as every other diagnostic file. Without a session (e.g. triage,
+ * or a caller that never started a run), it is a private mode-0600 temp file
+ * that the caller must remove via `release()`.
+ */
+function openStderrTarget(session: RunSession | undefined, stderrName: string): StderrTarget {
+	if (session) {
+		try {
+			const backing = session.diagnostics.openChildStderrFile(stderrName);
+			return { path: backing.path, fd: backing.fd, persistName: stderrName, closeFd: backing.closeFd, release: backing.release };
+		} catch (err) {
+			// A reused taskId within one session (unexpected, but not worth failing
+			// the whole dispatch over) or diagnostics already closing/sealed. Fall
+			// back to a private temp file rather than losing the fd-vs-pipe fix —
+			// but that fallback is otherwise invisible, so log it. `persistName`
+			// below is a reserved name distinct from `stderrName`: every later
+			// `diagnosticWriter.write/append` call for THIS dispatch must route
+			// through it, never through `stderrName` itself, or it would reopen
+			// and clobber the earlier dispatch's already-registered file.
+			const message = `stderr for ${stderrName} fell back to a private temp file: ${(err as Error).message}`;
+			console.warn(`[orchestrator] ${message}`);
+			try { session.log(message); } catch { /* best-effort */ }
+			const dir = mkdtempSync(join(tmpdir(), "orch-subagent-stderr-"));
+			const path = join(dir, stderrName);
+			const persistName = reserveFallbackName(session.diagnostics, stderrName);
+			let fd: number;
+			try {
+				fd = openSync(path, "wx", 0o600);
+			} catch (openErr) {
+				try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort temp cleanup */ }
+				throw openErr;
+			}
+			let fdOpen = true;
+			const closeFd = () => {
+				if (!fdOpen) return;
+				fdOpen = false;
+				try { closeSync(fd); } catch { /* already closed */ }
+			};
+			return {
+				path,
+				fd,
+				persistName,
+				closeFd,
+				release: () => {
+					closeFd();
+					// finish()/the 'close' handler already persist this dispatch's real
+					// and orchestrator-authored content under `persistName` as it goes
+					// (see runSubagentProcess); nothing further needs copying here.
+					// Just remove the private temp file/dir.
+					try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort temp cleanup */ }
+				},
+			};
+		}
+	}
+	// No session at all (e.g. triage): private mode-0600 temp file, removed via
+	// release(). `persistName` is unused here — nothing ever writes through a
+	// `diagnosticWriter`, since there is no session to own one.
+	const dir = mkdtempSync(join(tmpdir(), "orch-subagent-stderr-"));
+	const path = join(dir, stderrName);
+	let fd: number;
+	try {
+		fd = openSync(path, "wx", 0o600);
+	} catch (err) {
+		try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort temp cleanup */ }
+		throw err;
+	}
+	let fdOpen = true;
+	const closeFd = () => {
+		if (!fdOpen) return;
+		fdOpen = false;
+		try { closeSync(fd); } catch { /* already closed */ }
+	};
+	return {
+		path,
+		fd,
+		persistName: stderrName,
+		closeFd,
+		release: () => {
+			closeFd();
+			try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort temp cleanup */ }
+		},
+	};
+}
+
 /**
  * Spawn Pi as a one-shot subagent and parse its JSON event stream for the
  * assistant `message_end`, which carries `model`, `usage`, and `cost.total`.
@@ -1768,6 +1922,26 @@ export async function runSubagentProcess(opts: {
 		};
 		let diagnosticWriter: DiagnosticWriter | undefined;
 		let stderrPrefix = "";
+		let stderrTarget: StderrTarget | undefined;
+		// Decided exactly once, at the moment finish() first runs, from the size the
+		// child itself had written to the backing file *before* any orchestrator note
+		// is written into it. The close handler reuses this same decision instead of
+		// re-stat'ing after finish() has already written into the file: re-stat'ing
+		// there mistook the orchestrator's own just-written notes for real child bytes
+		// and appended the same notes a second time (BLOCKING 1).
+		let settledFileBytes: number | undefined;
+		// Set only when finish() itself writes its own notes into the *real*
+		// backing file (fileBytes === 0 at settle, non-fallback target): the
+		// file size immediately after that write. The 'close' handler diffs
+		// against this, not a fresh unconditional re-stat, to tell "the
+		// orchestrator's own notes" apart from "real child bytes that arrived
+		// between settle and close" (the latter must be preserved, not
+		// truncated away).
+		let noteWriteBytes: number | undefined;
+		const currentStderrFileBytes = (): number => {
+			if (!stderrTarget) return 0;
+			try { return statSync(stderrTarget.path).size; } catch { return 0; }
+		};
 		const finish = (processExitCode: number) => {
 			if (settled) return;
 			const cancelled = cancelledByListener || session?.cancellation.isCancelled === true;
@@ -1781,8 +1955,16 @@ export async function runSubagentProcess(opts: {
 			removeCancellationListener?.();
 			if (typeof proc?.pid === "number") liveDispatchPids.delete(proc.pid);
 			cleanupPrompt();
-			const stderr = stderrCapture.text();
-			const stderrSummary = summarizeStderr(stderr);
+			// Real child stderr now lands on a file, not a pipe (see openStderrTarget);
+			// nothing streams it into stderrCapture in real time, so read whatever the
+			// child has written so far — settlement can race the child's own exit on a
+			// timeout/cancel, and the file may still be mid-write at this exact instant.
+			// The 'close' handler below re-reads the final, complete content.
+			const fileBytes = currentStderrFileBytes();
+			if (settledFileBytes === undefined) settledFileBytes = fileBytes;
+			const fileText = fileBytes > 0 ? readStderrFileBounded(stderrTarget!.path) : "";
+			const rawStderr = stderrCapture.text() + (fileText ? `\n${fileText}` : "");
+			const stderrSummary = summarizeStderr(rawStderr);
 			const finalText = assistantTexts.length > 0 ? assistantTexts[assistantTexts.length - 1] : "";
 			// Only recover a process error after the JSON protocol proved the child
 			// completed normally; failures before settlement still fail the dispatch.
@@ -1797,11 +1979,41 @@ export async function runSubagentProcess(opts: {
 				spawnFailed,
 				stderrSummary,
 			});
+			stderrPrefix = outcome.status === "completed_after_process_error"
+				? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n`
+				: "";
+			// The prefix belongs at the START of both the returned stderr and the
+			// persisted stderr.log — it is a warning about how to read what follows,
+			// not a trailing note (pre-change behavior; a later refactor accidentally
+			// dropped it from the returned `stderr`, keeping it only in the file write).
+			// When real child bytes are on disk, the persisted log is written as
+			// prefix + child content + our own notes (BLOCKING 2, review round 2) —
+			// mirror that ordering here too, so the returned value and the log agree
+			// on what comes first. `stderrSummary`/classification above already ran
+			// against `rawStderr` in its original (notes, then file) order; reordering
+			// only the string handed back to the caller does not change either.
+			const stderr = stderrPrefix
+				? fileBytes > 0
+					? `${stderrPrefix}${fileText}${stderrCapture.text() ? `\n${stderrCapture.text()}` : ""}`
+					: `${stderrPrefix}${rawStderr}`
+				: rawStderr;
 			if (diagnosticWriter) {
-				stderrPrefix = outcome.status === "completed_after_process_error"
-					? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n`
-					: "";
-				diagnosticWriter.write(stderrName, stderrPrefix + stderr);
+				// If the child already has real bytes on disk (a real fd-backed stderr
+				// file), leave that file alone here: it may still be open for writing by
+				// a not-yet-exited child, and overwriting it now would race that write.
+				// The 'close' handler caps and appends our notes once the child has
+				// fully exited. Only the legacy (no real file content) path needs the
+				// full write here, matching pre-fd behavior for test doubles that
+				// bypass stdio entirely and stream stderr straight into stderrCapture.
+				if (fileBytes === 0) {
+					diagnosticWriter.write(stderrTarget!.persistName, stderrPrefix + stderrCapture.text());
+					// Only meaningful (and only safe to compare against later) when
+					// `persistName` IS the real backing file at `stderrTarget.path`
+					// (the non-fallback case): record how large that write left it, so
+					// the 'close' handler can tell its own notes apart from any real
+					// child bytes that land afterward, before the process actually exits.
+					if (stderrTarget!.persistName === stderrName) noteWriteBytes = currentStderrFileBytes();
+				}
 			}
 			session?.endDispatch(taskId, outcome.effectiveExitCode, usage.cost, interruptionNote ? summarizeInterruption(interruption!) : outcome.note);
 			resolve({
@@ -1929,10 +2141,11 @@ export async function runSubagentProcess(opts: {
 		const spawnChild: ChildSpawner = opts.spawnChild ?? spawn;
 		try {
 			diagnosticWriter = session?.diagnostics.writer();
+			stderrTarget = openStderrTarget(session ?? undefined, stderrName);
 			proc = spawnChild(invocation.command, invocation.args, {
 				cwd: opts.cwd,
 				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["ignore", "pipe", stderrTarget.fd],
 				env,
 				// Make the child a process-group leader so a timeout can kill the
 				// whole tree. A dispatched lead spawns its own subagents, and
@@ -1941,13 +2154,24 @@ export async function runSubagentProcess(opts: {
 				// their output. We never unref(), so we still await this child.
 				detached: true,
 			});
+			// The child has (or, on POSIX, will momentarily) inherit its own copy of
+			// the fd via the underlying fork/exec; ours is no longer needed. Closing
+			// it here does not affect the child's ability to keep writing to the file.
+			stderrTarget.closeFd();
 		} catch (err) {
 			spawnFailed = true;
 			stderrCapture.append(`\n[orchestrator] spawn threw: ${(err as Error).message}`);
-			finish(1);
-			diagnosticWriter?.close();
+			// A throw from finish() itself (e.g. a diagnostic write failure) must not
+			// leak the fd/lease/temp dir; release/close unconditionally.
+			try {
+				finish(1);
+			} finally {
+				stderrTarget?.release();
+				diagnosticWriter?.close();
+			}
 			return;
 		}
+
 
 		if (typeof proc.pid === "number") liveDispatchPids.add(proc.pid);
 		dispatchStartedAt = Date.now();
@@ -2075,6 +2299,9 @@ export async function runSubagentProcess(opts: {
 		});
 
 		proc.stderr?.on("data", (data) => {
+			// Only ever fires for a test double that hands us a real stream (see
+			// openStderrTarget's fallback for anything spawned for real: stdio[2] is
+			// a raw fd there, so `proc.stderr` is null and this listener is inert).
 			stderrCapture.append(data.toString());
 		});
 
@@ -2083,12 +2310,97 @@ export async function runSubagentProcess(opts: {
 				guardChildStreamHandler("stdout", () => {
 					if (buffer.trim()) processLine(buffer);
 					finish(code ?? 0);
+					// Early settlement on timeout/error is not pipe drain. Keep the lease
+					// until close. Reuse the *settle-time* byte count decided inside
+					// finish() above, not a fresh stat here: finish() may have just written
+					// orchestrator notes into an until-then-empty file, and re-stat'ing
+					// after that would mistake those notes for real child bytes and append
+					// the same notes a second time (BLOCKING 1). capChildStderrFile and the
+					// read-back below run inside this same guarded handler so a throw here
+					// cannot escape as an uncaught exception on the 'close' event.
+					const fileBytes = settledFileBytes ?? 0;
+					const persistName = stderrTarget?.persistName ?? stderrName;
+					// The taskId-collision fallback target (see openStderrTarget) writes its
+					// own persisted content to persistName, a name distinct from
+					// stderrTarget.path's physical file; re-stat'ing that path here is
+					// always safe (finish() never writes through it), unlike the
+					// non-fallback case where path IS the persisted file itself.
+					const isFallback = persistName !== stderrName;
+					if (diagnosticWriter) {
+						if (fileBytes > 0 || (isFallback && currentStderrFileBytes() > 0)) {
+							// Real child bytes exist on the backing file - either observed at
+							// settle, or (fallback only) arrived since. Persist them with the
+							// recovered-result prefix LEADING, not trailing (BLOCKING 2, review
+							// round 2): read the (possibly on-disk-capped) content once and
+							// write prefix+content, then append our own notes after it. Reserve
+							// room for the prefix and the notes in the cap itself (WARNING,
+							// review round 3) so the composed prefix+content+notes never
+							// exceeds MAX_CHILD_STDERR_DISK_BYTES even though only `content` is
+							// capped directly.
+							const notes = stderrCapture.text();
+							const notesSuffix = notes ? `\n${notes}` : "";
+							const reserveBytes = Buffer.byteLength(stderrPrefix, "utf8") + Buffer.byteLength(notesSuffix, "utf8");
+							const budget = Math.max(0, MAX_CHILD_STDERR_DISK_BYTES - reserveBytes);
+							const capped = capChildStderrFile(stderrTarget!.path, budget);
+							if (isFallback) {
+								// The backing file is a private temp file distinct from
+								// persistName's real file (see openStderrTarget's fallback):
+								// its content must actually be copied over. `capped` already
+								// read it through bounded, fixed-position reads when it's
+								// over budget; when under budget, `size <= budget` by
+								// definition of capChildStderrFile, so this read is bounded
+								// by the same cap - never an unbounded whole-file load.
+								const content = capped ?? readFileSync(stderrTarget!.path, "utf8");
+								diagnosticWriter.write(persistName, `${stderrPrefix}${content}`);
+								if (notes) diagnosticWriter.append(persistName, notesSuffix);
+							} else if (capped !== undefined || stderrPrefix) {
+								// Same physical file as persistName: only rewrite it when
+								// something must actually change (a prefix to prepend, or
+								// on-disk content that must shrink to fit the cap) - never an
+								// unconditional read-then-truncate-then-write, which would
+								// open a window where a concurrently-writing escaped
+								// descendant's bytes land between the read and the truncate
+								// and are lost (WARNING, review round 3).
+								const content = capped ?? readFileSync(stderrTarget!.path, "utf8");
+								diagnosticWriter.write(persistName, `${stderrPrefix}${content}`);
+								if (notes) diagnosticWriter.append(persistName, notesSuffix);
+							} else if (notes) {
+								// Nothing to prepend and nothing to cap: the child's bytes are
+								// already exactly where they belong: only the notes are new.
+								diagnosticWriter.append(persistName, notesSuffix);
+							}
+						} else if (!isFallback && noteWriteBytes !== undefined && currentStderrFileBytes() > noteWriteBytes) {
+							// finish() already wrote our notes into the real backing file
+							// (settle saw 0 bytes there), and the child kept writing real
+							// bytes for a moment before actually exiting. Those bytes landed
+							// through the same O_APPEND fd as everything else in this
+							// (non-fallback) file - persistName IS stderrTarget.path here - so
+							// they are already exactly where they belong. Re-reading and
+							// re-appending them (as review round 2 did, via an unbounded
+							// Buffer.alloc(lateBytes) with no cap check) duplicated them in
+							// the sealed log and could allocate without bound (BLOCKING,
+							// review round 3). Only cap the file if it has now grown past the
+							// limit; otherwise leave it untouched.
+							const capped = capChildStderrFile(stderrTarget!.path, MAX_CHILD_STDERR_DISK_BYTES);
+							if (capped !== undefined) diagnosticWriter.write(persistName, capped);
+						} else {
+							// Nothing real ever landed in the backing file (a test double that
+							// bypasses stdio entirely): fall back to persisting stderrCapture's
+							// text wholesale, matching the pre-fd behavior exactly, including
+							// any trailing diagnostics that arrived after finish() resolved.
+							// finish() already wrote this same content once (when fileBytes was
+							// 0 at settle time); this re-write is an idempotent overwrite with
+							// identical content, not a duplicate append.
+							diagnosticWriter.write(persistName, stderrPrefix + stderrCapture.text());
+						}
+					}
 				}, streamFailure);
-				// Early settlement on timeout/error is not pipe drain. Keep the lease until close,
-				// and persist stderr that arrived after finish() resolved the dispatch.
-				diagnosticWriter?.write(stderrName, stderrPrefix + stderrCapture.text());
-			} finally { diagnosticWriter?.close(); }
+			} finally {
+				stderrTarget?.release();
+				diagnosticWriter?.close();
+			}
 		});
+
 
 		proc.on("error", (err) => {
 			spawnFailed = true;
