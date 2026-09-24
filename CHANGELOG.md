@@ -1,5 +1,16 @@
 ## Unreleased
 
+### dashboard: spend-cap breaches
+
+- `spend_cap_exceeded` events were recorded but only visible in the 500-row
+  recent-events tail. `run_evidence.summarize_runs` now joins them onto each run
+  (`spend_cap_hit`, `spend_cap_hits` with cap, cost, overage, cost/cap ratio and
+  subagent share; malformed amounts are unknown, never 0). The dashboard adds a
+  **Spend-cap breaches** table grouped by capability and model with the run
+  verdict, a recent-breaches list, a Risk observatory count
+  (`summary.spend_cap_breaches`), and a Spend cap column in run evidence. These
+  are the numbers needed before switching `dispatch_spend_cap.mode` to `enforce`.
+
 ### method (single source of truth)
 
 - The orchestration method now lives in one file, `orchestrator/method.json`:

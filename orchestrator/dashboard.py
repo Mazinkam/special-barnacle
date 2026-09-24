@@ -39,7 +39,7 @@ from .outcomes import outcome_summary
 from .records import NO_DATA
 from .runtime import (default_state_root, exclusive_file_lock, iter_jsonl, read_json,
                       write_json, write_text_atomic)
-from .run_evidence import evidence_coverage, summarize_runs
+from .run_evidence import SPEND_CAP_EVENT, evidence_coverage, spend_cap_breach, summarize_runs
 from .verification import flaky_stats
 
 # Display tails only; every aggregate still covers the complete deduplicated history.
@@ -47,6 +47,7 @@ RECENT_EVENTS = 500
 RECENT_METRICS = 2000
 RECENT_ADAPTIVE = 500
 RECENT_RUNS = 200
+RECENT_SPEND_CAP_BREACHES = 50
 _LONE_SURROGATE = re.compile('[\ud800-\udfff]')
 
 #: A p99/p50 ratio computed from a handful of calls describes the handful, not the workload. Below
@@ -314,6 +315,52 @@ def _lead_sizes(orchestrated: list[dict], runs: list[dict]) -> list[dict[str, An
     return out
 
 
+def _spend_caps(cap_events: list[dict], runs: list[dict]) -> dict[str, Any]:
+    """Per-dispatch spend-cap breaches (`rules.dispatch_spend_cap`) from every event, not the tail.
+
+    Grouped by (capability, model). Verification is the run verdict, counted once per breached run
+    so the table answers "did over-cap dispatches still ship verified work?" before `enforce`.
+    """
+    verdict = {str(r.get('run_id')): r.get('verification') for r in runs}
+    breaches = [spend_cap_breach(e) for e in cap_events]
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for b in breaches:
+        g = groups.setdefault((b['capability'], b['model']), {
+            'breaches': 0, 'stopped': 0, 'runs': set(), 'caps': set(), 'costs': [], 'overs': [],
+            'ratios': [], 'nested': 0.0, 'nested_cost_base': 0.0})
+        g['breaches'] += 1
+        g['stopped'] += b['action'] == 'stop'
+        if b['run_id'] is not None: g['runs'].add(b['run_id'])
+        if b['cap_usd'] is not None: g['caps'].add(b['cap_usd'])
+        if b['cost_usd'] is not None: g['costs'].append(b['cost_usd'])
+        if b['over_usd'] is not None: g['overs'].append(b['over_usd'])
+        if b['over_ratio'] is not None: g['ratios'].append(b['over_ratio'])
+        if b['nested_cost_usd'] is not None and b['cost_usd']:
+            g['nested'] += b['nested_cost_usd']; g['nested_cost_base'] += b['cost_usd']
+    out = []
+    for (capability, model), g in groups.items():
+        verdicts = [verdict.get(rid) for rid in g['runs']]
+        out.append({
+            'capability': capability, 'model': model, 'breaches': g['breaches'], 'runs': len(g['runs']),
+            'stopped': g['stopped'],
+            'cap_usd': max(g['caps']) if g['caps'] else NO_DATA, 'cap_changed': len(g['caps']) > 1,
+            'total_cost_usd': sum(g['costs']) if g['costs'] else NO_DATA,
+            'max_cost_usd': max(g['costs']) if g['costs'] else NO_DATA,
+            'max_over_usd': max(g['overs']) if g['overs'] else NO_DATA,
+            'mean_over_ratio': records.ratio(sum(g['ratios']), len(g['ratios'])),
+            'nested_share': records.ratio(g['nested'], g['nested_cost_base']),
+            'verified_pass': sum(v == 'passed' for v in verdicts),
+            'verified_fail': sum(v == 'failed' for v in verdicts),
+            'verification_unknown': sum(v not in ('passed', 'failed') for v in verdicts),
+        })
+    out.sort(key=lambda g: (-_num(g['total_cost_usd']), g['capability'], g['model']))
+    recent = sorted(breaches, key=lambda b: str(b.get('ts') or ''))[-RECENT_SPEND_CAP_BREACHES:]
+    for b in recent:
+        b['verification'] = verdict.get(str(b['run_id'])) or 'unknown'
+    return {'breaches': len(breaches), 'runs': len({b['run_id'] for b in breaches if b['run_id'] is not None}),
+            'by_capability': out, 'recent': recent}
+
+
 def build_ingest_status(raw: Any, *, now: datetime) -> dict[str, Any]:
     """Validate persisted ingest health and derive staleness without trusting its contents."""
     unknown = {
@@ -396,6 +443,7 @@ def build_data(root: Path, config: dict | None = None):
     conflict_rows = 0
     invalidations = 0
     run_events = []
+    cap_events = []
     recent_events = deque(maxlen=RECENT_EVENTS)
     for event in unique_records(iter_jsonl(root / 'events.jsonl')):
         event_count += 1
@@ -404,6 +452,8 @@ def build_data(root: Path, config: dict | None = None):
         kind = event.get('event')
         conflict_rows += kind in _CONFLICT_EVENTS
         invalidations += kind == 'decision_invalidated'
+        if kind == SPEND_CAP_EVENT:
+            cap_events.append(event)
         if event.get('run_id') is not None or kind == 'decision_invalidated':
             run_events.append(event)
     outcomes = list(unique_records(iter_jsonl(root / 'outcomes.jsonl')))
@@ -543,6 +593,7 @@ def build_data(root: Path, config: dict | None = None):
     delayed_bad = sum(1 for x in mature30 if x['bad_outcome'])
     runs = summarize_runs(orchestrated, run_events, outcomes)
     run_cov = evidence_coverage(runs)
+    spend_caps = _spend_caps(cap_events, runs)
 
     def action_count(name: str) -> Any:
         """Count of one adaptive action: a real `0` when decisions exist, `NO_DATA` when none do."""
@@ -590,6 +641,8 @@ def build_data(root: Path, config: dict | None = None):
         'coordination_cost': overhead['coordination_cost'],
         'verification_cost': overhead['verification_cost'],
         'fanout_rework': fanout_rework(run_events),
+        # The bridge emits this event whenever a cap is crossed, so absence is a measured 0.
+        'spend_cap_breaches': spend_caps['breaches'],
         'context_miss_rate': records.ratio(context_misses, context_packets),
         # A genuine 0 stays 0; with no producer for merge-conflict events at all, the absence is
         # reported as absence and the renderer labels it `not instrumented`.
@@ -667,6 +720,7 @@ def build_data(root: Path, config: dict | None = None):
             'routes': build_route_stats(orchestrated, outcomes), 'outcomes': outsum,
             'run_evidence': run_cov, 'runs': runs[-RECENT_RUNS:],
             'lead_sizes': _lead_sizes(orchestrated, runs),
+            'spend_caps': spend_caps,
             # flaky_stats only matches rows with event=='verification_result'; session-ingest rows
             # are event=='model_call' and never contribute, but we pass `orchestrated` for
             # consistency with the rest of this function's inputs.
@@ -688,7 +742,7 @@ _HEAD='''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" 
 <div class="section card"><h2>Recent adaptive decisions</h2><div class="scroll"><table id="adaptive"></table></div></div>
 <div class="section card"><h2>Policy cohorts</h2><div class="scroll"><table id="policies"></table></div></div>
 <div class="section card"><h2>Daily trend</h2><div class="scroll"><table id="trends"></table></div></div>
-<div class="section card"><h2>Lead sizing</h2><div class="small">Lead calls tagged with the triage-chosen size (small → mid tier, standard → premium, large → frontier). Verification is the run verdict; an escalated run counts under each size it used. Self-implemented = the lead reported changed files without dispatching an implementer.</div><div class="scroll"><table id="leadsizes"></table></div></div><div class="section card"><h2>Run evidence (actual, by run)</h2><div class="small">Joined by run_id across metrics, events, and outcomes. Known cost is the sum of metered calls only; unmetered calls and missing durations are shown as gaps, never as $0 or 0s. Elapsed time comes from the run's terminal boundary and is tagged with the source the writer declared. Non-impl. share is the fraction of known cost spent outside implementation roles (lead, architect, review, QA, triage) — broader than the "Coordination overhead" card, which counts only coordination roles. Any flat-baseline comparison is a counterfactual estimate, not observed savings.</div><div class="scroll"><table id="runs"></table></div></div>
+<div class="section card"><h2>Lead sizing</h2><div class="small">Lead calls tagged with the triage-chosen size (small → mid tier, standard → premium, large → frontier). Verification is the run verdict; an escalated run counts under each size it used. Self-implemented = the lead reported changed files without dispatching an implementer.</div><div class="scroll"><table id="leadsizes"></table></div></div><div class="section card"><h2>Spend-cap breaches</h2><div class="small">Dispatches that crossed their per-capability ceiling (<code>method.json</code> <code>rules.dispatch_spend_cap</code>). Cost includes the dispatch&#39;s own subagents; subagent share is that nested part. <code>warn</code> lets the dispatch finish, <code>stop</code> means <code>enforce</code> killed it. Verification is the run verdict, counted once per breached run. Counted from every event, not only the recent-events tail.</div><div class="scroll"><table id="spendcaps"></table></div><div class="scroll"><table id="spendcapsRecent"></table></div></div><div class="section card"><h2>Run evidence (actual, by run)</h2><div class="small">Joined by run_id across metrics, events, and outcomes. Known cost is the sum of metered calls only; unmetered calls and missing durations are shown as gaps, never as $0 or 0s. Elapsed time comes from the run's terminal boundary and is tagged with the source the writer declared. Non-impl. share is the fraction of known cost spent outside implementation roles (lead, architect, review, QA, triage) — broader than the "Coordination overhead" card, which counts only coordination roles. Any flat-baseline comparison is a counterfactual estimate, not observed savings.</div><div class="scroll"><table id="runs"></table></div></div>
 <div class="section card"><h2>Historical route economics</h2><div class="scroll"><table id="routes"></table></div></div>
 <div class="section card"><h2>Cost by role</h2><div id="roles"></div></div>
 <div class="section card"><h2>Cost by agent runtime</h2><div id="runtimes"></div></div>
@@ -722,7 +776,7 @@ $('#statsNote').innerHTML=`Per-call statistics (p50/p90/p99, mean, max, tail rat
 // the ~89 legacy SESSION rows carry no `covers_calls` and so count as 1 real call each — an unknown
 // undercount, not a measured 1 — which is why the card above states that caveat instead of a bare number.
 const ah=[['History sufficient',p$('history_sufficient_rate',S.history_sufficient_rate)],['Observed exploration',p$('exploration_rate_observed',S.exploration_rate_observed)],['Recommend only',n$('adaptive_decisions',(S.adaptive_action_counts||{}).recommended_only)],['Empirical enforced',n$('adaptive_decisions',(S.adaptive_action_counts||{}).empirical_enforced)],['Static/fallback',S.adaptive_decisions?nz(n0((S.adaptive_action_counts||{}).static_default)+n0((S.adaptive_action_counts||{}).fallback_insufficient_history)):'—']];$('#adaptiveHealth').innerHTML=ah.map(x=>`<div class="risk"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
-const risks=[['Fan-out rework multiplier',fmt('fanout_rework',S.fanout_rework,mult)],['Context packet miss rate',p$('context_miss_rate',S.context_miss_rate)],['Merge/conflict events',n$('conflicts',S.conflicts)],['Shadow false-pass rate',p$('shadow_false_pass_rate',S.shadow_false_pass_rate)],['Shadow over-rejection',p$('shadow_over_reject_rate',S.shadow_over_reject_rate)],['Review wait p90',fmt('review_wait_p90_s',S.review_wait_p90_s,secs)],['p99 per-call cost',m$('p99_cost',S.p99_cost)]];$('#risk').innerHTML=risks.map(x=>`<div class="risk"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
+const risks=[['Fan-out rework multiplier',fmt('fanout_rework',S.fanout_rework,mult)],['Context packet miss rate',p$('context_miss_rate',S.context_miss_rate)],['Merge/conflict events',n$('conflicts',S.conflicts)],['Shadow false-pass rate',p$('shadow_false_pass_rate',S.shadow_false_pass_rate)],['Shadow over-rejection',p$('shadow_over_reject_rate',S.shadow_over_reject_rate)],['Review wait p90',fmt('review_wait_p90_s',S.review_wait_p90_s,secs)],['p99 per-call cost',m$('p99_cost',S.p99_cost)],['Spend-cap breaches',S.spend_cap_breaches?'<span class="warn">'+nz(S.spend_cap_breaches)+'</span>':'0']];$('#risk').innerHTML=risks.map(x=>`<div class="risk"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
 $('#rates').innerHTML=`<div class="small">Estimated spend is arithmetic over rate-table entries in <code>config.json</code>; none is provider-confirmed unless a row carries <code>cost_rate_verified_on</code>. Scope: ${esc(RP.scope||'')}. Dominant rate model <b>${esc(RP.dominant_model??'—')}</b> on ${n$('rate_provenance',RP.dominant_rows)} priced rows (${m$('rate_provenance',RP.dominant_cost)} of ${m$('rate_provenance',RP.estimated_cost)} estimated). Rows with a verified rate: ${nz(RP.verified_rate_rows)} of ${nz(RP.rate_rows)}; ${m$('rate_provenance',RP.unverified_rate_cost)} rests on unverified rates.</div><div class="scroll"><table><thead><tr><th>Rate model</th><th>Priced rows</th><th>Estimated cost</th><th>Rate source</th><th>Verified on</th></tr></thead><tbody>`+(RP.models||[]).map(r=>`<tr><td><code>${esc(r.model)}</code></td><td>${nz(r.rows)}</td><td>${m$('rate_provenance',r.cost)}</td><td>${r.source?esc(r.source):'<span class="pill off">unstated</span>'}</td><td>${r.verified_on?esc(r.verified_on):'<span class="pill warn">unverified</span>'}</td></tr>`).join('')+'</tbody></table></div>';
 $('#features').innerHTML='<thead><tr><th>Feature</th><th>State</th><th>Configuration</th></tr></thead><tbody>'+D.features.map(f=>`<tr><td>${esc(f.feature)}</td><td><span class="pill ${f.state==='off'?'off':(f.state==='recommend'||f.state==='observe'?'warn':'on')}">${esc(f.state)}</span></td><td><code>${esc(JSON.stringify(f.config))}</code></td></tr>`).join('')+'</tbody>';
 $('#adaptive').innerHTML='<thead><tr><th>Time</th><th>Task</th><th>Risk</th><th>Mode</th><th>Action</th><th>Selected</th><th>Effort</th><th>Verify</th><th>Rows (decayed)</th><th>Verified tasks</th><th>Explore</th><th>Canary</th></tr></thead><tbody>'+D.adaptive.slice().reverse().map(r=>`<tr><td>${esc(r.ts||'')}</td><td>${esc(r.task_class||'')}</td><td>${esc(r.risk||'')}</td><td>${esc(r.adaptive_mode||'')}</td><td>${esc(r.route_action||'')}</td><td>${esc(r.selected_capability||'')}</td><td>${esc(r.selected_effort||'')}</td><td>${esc(r.selected_verification_depth||'')}</td><td>${n$('historical_samples',r.historical_samples)}</td><td>${n$('verified_task_samples',r.verified_task_samples)}</td><td>${r.explored?'yes':'no'}</td><td>${r.canary?'yes':'no'}</td></tr>`).join('')+'</tbody>';
@@ -739,8 +793,12 @@ pauseButton.addEventListener('click',()=>{paused=!paused;try{localStorage.setIte
 try{const savedScroll=sessionStorage.getItem('orch-scroll');if(savedScroll!==null){window.scrollTo(0,Number(savedScroll)||0);sessionStorage.removeItem('orch-scroll');}}catch{}
 setInterval(()=>{if(document.visibilityState!=='visible'||paused)return;try{if(localStorage.getItem('orch-pause')==='1')return;}catch{}try{sessionStorage.setItem('orch-scroll',String(window.scrollY));}catch{}window.location.reload();},5000);
 const dur=x=>x==null?'<span class="warn">unknown</span>':(Number(x)/1000).toFixed(1)+'s';const knownCost=r=>r.cost_known_usd==null?'<span class="warn">unmetered</span>':m$('cost_known_usd',r.cost_known_usd)+(r.unmetered_calls?` <span class="warn">+${nz(r.unmetered_calls)} unmetered</span>`:'');const cf=r=>r.counterfactual?(r.counterfactual.cost_usd==null?'—':m$('counterfactual',r.counterfactual.cost_usd)+(r.counterfactual.comparable?'':' <span class="warn">(partial)</span>')):'—';
+const capCell=r=>{const h=r.spend_cap_hits||[];if(!h.length)return '—';const mx=Math.max(...h.map(x=>Number(x.cost_usd)||0));return `<span class="warn">${h.length} hit${h.length>1?'s':''}${h.some(x=>x.action==='stop')?' (stopped)':''}</span> <span class="small">max ${money(mx)}</span>`;};
 $('#leadsizes').innerHTML=(D.lead_sizes||[]).length?'<thead><tr><th>Lead size</th><th>Runs</th><th>Calls</th><th>Cost</th><th>Cost / run</th><th>Verified pass</th><th>Verified fail</th><th>Unverified</th><th>Self-implemented</th></tr></thead><tbody>'+D.lead_sizes.map(r=>`<tr><td><b>${esc(r.lead_size)}</b></td><td>${nz(r.runs)}</td><td>${nz(r.calls)}</td><td>${m$('cost',r.cost)}</td><td>${m$('cost_per_run',r.cost_per_run)}</td><td>${nz(r.verified_pass)}</td><td>${nz(r.verified_fail)}</td><td>${nz(r.verification_unknown)}</td><td>${n0(r.self_implemented)?'<span class="warn">'+nz(r.self_implemented)+'</span>':'0'}</td></tr>`).join('')+'</tbody>':'<tbody><tr><td class="small">No lead-sized runs yet (tags start with Phase A).</td></tr></tbody>';
-$('#runs').innerHTML='<thead><tr><th>Run</th><th>Status</th><th>Elapsed (wall)</th><th>Known cost (actual)</th><th>Coverage</th><th>Non-impl. share</th><th>Call rows</th><th>Tasks</th><th>Retries</th><th>Verification</th><th>Delayed bad</th><th>Counterfactual (est.)</th></tr></thead><tbody>'+D.runs.slice().reverse().map(r=>`<tr><td><code>${esc(r.run_id)}</code></td><td>${esc(r.status)}</td><td>${dur(r.elapsed_ms)}${r.elapsed_source&&r.elapsed_source!=='unknown'?` <span class="small">${esc(r.elapsed_source)}</span>`:''}</td><td>${knownCost(r)}</td><td>${p$('cost_coverage',r.cost_coverage)}</td><td>${p$('overhead_ratio',r.overhead_ratio)}</td><td>${nz(r.call_rows)}</td><td>${nz(r.tasks)}</td><td>${nz(r.retries)}</td><td>${esc(r.verification)}</td><td>${r.delayed_bad_outcome==null?'—':(r.delayed_bad_outcome?'yes':'no')}</td><td>${cf(r)}</td></tr>`).join('')+'</tbody>';
+$('#runs').innerHTML='<thead><tr><th>Run</th><th>Status</th><th>Elapsed (wall)</th><th>Known cost (actual)</th><th>Coverage</th><th>Non-impl. share</th><th>Call rows</th><th>Tasks</th><th>Retries</th><th>Spend cap</th><th>Verification</th><th>Delayed bad</th><th>Counterfactual (est.)</th></tr></thead><tbody>'+D.runs.slice().reverse().map(r=>`<tr><td><code>${esc(r.run_id)}</code></td><td>${esc(r.status)}</td><td>${dur(r.elapsed_ms)}${r.elapsed_source&&r.elapsed_source!=='unknown'?` <span class="small">${esc(r.elapsed_source)}</span>`:''}</td><td>${knownCost(r)}</td><td>${p$('cost_coverage',r.cost_coverage)}</td><td>${p$('overhead_ratio',r.overhead_ratio)}</td><td>${nz(r.call_rows)}</td><td>${nz(r.tasks)}</td><td>${nz(r.retries)}</td><td>${capCell(r)}</td><td>${esc(r.verification)}</td><td>${r.delayed_bad_outcome==null?'—':(r.delayed_bad_outcome?'yes':'no')}</td><td>${cf(r)}</td></tr>`).join('')+'</tbody>';
+const SC=D.spend_caps||{breaches:0,by_capability:[],recent:[]};
+$('#spendcaps').innerHTML=SC.by_capability.length?'<thead><tr><th>Capability</th><th>Model</th><th>Cap</th><th>Breaches</th><th>Runs</th><th>Stopped</th><th>Max cost</th><th>Max over cap</th><th>Mean cost / cap</th><th>Subagent share</th><th>Verified pass</th><th>Verified fail</th><th>Unverified</th></tr></thead><tbody>'+SC.by_capability.map(g=>`<tr><td><b>${esc(g.capability)}</b></td><td><code>${esc(g.model)}</code></td><td>${m$('cap_usd',g.cap_usd)}${g.cap_changed?' <span class="warn">(cap changed)</span>':''}</td><td><span class="warn">${nz(g.breaches)}</span></td><td>${nz(g.runs)}</td><td>${nz(g.stopped)}</td><td>${m$('max_cost_usd',g.max_cost_usd)}</td><td>${m$('max_over_usd',g.max_over_usd)}</td><td>${fmt('mean_over_ratio',g.mean_over_ratio,x=>x.toFixed(2)+'×')}</td><td>${p$('nested_share',g.nested_share)}</td><td>${nz(g.verified_pass)}</td><td>${nz(g.verified_fail)}</td><td>${nz(g.verification_unknown)}</td></tr>`).join('')+'</tbody>':'<tbody><tr><td class="small">No spend-cap breaches recorded.</td></tr></tbody>';
+$('#spendcapsRecent').innerHTML=SC.recent.length?'<thead><tr><th>Time</th><th>Run</th><th>Task</th><th>Capability</th><th>Action</th><th>Cap</th><th>Cost</th><th>In subagents</th><th>Run verification</th></tr></thead><tbody>'+SC.recent.slice().reverse().map(b=>`<tr><td>${esc(fmtTs(b.ts))}</td><td><code>${esc(b.run_id??'—')}</code></td><td><code>${esc(b.task_id??'—')}</code></td><td>${esc(b.capability)}</td><td>${b.action==='stop'?'<span class="warn">stop</span>':esc(b.action)}</td><td>${m$('cap_usd',b.cap_usd)}</td><td>${m$('cost_usd',b.cost_usd)}</td><td>${m$('nested_cost_usd',b.nested_cost_usd)}</td><td>${esc(b.verification)}</td></tr>`).join('')+'</tbody>':'';
 </script></main></body></html>'''
 
 
