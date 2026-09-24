@@ -82,6 +82,9 @@ def cost_class(row: dict) -> str:
     """
     source=str(row.get('cost_source') or '').strip().lower()
     measured=row_cost(row)>0 or has_reported_tokens(row)
+    # Older HT bridges labelled a zero placeholder as an estimate before pricing it.
+    if source == 'estimated-from-reported-tokens' and not row.get('cost_rate_model') and row_cost(row) == 0:
+        return UNMETERED
     if 'estimat' in source or 'blended' in source or 'derived' in source: return ESTIMATED if measured else UNMETERED
     if source in {'reported','provider','provider_reported','provider-reported','metered','measured','actual'}:
         return REPORTED if measured else UNMETERED

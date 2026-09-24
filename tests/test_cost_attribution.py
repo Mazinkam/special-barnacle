@@ -46,9 +46,9 @@ class CostClassTests(unittest.TestCase):
     def test_zero_cost_with_reported_tokens_stays_metered(self):
         # A genuinely free call that did report usage was measured; keep it distinct from a gap.
         self.assertEqual(cost_class({'cost_usd': 0, 'cost_source': 'estimated-from-reported-tokens',
-                                     'input_tokens': 5, 'output_tokens': 1}), ESTIMATED)
+                                     'input_tokens': 5, 'output_tokens': 1, 'cost_rate_model':'free-model'}), ESTIMATED)
         self.assertEqual(cost_class({'cost_usd': 0, 'cost_source': 'estimated-from-reported-tokens',
-                                     'input_tokens': 0, 'cache_write_tokens': 12}), ESTIMATED)
+                                     'input_tokens': 0, 'cache_write_tokens': 12, 'cost_rate_model':'free-model'}), ESTIMATED)
         self.assertEqual(cost_class({'cost_usd': 0, 'cost_source': 'reported', 'input_tokens': 5, 'output_tokens': 1}), REPORTED)
 
     def test_reported_zero_without_tokens_is_still_unmetered(self):

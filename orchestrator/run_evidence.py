@@ -32,7 +32,7 @@ from datetime import datetime
 from typing import Any
 import json
 
-from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, has_reported_tokens, is_call_row, is_session_ingest, row_cost
+from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, has_reported_tokens, is_call_row, is_session_ingest, row_cost, unique_records, verification_passed
 
 ACTUAL = 'actual'
 COUNTERFACTUAL = 'counterfactual'
@@ -134,7 +134,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
             if rid not in first_ts or ts < first_ts[rid]: first_ts[rid] = ts
         return rid
 
-    for row in metrics:
+    for row in unique_records(metrics):
         rid = row.get('run_id')
         if rid is None: continue
         # Session ingest never establishes a run; the count is only reported if a real stream does.
@@ -152,7 +152,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
     status: dict[str, str] = {}
     retry_dispatches: dict[str, set[str]] = defaultdict(set)
     rework_events: dict[str, int] = defaultdict(int)
-    for e in events:
+    for e in unique_records(events):
         rid = e.get('run_id')
         if rid is None: continue
         rid = touch(rid, e.get('ts')); kind = e.get('event')
@@ -166,7 +166,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
     summary_note: dict[str, dict] = {}
     delayed_bad: dict[str, bool] = defaultdict(bool)
     outcome_tasks: dict[str, set[str]] = defaultdict(set)
-    for o in outcomes:
+    for o in unique_records(outcomes):
         rid = o.get('run_id')
         if rid is None: continue
         rid = touch(rid, o.get('ts')); tid = str(o.get('task_id') or '')
@@ -200,12 +200,14 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
         durations = [_int_or_none(r.get('duration_ms')) for r in rows]
         known_durations = [d for d in durations if d is not None]
         tokens_known = sum(1 for r in rows if has_reported_tokens(r))
-        verified_tasks = {str(v.get('task_id')) for v in verifications[rid] if v.get('task_id') is not None}
+        latest_verification = {str(v.get('task_id')): v for v in verifications[rid] if v.get('task_id') is not None}
+        verified_tasks = {tid for tid,v in latest_verification.items() if verification_passed(v)}
         retries = len(retry_dispatches[rid]) or sum(1 for r in rows if _int_or_none(r.get('retry')))
         note = summary_note.get(rid, {})
         if retries == 0 and _int_or_none(note.get('retries')): retries = int(note['retries'])
         verdict = verification.get(rid)
         if verdict is None and note.get('verification_passed') is not None: verdict = 'passed' if note['verification_passed'] else 'failed'
+        if any(not verification_passed(v) for v in latest_verification.values()): verdict = 'failed'
         if verdict is None and verified_tasks: verdict = 'passed'
         term = terminal.get(rid)
         elapsed_ms, elapsed_source = _elapsed(term)

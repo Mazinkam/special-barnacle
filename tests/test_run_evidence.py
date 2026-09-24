@@ -101,7 +101,7 @@ class MissingDataTests(unittest.TestCase):
         self.assertEqual(r['tokens_known_calls'],1)
         self.assertEqual(r['tokens_missing_calls'],1)
         # A genuine estimated $0 call that did report tokens stays metered (pricing may be tiny/zero).
-        priced=call('r13','r13-a',cost_usd=0,cost_source='estimated-from-reported-tokens',input_tokens=5,output_tokens=1)
+        priced=call('r13','r13-a',cost_usd=0,cost_source='estimated-from-reported-tokens',input_tokens=5,output_tokens=1,cost_rate_model='free-model')
         r13=by_run(summarize_runs([priced],[],[]))['r13']
         self.assertEqual(r13['metered_calls'],1)
         self.assertEqual(r13['tokens_known_calls'],1)
