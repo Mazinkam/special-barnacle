@@ -94,9 +94,11 @@ import { RunCancellation } from "./cancellation.ts";
 import { connectCancellationLoader } from "./run-ui.ts";
 // Rule-2 recon planning/evidence helpers (pure; see recon.ts). `dispatchHierarchical()`
 // dispatches these as ordinary parent-owned tasks through the existing
-// `dispatchParallel()` path; `DispatchTask` is kept structurally compatible
-// with `ReconTaskPlan` so a planned recon task needs no conversion step.
-import { formatReconEvidence, planReconTasks, type ReconTaskPlan } from "./recon.ts";
+// `dispatchParallel()` path. `DispatchTask` below is declared independently;
+// `ReconTaskPlan` is structurally assignable to it, which the annotated
+// `const reconTasks: DispatchTask[] = planReconTasks(...)` checks at compile
+// time, so a planned recon task still needs no conversion step.
+import { formatReconEvidence, planReconTasks } from "./recon.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -1578,8 +1580,24 @@ async function failRun(runId: string, error: string): Promise<void> {
 // Subagent dispatch
 // -----------------------------------------------------------------------------
 
-// Recon always specifies tools; other dispatches inherit their persona's tools.
-export interface DispatchTask extends Omit<ReconTaskPlan, "tools"> {
+/**
+ * One task for `dispatchParallel()`. Declared standalone rather than derived
+ * from `recon.ts`'s `ReconTaskPlan`: the bridge's dispatch contract is the
+ * general case and must not depend on the pure Rule-2 recon module, which is
+ * only one of its callers. `ReconTaskPlan` is structurally assignable here
+ * (its `tools` is required, this one's is optional), and the annotation on
+ * `reconTasks` in `dispatchHierarchical()` fails the typecheck if that ever
+ * stops being true.
+ */
+export interface DispatchTask {
+	taskId: string;
+	capability: string;
+	task: string;
+	/**
+	 * Explicit tool allow-list, overriding whatever the bound persona permits.
+	 * Recon always specifies this; other dispatches omit it and inherit their
+	 * persona's own tools.
+	 */
 	tools?: string[];
 	retryOf?: string;
 	retryCount?: number;
