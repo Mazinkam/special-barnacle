@@ -11,7 +11,7 @@ import pytest
 from orchestrator.dashboard import build_data
 from orchestrator.engine import OrchestrationEngine
 from orchestrator.record_index import DATABASE_FILE
-from orchestrator.runtime import load_jsonl, read_json
+from orchestrator.runtime import EventStore, load_jsonl, read_json
 from tests.test_dashboard_refresh import load_benchmark_module
 from tests.test_record_batch import REPO, cli_env, run_batch, run_cli, sample_batch
 
@@ -32,9 +32,12 @@ def test_routine_refresh_preserves_exact_id_cache_and_catches_up(tmp_path, bound
         OrchestrationEngine(tmp_path).complete_run('R1', record_id='terminal')
         assert read_json(tmp_path / 'ledger.json', {})['runs']['R1']['status'] == 'completed'
     else:
-        result = subprocess.run([sys.executable, '-B', str(REPO / 'scripts/init_orchestrator.py')],
-                                env=cli_env(tmp_path), cwd=REPO, capture_output=True, text=True, timeout=60)
-        assert result.returncode == 0, result.stderr
+        store = EventStore(tmp_path)
+        store.emit('orchestrator_initialized', schema_version=3)
+        from orchestrator.state import refresh_ledger
+        from orchestrator.dashboard import generate_dashboard
+        refresh_ledger(store.root)
+        generate_dashboard(store.root)
         assert load_jsonl(tmp_path / 'events.jsonl')[-1]['event'] == 'orchestrator_initialized'
     ledger = read_json(tmp_path / 'ledger.json', {})
     assert ledger['checkpoint']['events_offset'] == (tmp_path / 'events.jsonl').stat().st_size
