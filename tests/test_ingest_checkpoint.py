@@ -188,6 +188,99 @@ class UnchangedSessionTests(CheckpointTestCase):
 
 
 class SessionProvenanceTests(CheckpointTestCase):
+    def test_explicit_session_replacement_bills_reused_ids_without_checkpoint(self):
+        for corrupt in (False, True):
+            for rotate in (False, True):
+                for first in (CALL, SESSION):
+                    for second in (CALL, SESSION):
+                        with self.subTest(corrupt=corrupt, rotate=rotate, first=first, second=second):
+                            name = f'{corrupt}-{rotate}-{first}-{second}'
+                            self.root = self.dir / f'state-{name}'
+                            log = ht_session(self.dir / f'{name}.jsonl', 2, session='sess-A')
+                            self.one(log, first)
+                            checkpoint = ingest_checkpoint.checkpoint_path(self.root, log)
+                            if corrupt:
+                                checkpoint.write_text('not json', encoding='utf-8')
+                            else:
+                                checkpoint.unlink()
+                            before = (self.root / 'metrics.jsonl').read_bytes()
+                            old_size = log.stat().st_size
+                            replacement = self.dir / 'replacement.jsonl' if rotate else log
+                            ht_session(replacement, 2, session='sess-B')
+                            if rotate:
+                                os.replace(replacement, log)
+                            self.assertEqual(log.stat().st_size, old_size)
+                            preview_before = snapshot(self.root)
+                            preview = self.one(log, second, dry_run=True)
+                            self.assertEqual(preview['emitted'], 2 if second == CALL else 1)
+                            self.assertEqual(snapshot(self.root), preview_before)
+                            result = self.one(log, second)
+                            self.assertEqual(result['emitted'], 2 if second == CALL else 1)
+                            self.assertEqual(recorded_input_tokens(self.root, 'sess-A'), 2000)
+                            self.assertEqual(recorded_input_tokens(self.root, 'sess-B'), 2000)
+                            self.assertTrue((self.root / 'metrics.jsonl').read_bytes().startswith(before))
+                            self.assertEqual(self.one(log, second)['emitted'], 0)
+
+    def test_fallback_promotion_recovers_canonical_origins_without_checkpoint(self):
+        for corrupt in (False, True):
+            for first in (CALL, SESSION):
+                for second in (CALL, SESSION):
+                    with self.subTest(corrupt=corrupt, first=first, second=second):
+                        name = f'{corrupt}-{first}-{second}'
+                        self.root = self.dir / f'state-{name}'
+                        log = self.dir / f'{name}_fallback.jsonl'
+                        log.write_text(ht_call(0), encoding='utf-8')
+                        self.one(log, first)
+                        checkpoint = ingest_checkpoint.checkpoint_path(self.root, log)
+                        if corrupt:
+                            checkpoint.write_text('not json', encoding='utf-8')
+                        else:
+                            checkpoint.unlink()
+                        ht_session(log, 2, session='explicit')
+                        before = (self.root / 'metrics.jsonl').read_bytes()
+                        self.assertEqual(self.one(log, second)['emitted'], 1)
+                        self.assertEqual(recorded_input_tokens(self.root, 'fallback'), 1000)
+                        self.assertEqual(recorded_input_tokens(self.root, 'explicit'), 1000)
+                        self.assertTrue((self.root / 'metrics.jsonl').read_bytes().startswith(before))
+                        self.assertEqual([r.get('session_origin') for r in ingest_rows(self.root)],
+                                         ['fallback', 'explicit'])
+                        checkpoint.unlink()
+                        self.assertEqual(self.one(log, second)['emitted'], 0)
+
+    def test_unknown_ledger_origin_rejects_cross_session_matches_without_writes(self):
+        for origin in (None, 'invalid', ['fallback']):
+            for first in (CALL, SESSION):
+                for second in (CALL, SESSION):
+                    with self.subTest(origin=origin, first=first, second=second):
+                        self.root = self.dir / f'state-{origin}-{first}-{second}'
+                        log = ht_session(self.dir / 'legacy.jsonl', 1, session='sess-A')
+                        self.one(log, first)
+                        rows = ingest_rows(self.root)
+                        for row in rows:
+                            row.pop('session_origin', None)
+                            if origin is not None:
+                                row['session_origin'] = origin
+                        (self.root / 'metrics.jsonl').write_text(
+                            ''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+                        source_checkpoint = ingest_checkpoint.checkpoint_path(self.root, log)
+                        source_checkpoint.unlink()
+                        ht_session(log, 2, session='sess-B')
+                        before = snapshot(self.root)
+                        authoritative = {name: (self.root / name).read_bytes()
+                                         for name in ('events.jsonl', 'metrics.jsonl', 'outcomes.jsonl')
+                                         if (self.root / name).exists()}
+                        for dry_run in (True, False):
+                            result = self.ingest(log, second, dry_run=dry_run)
+                            self.assertEqual(result['emitted'], 0)
+                            self.assertEqual(len(result['failures']), 1, result)
+                            self.assertIn('SourceConflict', result['failures'][0]['error'])
+                            self.assertIn('provenance', result['failures'][0]['error'])
+                            if dry_run:
+                                self.assertEqual(snapshot(self.root), before)
+                            else:
+                                self.assertEqual({name: (self.root / name).read_bytes() for name in authoritative}, authoritative)
+                                self.assertFalse(source_checkpoint.exists(), 'a rejected source must not be checkpointed')
+
     def test_header_provenance_and_inode_distinguish_drift_from_new_sessions(self):
         # Only an in-place fallback -> explicit transition may alias identical calls.
         for explicit in (False, True):

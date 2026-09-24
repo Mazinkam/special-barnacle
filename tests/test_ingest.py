@@ -535,9 +535,12 @@ class DedupeHardeningTests(unittest.TestCase):
                 checkpoint_path(root, log).unlink()
                 log.write_text(log.read_text().replace('sess-1', 'sess-2'), encoding='utf-8')
                 before = metrics.read_bytes()
-                with self.assertRaises(SourceConflict):
-                    ingest_file(log, state_root=root, granularity=SESSION)
-                self.assertEqual(metrics.read_bytes(), before)
+                second = ingest_file(log, state_root=root, granularity=SESSION)
+                self.assertEqual(second['emitted'], 1, 'an explicit replacement session has its own usage identity')
+                final_rows = load_jsonl(metrics)
+                self.assertEqual(sum(row['input_tokens'] for row in final_rows if row['session_id'] == 'sess-1'), 1002)
+                self.assertEqual(sum(row['input_tokens'] for row in final_rows if row['session_id'] == 'sess-2'), 1002)
+                self.assertNotEqual(metrics.read_bytes(), before)
 
     def test_drift_rejects_reused_native_id_with_changed_usage(self):
         from orchestrator.ingest import SourceConflict

@@ -25,7 +25,9 @@ One checkpoint per source path lives in ``<state root>/ingest-checkpoints/<sha25
   HT ``reader.session_provenance`` distinguishes filename fallback from explicit session IDs;
   ``session_aliases`` binds proven fallback calls to the explicit logical session, never its
   successor. Inode changes start a new source generation rather than promoting a fallback ID.
-  Older checkpoints without provenance retain conservative source-coverage reconciliation.
+  New metric rows persist canonical ``session_origin`` (fallback/explicit) as well. Without
+  checkpoint provenance, source-scoped ledger origins determine alias eligibility; missing or
+  conflicting legacy origins cannot establish a cross-session identity.
   The ever-seen IDs deduplicate calls reintroduced after truncation; the ledger's authoritative
   coverage identifies which calls are paid, even if they disappeared from the source;
 * ``metrics`` (identity/offset/tail_hash of ``metrics.jsonl``) and ``recorded`` — the
@@ -353,6 +355,11 @@ class IngestLedger:
         if isinstance(source, str) and source:
             source_state = self.sources.setdefault((key[0], source_key(source)), {}).setdefault(key[1], _blank_state())
             self._apply_state(source_state, row)
+            # Source provenance must be rebuilt from authoritative rows, not session-wide
+            # checkpoint totals (which can include contributions from other paths).
+            origin = row.get('session_origin')
+            source_state.setdefault('session_origins', set()).add(
+                origin if origin in ('fallback', 'explicit') else 'unknown')
 
     @staticmethod
     def _apply_state(state: dict[str, Any], row: dict[str, Any]) -> None:

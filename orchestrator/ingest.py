@@ -177,6 +177,7 @@ def _parse_humain_terminal(record: dict[str, Any], state: dict[str, Any]) -> Opt
         'native_id': str(record.get('id') or state['count']),
         '_native_id_stable': bool(record.get('id')),
         'session_id': state['session_id'],
+        'session_origin': state['session_origin'],
         'ts': record.get('timestamp'),
         'model': message.get('model'),
         'provider': message.get('provider'),
@@ -235,6 +236,7 @@ def _parse_codex(record: dict[str, Any], state: dict[str, Any]) -> Optional[dict
         'native_id': str(payload.get('response_id') or f"{turn_id}:{record.get('ordinal')}"),
         '_native_id_stable': bool(payload.get('response_id') or (turn_id and record.get('ordinal') is not None)),
         'session_id': str(payload.get('session_id') or state['stem']),
+        'session_origin': 'explicit' if payload.get('session_id') else 'fallback',
         'turn_id': turn_id,
         'ts': record.get('timestamp'),
         'model': state['models'].get(str(turn_id), state['latest_model']),
@@ -360,14 +362,29 @@ def _reconcile_source_calls(calls: list[dict[str, Any]], *, runtime: str, path: 
     complete matching coverage and per-model usage as well: reused IDs with missing or changed
     calls are ambiguous. Totals validate an identity match; they never pay for unmatched IDs.
     """
-    # None preserves source-scope recovery for old/missing checkpoints. With provenance,
-    # only fallback promotion or an already-proven alias in this logical session is eligible.
-    eligible = None if alias_targets is None else {sid for ids in alias_targets.values() for sid in ids}
+    # Missing/old checkpoints are not permission to alias explicit logical sessions.
+    # Rebuild eligibility from source-scoped authoritative rows. Unknown legacy origins
+    # remain candidates only so an overlapping identity is rejected, never guessed paid/new.
+    unknown_origins: set[str] = set()
+    if alias_targets is None:
+        source_states = ledger.source_states(runtime, path)
+        fallback = set()
+        for sid in (set(source_states) | {sid for sid, _ in history}) - live:
+            origins = source_states.get(sid, {}).get('session_origins', set())
+            if origins == {'fallback'}:
+                fallback.add(sid)
+            elif origins != {'explicit'}:
+                unknown_origins.add(sid)
+        alias_targets = {sid: set(unknown_origins) for sid in live}
+        for call in calls:
+            if call.get('session_origin') == 'explicit':
+                alias_targets[str(call['session_id'])].update(fallback)
+    eligible = {sid for ids in alias_targets.values() for sid in ids}
     candidates: dict[str, set[str]] = {}
     evidence = []
     if not resumable:
         for sid, state in ledger.source_states(runtime, path).items():
-            if sid in live or (eligible is not None and sid not in eligible):
+            if sid in live or sid not in eligible:
                 continue
             if state['unidentified']:
                 raise SourceConflict(f'{path}: session {sid}: ambiguous totals-only source history after session ID '
@@ -375,7 +392,7 @@ def _reconcile_source_calls(calls: list[dict[str, Any]], *, runtime: str, path: 
             candidates[sid] = set(state['covered_call_ids'])
             evidence.append((sid, set(state['covered_call_ids']), state['models']))
     for (sid, model), group in history.items():
-        if sid not in live and (eligible is None or sid in eligible):
+        if sid not in live and sid in eligible:
             candidates.setdefault(sid, set()).update(group['call_ids'])
             if not resumable:
                 evidence.append((sid, set(group['call_ids']), {model: group}))
@@ -385,10 +402,13 @@ def _reconcile_source_calls(calls: list[dict[str, Any]], *, runtime: str, path: 
     for call in calls:
         target = str(call['session_id'])
         matches = {sid: call_id_for(runtime, sid, call['native_id']) for sid, ids in candidates.items()
-                   if (alias_targets is None or sid in alias_targets.get(target, set()))
+                   if sid in alias_targets.get(target, set())
                    and call_id_for(runtime, sid, call['native_id']) in ids}
         if not matches:
             continue
+        if unknown_origins.intersection(matches):
+            raise SourceConflict(f'{path}: ambiguous session provenance in source history after session ID drift; '
+                                 'restore provenance or reconcile the legacy rows before retrying; nothing was written.')
         # Historical hashes do not distinguish HT's numeric positional fallback from an
         # explicit numeric ID. Neither can safely establish cross-session identity.
         positional = runtime == HUMAIN_TERMINAL and call['native_id'].isdecimal()
@@ -399,6 +419,7 @@ def _reconcile_source_calls(calls: list[dict[str, Any]], *, runtime: str, path: 
         # Retain the original session-qualified identity for old calls only. New calls keep
         # the session the reader found; no tokens move between recorded session buckets.
         call['session_id'] = sid
+        call['session_origin'] = 'fallback'
         aliases.setdefault(target, set()).add(sid)
         matched.setdefault(sid, {})[call_id] = call
         if call_id in ledger.state(runtime, sid)['covered_call_ids']:
@@ -465,11 +486,14 @@ def _observe(observed: dict[tuple[str, str], dict[str, Any]], calls: list[dict[s
             continue
         seen.add(call_id)
         group = out.setdefault(_group_key(call), {**empty_totals(), 'session_id': str(call['session_id']),
+                                                   'session_origin': call.get('session_origin'),
                                                    'model': call.get('model'), 'provider': call.get('provider'),
                                                    'repository': call.get('repository'), 'first_ts': call.get('ts'),
                                                    'ts': call.get('ts'), 'call_ids': []})
         add_totals(group, call)
         group['call_ids'].append(call_id)
+        if call.get('session_origin') == 'explicit':
+            group['session_origin'] = 'explicit'
         for field in ('provider', 'repository'):
             if call.get(field):
                 group[field] = call[field]
