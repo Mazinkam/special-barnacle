@@ -135,6 +135,25 @@ def test_release_commands_visible_without_creating_state(tmp_path):
     assert not root.exists()
 
 
+def test_legacy_benchmark_compares_equivalent_copied_workloads(tmp_path):
+    source=tmp_path/'fixture'; source.mkdir()
+    for name in ('events.jsonl','metrics.jsonl','outcomes.jsonl'): (source/name).write_text('')
+    result=subprocess.run([sys.executable,'-B',str(REPO/'scripts/benchmark_refresh.py'), '--source',str(source),
+                           '--compare-legacy',str(REPO),'--repeat','1','--scales','1,2,4','--json'],
+                          env=cli_env(tmp_path/'must-not-exist'),cwd=REPO,capture_output=True,text=True,timeout=60)
+    assert result.returncode == 0, result.stderr
+    report=json.loads(result.stdout)
+    assert len(report['results'])==3
+    for row in report['results']:
+        assert row['equivalence']['canonical_bytes'] is True
+        assert row['equivalence']['ledger'] is True
+        assert row['equivalence']['dashboard_accounting'] is True
+        assert row['before']['subprocesses']==5
+        assert row['after']['subprocesses']==1
+    assert not (tmp_path/'must-not-exist').exists()
+    assert all(p.read_bytes()==b'' for p in source.iterdir())
+
+
 def test_benchmark_overrides_inherited_live_paths(tmp_path, monkeypatch):
     bench = load_benchmark_module()
     for name in ('CODING_AGENT_ORCHESTRATOR_HOME', 'HUMAIN_ORCHESTRATOR_STATE_ROOT', 'HUMAIN_ORCHESTRATOR_SKILL_ROOT'):

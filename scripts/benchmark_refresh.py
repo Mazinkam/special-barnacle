@@ -24,7 +24,7 @@ here is evidence of real model-cost or quality savings. `--source` should name a
 live state. All target mutations are confined to disposable fixtures; state/code-root
 encodings override inherited environment values.
 
-Per measured operation it prints the subprocess count, median elapsed seconds (spawn to reap),
+Per measured operation it prints the subprocess count, median elapsed seconds (spawn to exit),
 peak child RSS, throughput, and the bytes the child actually read and wrote:
 
 * **logical** bytes are counted inside the child by `instrumented_argv`: every file object the
@@ -49,11 +49,14 @@ import argparse
 import hashlib
 import json
 import os
+import select
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -66,6 +69,22 @@ STREAMS = ('events.jsonl', 'metrics.jsonl', 'outcomes.jsonl')
 ID_FIELDS = ('record_id', 'run_id', 'task_id', 'session_id', 'decision_id')
 IO_REPORT_ENV = 'ORCHESTRATOR_BENCH_IO_REPORT'
 LOGICAL_SOURCE = 'python file objects + os.read/os.write in the child (excludes interpreter start-up, stdio and sqlite3)'
+LEGACY_TIMEOUT_FLOOR_S = 60
+LEGACY_TIMEOUT_CAP_S = 240
+
+
+def legacy_process_timeout(planned_process_count: int, seconds_per_process: float = 1) -> int:
+    """Budget `seconds_per_process` per planned child (default one second), bounded to a practical 60–240s.
+
+    The driver uses the default for each legacy child; the outer regression test budgets its whole
+    compare-legacy run per child at a higher rate so emulated Linux stays inside the same bounds.
+    """
+    return int(min(LEGACY_TIMEOUT_CAP_S, max(LEGACY_TIMEOUT_FLOOR_S, planned_process_count * seconds_per_process)))
+
+
+def compare_legacy_process_count(*, scales: int, repeat: int, batch_size: int) -> int:
+    """Children `compare_legacy` spawns: per scale, repeat+1 trials of batch_size legacy children plus one batch child."""
+    return scales * (repeat + 1) * (batch_size + 1)
 
 # Prepended to every instrumented child's `-c` program. Pure standard library, runs before the
 # program under test, writes its report at exit to the path in $ORCHESTRATOR_BENCH_IO_REPORT.
@@ -181,7 +200,7 @@ cli.main()
 class ChildRun:
     argv: list
     returncode: int
-    elapsed_s: float          # spawn to reap, i.e. what one more subprocess costs the caller
+    elapsed_s: float          # spawn to the kernel's exit notification, i.e. what one more subprocess costs the caller
     ru_maxrss: int            # the child's own high-water mark (os.wait4)
     ru_inblock: int           # rusage block counts: populated on Linux, always 0 on macOS
     ru_oublock: int
@@ -209,24 +228,111 @@ def cli_argv(*args: str) -> list[str]:
     return instrumented_argv(_RUN_CLI, *args)
 
 
-def run_child(argv: list[str], *, env: dict[str, str], cwd: str | None = None, stdin: str | None = None) -> ChildRun:
+def _await_exit(pid: int) -> None:
+    """Block until child `pid` has exited WITHOUT reaping it, so wait4 still collects its rusage.
+
+    No sampling: the kernel wakes this thread on exit. Linux (and CPython 3.14+ on macOS) expose
+    waitid(WNOWAIT); older CPython omits waitid on macOS, where kqueue's EVFILT_PROC/NOTE_EXIT is
+    the equivalent. A child that already exited (zombie) returns immediately on both.
+    """
+    if hasattr(os, 'waitid'):
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT); return
+    kq = select.kqueue()
+    try:
+        exit_event = select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)
+        try: kq.control([exit_event], 1)
+        except ProcessLookupError: pass  # exited before the filter attached; wait4 reaps it at once
+    finally: kq.close()
+
+
+class _KillOnDeadline:
+    """Timer supervisor that SIGKILLs an unreaped child at `timeout`, adding nothing to the measured child.
+
+    The reaping thread blocks in `_await_exit`; the timer thread only ever signals. Killing and
+    reaping are serialized by `_lock`: the kill is sent only while `closed` is False, and the reaper
+    sets `closed` before its wait4, so a SIGKILL can never reach a reaped (potentially recycled) pid.
+
+    Construction starts no thread. `arm` binds the Timer to `self._timer` *before* `Timer.start()`,
+    so the supervisor is disarmable even when `start()` raises (thread limit) or is interrupted
+    after the thread is already running: the caller's exception path reaches `close()`, which
+    forbids the kill under the lock, cancels the timer and joins its thread before the child is
+    reaped. Nothing armed can outlive `close()`.
+    """
+
+    def __init__(self):
+        self.pid = None; self.expired = False; self._closed = False; self._lock = threading.Lock()
+        self._timer = None
+
+    def arm(self, pid: int, timeout: float | None) -> None:
+        """Supervise `pid`; SIGKILL it after `timeout` seconds (None: never). Call inside the caller's cleanup try."""
+        with self._lock:
+            if self._closed: return
+            self.pid = pid
+            if timeout is None: return
+            self._timer = threading.Timer(timeout, self._expire); self._timer.daemon = True
+        self._timer.start()  # may raise or be interrupted: `_timer` is already bound, so `close()` still disarms it
+
+    def _expire(self) -> None:
+        with self._lock:
+            if self._closed: return
+            self.expired = True
+            try: os.kill(self.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+
+    def close(self) -> None:
+        """Forbid any further kill; call before reaping. Blocks while an in-flight kill finishes.
+
+        After this returns the timer thread, if it ever started, has exited: the deadline can no
+        longer fire, so the caller may reap the child and the kernel may recycle its pid.
+        """
+        with self._lock:
+            self._closed = True; timer = self._timer
+        if timer is None: return
+        timer.cancel()
+        if timer.is_alive(): timer.join()  # not alive: start() never got the thread running, nothing to wait for
+
+
+def run_child(argv: list[str], *, env: dict[str, str], cwd: str | None = None, stdin: str | None = None,
+              timeout: float | None = None) -> ChildRun:
     """Spawn `argv`, reap it with os.wait4 and collect its output and I/O report.
 
     stdin/stdout/stderr are temporary files rather than pipes, so the child can never block on a
-    full pipe while this process is blocked in wait4 (and the parent never has to read while
+    full pipe while this process is blocked waiting (and the parent never has to read while
     waiting). The I/O report path is handed to the child through $ORCHESTRATOR_BENCH_IO_REPORT and
     lives in the same private temporary directory, never in the state root under test.
+
+    Every child, timed or not, is waited for the same way: block until the kernel reports the exit
+    (`_await_exit`), stamp `elapsed_s`, then one blocking wait4 for status and rusage. `timeout`
+    arms `_KillOnDeadline`; a fixed WNOHANG/sleep poll would add up to one sampling interval to
+    only the timed (legacy) children and bias the before/after comparison. Raises
+    `subprocess.TimeoutExpired` after the killed child is reaped.
     """
     with tempfile.TemporaryDirectory(prefix='orchestrator-bench-child-') as tmp:
         report = Path(tmp, 'io.json')
         with open(Path(tmp, 'stdin'), 'w+b') as inp, open(Path(tmp, 'stdout'), 'w+b') as out, open(Path(tmp, 'stderr'), 'w+b') as err:
             if stdin is not None: inp.write(stdin.encode('utf-8')); inp.flush(); inp.seek(0)
+            deadline = _KillOnDeadline(); proc = None
             start = time.perf_counter()
-            proc = subprocess.Popen(argv, stdin=inp if stdin is not None else subprocess.DEVNULL, stdout=out, stderr=err,
-                                    env={**env, IO_REPORT_ENV: str(report)}, cwd=cwd)
-            _, status, usage = os.wait4(proc.pid, 0)
-            elapsed = time.perf_counter() - start
+            try:
+                proc = subprocess.Popen(argv, stdin=inp if stdin is not None else subprocess.DEVNULL, stdout=out, stderr=err,
+                                        env={**env, IO_REPORT_ENV: str(report)}, cwd=cwd)
+                deadline.arm(proc.pid, timeout)
+                _await_exit(proc.pid)
+                elapsed = time.perf_counter() - start
+            except BaseException:
+                deadline.close()  # disarmed and its thread gone before anything below can free the pid
+                if proc is not None:  # Popen itself failing leaves no child to reap
+                    # The child is unreaped here (zombie or alive), so this kill is safe.
+                    try: os.kill(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError: pass
+                    _, status, _ = os.wait4(proc.pid, 0)
+                    proc.returncode = os.waitstatus_to_exitcode(status)
+                raise
+            deadline.close()
+            _, status, usage = os.wait4(proc.pid, 0)  # immediate: the child is a zombie
             proc.returncode = code = os.waitstatus_to_exitcode(status)  # tell Popen it is reaped; no second waitpid
+            if deadline.expired:
+                raise subprocess.TimeoutExpired(argv, timeout)
             out.seek(0); err.seek(0)
             stdout = out.read().decode('utf-8', 'replace'); stderr = err.read().decode('utf-8', 'replace')
         io_report = _load_io_report(report)
@@ -246,9 +352,10 @@ def _load_io_report(path: Path) -> dict | None:
     return loaded if isinstance(loaded, dict) else None
 
 
-def run_cli(root: Path, *args: str, stdin: str | None = None, checkout: Path = REPO) -> ChildRun:
+def run_cli(root: Path, *args: str, stdin: str | None = None, checkout: Path = REPO,
+            timeout: float | None = None) -> ChildRun:
     """Run one instrumented CLI subprocess against `root`; a non-zero exit aborts the benchmark."""
-    run = run_child(cli_argv(*args), env=cli_env(root, checkout), cwd=str(checkout), stdin=stdin)
+    run = run_child(cli_argv(*args), env=cli_env(root, checkout), cwd=str(checkout), stdin=stdin, timeout=timeout)
     if run.returncode != 0:
         raise SystemExit(f'CLI {args[0]} failed ({run.returncode}):\n{run.stdout}\n{run.stderr}')
     return run
@@ -324,6 +431,7 @@ def measure(root: Path, scale: int, args: argparse.Namespace, tag: str) -> dict:
     size = args.batch_size
     checkout = args.checkout
     cli = partial(run_cli, checkout=checkout)
+    legacy_timeout = legacy_process_timeout(size * args.repeat)
     # Freeze input accounting before any workload contaminates it with synthetic billing rows.
     rows = {}; fixture_bytes = {}; digests = {}
     for name in STREAMS:
@@ -346,8 +454,8 @@ def measure(root: Path, scale: int, args: argparse.Namespace, tag: str) -> dict:
         group = []
         for record in batch_records(f'{tag}-single-{i}', size):
             stream = record.pop('stream')
-            if stream == 'event': group.append(cli(root, 'event', record.pop('event'), json.dumps(record)))
-            else: group.append(cli(root, stream, json.dumps(record)))
+            if stream == 'event': group.append(cli(root, 'event', record.pop('event'), json.dumps(record), timeout=legacy_timeout))
+            else: group.append(cli(root, stream, json.dumps(record), timeout=legacy_timeout))
         single.append(group)
     engine = []
     program = '''
@@ -388,6 +496,75 @@ engine.record_model_call(run_id=sys.argv[1], model='benchmark-unpriced', input_t
     }
 
 
+def assert_equivalent_roots(before: Path, after: Path) -> dict:
+    """Abort measurement on lost/changed records or changed common derived accounting.
+
+    New evidence/route fields intentionally differ from the pre-program implementation;
+    this gate checks common accounting, not equality of corrected semantic diagnostics.
+    """
+    from orchestrator.runtime import read_json
+    for name in STREAMS:
+        if (before/name).read_bytes() != (after/name).read_bytes():
+            raise ValueError(f'canonical bytes differ: {name}')
+    ledgers=[read_json(root/'ledger.json',{}) for root in (before,after)]
+    for key in ('runs','tasks','decisions','workstreams','locks','artifacts','verification','repo_revision','adaptive'):
+        if ledgers[0].get(key) != ledgers[1].get(key): raise ValueError(f'ledger differs: {key}')
+    pages=[json.JSONDecoder().raw_decode((root/'dashboard.html').read_text().split('const D=',1)[1])[0] for root in (before,after)]
+    for key in ('event_count','metric_count'):
+        if pages[0][key] != pages[1][key]: raise ValueError(f'dashboard differs: {key}')
+    for key in ('total_cost','waste_cost','conflicts'):
+        if pages[0]['summary'][key] != pages[1]['summary'][key]: raise ValueError(f'dashboard accounting differs: {key}')
+    for key in ('by_role','by_runtime','interactive_sessions'):
+        if pages[0][key] != pages[1][key]: raise ValueError(f'dashboard accounting differs: {key}')
+    return {'canonical_bytes':True,'ledger':True,'dashboard_accounting':True,
+            'scope':'all canonical bytes; ledger entities; dashboard counts, total/waste cost, conflicts, role/runtime/session aggregates; corrected evidence/routes excluded'}
+
+
+def compare_legacy(source: Path, scale: int, args: argparse.Namespace) -> dict:
+    """Same input and records, old per-record CLI versus final batch; alternating trial order."""
+    from orchestrator.records import to_json as records_to_json
+    from orchestrator.economics import cost_attribution
+    from orchestrator.run_evidence import evidence_coverage, summarize_runs
+    from orchestrator.runtime import iter_jsonl
+    groups={'before':[], 'after':[]}
+    with tempfile.TemporaryDirectory(prefix='orchestrator-legacy-compare-') as tmp:
+        roots={side:Path(tmp,side) for side in groups}
+        for root in roots.values(): copy_fixture(source,root,scale)
+        hashes={name:hashlib.sha256((roots['before']/name).read_bytes()).hexdigest() for name in STREAMS}
+        sizes={name:(roots['before']/name).stat().st_size for name in STREAMS}
+        legacy_timeout = legacy_process_timeout(compare_legacy_process_count(scales=1, repeat=args.repeat, batch_size=args.batch_size))
+        root=roots['before']
+        evidence=evidence_coverage(summarize_runs(iter_jsonl(root/'metrics.jsonl'),iter_jsonl(root/'events.jsonl'),iter_jsonl(root/'outcomes.jsonl')))
+        billing=cost_attribution(iter_jsonl(root/'metrics.jsonl'))
+        cold={}
+        # First trial is cold; both roots then have identical warm history for each trial.
+        for trial in range(args.repeat+1):
+            records=batch_records(f'paired-{trial}',args.batch_size)
+            for record in records: record['ts']='2026-09-23T00:00:00+00:00'
+            for side in (('before','after') if trial%2==0 else ('after','before')):
+                root=roots[side]; runs=[]
+                if side=='after':
+                    runs.append(run_cli(root,'batch','-',stdin=json.dumps(records),checkout=args.checkout))
+                else:
+                    for record in records:
+                        payload=dict(record); stream=payload.pop('stream')
+                        command=[stream]
+                        if stream=='event': command.append(payload.pop('event'))
+                        runs.append(run_cli(root,*command,json.dumps(payload),checkout=args.compare_legacy,timeout=legacy_timeout))
+                if trial==0: cold[side]=runs
+                else: groups[side].append(runs)
+            equivalence=assert_equivalent_roots(roots['before'],roots['after'])
+        def summary(trials):
+            seconds=statistics.median(sum(r.elapsed_s for r in group) for group in trials)
+            return {'subprocesses':len(trials[0]),'median_s':round(seconds,4),
+                    'median_peak_rss_mib':round(statistics.median(max(rss_mib(r.ru_maxrss) for r in group) for group in trials),1),
+                    'records_per_s':round(args.batch_size/seconds,2),'io':io_summary(trials)}
+        return {'scale':f'{scale}x','fixture_sha256':hashes,'fixture_bytes':sizes,'input_evidence':records_to_json(evidence),
+                'input_billing_including_sessions':records_to_json(billing),'equivalence':equivalence,
+                'before':summary(groups['before']),'after':summary(groups['after']),
+                'cold':{side:summary([runs]) for side,runs in cold.items()}}
+
+
 def _mib(n: int | None) -> str:
     return '—' if n is None else f'{n / 2 ** 20:.2f}'
 
@@ -411,6 +588,7 @@ def main() -> None:
     ap.add_argument('--batch-size', type=int, default=5); ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--source', type=Path, default=None, help='copy this root\'s JSONL streams into the temp fixture instead of synthesizing')
     ap.add_argument('--checkout', type=Path, default=REPO, help='Python code checkout to measure (same driver for before/after)')
+    ap.add_argument('--compare-legacy', type=Path, help='old checkout without batch: compare its per-record CLI to --checkout batch on identical copied inputs (requires --source --json)')
     ap.add_argument('--json', action='store_true', help='print one JSON document instead of a table')
     args = ap.parse_args()
     try: scales = [int(s) for s in args.scales.split(',') if s.strip()]
@@ -426,6 +604,16 @@ def main() -> None:
         args.source = args.source.expanduser().resolve()
         if not args.source.is_dir() or not any((args.source / n).is_file() for n in STREAMS):
             ap.error('--source must be a copied root containing JSONL streams')
+    if args.compare_legacy is not None:
+        args.compare_legacy=args.compare_legacy.expanduser().resolve()
+        if not (args.compare_legacy/'orchestrator/cli.py').is_file(): ap.error('--compare-legacy must contain orchestrator/cli.py')
+        if args.source is None or not args.json: ap.error('--compare-legacy requires --source and --json')
+        results=[compare_legacy(args.source,scale,args) for scale in scales]
+        print(json.dumps({'meta':{'before':str(args.compare_legacy),'after':str(args.checkout),'repeat':args.repeat,
+                                 'python':sys.version.split()[0],'platform':sys.platform,'order':'alternating; cold excluded',
+                                 'scope':'copied fixture; old per-record vs final batch; no model spend or causal savings claim'},
+                          'results':results},indent=2))
+        return
     results = []
     with tempfile.TemporaryDirectory(prefix='orchestrator-bench-') as tmp:
         for scale in scales:
