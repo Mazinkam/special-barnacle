@@ -72,6 +72,17 @@ export interface ChildStderrFile {
 export class RunDiagnostics {
 	private readonly owner;
 	private readonly files = new Map<string, { dev: number; ino: number }>();
+	/**
+	 * Recorded once, at `openChildStderrFile(...).release()` time, for a
+	 * child-stderr file only: the fstat size/mtime the orchestrator itself last
+	 * observed after every write it intended to make. A detached descendant
+	 * that escaped the process group (see index.ts's `killProcessTree`) can
+	 * still hold the same underlying open file description and keep writing
+	 * after that point; `seal()` compares against this snapshot and vetoes the
+	 * seal if the file no longer matches, the way the old pipe path effectively
+	 * did when a holder kept the pipe open.
+	 */
+	private readonly childStderrFinal = new Map<string, { size: number; mtimeMs: number }>();
 	private readonly leases = new Set<symbol>();
 	private accepting = true;
 	private failed = false;
@@ -123,7 +134,15 @@ export class RunDiagnostics {
 		assertSafeDiagnosticName(name);
 		if (this.files.has(name)) throw new Error(`diagnostic file already exists: ${name}`);
 		const path = join(this.dir, name);
-		const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+		// O_APPEND matters beyond this process's own writes: a detached descendant
+		// that escaped the process group (its own dup of this same fd, inherited
+		// through fork/exec) can keep writing after we believe the run is done.
+		// Without O_APPEND its writes land at that fd's own (possibly stale, e.g.
+		// still 0) offset, which can overwrite bytes a *different* fd (ours, in
+		// writeOwned below) wrote later at that same offset. With O_APPEND every
+		// write through this open file description — including the descendant's —
+		// atomically targets the current end of file, so it can only ever append.
+		const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_APPEND, 0o600);
 		try {
 			const st = fstatSync(fd);
 			if (!st.isFile() || st.nlink !== 1) throw new Error("diagnostic inode changed");
@@ -146,6 +165,25 @@ export class RunDiagnostics {
 			closeFd,
 			release: () => {
 				closeFd();
+				// Snapshot the file's current state as "the orchestrator's final,
+				// intended write" — release() is documented as being called once no
+				// further diagnostic writes (raw child bytes or writer() appends)
+				// will target this file. Any later change (a still-writing escaped
+				// descendant) is caught by seal()'s comparison against this snapshot.
+				try {
+					const identity = this.files.get(name);
+					if (identity) {
+						const rfd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+						try {
+							const st = fstatSync(rfd);
+							if (st.isFile() && st.nlink === 1 && st.dev === identity.dev && st.ino === identity.ino) {
+								this.childStderrFinal.set(name, { size: st.size, mtimeMs: st.mtimeMs });
+							}
+						} finally { closeSync(rfd); }
+					}
+				} catch {
+					/* seal() independently re-validates and fails closed if unreadable */
+				}
 				this.leases.delete(lease);
 				if (this.leases.size === 0) this.drained?.();
 			},
@@ -204,6 +242,14 @@ export class RunDiagnostics {
 				try {
 					const st = fstatSync(fd);
 					if (!st.isFile() || st.nlink !== 1 || st.dev !== identity.dev || st.ino !== identity.ino) throw new Error("diagnostic inode changed before seal");
+					// A child-stderr file only: if it grew/changed after the orchestrator's
+					// own last intended write (recorded at openChildStderrFile(...).release()),
+					// an escaped descendant is still writing through the inherited fd. Veto
+					// the seal rather than sha256/publish a file we cannot vouch for.
+					const finalSnapshot = this.childStderrFinal.get(name);
+					if (finalSnapshot && (st.size !== finalSnapshot.size || st.mtimeMs !== finalSnapshot.mtimeMs)) {
+						throw new Error(`child stderr file changed after the orchestrator's final write; seal vetoed: ${name}`);
+					}
 					fsyncSync(fd);
 					const hash = createHash("sha256");
 					let raw_bytes = 0, n: number;

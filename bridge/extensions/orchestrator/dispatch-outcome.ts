@@ -3,7 +3,7 @@
  * Keeping this separate from the HT extension makes teardown recovery testable
  * without importing terminal runtime APIs.
  */
-import { closeSync, existsSync, fstatSync, openSync, readSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, openSync, readSync, writeSync } from "node:fs";
 
 const DEFAULT_HEAD_BYTES = 8 * 1024;
 const DEFAULT_TAIL_BYTES = 56 * 1024;
@@ -93,7 +93,10 @@ export function readStderrFileBounded(path: string, headBytes?: number, tailByte
 	if (!existsSync(path)) return "";
 	let fd: number;
 	try {
-		fd = openSync(path, "r");
+		// O_NOFOLLOW: this reopens by path (the caller does not hand us an owned
+		// fd), so refuse to follow a symlink swapped in at that path between the
+		// write side's open and this read.
+		fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
 	} catch {
 		return "";
 	}
@@ -138,7 +141,8 @@ export function capChildStderrFile(
 	maxBytes: number = MAX_CHILD_STDERR_DISK_BYTES,
 	headBytes: number = CAP_HEAD_BYTES,
 ): string | undefined {
-	const fd = openSync(path, "r");
+	// O_NOFOLLOW: same symlink-swap defense as readStderrFileBounded above.
+	const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
 	let size: number;
 	try {
 		size = fstatSync(fd).size;
