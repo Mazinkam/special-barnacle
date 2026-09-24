@@ -66,6 +66,35 @@ Because the runtime paths are symlinks, editing a file under `bridge/` is
 immediately visible to HT — no copy step needed. Commit changes in `bridge/`
 and they're the new canonical version for every machine that pulls this repo.
 
+## Verification gates
+
+Run all three from the repo root before integrating a bridge change:
+
+```bash
+cd bridge/extensions/orchestrator && bun test   # unit; expect 0 fail
+python3 -m pytest tests -q                      # Python runtime; expect 0 fail
+./scripts/typecheck-bridge.sh                   # strict typecheck; expect exit 0
+```
+
+This repo intentionally has no `package.json`, `node_modules`, or `tsconfig.json`
+— HT loads the extension from here via symlinks, and its own workspace supplies
+`@humain/terminal`, `typebox`, `@types/node`, and `bun-types`. A bare
+`bunx tsc --noEmit *.ts` therefore cannot resolve any of those and fails with
+cascading `TS2307`s that look like code defects but are not.
+`scripts/typecheck-bridge.sh` exists to close that gap: it discovers the
+installed HT workspace (override with `HUMAIN_TERMINAL_ROOT`), generates a
+tsconfig pointing at it, and runs `tsc` with three distinct exit codes:
+
+| Exit | Meaning | What an automated QA agent should report |
+|---|---|---|
+| 0 | no diagnostics | PASS |
+| 1 | type errors | FAIL — fix the code |
+| 2 | HT workspace / tsc / bun-types not found | SKIPPED — environment, **not** a code failure |
+
+Scope is `bridge/extensions/orchestrator/*.ts`. `cross-review-demo.ts` is
+excluded: it carries pre-existing diagnostics, and keeping the gate at exactly
+zero means any new error is unambiguous.
+
 ## Why a bridge directory?
 
 The Python orchestrator (`../orchestrator/`) is the model-agnostic routing

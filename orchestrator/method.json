@@ -55,20 +55,22 @@
     },
 
     "pre_implementation_recon": {
-      "summary": "Tasks at complexity >= 5 get a parallel fan-out of cheap recon workers before any implementer touches code.",
+      "summary": "Tasks at complexity >= 5 get a parallel fan-out of cheap, read-only recon workers before any implementer touches code. The orchestrator extension owns this fan-out directly (it is a billed, observable dispatch); leads must not re-run their own recon.",
       "min_complexity": 5,
       "workers_by_complexity": [
         { "min": 5, "max": 6,  "workers": 3 },
         { "min": 7, "max": 8,  "workers": 4 },
         { "min": 9, "max": 10, "workers": 5 }
       ],
-      "worker_capability": "implementation_fast",
+      "worker_capability": "scout",
       "worker_effort": "low",
       "worker_verification_depth": "targeted",
       "lead_synthesis_capability": "technical_lead",
       "evidence_packet_max_tokens": 2000,
+      "evidence_packet_max_tokens_scope": "aggregate",
       "skip_for_task_classes": ["investigation", "qa_verification"],
-      "rationale": "implementation_strong-class tasks with 150K-400K input tokens cost $0.55-$2.38 because the implementer reads raw repository context. A $0.05 scout pre-digesting that context into a 2K-token evidence packet saves $1+ on the most expensive implementer calls and improves focus."
+      "rationale": "implementation_strong-class tasks with 150K-400K input tokens cost $0.55-$2.38 because the implementer reads raw repository context. Cheap scouts pre-digesting that context into one bounded evidence packet save $1+ on the most expensive implementer calls and improve focus.",
+      "evidence_packet_rationale": "evidence_packet_max_tokens is the AGGREGATE budget for the single combined packet handed to each lead, not a per-scout allowance: the cost being bounded is the lead's input prompt, which carries every scout's output at once. Each of the N workers therefore gets an equal share (budget / N), and the combined packet is capped at the total again after assembly. Failed workers are allocated their header plus a fair share of diagnostic space before any successful output, so a failure can never be hidden by a verbose success."
     },
 
     "exploration_topology": {

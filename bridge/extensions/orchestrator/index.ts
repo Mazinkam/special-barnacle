@@ -108,6 +108,13 @@ import { connectCancellationLoader, applyObservation, applyWarnings, createProgr
 import type { DispatchProgressView } from "./run-ui.ts";
 import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
 import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.ts";
+// Rule-2 recon planning/evidence helpers (pure; see recon.ts). `dispatchHierarchical()`
+// dispatches these as ordinary parent-owned tasks through the existing
+// `dispatchParallel()` path. `DispatchTask` below is declared independently;
+// `ReconTaskPlan` is structurally assignable to it, which the annotated
+// `const reconTasks: DispatchTask[] = planReconTasks(...)` checks at compile
+// time, so a planned recon task still needs no conversion step.
+import { formatReconEvidence, planReconTasks } from "./recon.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -199,6 +206,24 @@ const TELEMETRY_FLUSH_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_TELEMETRY_FLUSH_M
 const TELEMETRY_MAX_BATCH = positiveIntEnv("HUMAIN_ORCHESTRATOR_TELEMETRY_BATCH", 100);
 
 
+/**
+ * Bounds the aggregate parent-owned recon evidence packet handed to every
+ * lead prompt (see `formatReconEvidence` in recon.ts). Derived from
+ * method.json's `evidence_packet_max_tokens` — a token budget the policy
+ * already declares — via a conservative ~4 chars/token estimate, rather than
+ * inventing a new, undeclared character cap.
+ */
+const CHARS_PER_TOKEN_ESTIMATE = 4;
+const RECON_EVIDENCE_MAX_CHARS = positiveIntEnv(
+	"HUMAIN_ORCHESTRATOR_RECON_EVIDENCE_MAX_CHARS",
+	METHOD.rules.pre_implementation_recon.evidence_packet_max_tokens * CHARS_PER_TOKEN_ESTIMATE,
+);
+
+// `dispatchTimeoutFor()` + LEAD_DISPATCH_TIMEOUT_MS lived here. Dropped in
+// favour of main's progress-aware lead timeouts (`cb9f51e`): a flat per-
+// capability ceiling is exactly what that change replaced, and
+// ORCHESTRATING_CAPABILITIES now drives `opts.leadTimeouts` in
+// runSubagentProcess instead.
 
 /**
  * PIDs of dispatched children that are still running. Children are spawned
@@ -685,14 +710,28 @@ function heuristicTriage(goal: string): TriageResult {
 	};
 }
 
+/**
+ * Normalise any complexity input (triage JSON or the manual `--complexity`
+ * flag) to the integer 1-10 scale method.json's Rule-2 bands are defined on.
+ * Out-of-band values (6.5, 12) otherwise match no `workers_by_complexity`
+ * band, silently plan zero recon workers, and make the no-recon phase line
+ * report a false reason.
+ */
+export function clampComplexity(raw: unknown, fallback = 5): number {
+	// Only numbers and non-empty numeric strings are complexity values; null,
+	// "", booleans and arrays mean "absent" and must take the fallback rather
+	// than coerce to 0 and collapse to the minimum (which would skip recon).
+	if (typeof raw !== "number" && !(typeof raw === "string" && raw.trim() !== "")) return fallback;
+	const n = Number(raw);
+	return Number.isFinite(n) ? Math.max(1, Math.min(10, Math.round(n))) : fallback;
+}
+
 function clampTriage(raw: Partial<TriageResult>): TriageResult | null {
 	if (!raw || typeof raw !== "object") return null;
 	const task_class = VALID_TASK_CLASSES.includes(raw.task_class ?? "")
 		? raw.task_class!
 		: "implementation";
-	const complexity = Number.isFinite(raw.complexity)
-		? Math.max(1, Math.min(10, Math.round(Number(raw.complexity))))
-		: 5;
+	const complexity = clampComplexity(raw.complexity);
 	const risk = VALID_RISKS.includes(raw.risk ?? "") ? raw.risk! : "medium";
 	const reasoning = typeof raw.reasoning === "string" && raw.reasoning.length > 0
 		? raw.reasoning.slice(0, 200)
@@ -719,6 +758,10 @@ function clampTriage(raw: Partial<TriageResult>): TriageResult | null {
 // assistant message_end events with model, input/output tokens, and cost.
 // That path is the one we replicate here.
 
+// The `ChildSpawner` seam this branch added here is deliberately NOT duplicated:
+// main declares a byte-identical alias further down (`cc9836d`), which is the
+// shape `f2ddaa6` adopted precisely so this merge would converge. Two aliases
+// would be a duplicate-identifier error; the one below serves both call sites.
 function reportedCost(total: unknown): number | undefined {
 	return typeof total === "number" && Number.isFinite(total) && total >= 0 ? total : undefined;
 }
@@ -1356,6 +1399,13 @@ export async function runSubagentProcess(opts: {
 	 * `spawn`; production callers never set this. Lets tests exercise the real
 	 * stream/event/close handling below against a deterministic local fixture
 	 * instead of the actual `humain-terminal --mode json` binary.
+	 */
+	/*
+	 * This branch previously added a second positional parameter
+	 * (`spawnProcess: ChildSpawner = spawn`) for the same purpose. Converged on
+	 * `spawnChild` instead of shipping two seams for one job: it is the one
+	 * main's suite already exercises, and keeping it inside the options object
+	 * means the next seam does not grow the signature again.
 	 */
 	spawnChild?: ChildSpawner;
 }): Promise<SubagentProcessResult> {
@@ -2186,15 +2236,30 @@ function warnTelemetry(ctx: ExtensionContext, report: FlushReport): void {
 // Subagent dispatch
 // -----------------------------------------------------------------------------
 
-interface DispatchTask {
+/**
+ * One task for `dispatchParallel()`. Declared standalone rather than derived
+ * from `recon.ts`'s `ReconTaskPlan`: the bridge's dispatch contract is the
+ * general case and must not depend on the pure Rule-2 recon module, which is
+ * only one of its callers. `ReconTaskPlan` is structurally assignable here
+ * (its `tools` is required, this one's is optional), and the annotation on
+ * `reconTasks` in `dispatchHierarchical()` fails the typecheck if that ever
+ * stops being true.
+ */
+export interface DispatchTask {
+	taskId: string;
 	capability: string;
 	task: string;
-	taskId: string;
+	/**
+	 * Explicit tool allow-list, overriding whatever the bound persona permits.
+	 * Recon always specifies this; other dispatches omit it and inherit their
+	 * persona's own tools.
+	 */
+	tools?: string[];
 	retryOf?: string;
 	retryCount?: number;
 }
 
-interface DispatchResult {
+export interface DispatchResult {
 	taskId: string;
 	capability: string;
 	model: string;
@@ -2212,13 +2277,14 @@ interface DispatchResult {
 	filesChanged: string[];
 }
 
-async function dispatchParallel(
+export async function dispatchParallel(
 	cwd: string,
 	runId: string,
 	tasks: DispatchTask[],
 	adapter: Adapter,
 	ctx: ExtensionContext,
 	depth: number = 0,
+	deps = { recordEvent, runProcess: runSubagentProcess },
 ): Promise<DispatchResult[]> {
 	if (tasks.length === 0) return [];
 
@@ -2248,6 +2314,7 @@ async function dispatchParallel(
 			task: formatTaskPrompt(t, runId, userMessages),
 			model: binding.model ?? "unknown",
 			effort: binding.effort,
+			tools: t.tools,
 			cwd,
 			_capability: t.capability,
 			_taskId: t.taskId,
@@ -2267,8 +2334,10 @@ async function dispatchParallel(
 		// Left unparenthesised this failed to load the whole extension.
 		const shortId =
 			(input._taskId ?? "").replace(`${runId}-`, "") || input._capability || "task";
-		// Queued, not awaited: the child starts now and the record lands in the next batch.
-		recordEvent("dispatch_started", {
+		// Queued, not awaited: the child starts now and the record lands in the next
+		// batch. Routed through `deps` so tests can observe it; the default binding
+		// is the same `recordEvent`, so the queuing behaviour is unchanged.
+		deps.recordEvent("dispatch_started", {
 			run_id: runId,
 			task_id: input._taskId,
 			capability: input._capability,
@@ -2277,7 +2346,7 @@ async function dispatchParallel(
 			retry_of: input._retryOf,
 		});
 		try {
-			const r = await runSubagentProcess({
+			const r = await deps.runProcess({
 				cwd: input.cwd,
 				agentName: input.agent,
 				task: input.task,
@@ -2287,13 +2356,17 @@ async function dispatchParallel(
 				label: shortId,
 				capability: input._capability,
 				depth,
-				// Deliberately no `tools` override: each orch-* persona declares its
-				// own allow-list in frontmatter, and those lists encode policy
-				// (reviewers and scouts are read-only). Hardcoding a set here both
-				// granted reviewers write access and dropped tools the personas need.
+				// Still no *hardcoded* tools override here — that is what previously
+				// granted reviewers write access and stripped tools the personas need.
+				// `input.tools` is per-task and set by exactly one producer,
+				// `planReconTasks()`, which pins recon to read-only. Every other task
+				// leaves it undefined, and runSubagentProcess then falls back to the
+				// persona's own frontmatter allow-list, so persona policy still wins
+				// everywhere it did before.
+				tools: input.tools,
 				ctx,
 			});
-			recordEvent("dispatch_finished", {
+			deps.recordEvent("dispatch_finished", {
 				run_id: runId,
 				task_id: input._taskId,
 				capability: input._capability,
@@ -3020,9 +3093,7 @@ async function dispatchHierarchical(
 	/** Mutable sink the caller appends escalation dispatches to, so they get billed. */
 	escalationResults: DispatchResult[];
 }> {
-	const { depth, leads, workers, shape } = plan.topology;
-	const recCap = plan.route.recommended.capability;
-	const recEffort = plan.route.recommended.effort;
+	const { depth } = plan.topology;
 
 	// Always: dispatch the architect first if it's a high-complexity / new-domain
 	// task. The architect's output feeds into subsequent dispatch prompts.
@@ -3068,6 +3139,38 @@ async function dispatchHierarchical(
 		}
 	}
 
+	const captureOpts: CaptureOpts = {
+		runId, planId, taskClass: plan.task_class, complexity: plan.complexity,
+		risk: plan.risk, recommended: plan.route.recommended, mode: plan.route.mode,
+	};
+	const results = await dispatchReconAndLeads({ runId, goal, plan, adapter, architectResult }, {
+		dispatch: (tasks) => dispatchParallel(cwd, runId, tasks, adapter, ctx),
+		capture: (result) => captureDispatchCost(captureOpts, result),
+		setPhase: (phase) => ACTIVE_RUN?.setPhase(phase),
+		throwIfCancelled: () => ACTIVE_RUN?.cancellation.throwIfCancelled(),
+	});
+	return { ...results, architectResult, escalationResults: [] };
+}
+
+/** Parent-owned recon/lead sequencing; effects are supplied by the bridge. */
+export async function dispatchReconAndLeads(
+	input: {
+		runId: string;
+		goal: string;
+		plan: PlanResponse;
+		adapter: Adapter;
+		architectResult?: DispatchResult;
+		evidenceMaxChars?: number;
+	},
+	effects: {
+		dispatch: (tasks: DispatchTask[]) => Promise<DispatchResult[]>;
+		capture: (result: DispatchResult) => Promise<void>;
+		setPhase: (phase: string) => void;
+		throwIfCancelled: () => void;
+	},
+): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[] }> {
+	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars = RECON_EVIDENCE_MAX_CHARS } = input;
+	const { leads } = plan.topology;
 	// `Math.max(1, leads)` returns NaN when the plan omits `topology.leads` or
 	// sends a non-number, and `Array.from({ length: NaN })` is empty — that is
 	// how a run reported "leads: 0/0 succeeded" with nothing dispatched. Coerce
@@ -3075,30 +3178,120 @@ async function dispatchHierarchical(
 	const leadCount = Number.isFinite(leads)
 		? Math.min(MAX_LEADS, Math.max(1, Math.trunc(leads)))
 		: 1;
+
+	// Rule 2: parent-owned, read-only recon dispatched directly by the bridge
+	// (not left to a lead's discretion) so it is an observable, billed dispatch
+	// with its own progress row, log files, and cost — not an optimistic claim
+	// that "workers fan out inside each lead".
+	const reconTasks: DispatchTask[] = planReconTasks({
+		method: METHOD.rules.pre_implementation_recon,
+		complexity: plan.complexity,
+		taskClass: plan.task_class,
+		goal,
+		runId,
+	});
+	// Cancellation boundaries. A cancelled run must (1) dispatch nothing new,
+	// but (2) never lose the accounting for children that already finished.
+	// So the check runs BEFORE each dispatch batch and AFTER the whole capture
+	// loop for a completed batch — never between captures, or a cancellation
+	// that lands mid-billing would leave some finished workers unbilled.
+	effects.throwIfCancelled();
+	let workerResults: DispatchResult[] = [];
+	if (reconTasks.length === 0) {
+		// Name the actual reason; "below threshold OR exempt" made the operator
+		// guess, and read as false for an exempt class at high complexity.
+		const rule = METHOD.rules.pre_implementation_recon;
+		const reason = plan.complexity < rule.min_complexity
+			? `complexity ${plan.complexity} is below the Rule-2 threshold ${rule.min_complexity}`
+			: `task class "${plan.task_class}" is exempt (skip_for_task_classes)`;
+		effects.setPhase(`no parent-owned recon required: ${reason}`);
+	} else {
+		effects.setPhase(`recon: 0/${reconTasks.length} starting`);
+		workerResults = await effects.dispatch(reconTasks);
+		for (const result of workerResults) await effects.capture(result);
+		// Every finished recon worker is now billed exactly once; if the run was
+		// cancelled while recon ran (or while billing it), stop here — before any
+		// lead is announced or started.
+		effects.throwIfCancelled();
+		const completedRecon = workerResults.filter((r) => r.exitCode === 0).length;
+		effects.setPhase(`recon: ${completedRecon}/${reconTasks.length} completed; dispatching lead(s)`);
+	}
+	// Every completed/failed recon result is folded into one bounded evidence
+	// packet; failed workers are represented as unavailable, never silently
+	// dropped. If ALL recon calls failed, say so explicitly rather than
+	// letting the per-worker diagnostics read as ordinary partial coverage.
+	const reconEvidenceBody = formatReconEvidence(workerResults, evidenceMaxChars);
+	const reconAllFailed = reconTasks.length > 0 && workerResults.every((r) => r.exitCode !== 0);
+	const reconEvidence = reconAllFailed
+		? `DEGRADED: all ${workerResults.length} parent-owned recon worker(s) failed; no verified recon evidence is available for this run. Raw diagnostics follow for context only:\n\n${reconEvidenceBody}`
+		: reconEvidenceBody;
+
 	const leadTasks: DispatchTask[] = Array.from({ length: leadCount }, (_, i) => ({
 		capability: "lead",
-		task: leadPrompt(goal, plan, architectResult, i, leadCount, adapter),
+		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter),
 		taskId: `${runId}-lead-${i}`,
 	}));
 
-	ACTIVE_RUN?.setPhase(
-		`${leadCount} lead(s) executing on ${shortName(adapter.lead?.model ?? "?")} — workers fan out inside each lead`,
+	const completedReconCount = workerResults.filter((r) => r.exitCode === 0).length;
+	const reconPhaseNote =
+		reconTasks.length > 0
+			? `${completedReconCount}/${reconTasks.length} completed recon packet(s)`
+			: "no parent-owned recon packets (not required for this task)";
+	effects.throwIfCancelled();
+	effects.setPhase(
+		`${leadCount} lead(s) executing on ${shortName(adapter.lead?.model ?? "?")} with ${reconPhaseNote}; nested subagent calls inside a lead are not authoritative worker accounting`,
 	);
-	const leadResults = await dispatchParallel(cwd, runId, leadTasks, adapter, ctx);
-	for (const r of leadResults) {
-		await captureDispatchCost(
-			{ runId, planId, taskClass: plan.task_class, complexity: plan.complexity,
-			  risk: plan.risk, recommended: plan.route.recommended, mode: plan.route.mode },
-			r,
-		);
-	}
+	const leadResults = await effects.dispatch(leadTasks);
+	for (const r of leadResults) await effects.capture(r);
+	// Same contract as recon: bill every finished lead, then honour cancellation.
+	effects.throwIfCancelled();
 
-	// Lead agents own their own worker fan-out via HT's subagent tool. We
-	// don't see worker results here; they'll land in HT's own session log +
-	// subsequently in our cost capture via the architectResult's reports.
-	// For depth <= 2, the "lead" dispatch IS the orchestrator-lead and it
-	// does its own fan-out inside its own context window.
-	return { leadResults, workerResults: [], architectResult, escalationResults: [] };
+	// Recon is parent-owned and returned for billing/reporting. Any further
+	// fan-out a lead performs via HT's own subagent tool happens inside that
+	// lead's own context window; the bridge has no visibility into it and does
+	// not count it as part of this run's authoritative worker accounting.
+	return { leadResults, workerResults };
+}
+
+/**
+ * Every dispatch this run paid for, in lifecycle order. Parent-owned recon
+ * workers are billed dispatches like any other; omitting them under-reported
+ * total spend, which is the number the cost policy is judged on. Each result
+ * appears exactly once — recon is captured to the ledger during
+ * `dispatchReconAndLeads()`, and this list is only the final-summary view.
+ */
+export function collectBilledResults(input: {
+	architectResult?: DispatchResult;
+	workerResults: DispatchResult[];
+	leadResults: DispatchResult[];
+	verificationResults: DispatchResult[];
+	escalationResults: DispatchResult[];
+}): DispatchResult[] {
+	return [
+		...(input.architectResult ? [input.architectResult] : []),
+		...input.workerResults,
+		...input.leadResults,
+		...input.verificationResults,
+		...input.escalationResults,
+	];
+}
+
+/**
+ * Operator-facing summary line for parent-owned recon. Failed workers are
+ * named with a summarized (never raw) stderr so the final notification stays
+ * bounded and readable.
+ */
+export function summarizeReconWorkers(workerResults: DispatchResult[]): string {
+	if (workerResults.length === 0) return "recon workers: none (not required for this task)";
+	const completed = workerResults.filter((r) => r.exitCode === 0).length;
+	const cost = workerResults.reduce((s, r) => s + r.costUsd, 0);
+	const failures = workerResults
+		.filter((r) => r.exitCode !== 0)
+		.map((r) => `${r.taskId} exit ${r.exitCode}: ${summarizeStderr(r.stderr, 120) || "(no output)"}`);
+	return [
+		`recon workers: ${completed}/${workerResults.length} completed · $${cost.toFixed(4)}`,
+		...failures.map((f) => `  failed ${f}`),
+	].join("\n");
 }
 
 /** An architect is worth spawning at the same complexity where method.json Rule 2 mandates recon. */
@@ -3153,10 +3346,11 @@ function modelTableForLead(adapter: Adapter): string[] {
 	];
 }
 
-function leadPrompt(
+export function leadPrompt(
 	goal: string,
 	plan: PlanResponse,
 	architectResult: DispatchResult | undefined,
+	reconEvidence: string,
 	leadIndex: number,
 	leadCount: number,
 	adapter: Adapter,
@@ -3172,6 +3366,17 @@ function leadPrompt(
 		leadCount > 1
 			? `You are lead ${leadIndex + 1} of ${leadCount}. Focus on your assigned sub-domain; other leads handle parallel sub-domains.`
 			: "You are the sole lead for this orchestration.";
+	// The orchestrator already dispatched and billed the required Rule-2 recon
+	// workers before this lead ever started (see dispatchHierarchical). State
+	// that plainly, whether evidence exists or not, instead of letting the lead
+	// assume no recon happened just because this section is silent.
+	const reconSection = [
+		"Recon evidence (already gathered by dedicated parent-owned recon workers the orchestrator dispatched and billed before you started; treat it as ground truth for this run):",
+		"",
+		reconEvidence || "(none: this task's complexity/task class does not require parent-owned recon)",
+		"",
+		"Do not repeat broad repository discovery already covered by the recon evidence above. You may still use your own tools to verify a specific, material uncertainty before acting.",
+	].join("\n");
 	return [
 		`You are the orchestrator lead for the following goal. Drive it to completion.`,
 		"",
@@ -3184,13 +3389,15 @@ function leadPrompt(
 		scopeNote,
 		architectOutput,
 		"",
+		reconSection,
+		"",
 		"You are running non-interactively: there is no human to answer questions mid-run. If the goal is ambiguous, make the conservative choice, do the unambiguous part, and list every open question under '## Open items' in your final report instead of stopping to ask.",
 		"",
-		"Use the subagent tool to dispatch workers. For each dispatch:",
+		"You may use the subagent tool for implementation, review, and QA work. Nested subagent calls you make run inside your own context: the orchestrator bridge does not see, log, or bill them the way it does the parent-owned recon above, so they are not authoritative worker accounting for this run — only your own final report is. For each nested dispatch:",
 		"- Choose the right agent (orch-worker, orch-implementation-strong, orch-implementation-fast, orch-technical-review, orch-security-review, orch-qa-agent).",
 		"- Pass a narrowly-scoped task prompt.",
 		"- Pass the `model` for that agent from the routing table below.",
-		"- After all workers finish, run QA via orch-qa-agent. If verification fails, escalate per method.json rules.review_after_fix (Rule 1).",
+		"- After implementation is done, run QA via orch-qa-agent. If verification fails, escalate per method.json rules.review_after_fix (Rule 1).",
 		"",
 		...modelTableForLead(adapter),
 	].join("\n");
@@ -3239,7 +3446,7 @@ export function parseArgs(args: string): OrchestrateArgs {
 		const next = tokens[i + 1];
 		switch (t) {
 			case "--task-class": if (next) { out.taskClass = next; i++; } break;
-			case "--complexity": if (next) { out.complexity = Number(next) || 5; i++; } break;
+			case "--complexity": if (next) { out.complexity = clampComplexity(next); i++; } break;
 			case "--risk": if (next) { out.risk = next; i++; } break;
 			case "--quality-floor": if (next) { out.qualityFloor = Number(next); i++; } break;
 			case "--cost-aggressiveness": if (next) { out.costAggressiveness = Number(next); i++; } break;
@@ -3742,7 +3949,10 @@ export default function (pi: ExtensionAPI) {
 
 				const dirtyBefore = gitDirtySnapshot(cwd);
 				const headBefore = gitHead(cwd);
-				const { leadResults, architectResult, escalationResults } = await dispatchHierarchical(
+				// `workerResults` carries the parent-owned recon dispatches; they must stay
+				// destructured here or the run stops billing them (plan Task 3).
+				const { leadResults, workerResults, architectResult, escalationResults } = await dispatchHierarchical(
+
 					cwd,
 					runId,
 					plan.plan_id,
@@ -3898,15 +4108,17 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Step 4: Finalize.
-				// Total cost must cover EVERY dispatch this run paid for — architect and
-				// escalations included. Summing leads alone under-reported spend, which
-				// is the one number the cost-optimisation policy is judged on.
-				const billedResults = [
-					...(architectResult ? [architectResult] : []),
-					...leadResults,
-					...verificationResults,
-					...escalationResults,
-				];
+				// Total cost must cover EVERY dispatch this run paid for — architect,
+				// parent-owned recon workers, and escalations included. Summing leads
+				// alone under-reported spend, which is the one number the
+				// cost-optimisation policy is judged on.
+				const billedResults = collectBilledResults({
+					architectResult,
+					workerResults,
+					leadResults,
+					verificationResults,
+					escalationResults,
+				});
 				const totalCost =
 					triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0);
 				const succeededLeads = leadResults.filter((r) => r.exitCode === 0).length;
@@ -3974,16 +4186,19 @@ export default function (pi: ExtensionAPI) {
 					`Orchestration ${dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(Date.now() - Number(runId.split("-")[2]))}.`,
 					`run_id: ${runId}`,
 					`leads: ${succeededLeads}/${leadResults.length} succeeded · retries: ${retries} · files: ${allFiles.length} changed`,
+					summarizeReconWorkers(workerResults),
 					`verification: ${verdict}`,
 					`total cost: $${totalCost.toFixed(4)} (${billedResults.length + (triageCost.usd > 0 ? 1 : 0)} dispatches)`,
 					...(dispatchOk
 						? []
 						: [
-								`first failure: ${
-									(billedResults.find((r) => r.exitCode !== 0)?.stderr ?? "(no dispatch attempted)")
-										.trim()
-										.slice(0, 300) || "(no output)"
-								}`,
+								`first failure: ${(() => {
+									// The run FAILED because no lead succeeded, so name a lead first;
+									// recon/architect failures are reported on their own lines.
+									const failed = leadResults.find((r) => r.exitCode !== 0) ?? billedResults.find((r) => r.exitCode !== 0);
+									if (!failed) return "(no dispatch attempted)";
+									return `${failed.taskId.replace(`${runId}-`, "")} exit ${failed.exitCode}: ${summarizeStderr(failed.stderr, 300) || "(no output)"}`;
+								})()}`,
 							]),
 					...(reportLines.length > 0
 						? ["", showFullReport ? "lead report:" : "open items from lead:", ...reportLines, ...(reportTruncated ? [`… full report: ${describeRunArtifact(session.file("lead-report.md"))}`] : [])]

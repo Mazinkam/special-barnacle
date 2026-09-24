@@ -10,6 +10,31 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-23-enforced-worker-topology-design.md`
 
+## Status: implementation complete on `feat/enforced-worker-topology`; NOT yet merged
+
+All 22 steps are done and ticked. Verification on the branch: `bun test` 90 pass / 0 fail,
+`python3 -m pytest tests -q` 77 passed, `./scripts/typecheck-bridge.sh` exit 0.
+
+Two deviations from the plan as written, both recorded inline at the step:
+
+- **Task 4 Step 3** — the typecheck command in the plan could never pass in this
+  repo (no `package.json`/`tsconfig.json`); replaced by `scripts/typecheck-bridge.sh`.
+- **Task 4 Step 5** — no separate "final integration commit" was needed; every
+  change landed in the per-task commits, and the tree is clean.
+
+**Remaining work is integration only, and it is blocked on an owner decision** — see
+`docs/superpowers/plans/2026-09-23-enforced-worker-topology-integration.md`.
+
+### Scope additions made during execution (beyond the original file list)
+
+- `bridge/agents/orchestrator-lead.md` — required by Task 2 Step 4 ("update lead
+  instructions"); it still told leads to run their own `orch-scout` recon.
+- `orchestrator/method.json`, `SKILL.md`, `bridge/agents/orch-scout.md` — binding
+  recon to the `scout` capability and settling the `evidence_packet_max_tokens`
+  scope question, both of which are policy data/prose rather than code.
+- `scripts/typecheck-bridge.sh`, `bridge/README.md` — making the Task 4 Step 3
+  gate runnable.
+
 ## Global Constraints
 
 - Derive Rule-2 thresholds, worker count, capability, and skip classes from `orchestrator/method.json`; do not duplicate policy constants.
@@ -39,7 +64,7 @@
 - Consumes: `METHOD.rules.pre_implementation_recon`, task class, complexity, original goal, and completed dispatch-shaped output.
 - Produces: `planReconTasks(input): ReconTaskPlan[]` and `formatReconEvidence(results, maxChars): string`.
 
-- [ ] **Step 1: Write the failing Rule-2 planning tests**
+- [x] **Step 1: Write the failing Rule-2 planning tests**
 
 ```ts
 test("plans three independent read-only recon tasks at complexity 5", () => {
@@ -64,13 +89,13 @@ test.each(["investigation", "qa_verification"])("skips Rule-2 recon for %s", (ta
 });
 ```
 
-- [ ] **Step 2: Run the recon test to verify it fails**
+- [x] **Step 2: Run the recon test to verify it fails**
 
 Run: `cd bridge/extensions/orchestrator && bun test recon.test.ts`
 
 Expected: FAIL because `recon.ts` and `planReconTasks` do not exist.
 
-- [ ] **Step 3: Write the failing evidence formatting tests**
+- [x] **Step 3: Write the failing evidence formatting tests**
 
 ```ts
 test("includes completed worker evidence and failed worker diagnostics", () => {
@@ -91,7 +116,7 @@ test("bounds each recon evidence packet and aggregate output", () => {
 });
 ```
 
-- [ ] **Step 4: Implement the minimal pure helpers**
+- [x] **Step 4: Implement the minimal pure helpers**
 
 ```ts
 export function planReconTasks(input: ReconPlanInput): ReconTaskPlan[] {
@@ -107,13 +132,13 @@ export function planReconTasks(input: ReconPlanInput): ReconTaskPlan[] {
 
 Implement byte/character-safe truncation with an explicit truncation marker and include both successful evidence and summarized failed-worker diagnostics.
 
-- [ ] **Step 5: Run the focused recon tests to verify they pass**
+- [x] **Step 5: Run the focused recon tests to verify they pass**
 
 Run: `cd bridge/extensions/orchestrator && bun test recon.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit the pure recon helper**
+- [x] **Step 6: Commit the pure recon helper**
 
 ```bash
 git add bridge/extensions/orchestrator/recon.ts bridge/extensions/orchestrator/recon.test.ts
@@ -131,7 +156,7 @@ git commit -m "feat(orchestrator): plan required recon workers"
 - Consumes: `ReconTaskPlan[]`, existing `dispatchParallel()`, `captureDispatchCost()`, and `formatReconEvidence()`.
 - Produces: populated `workerResults` from `dispatchHierarchical()` and a lead prompt containing `Recon evidence`.
 
-- [ ] **Step 1: Write the failing integration-shape test**
+- [x] **Step 1: Write the failing integration-shape test**
 
 Export a narrow pure wrapper only if needed and test the externally observable task preparation rather than spawning terminal processes:
 
@@ -149,13 +174,13 @@ test("adds completed recon evidence to the lead prompt", () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused test to verify it fails**
+- [x] **Step 2: Run the focused test to verify it fails**
 
 Run: `cd bridge/extensions/orchestrator && bun test index.test.ts recon.test.ts`
 
 Expected: FAIL because the lead-prompt builder does not accept evidence yet.
 
-- [ ] **Step 3: Implement parent-owned recon dispatch**
+- [x] **Step 3: Implement parent-owned recon dispatch**
 
 In `dispatchHierarchical()`:
 
@@ -170,17 +195,19 @@ ACTIVE_RUN?.setPhase(`recon: ${workerResults.filter((r) => r.exitCode === 0).len
 
 Pass the evidence to every lead prompt. If no Rule-2 task applies, use a phase that correctly states no parent-owned recon is required. If all recon calls fail, include an explicit degraded-evidence notice instead of hiding the failures.
 
-- [ ] **Step 4: Update lead instructions**
+- [x] **Step 4: Update lead instructions**
 
 Replace the unconditional “workers fan out inside each lead” messaging with wording that reports actual completed parent-owned recon packets. Retain nested subagent guidance only for implementation, review, and QA; state those nested calls are not authoritative worker accounting.
 
-- [ ] **Step 5: Run the focused bridge tests to verify they pass**
+Done in `bridge/agents/orchestrator-lead.md`: workflow step 1 previously told every lead to “dispatch 3–5 `orch-scout` agents”, which duplicated the parent-owned Rule-2 fan-out at the lead's own expense and hid the second round from the bridge's worker accounting. It now states that recon is parent-owned, points the lead at the **Recon evidence** section, covers the missing/`DEGRADED` packet case, and marks nested implementation/review/QA children as non-authoritative. Guarded by the `lead persona recon contract` tests in `index.test.ts`.
+
+- [x] **Step 5: Run the focused bridge tests to verify they pass**
 
 Run: `cd bridge/extensions/orchestrator && bun test index.test.ts recon.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit the bridge integration**
+- [x] **Step 6: Commit the bridge integration**
 
 ```bash
 git add bridge/extensions/orchestrator/index.ts bridge/extensions/orchestrator/index.test.ts bridge/extensions/orchestrator/recon.ts bridge/extensions/orchestrator/recon.test.ts
@@ -198,7 +225,7 @@ git commit -m "feat(orchestrator): dispatch recon before leads"
 - Consumes: `workerResults` returned by `dispatchHierarchical()`.
 - Produces: final billed-result list and operator summary containing parent-owned recon counts/costs.
 
-- [ ] **Step 1: Write the failing accounting test**
+- [x] **Step 1: Write the failing accounting test**
 
 Extract a pure `collectBilledResults()` helper if necessary:
 
@@ -210,13 +237,13 @@ test("includes parent-owned worker results in billed dispatches", () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused test to verify it fails**
+- [x] **Step 2: Run the focused test to verify it fails**
 
 Run: `cd bridge/extensions/orchestrator && bun test index.test.ts`
 
 Expected: FAIL because worker results are omitted from the billed list.
 
-- [ ] **Step 3: Implement accounting and summary changes**
+- [x] **Step 3: Implement accounting and summary changes**
 
 Destructure `workerResults` at the command call site, include it in `billedResults`, and add an explicit final-summary line:
 
@@ -226,13 +253,13 @@ Destructure `workerResults` at the command call site, include it in `billedResul
 
 Use `summarizeStderr()` rather than raw stderr slices for any failed recon summary. Update README topology and progress/log documentation to describe parent-owned recon and the limitation on nested lead-created children.
 
-- [ ] **Step 4: Run focused tests to verify they pass**
+- [x] **Step 4: Run focused tests to verify they pass**
 
 Run: `cd bridge/extensions/orchestrator && bun test index.test.ts recon.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit accounting and documentation**
+- [x] **Step 5: Commit accounting and documentation**
 
 ```bash
 git add bridge/extensions/orchestrator/index.ts bridge/extensions/orchestrator/index.test.ts bridge/extensions/orchestrator-README.md
@@ -248,35 +275,47 @@ git commit -m "fix(orchestrator): report actual recon workers"
 - Consumes: `classifyDispatchOutcome()` and `summarizeStderr()`.
 - Produces: recovered dispatch result with effective zero exit code but retained raw-exit diagnostic.
 
-- [ ] **Step 1: Run the recovery test suite first**
+- [x] **Step 1: Run the recovery test suite first**
 
 Run: `cd bridge/extensions/orchestrator && bun test dispatch-outcome.test.ts`
 
 Expected: PASS. If it fails, add the smallest failing regression test before changing implementation.
 
-- [ ] **Step 2: Run all bridge tests**
+- [x] **Step 2: Run all bridge tests**
 
 Run: `cd bridge/extensions/orchestrator && bun test`
 
 Expected: PASS with no failures.
 
-- [ ] **Step 3: Run the extension typecheck/build used by the repository**
+- [x] **Step 3: Run the extension typecheck/build used by the repository**
 
-Run: inspect the repository’s documented bridge validation command; if none exists, run:
+Run:
 
 ```bash
-cd bridge/extensions/orchestrator && bunx tsc --noEmit --strict --module esnext --moduleResolution bundler --target es2022 --skipLibCheck --allowImportingTsExtensions --resolveJsonModule *.ts
+./scripts/typecheck-bridge.sh
 ```
 
 Expected: exit code 0.
 
-- [ ] **Step 4: Run the Python suite**
+> **Amended during execution.** The command originally written here —
+> `cd bridge/extensions/orchestrator && bunx tsc --noEmit --strict … *.ts` —
+> cannot pass in this repository and never could: there is no `package.json`,
+> `node_modules`, or `tsconfig.json`, so `@humain/terminal`, `typebox`,
+> `node:*`, and `bun:test` are all unresolvable and tsc emits cascading
+> `TS2307`s on `main` as well as on any branch. Two consecutive QA rounds
+> reported that as a `typecheck` FAIL against the feature branch. It is now
+> replaced by `scripts/typecheck-bridge.sh`, which resolves the installed HT
+> workspace (override: `HUMAIN_TERMINAL_ROOT`) and separates "type errors"
+> (exit 1) from "cannot run here" (exit 2) so the gate is reproducible. See
+> `bridge/README.md` → Verification gates.
+
+- [x] **Step 4: Run the Python suite**
 
 Run: `python3 -m pytest tests -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Inspect the final diff and commit the completed implementation**
+- [x] **Step 5: Inspect the final diff and commit the completed implementation**
 
 ```bash
 git diff --check
@@ -286,3 +325,9 @@ git commit -m "fix(orchestrator): enforce observable worker recon"
 ```
 
 Do not include unrelated files. If earlier task commits were made, use this final commit only for any remaining integration/verification corrections.
+
+> **Not needed.** Every change landed in the per-task commits listed above, so
+> there were no remaining integration/verification corrections to fold in. The
+> worktree is clean and `git diff --check` reports nothing; a separate empty
+> “final” commit would only add noise to the history. Step marked done on that
+> basis, not skipped.

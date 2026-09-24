@@ -40,6 +40,10 @@ interface MethodFile {
 		pre_implementation_recon: {
 			min_complexity: number;
 			workers_by_complexity: { min: number; max: number; workers: number }[];
+			/** Abstract capability every parent-owned recon worker dispatches as. */
+			worker_capability: string;
+			/** Token budget for the aggregate recon evidence packet handed to a lead. */
+			evidence_packet_max_tokens: number;
 			skip_for_task_classes: string[];
 		};
 	};
