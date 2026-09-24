@@ -1413,6 +1413,62 @@ describe("runSubagentProcess process/event handling", () => {
 		}
 	});
 
+	test("spend cap enforce stops a dispatch once, on the first message that crosses it", async () => {
+		const { SpendCapTracker } = await import("./spend-cap.ts");
+		const session = createSession("spend-cap-enforce");
+		session.spendCaps = new SpendCapTracker({ mode: "enforce", usd_by_capability: { lead: 4 }, default_usd: 1 });
+		const kill = mock(() => true);
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill, pid: undefined });
+		const emit = (cost: number) => child.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: `turn ${cost}`, usage: { input: 1, output: 1, cost: { total: cost } } } })}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "capped-lead", session,
+				spawnChild: () => child as never,
+			});
+			emit(3);
+			emit(9); // one big jump from $3 to $12
+			const result = await pending;
+			expect(result.stopReason).toBe("spend_cap");
+			expect(result.exitCode).toBe(125);
+			expect(result.outcome).toBe("failed");
+			expect(result.costUsd).toBe(12);
+			expect(result.stderr).toContain("dispatch stopped (dispatch_spend_cap.mode=enforce)");
+			const log = readFileSync(session.file("run.log"), "utf8");
+			expect(log.match(/exceeded by capped-lead at \$\d+\.\d+ \(stopping it\)/g) ?? []).toHaveLength(1);
+		} finally {
+			child.emit("close", 137);
+			session.close();
+		}
+	});
+
+	test("spend cap warn logs once and lets the dispatch finish", async () => {
+		const { SpendCapTracker } = await import("./spend-cap.ts");
+		const session = createSession("spend-cap-warn");
+		session.spendCaps = new SpendCapTracker({ mode: "warn", usd_by_capability: { lead: 4 }, default_usd: 1 });
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "warned-lead", session,
+				spawnChild: () => child as never,
+			});
+			for (const cost of [5, 5]) emit({ type: "message_end", message: { role: "assistant", content: "w", usage: { input: 1, output: 1, cost: { total: cost } } } });
+			emit({ type: "message_end", message: { role: "assistant", content: "done", usage: { input: 1, output: 1, cost: { total: 0 } }, stopReason: "stop" } });
+			emit({ type: "agent_settled" });
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.exitCode).toBe(0);
+			expect(result.stopReason).toBe("stop");
+			const log = readFileSync(session.file("run.log"), "utf8");
+			expect(log.match(/exceeded by warned-lead/g) ?? []).toHaveLength(1);
+			expect(log).toContain("warn only");
+		} finally {
+			session.close();
+		}
+	});
+
 	test("cancellation settles without close after bounded usage drain and retains the diagnostic lease", async () => {
 		const session = createSession("cancelled-without-close");
 		const child = Object.assign(new EventEmitter(), {

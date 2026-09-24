@@ -94,6 +94,7 @@ import {
 	type LeadSize,
 	userLayerWarnings,
 } from "./models.ts";
+import { SpendCapTracker, capFor, type SpendCapVerdict } from "./spend-cap.ts";
 import { escalateLeadCapability, isLeadCapability, isLeadSize, leadSizeOf, sizeLead, type LeadSizeDecision } from "./lead-sizing.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
 import { BoundedCapture, classifyDispatchOutcome, summarizeStderr, trimEventForLog } from "./dispatch-outcome.ts";
@@ -936,6 +937,8 @@ export class RunSession {
 	private tickTimer: ReturnType<typeof setInterval> | undefined;
 	private closed = false;
 	readonly cancellation = new RunCancellation();
+	/** Per-dispatch spend cap (method.json rules.dispatch_spend_cap). Replaceable in tests. */
+	spendCaps = new SpendCapTracker();
 	/** User messages queued while a run is live; drained at the next dispatch boundary. */
 	private queuedMessages: Array<{ text: string; queuedAt: number }> = [];
 	/** History of message batches we've folded into prompts, so the user can see delivery. */
@@ -1514,6 +1517,7 @@ export async function runSubagentProcess(opts: {
 		let interruptionNote: string | undefined;
 		let armTimer: () => void = () => {};
 		let handleExpiry: (reason: "inactivity" | "absolute") => void = () => {};
+		let handleSpendCap: (verdict: Exclude<SpendCapVerdict, "ok">) => void = () => {};
 		// `--mode json` writes newline-delimited events, NOT plain prose. Callers
 		// need the assistant's text, so accumulate it here; handing them the raw
 		// event stream made triage's JSON.parse fail every single time.
@@ -1622,6 +1626,8 @@ export async function runSubagentProcess(opts: {
 				costReported = (usage.turns === 1 || costReported) && cost !== undefined;
 				usage.cost += cost ?? 0;
 				usage.contextTokens = msg.usage.totalTokens || usage.contextTokens;
+				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", usage.cost) ?? "ok";
+				if (verdict !== "ok") handleSpendCap(verdict);
 			}
 			if (msg.stopReason) stopReason = msg.stopReason;
 			if (Array.isArray(msg.content)) {
@@ -1740,6 +1746,24 @@ export async function runSubagentProcess(opts: {
 			session?.log(report);
 			if (proc) killProcessTree(proc);
 			finish(124);
+		};
+
+		handleSpendCap = (verdict) => {
+			if (settled || cancelledByListener) return;
+			const capability = opts.capability ?? "unknown";
+			const cap = capFor(capability);
+			const message = `spend cap $${cap.toFixed(2)} for ${capability} exceeded by ${taskId} at $${usage.cost.toFixed(4)}`;
+			session?.log(`${message} (${verdict === "stop" ? "stopping it" : "warn only"})`);
+			recordEvent("spend_cap_exceeded", {
+				run_id: session?.runId, task_id: taskId, capability, model: opts.model,
+				cap_usd: cap, cost_usd: usage.cost, action: verdict,
+			});
+			session?.ctx.ui?.notify?.(`${message}${verdict === "stop" ? " — stopping it" : ""}`, "warning");
+			if (verdict !== "stop") return;
+			stopReason = "spend_cap";
+			stderrCapture.append(`\n[orchestrator] ${message}; dispatch stopped (dispatch_spend_cap.mode=enforce)`);
+			if (proc) killProcessTree(proc);
+			finish(125);
 		};
 
 		removeCancellationListener = session?.cancellation.onCancel(() => {
