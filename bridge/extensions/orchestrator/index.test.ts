@@ -52,7 +52,19 @@ describe("/orchestrate argument parsing", () => {
 		// Previously 6.5 matched no workers_by_complexity band and planned zero recon.
 		const tasks = planReconTasks({ method: METHOD.rules.pre_implementation_recon, complexity: parse("repair flow --complexity 6.5").complexity,
 			taskClass: "implementation", goal: "repair flow", runId: "run" });
-		expect(tasks.length).toBeGreaterThan(0);
+		expect(tasks.length).toBe(4);
+	});
+
+	test("clampComplexity treats absent or non-numeric triage values as the fallback, not the minimum", () => {
+		const clamp = orchestrator.clampComplexity;
+		for (const absent of [undefined, null, "", "  ", true, false, [], [7], {}, "abc", Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(clamp(absent)).toBe(5);
+		}
+		expect(clamp(7)).toBe(7);
+		expect(clamp("7")).toBe(7);
+		expect(clamp(-3)).toBe(1);
+		expect(clamp(12)).toBe(10);
+		expect(clamp(6.5)).toBe(7);
 	});
 });
 

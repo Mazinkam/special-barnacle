@@ -612,7 +612,11 @@ function heuristicTriage(goal: string): TriageResult {
  * band, silently plan zero recon workers, and make the no-recon phase line
  * report a false reason.
  */
-function clampComplexity(raw: unknown, fallback = 5): number {
+export function clampComplexity(raw: unknown, fallback = 5): number {
+	// Only numbers and non-empty numeric strings are complexity values; null,
+	// "", booleans and arrays mean "absent" and must take the fallback rather
+	// than coerce to 0 and collapse to the minimum (which would skip recon).
+	if (typeof raw !== "number" && !(typeof raw === "string" && raw.trim() !== "")) return fallback;
 	const n = Number(raw);
 	return Number.isFinite(n) ? Math.max(1, Math.min(10, Math.round(n))) : fallback;
 }
