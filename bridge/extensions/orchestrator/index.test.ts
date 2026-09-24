@@ -1061,6 +1061,79 @@ describe("runSubagentProcess process/event handling", () => {
 		}
 	});
 
+	test("cancellation settles without close after bounded usage drain and retains the diagnostic lease", async () => {
+		const session = createSession("cancelled-without-close");
+		const child = Object.assign(new EventEmitter(), {
+			stdout: new PassThrough(), stderr: new PassThrough(), kill: mock(() => true),
+		});
+		const emitUsage = (cost: number) => child.stdout.write(`${JSON.stringify({ type: "message_end", message: {
+			role: "assistant", content: "buffered work", usage: { input: 10, output: 2, cost: { total: cost } }, stopReason: "stop",
+		} })}\n`);
+		let deadline: (() => void) | undefined;
+		let deadlineMs: number | undefined;
+		const realTimer = globalThis.setTimeout;
+		const timers: ReturnType<typeof setTimeout>[] = [];
+		let timer: ReturnType<typeof spyOn> | undefined;
+		try {
+			let settlements = 0;
+			let result: Awaited<ReturnType<typeof orchestrator.runSubagentProcess>> | undefined;
+			void orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "no-close", session,
+				spawnChild: () => child as never,
+			}).then(value => { settlements++; result = value; });
+			// Capture only the cancellation deadline, not the normal progress timer.
+			timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms: number) => {
+				deadline = callback; deadlineMs = ms;
+				const handle = realTimer(() => {}, 60_000);
+				timers.push(handle);
+				return handle;
+			}) as typeof setTimeout);
+			session.cancellation.cancel();
+			const cancelDeadline = deadline;
+			const cancelDeadlineMs = deadlineMs;
+			expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+			await Promise.resolve();
+			expect(result).toBeUndefined();
+			// A later pipe callback arrives inside the grace period, without close.
+			await new Promise<void>(resolve => realTimer(() => { emitUsage(.03); resolve(); }, 10));
+			expect(result).toBeUndefined();
+			expect(cancelDeadline).toBeDefined();
+			expect(cancelDeadlineMs).toBeGreaterThan(0);
+			expect(cancelDeadlineMs).toBeLessThanOrEqual(2000);
+			cancelDeadline?.();
+			for (let i = 0; i < 20; i++) await Promise.resolve();
+			expect(result?.outcome).toBe("cancelled");
+			expect(result?.exitCode).toBe(137);
+			expect(result?.costUsd).toBe(.03);
+			expect(result?.costReported).toBe(true);
+			expect(result?.usage.turns).toBe(1);
+			expect(result?.interruption?.partialText).toBe("buffered work");
+			session.close(true);
+			const sealing = session.sealDiagnostics(Promise.resolve(true));
+			deadline?.(); // the existing bounded seal deadline must fail, not revoke the lease
+			expect(await sealing).toBe(false);
+			emitUsage(.5);
+			child.stderr.write("late teardown diagnostic\n");
+			expect(readFileSync(session.file("no-close.events.jsonl"), "utf8").trim().split("\n")).toHaveLength(2);
+			expect(result?.usage.turns).toBe(1);
+			expect(result?.usage.cost).toBe(.03);
+			child.emit("close", 0); // eventual real close may release, but never re-bill or seal
+			await Promise.resolve();
+			expect(settlements).toBe(1);
+			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(false);
+			expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+			expect(readFileSync(session.file("no-close.stderr.log"), "utf8")).toContain("late teardown diagnostic");
+			expect(readFileSync(session.file("run.log"), "utf8").match(/\ntaskId: no-close\n/g) ?? []).toHaveLength(1);
+		} finally {
+			timer?.mockRestore();
+			for (const handle of timers) clearTimeout(handle);
+			child.emit("close", 137);
+			child.stdout.destroy(); child.stderr.destroy();
+			session.close();
+		}
+	});
+
 	test("pre-cancelled leaf does not arm a stale timeout", async () => {
 		const session = createSession("pre-cancelled-leaf");
 		const previousTimeout = process.env.HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS;
@@ -1963,6 +2036,71 @@ describe("final triage and shutdown integration", () => {
 			} finally { phase.mockRestore(); spawn.mockRestore(); }
 		}, 30_000);
 	}
+
+	test("Esc without child close flushes terminal billing, releases the TUI, and admits the next run", async () => {
+		const { handler } = activate();
+		const sessions: InstanceType<typeof orchestrator.RunSession>[] = [];
+		const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) {
+			sessions.push(this);
+			if (sessions.length > 1) throw new Error("stop next run before dispatch");
+		});
+		const child = Object.assign(new EventEmitter(), {
+			stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true,
+		});
+		let abort!: () => void;
+		const original = childProcess.spawn;
+		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
+			if (!args.includes("--mode")) return original(command, args, opts);
+			setTimeout(() => {
+				abort(); // same loader callback as Esc; no session_shutdown safety net
+				setTimeout(() => child.stdout.write(`${JSON.stringify({ type: "message_end", message: {
+					role: "assistant", model: "claude-sonnet-4-5", content: "partial triage",
+					usage: { input: 10, output: 2, cost: { total: .03 } }, stopReason: "stop",
+				} })}\n`), 10);
+			}, 0);
+			return child;
+		}) as typeof childProcess.spawn);
+		const notices: string[] = [];
+		let tuiClosed = 0;
+		const ctx = {
+			mode: "tui", modelRegistry: registry(),
+			ui: {
+				notify: (message: string) => notices.push(message), setWidget() {}, setStatus() {},
+				custom: (factory: (...args: unknown[]) => { onAbort: () => void }) => new Promise<void>(done => {
+					const loader = factory({}, {}, {}, () => { tuiClosed++; done(); });
+					abort = () => loader.onAbort();
+				}),
+			},
+		};
+		let watchdog: ReturnType<typeof setTimeout> | undefined;
+		const running = handler("synthetic Esc triage", ctx as never);
+		try {
+			const completed = await Promise.race([
+				running.then(() => true),
+				new Promise<boolean>(resolve => { watchdog = setTimeout(() => resolve(false), 8000); }),
+			]);
+			expect(completed).toBe(true);
+			expect(tuiClosed).toBe(1);
+			const runId = sessions[0].runId;
+			const calls = readRows("metrics.jsonl").filter(row => row.run_id === runId && row.event === "model_call");
+			expect(calls).toHaveLength(1);
+			expect(calls[0].cost_usd).toBe(.03);
+			expect(readRows("outcomes.jsonl").filter(row => row.run_id === runId && row.task_id === "run-failed")).toHaveLength(1);
+			expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("failed");
+			expect(notices.some(message => message.includes("UNSEALED"))).toBe(true);
+			expect(existsSync(sessions[0].file(".diagnostics-sealed.json"))).toBe(false);
+			await handler("next synthetic run --complexity 4", ctx as never);
+			expect(sessions).toHaveLength(2);
+			expect(tuiClosed).toBe(2);
+			expect(notices.some(message => message.includes("already running"))).toBe(false);
+		} finally {
+			if (watchdog !== undefined) clearTimeout(watchdog);
+			child.emit("close", 137);
+			await running;
+			child.stdout.destroy(); child.stderr.destroy();
+			phase.mockRestore(); spawn.mockRestore();
+		}
+	}, 15_000);
 
 	test("shutdown is bounded even when session ingestion never exits", async () => {
 		const { shutdown } = activate();

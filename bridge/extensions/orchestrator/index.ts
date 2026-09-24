@@ -1711,10 +1711,13 @@ export async function runSubagentProcess(opts: {
 					clearTimeout(timeoutTimer);
 					timeoutTimer = undefined;
 				}
+				// Drain already-buffered usage before billing, but do not depend on
+				// close: a detached descendant can hold inherited pipes open forever.
+				// Keep this inside shutdown's 2s budget. finish() is idempotent and
+				// clears the timer; only real close releases the diagnostic lease, so
+				// an undrained producer still prevents sealing after we settle.
+				timeoutTimer = setTimeout(() => finish(137), 1000);
 				killProcessTree(proc);
-				// Cancellation stops work now, but close drains usage already in the
-				// pipe before callers bill the result. Shutdown's outer deadline still
-				// bounds this wait and vetoes sealing if a producer never closes.
 			}
 		});
 
@@ -1743,7 +1746,7 @@ export async function runSubagentProcess(opts: {
 			}, delay);
 		};
 		// A cancellation that fired synchronously above is already stopping the
-		// child; never arm another timer. Do NOT return early here: handlers must
+		// child; never arm another execution deadline. Do NOT return early here: handlers must
 		// still attach to drain usage and catch a late child 'error' event.
 		if (isLead) {
 			armTimer();
