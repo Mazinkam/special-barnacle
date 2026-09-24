@@ -26,6 +26,12 @@ function syncDirectory(dir: string): void {
 	try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
+function assertSafeDiagnosticName(name: string): void {
+	if (!name || basename(name) !== name || /[/\\\0]/.test(name) || name.startsWith(".") || name.endsWith(".gz") || protectedNames.has(name)) {
+		throw new Error(`unsafe diagnostic name: ${name}`);
+	}
+}
+
 function publish(dir: string, name: string, value: unknown): void {
 	const tmp = join(dir, `.${name}.${randomUUID()}.tmp`);
 	const fd = openSync(tmp, "wx", 0o600);
@@ -40,6 +46,27 @@ export interface DiagnosticWriter {
 	write(name: string, text: string): boolean;
 	append(name: string, text: string): boolean;
 	close(): void;
+}
+
+/**
+ * A raw, real file descriptor for a child process's stdio slot (e.g.
+ * `stdio[2]`), created/owned under the same fresh-directory, single-owner
+ * guarantees as every other diagnostic file. Node's async pipe reads can
+ * silently drop the tail of a fast-exiting child's stderr (see index.ts's
+ * runSubagentProcess); handing the child a real fd instead avoids that
+ * entirely, at the cost of the caller managing the fd's lifetime explicitly.
+ */
+export interface ChildStderrFile {
+	readonly path: string;
+	readonly fd: number;
+	/** Close the caller's copy of the fd. Idempotent. Call once the child has
+	 * inherited it (or spawning failed) — the child's own duplicate, if any,
+	 * keeps the file writable independently of this call. */
+	closeFd(): void;
+	/** Release the write lease taken for this file, closing the fd first if the
+	 * caller has not already done so. Call once no further diagnostic writes
+	 * (raw child bytes or `writer()` appends) will target this file. */
+	release(): void;
 }
 
 export class RunDiagnostics {
@@ -83,11 +110,51 @@ export class RunDiagnostics {
 		};
 	}
 
+	/**
+	 * Open/create `name` for a child process to write directly (e.g. as
+	 * `stdio[2]`), under a lease like `writer()`. The returned fd is registered
+	 * as this file's owned identity so later `writer().write/append(name, ...)`
+	 * calls (used to append the orchestrator's own notes once the child has
+	 * exited) pass the same inode-unchanged validation as any other diagnostic
+	 * write, instead of bypassing it.
+	 */
+	openChildStderrFile(name: string): ChildStderrFile {
+		if (!this.accepting) throw new Error("diagnostics are closing/sealed; no new writer allowed");
+		assertSafeDiagnosticName(name);
+		if (this.files.has(name)) throw new Error(`diagnostic file already exists: ${name}`);
+		const path = join(this.dir, name);
+		const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+		try {
+			const st = fstatSync(fd);
+			if (!st.isFile() || st.nlink !== 1) throw new Error("diagnostic inode changed");
+			this.files.set(name, { dev: st.dev, ino: st.ino });
+		} catch (error) {
+			closeSync(fd);
+			throw error;
+		}
+		const lease = Symbol();
+		this.leases.add(lease);
+		let fdOpen = true;
+		const closeFd = () => {
+			if (!fdOpen) return;
+			fdOpen = false;
+			closeSync(fd);
+		};
+		return {
+			path,
+			fd,
+			closeFd,
+			release: () => {
+				closeFd();
+				this.leases.delete(lease);
+				if (this.leases.size === 0) this.drained?.();
+			},
+		};
+	}
+
 	private writeOwned(name: string, text: string, append: boolean): boolean {
 		try {
-			if (!name || basename(name) !== name || /[/\\\0]/.test(name) || name.startsWith(".") || name.endsWith(".gz") || protectedNames.has(name)) {
-				throw new Error(`unsafe diagnostic name: ${name}`);
-			}
+			assertSafeDiagnosticName(name);
 			const previous = this.files.get(name);
 			const fd = openSync(join(this.dir, name), constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK |
 				(previous ? 0 : constants.O_CREAT | constants.O_EXCL) | (append ? constants.O_APPEND : 0), 0o600);
