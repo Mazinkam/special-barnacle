@@ -27,7 +27,7 @@
  * skill's history has (recommended, executed, observed) triples to learn from.
  */
 
-import { spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn, type SpawnOptions, spawnSync } from "node:child_process";
 import {
 	appendFileSync,
 	existsSync,
@@ -639,6 +639,16 @@ function clampTriage(raw: Partial<TriageResult>): TriageResult | null {
 // assistant message_end events with model, input/output tokens, and cost.
 // That path is the one we replicate here.
 
+/**
+ * Injectable process-creation seam for `runSubagentProcess`. Only the
+ * `(command, args, options) => ChildProcess` overload is ever used at the one
+ * call site, so the seam is typed to exactly that call shape — the real
+ * `spawn` satisfies it structurally, and tests can supply a plain function
+ * without fighting `spawn`'s overload set (which otherwise infers `args` as
+ * `readonly string[] | SpawnOptions`).
+ */
+type ChildSpawner = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
+
 interface SubagentProcessResult {
 	exitCode: number;
 	/** Every assistant text block, in order, joined by blank lines. */
@@ -949,7 +959,7 @@ export async function runSubagentProcess(opts: {
 	label?: string;
 	/** Selects the wall clock: orchestrating capabilities wait on their own children. */
 	capability?: string;
-}, spawnProcess: typeof spawn = spawn): Promise<SubagentProcessResult> {
+}, spawnProcess: ChildSpawner = spawn): Promise<SubagentProcessResult> {
 	const emptyUsage: SubagentUsageStats = {
 		input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
 		cost: 0, contextTokens: 0, turns: 0,
@@ -1170,7 +1180,7 @@ export async function runSubagentProcess(opts: {
 		// runs and the persona prompt temp dir leaks.
 		// Optional so `finish()` can run from the synchronous-spawn-throw path,
 		// where no child was ever created.
-		let proc: ReturnType<typeof spawn> | undefined;
+		let proc: ChildProcess | undefined;
 		try {
 			proc = spawnProcess(invocation.command, invocation.args, {
 				cwd: opts.cwd,
