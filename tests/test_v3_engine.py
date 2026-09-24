@@ -44,16 +44,23 @@ class V3EngineTests(unittest.TestCase):
             # Every pre-existing section must survive.
             for anchor in ('id="cards"','id="adaptiveHealth"','id="risk"','id="features"','id="adaptive"',
                            'id="policies"','id="trends"','id="routes"','id="roles"','id="runtimes"',
-                           'id="interactive"','id="runs"','id="events"'):
+                           'id="interactive"','id="events"'):
                 self.assertIn(anchor,html)
             self.assertIn('prefers-color-scheme',html)
-            self.assertIn('counterfactual', html.lower())
-            self.assertNotIn('<th>Workers</th>', html)
-            self.assertIn('<th>Tasks</th>', html)
-            self.assertIn('<th>Non-impl. share</th>', html)
-            self.assertIn('<th>Rows (decayed)</th>', html)
-            self.assertIn('<th>Verified tasks</th>', html)
-            self.assertIn('verified_task_samples', html)
+            # Run evidence must be visible with coverage, and an HT-planned run without a
+            # terminal boundary reports unknown elapsed time rather than zero.
+            self.assertIn('"run_evidence"',html)
+            self.assertIn('id="runs"',html)
+            self.assertIn('counterfactual',html.lower())
+            # Column labels must match what the fields measure: distinct tasks (not "workers"),
+            # per-run overhead defined as non-implementation spend, and verified-task evidence
+            # alongside the legacy decayed row count in the adaptive decisions table.
+            self.assertNotIn('<th>Workers</th>',html)
+            self.assertIn('<th>Tasks</th>',html)
+            self.assertIn('<th>Non-impl. share</th>',html)
+            self.assertIn('<th>Rows (decayed)</th>',html)
+            self.assertIn('<th>Verified tasks</th>',html)
+            self.assertIn('verified_task_samples',html)
 
     def test_rendered_payload_contains_no_implausible_metric(self):
         """A generated page must not carry a number no reader could defend.
@@ -114,28 +121,54 @@ class V3EngineTests(unittest.TestCase):
         self.assertGreaterEqual(interactive['calls'],interactive['rows'])
         self.assertIn('rows',interactive)
 
-    def test_dashboard_reports_complete_run_evidence_coverage(self):
+    def test_dashboard_data_reports_run_evidence_and_coverage(self):
         from orchestrator.dashboard import build_data
         with tempfile.TemporaryDirectory() as td:
-            engine = OrchestrationEngine(td)
-            engine.plan_run(run_id='r1', task_class='crud', complexity=3, risk='low')
-            engine.record_model_call(run_id='r1', task_id='r1-a', role='worker',
-                                     capability_class='implementation_fast', model='known',
-                                     cost_usd=.05, cost_source='reported')
-            engine.record_model_call(run_id='r1', task_id='r1-b', role='worker',
-                                     capability_class='implementation_fast', model='unknown',
-                                     cost_source='unmetered')
-            data = build_data(Path(td), config=engine.config)
-            runs = {row['run_id']: row for row in data['runs']}
-            self.assertIn('r1', runs)
-            self.assertAlmostEqual(runs['r1']['cost_known_usd'], .05)
-            self.assertEqual(runs['r1']['unmetered_calls'], 1)
-            self.assertEqual(runs['r1']['call_rows'], 2)
-            self.assertIsNone(runs['r1']['elapsed_ms'])
-            self.assertEqual(data['run_evidence']['runs'], 1)
-            self.assertEqual(data['run_evidence']['runs_fully_priced'], 0)
-            self.assertEqual(data['run_evidence']['runs_with_elapsed'], 0)
-            self.assertTrue(all(route['capability'] != 'interactive_session' for route in data['routes']))
+            e=OrchestrationEngine(td)
+            e.plan_run(run_id='r1',task_class='crud',complexity=3,risk='low')
+            e.record_model_call(run_id='r1',task_id='r1-a',role='worker',capability_class='implementation_fast',model='anthropic/claude-sonnet-4-5',cost_usd=.05,cost_source='reported')
+            e.record_model_call(run_id='r1',task_id='r1-b',role='worker',capability_class='implementation_fast',model='mystery',cost_source='unmetered')
+            e.record_model_call(run_id='r1',task_id='r1-x',role='interactive_session',source='session_ingest',cost_usd=9,cost_source='estimated')
+            data=build_data(Path(td),config=e.config)
+            runs={r['run_id']:r for r in data['runs']}
+            self.assertIn('r1',runs)
+            r=runs['r1']
+            self.assertAlmostEqual(r['cost_known_usd'],.05)
+            self.assertEqual(r['unmetered_calls'],1)
+            self.assertEqual(r['call_rows'],2)
+            self.assertIsNone(r['elapsed_ms'])
+            self.assertEqual(r['decision_rows'],1)
+            cov=data['run_evidence']
+            self.assertEqual(cov['runs'],1)
+            self.assertEqual(cov['runs_fully_priced'],0)
+            self.assertEqual(cov['runs_with_elapsed'],0)
+            self.assertEqual(cov['cost_provenance'],'actual')
+            self.assertEqual(data['summary']['priced_run_coverage'],0)
+            self.assertEqual(data['summary']['duration_coverage'],0)
+            # route stats show task/run samples and exclude the session-ingest row
+            self.assertTrue(all(s['capability']!='interactive_session' for s in data['routes']))
+
+    def test_enforce_mode_one_sample_topology_falls_back_with_reason(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg=json.loads(Path('orchestrator/config.json').read_text())
+            cfg['features']['adaptive_routing']['mode']='enforce'
+            cp=Path(td,'config.json'); cp.write_text(json.dumps(cfg))
+            base={'task_class':'crud','complexity':3,'risk':'low','capability_class':'implementation_fast','effort':'low','verification_depth':'targeted',
+                  'topology_shape':'multi_lead','topology_depth':3,'topology_workers':6,'topology_leads':2,'run_id':'R0','task_id':'T0','ts':'2026-09-23T00:00:00+00:00'}
+            with Path(td,'metrics.jsonl').open('w') as f:
+                for _ in range(20): f.write(json.dumps({**base,'event':'model_call','model':'m','cost_usd':.01,'cost_source':'reported'})+'\n')
+                f.write(json.dumps({**base,'event':'task_verified','result':'verified','quality_evidence_score':.99})+'\n')
+            e=OrchestrationEngine(td,cp)
+            p=e.plan_run(run_id='r3',task_class='crud',complexity=3,risk='low')
+            self.assertEqual(p['route']['mode'],'enforce')
+            self.assertEqual(p['topology']['source'],'heuristic')
+            self.assertEqual(p['topology']['shape'],'direct')
+            rec=p['topology_recommendation']
+            self.assertIsNone(rec['empirical'])
+            self.assertEqual(rec['fallback_reason'],'insufficient_history')
+            self.assertEqual(rec['min_samples'],12)
+            self.assertEqual(rec['candidates'][0]['verified_tasks'],1)
+            self.assertEqual(p['route']['explanation']['action'],'fallback_insufficient_history')
 
     def test_master_switch_freezes_route(self):
         with tempfile.TemporaryDirectory() as td:

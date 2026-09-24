@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { escalateLeadCapability, isLeadCapability, isLeadSize, sizeLead } from "./lead-sizing.ts";
+import type { LeadSize } from "./models.ts";
 
 describe("sizeLead", () => {
-	const cases: Array<[number, string, string]> = [
+	const cases: Array<[number, string, LeadSize]> = [
 		[1, "low", "small"], [3, "low", "small"], [4, "low", "standard"], [6, "low", "standard"],
 		[7, "low", "large"], [10, "low", "large"], [2, "medium", "standard"], [2, "high", "large"],
 		[2, "critical", "large"], [5, "high", "large"], [2, "weird", "standard"],

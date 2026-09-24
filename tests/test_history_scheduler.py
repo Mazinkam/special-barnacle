@@ -9,6 +9,14 @@ from orchestrator.scheduler import recommend_package, topology_for
 from orchestrator.adaptive import adaptive_route, recommend_topology
 
 
+def topo_rows(run_id='R1',task_id='T1',calls=3,verified=True,shape='multi_lead'):
+    base={'task_class':'crud','complexity':3,'risk':'low','capability_class':'implementation_fast','effort':'low','verification_depth':'targeted',
+          'topology_shape':shape,'topology_depth':3,'topology_workers':6,'topology_leads':2,'run_id':run_id,'task_id':task_id}
+    rows=[{**base,'event':'model_call','model':'m','cost_usd':.01,'cost_source':'reported'} for _ in range(calls)]
+    if verified: rows.append({**base,'event':'task_verified','result':'verified','quality_evidence_score':.99})
+    return rows
+
+
 class T(unittest.TestCase):
     def test_stats(self):
         """`verified_tasks` requires ATTESTED evidence; a dispatch `result` does not qualify.
@@ -166,81 +174,74 @@ class T(unittest.TestCase):
         self.assertEqual(s3[0]['verified_tasks'], 0)
         self.assertIsNone(s3[0]['verified_cost_usd'])
 
+    def test_outcome_summary_honors_typed_field_over_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'outcomes.jsonl').write_text(
+                '{"task_id":"T1","reopened":false,"notes":"{\\"reopened\\": true}"}\n',
+                encoding='utf-8',
+            )
+            result = outcome_summary(root)
+            # typed top-level `reopened: false` is authoritative even though `notes` says true.
+            self.assertFalse(result[0]['bad_outcome'])
 
-class EvidenceSampleTests(unittest.TestCase):
-    @staticmethod
-    def _topology_rows(run_id, task_id, calls, verified=True):
-        base = {
-            'task_class': 'crud', 'complexity': 3, 'risk': 'low',
-            'capability_class': 'implementation_fast', 'effort': 'low',
-            'verification_depth': 'targeted', 'topology_shape': 'multi_lead',
-            'topology_depth': 3, 'topology_workers': 6, 'topology_leads': 2,
-            'run_id': run_id, 'task_id': task_id,
-        }
-        rows = [{**base, 'event': 'model_call', 'model': 'm', 'cost_usd': .01,
-                 'cost_source': 'reported'} for _ in range(calls)]
-        if verified:
-            rows.append({**base, 'event': 'task_verified', 'result': 'verified',
-                         'quality_evidence_score': .99})
-        return rows
+    def test_route_stats_count_tasks_and_runs_not_rows(self):
+        rows=topo_rows('R1','T1',calls=3)+topo_rows('R1','T2',calls=2)+topo_rows('R2','T3',calls=1,verified=False)
+        s=build_route_stats(rows,[]); self.assertEqual(len(s),1); g=s[0]
+        self.assertEqual(g['samples'],8)               # legacy: every row
+        self.assertEqual(g['call_samples'],6)
+        self.assertEqual(g['verification_samples'],2)
+        self.assertEqual(g['task_samples'],3)
+        self.assertEqual(g['verified_tasks'],2)
+        self.assertEqual(g['run_samples'],2)
+        self.assertEqual(g['verified_runs'],1)
+        self.assertAlmostEqual(g['total_cost_usd'],.06)
 
-    def test_route_stats_separate_rows_calls_tasks_and_runs(self):
-        rows = (self._topology_rows('R1', 'T1', 3) + self._topology_rows('R1', 'T2', 2)
-                + self._topology_rows('R2', 'T3', 1, verified=False))
-        stats = build_route_stats(rows, [])
-        self.assertEqual(len(stats), 1)
-        route = stats[0]
-        self.assertEqual(route['samples'], 8)
-        self.assertEqual(route['call_samples'], 6)
-        self.assertEqual(route['verification_samples'], 2)
-        self.assertEqual(route['task_samples'], 3)
-        self.assertEqual(route['run_samples'], 2)
-        self.assertEqual(route['verified_tasks'], 2)
-        self.assertEqual(route['verified_runs'], 1)
+    def test_session_ingest_excluded_from_route_stats(self):
+        rows=topo_rows()+[{'task_class':'crud','complexity':3,'risk':'low','role':'interactive_session','source':'session_ingest','cost_usd':9,'task_id':'S1','result':'verified'}]
+        s=build_route_stats(rows,[]); self.assertEqual(len(s),1); self.assertAlmostEqual(s[0]['total_cost_usd'],.03); self.assertEqual(s[0]['verified_tasks'],1)
 
-    def test_session_ingest_does_not_contribute_to_route_evidence(self):
-        rows = self._topology_rows('R1', 'T1', 3)
-        rows.append({'task_class': 'crud', 'complexity': 3, 'risk': 'low',
-                     'role': 'interactive_session', 'source': 'session_ingest',
-                     'cost_usd': 9, 'task_id': 'S1', 'result': 'verified'})
-        stats = build_route_stats(rows, [])
-        self.assertEqual(len(stats), 1)
-        self.assertAlmostEqual(stats[0]['total_cost_usd'], .03)
-        self.assertEqual(stats[0]['verified_tasks'], 1)
+    def test_enforce_topology_needs_min_samples_of_verified_tasks(self):
+        stats=build_route_stats(topo_rows(calls=20),[])
+        features={'adaptive_routing':{'mode':'enforce'},'historical_learning':{'minimum_samples':12}}
+        rec=recommend_topology(task_class='crud',complexity=3,risk='low',coupling=.5,parallelizable=.5,stats=stats,quality_floor=.9,features=features)
+        self.assertIsNone(rec['empirical'])
+        self.assertEqual(rec['fallback_reason'],'insufficient_history')
+        self.assertEqual(rec['min_samples'],12)
+        self.assertEqual(rec['candidates'][0]['verified_tasks'],1)
+        self.assertFalse(rec['candidates'][0]['sufficient'])
+        self.assertEqual(rec['heuristic']['shape'],'direct')
+        rec1=recommend_topology(task_class='crud',complexity=3,risk='low',coupling=.5,parallelizable=.5,stats=stats,quality_floor=.9,features=features,min_samples=1)
+        self.assertEqual(rec1['empirical']['shape'],'multi_lead'); self.assertIsNone(rec1['fallback_reason'])
 
-    def test_enforced_topology_requires_verified_task_sample_count(self):
-        rows = self._topology_rows('R1', 'T1', 20)
-        stats = build_route_stats(rows, [])
-        features = {'adaptive_routing': {'mode': 'enforce'},
-                    'historical_learning': {'minimum_samples': 12}}
-        recommendation = recommend_topology(
-            task_class='crud', complexity=3, risk='low', coupling=.5,
-            parallelizable=.5, stats=stats, quality_floor=.9,
-            features=features, min_samples=12,
-        )
-        self.assertIsNone(recommendation['empirical'])
-        self.assertEqual(recommendation['fallback_reason'], 'insufficient_history')
-        self.assertEqual(recommendation['candidates'][0]['verified_tasks'], 1)
-        route = adaptive_route(
-            run_id='new', task_class='crud', complexity=3, risk='low', quality_floor=.9,
-            cost_aggressiveness=.8, stats=stats, features=features,
-            default_efforts={'implementation_fast': 'low', 'implementation_strong': 'standard'},
-            min_samples=12,
-        )
-        self.assertEqual(route['explanation']['action'], 'fallback_insufficient_history')
-        self.assertFalse(route['history_sufficient'])
-
-    def test_topology_fallback_distinguishes_missing_quality_from_no_history(self):
-        rows = self._topology_rows('R1', 'T1', 3, verified=False)
-        stats = build_route_stats(rows, [])
+    def test_topology_fallback_reasons(self):
+        rec=recommend_topology(task_class='crud',complexity=3,risk='low',coupling=.5,parallelizable=.5,stats=[],quality_floor=.9,features={},min_samples=1)
+        self.assertEqual(rec['fallback_reason'],'no_comparable_history')
+        stats=build_route_stats(topo_rows(),[])
+        rec=recommend_topology(task_class='crud',complexity=3,risk='low',coupling=.5,parallelizable=.5,stats=stats,quality_floor=.999,features={},min_samples=1)
+        self.assertEqual(rec['fallback_reason'],'below_quality_floor')
+        # Comparable topology-tagged history that never produced a verified task (or quality score) is
+        # a data gap, not "no history": say so, so operators do not go looking for missing tags.
+        stats=build_route_stats(topo_rows(verified=False),[])
         self.assertIsNone(stats[0]['verified_cost_usd'])
-        recommendation = recommend_topology(
-            task_class='crud', complexity=3, risk='low', coupling=.5,
-            parallelizable=.5, stats=stats, quality_floor=.9,
-            features={}, min_samples=1,
-        )
-        self.assertEqual(recommendation['fallback_reason'], 'missing_quality_or_cost')
-        self.assertEqual(recommendation['candidates'], [])
-        self.assertEqual(recommendation['comparable_groups'], 1)
-        self.assertEqual(recommendation['skipped_missing_quality_or_cost'], 1)
-        self.assertIsNone(recommendation['empirical'])
+        rec=recommend_topology(task_class='crud',complexity=3,risk='low',coupling=.5,parallelizable=.5,stats=stats,quality_floor=.9,features={},min_samples=1)
+        self.assertEqual(rec['fallback_reason'],'missing_quality_or_cost')
+        self.assertEqual(rec['candidates'],[])
+        self.assertEqual(rec['comparable_groups'],1)
+        self.assertEqual(rec['skipped_missing_quality_or_cost'],1)
+        self.assertIsNone(rec['empirical'])
+
+    def test_enforce_route_gate_counts_verified_tasks_not_call_rows(self):
+        rows=[]
+        base={'task_class':'crud','complexity':3,'risk':'low','capability_class':'implementation_fast','effort':'low','verification_depth':'targeted','run_id':'R1','task_id':'T1'}
+        rows+=[{**base,'event':'model_call','model':'m','cost_usd':.001,'cost_source':'reported'} for _ in range(30)]
+        rows.append({**base,'event':'task_verified','result':'verified','quality_evidence_score':.99})
+        stats=build_route_stats(rows,[]); self.assertGreaterEqual(stats[0]['effective_samples'],12); self.assertEqual(stats[0]['verified_tasks'],1)
+        f={'adaptive_routing':{'mode':'enforce'},'historical_learning':{'enabled':True,'minimum_samples':12}}
+        r=adaptive_route(run_id='x',task_class='crud',complexity=3,risk='low',quality_floor=.9,cost_aggressiveness=.8,stats=stats,features=f,default_efforts={'implementation_fast':'low','implementation_strong':'standard'},min_samples=12)
+        self.assertEqual(r['explanation']['action'],'fallback_insufficient_history')
+        self.assertFalse(r['history_sufficient'])
+        self.assertEqual(r['explanation']['verified_task_samples'],1)
+        self.assertEqual(r['explanation']['run_samples'],1)
+        self.assertEqual(r['explanation']['min_samples'],12)
+        self.assertEqual(r['selected'],r['default'])

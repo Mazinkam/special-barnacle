@@ -1,8 +1,13 @@
 """Per-source ingestion checkpoints and the incremental `session_ingest` dedup ledger.
 
-Two JSONL files are authoritative for ingestion: the harness's session log (what happened) and
-the state root's ``metrics.jsonl`` (what is already recorded). Both only grow by appending
-complete lines under normal operation, so both can be resumed from a verified byte offset. For
+The harness log (what happened), ``metrics.jsonl`` (what is paid) and ``events.jsonl``
+(logical fallback -> explicit promotions) are authoritative. Promotion events carry a stable
+record ID, source path/inode and from/to sessions, including transitions with zero new metrics.
+New metrics persist ``source_identity`` from the scanned descriptor and attest ``promotion_version``:
+legacy fallback-only rows without this marker could
+have undergone an invisible zero-metric promotion, so origins alone cannot prove eligibility
+when the source checkpoint is lost. Logs and metrics normally grow by appending complete lines
+and can be resumed from a verified byte offset. For
 the log: same identity (device, inode), unchanged stat signature and matching edges, or growth
 with the entire checkpointed prefix hashing identically. For ``metrics.jsonl``
 (read only under the writer lock): same identity, long enough, same last line. Anything else —
@@ -23,11 +28,13 @@ One checkpoint per source path lives in ``<state root>/ingest-checkpoints/<sha25
   ``live_sessions`` retains the physical source's session IDs separately from the original
   identities of calls reconciled after session-ID drift (absent in older v3 checkpoints).
   HT ``reader.session_provenance`` distinguishes filename fallback from explicit session IDs;
-  ``session_aliases`` binds proven fallback calls to the explicit logical session, never its
-  successor. Inode changes start a new source generation rather than promoting a fallback ID.
-  New metric rows persist canonical ``session_origin`` (fallback/explicit) as well. Without
-  checkpoint provenance, source-scoped ledger origins determine alias eligibility; missing or
-  conflicting legacy origins cannot establish a cross-session identity.
+  ``session_aliases`` caches proven fallback bindings, whose authoritative copies live in
+  ``events.jsonl`` and survive checkpoint loss. Inode changes start a new source generation
+  rather than promoting a fallback ID. New metric rows persist canonical ``session_origin``
+  (fallback/explicit), ``source_identity`` (device, inode), and ``promotion_version`` as well.
+  Without checkpoint provenance, source-scoped ledger generations, origins and durable bindings
+  determine alias eligibility; missing or
+  conflicting legacy evidence cannot establish a cross-session identity.
   The ever-seen IDs deduplicate calls reintroduced after truncation; the ledger's authoritative
   coverage identifies which calls are paid, even if they disappeared from the source;
 * ``metrics`` (identity/offset/tail_hash of ``metrics.jsonl``) and ``recorded`` — the
@@ -57,11 +64,13 @@ import os
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Optional
 
-from .runtime import TAIL_FINGERPRINT_BYTES, iter_jsonl_from, open_binary, read_json, tail_fingerprint, write_json
+from .runtime import TAIL_FINGERPRINT_BYTES, iter_jsonl_from, open_binary, read_json, stable_hash, tail_fingerprint, write_json
 
 FORMAT_VERSION = 3  # 3: full prefix hash and authoritative aggregate call coverage; older caches cost a full read
 CHECKPOINT_DIR = 'ingest-checkpoints'
 INGEST_SOURCE = 'session_ingest'
+PROMOTION_EVENT = 'session_ingest_promotion'
+PROMOTION_VERSION = 1
 CALL = 'call'
 SESSION = 'session'
 GRANULARITIES = (CALL, SESSION)
@@ -179,6 +188,16 @@ def verify_prefix(path: Path, offset: int, tail_hash: Optional[str]) -> bool:
 
 def source_key(source: str | Path) -> str:
     return str(Path(os.path.abspath(os.fspath(source))))
+
+
+def promotion_record(runtime: str, source: str | Path, identity: list[int],
+                     from_session: str, to_session: str) -> dict[str, Any]:
+    """Stable-ID logical binding, written before metrics even when promotion owes no new usage."""
+    source = source_key(source)
+    return {'stream': 'event', 'event': PROMOTION_EVENT, 'source': INGEST_SOURCE,
+            'record_id': stable_hash([PROMOTION_EVENT, runtime, source, identity, from_session, to_session]),
+            'agent_runtime': runtime, 'ingest_source': source, 'source_identity': identity,
+            'from_session_id': from_session, 'to_session_id': to_session}
 
 
 def checkpoint_path(root: Path, source: str | Path) -> Path:
@@ -360,6 +379,12 @@ class IngestLedger:
             origin = row.get('session_origin')
             source_state.setdefault('session_origins', set()).add(
                 origin if origin in ('fallback', 'explicit') else 'unknown')
+            identity = row.get('source_identity')
+            source_state.setdefault('source_identities', set()).add(
+                tuple(identity) if identity is not None and _valid_identity(identity) else None)
+            version = row.get('promotion_version')
+            if not _is_int(version) or version != PROMOTION_VERSION:
+                source_state['legacy_promotions'] = True
 
     @staticmethod
     def _apply_state(state: dict[str, Any], row: dict[str, Any]) -> None:
@@ -402,10 +427,10 @@ class IngestLedger:
                 self.provisional = True
         return pos
 
-    def _complete_tail(self, offset: int) -> Optional[dict[str, Any]]:
+    def _complete_tail(self, offset: int, path: Path | None = None) -> Optional[dict[str, Any]]:
         """The JSON object occupying [offset, EOF) without a trailing newline, or None (nothing, torn, or too big)."""
         try:
-            with open_binary(self.path) as handle:
+            with open_binary(self.path if path is None else path) as handle:
                 handle.seek(offset)
                 data = handle.read(MAX_TAIL_BYTES + 1)
         except FileNotFoundError:
@@ -496,6 +521,44 @@ class IngestLedger:
             self._apply(row, None)
 
     # -- queries ---------------------------------------------------------------------------------
+    def source_promotions(self, runtime: str, source: str | Path) -> dict[str, dict[str, Any]]:
+        """Rebuild immutable fallback -> explicit bindings from events, never from the cache.
+
+        Called only for call reconciliation, not unchanged checkpoint refreshes. The caller
+        settles events under the writer lock; dry runs also recognize a complete pending tail
+        and staged bindings without publishing them. Conflicting/malformed bindings fail closed.
+        A binding remains consumed across source generations: inode reuse or rotation is not
+        permission to give a different explicit session the old fallback's paid call IDs.
+        """
+        source = source_key(source)
+        bindings: dict[str, dict[str, Any]] = {}
+
+        def apply(row: Any) -> None:
+            if not isinstance(row, dict) or row.get('event') != PROMOTION_EVENT:
+                return
+            if row.get('agent_runtime') != runtime or row.get('ingest_source') != source:
+                return
+            before, after = row.get('from_session_id'), row.get('to_session_id')
+            identity = row.get('source_identity')
+            if (row.get('source') != INGEST_SOURCE or not _valid_identity(identity) or identity is None
+                    or not isinstance(before, str) or not before.strip()
+                    or not isinstance(after, str) or not after.strip() or before == after
+                    or row.get('record_id') != promotion_record(runtime, source, identity, before, after)['record_id']
+                    or (before in bindings and (bindings[before]['to_session_id'] != after
+                                                or bindings[before]['source_identity'] != identity))):
+                raise ValueError(f'{source}: ambiguous session promotion binding; reconcile events.jsonl before retrying; '
+                                 'nothing was written.')
+            bindings[before] = {'to_session_id': after, 'source_identity': identity}
+
+        path = self.path.with_name('events.jsonl')
+        end = 0
+        for row, end in iter_jsonl_from(path):
+            apply(row)
+        apply(self._complete_tail(end, path))
+        for row in self.staged:
+            apply(row)
+        return bindings
+
     def source_states(self, runtime: str, source: str | Path) -> dict[str, dict[str, Any]]:
         """Authoritative coverage per session for one source, never totals from other paths.
 

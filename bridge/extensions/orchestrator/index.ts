@@ -117,8 +117,13 @@ import { connectCancellationLoader, applyObservation, applyWarnings, createProgr
 import type { DispatchProgressView } from "./run-ui.ts";
 import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
 import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.ts";
-// Rule-2 recon planning/evidence helpers (pure; see recon.ts).
-import { formatReconEvidence, planReconTasks, type ReconTaskPlan } from "./recon.ts";
+// Rule-2 recon planning/evidence helpers (pure; see recon.ts). `dispatchHierarchical()`
+// dispatches these as ordinary parent-owned tasks through the existing
+// `dispatchParallel()` path. `DispatchTask` below is declared independently;
+// `ReconTaskPlan` is structurally assignable to it, which the annotated
+// `const reconTasks: DispatchTask[] = planReconTasks(...)` checks at compile
+// time, so a planned recon task still needs no conversion step.
+import { formatReconEvidence, planReconTasks } from "./recon.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -235,6 +240,12 @@ const RECON_EVIDENCE_MAX_CHARS = positiveIntEnv(
 	"HUMAIN_ORCHESTRATOR_RECON_EVIDENCE_MAX_CHARS",
 	METHOD.rules.pre_implementation_recon.evidence_packet_max_tokens * CHARS_PER_TOKEN_ESTIMATE,
 );
+
+// `dispatchTimeoutFor()` + LEAD_DISPATCH_TIMEOUT_MS lived here. Dropped in
+// favour of main's progress-aware lead timeouts (`cb9f51e`): a flat per-
+// capability ceiling is exactly what that change replaced, and
+// ORCHESTRATING_CAPABILITIES now drives `opts.leadTimeouts` in
+// runSubagentProcess instead.
 
 /**
  * PIDs of dispatched children that are still running. Children are spawned
@@ -729,14 +740,28 @@ function heuristicTriage(goal: string): TriageResult {
 	};
 }
 
+/**
+ * Normalise any complexity input (triage JSON or the manual `--complexity`
+ * flag) to the integer 1-10 scale method.json's Rule-2 bands are defined on.
+ * Out-of-band values (6.5, 12) otherwise match no `workers_by_complexity`
+ * band, silently plan zero recon workers, and make the no-recon phase line
+ * report a false reason.
+ */
+export function clampComplexity(raw: unknown, fallback = 5): number {
+	// Only numbers and non-empty numeric strings are complexity values; null,
+	// "", booleans and arrays mean "absent" and must take the fallback rather
+	// than coerce to 0 and collapse to the minimum (which would skip recon).
+	if (typeof raw !== "number" && !(typeof raw === "string" && raw.trim() !== "")) return fallback;
+	const n = Number(raw);
+	return Number.isFinite(n) ? Math.max(1, Math.min(10, Math.round(n))) : fallback;
+}
+
 function clampTriage(raw: Partial<TriageResult>): TriageResult | null {
 	if (!raw || typeof raw !== "object") return null;
 	const task_class = VALID_TASK_CLASSES.includes(raw.task_class ?? "")
 		? raw.task_class!
 		: "implementation";
-	const complexity = Number.isFinite(raw.complexity)
-		? Math.max(1, Math.min(10, Math.round(Number(raw.complexity))))
-		: 5;
+	const complexity = clampComplexity(raw.complexity);
 	const risk = VALID_RISKS.includes(raw.risk ?? "") ? raw.risk! : "medium";
 	const reasoning = typeof raw.reasoning === "string" && raw.reasoning.length > 0
 		? raw.reasoning.slice(0, 200)
@@ -763,6 +788,10 @@ function clampTriage(raw: Partial<TriageResult>): TriageResult | null {
 // assistant message_end events with model, input/output tokens, and cost.
 // That path is the one we replicate here.
 
+// The `ChildSpawner` seam this branch added here is deliberately NOT duplicated:
+// main declares a byte-identical alias further down (`cc9836d`), which is the
+// shape `f2ddaa6` adopted precisely so this merge would converge. Two aliases
+// would be a duplicate-identifier error; the one below serves both call sites.
 function reportedCost(total: unknown): number | undefined {
 	return typeof total === "number" && Number.isFinite(total) && total >= 0 ? total : undefined;
 }
@@ -1402,6 +1431,13 @@ export async function runSubagentProcess(opts: {
 	 * `spawn`; production callers never set this. Lets tests exercise the real
 	 * stream/event/close handling below against a deterministic local fixture
 	 * instead of the actual `humain-terminal --mode json` binary.
+	 */
+	/*
+	 * This branch previously added a second positional parameter
+	 * (`spawnProcess: ChildSpawner = spawn`) for the same purpose. Converged on
+	 * `spawnChild` instead of shipping two seams for one job: it is the one
+	 * main's suite already exercises, and keeping it inside the options object
+	 * means the next seam does not grow the signature again.
 	 */
 	spawnChild?: ChildSpawner;
 }): Promise<SubagentProcessResult> {
@@ -2255,8 +2291,24 @@ function warnTelemetry(ctx: ExtensionContext, report: FlushReport): void {
 // Subagent dispatch
 // -----------------------------------------------------------------------------
 
-// Recon always specifies tools; other dispatches inherit their persona's tools.
-export interface DispatchTask extends Omit<ReconTaskPlan, "tools"> {
+/**
+ * One task for `dispatchParallel()`. Declared standalone rather than derived
+ * from `recon.ts`'s `ReconTaskPlan`: the bridge's dispatch contract is the
+ * general case and must not depend on the pure Rule-2 recon module, which is
+ * only one of its callers. `ReconTaskPlan` is structurally assignable here
+ * (its `tools` is required, this one's is optional), and the annotation on
+ * `reconTasks` in `dispatchHierarchical()` fails the typecheck if that ever
+ * stops being true.
+ */
+export interface DispatchTask {
+	taskId: string;
+	capability: string;
+	task: string;
+	/**
+	 * Explicit tool allow-list, overriding whatever the bound persona permits.
+	 * Recon always specifies this; other dispatches omit it and inherit their
+	 * persona's own tools.
+	 */
 	tools?: string[];
 	retryOf?: string;
 	retryCount?: number;
@@ -2342,7 +2394,9 @@ export async function dispatchParallel(
 		// Left unparenthesised this failed to load the whole extension.
 		const shortId =
 			(input._taskId ?? "").replace(`${runId}-`, "") || input._capability || "task";
-		// Queued, not awaited: the child starts now and the record lands in the next batch.
+		// Queued, not awaited: the child starts now and the record lands in the next
+		// batch. Routed through `deps` so tests can observe it; the default binding
+		// is the same `recordEvent`, so the queuing behaviour is unchanged.
 		deps.recordEvent("dispatch_started", {
 			run_id: runId,
 			task_id: input._taskId,
@@ -2362,8 +2416,13 @@ export async function dispatchParallel(
 				label,
 				capability: input._capability,
 				depth,
-				// Recon overrides a potentially write-capable persona with an explicit
-				// read-only tool list; other tasks keep their persona's allow-list.
+				// Still no *hardcoded* tools override here — that is what previously
+				// granted reviewers write access and stripped tools the personas need.
+				// `input.tools` is per-task and set by exactly one producer,
+				// `planReconTasks()`, which pins recon to read-only. Every other task
+				// leaves it undefined, and runSubagentProcess then falls back to the
+				// persona's own frontmatter allow-list, so persona policy still wins
+				// everywhere it did before.
 				tools: input.tools,
 				ctx,
 			});
@@ -3580,7 +3639,7 @@ export function parseArgs(args: string): OrchestrateArgs {
 		const next = tokens[i + 1];
 		switch (t) {
 			case "--task-class": if (next) { out.taskClass = next; i++; } break;
-			case "--complexity": if (next) { out.complexity = Number(next) || 5; i++; } break;
+			case "--complexity": if (next) { out.complexity = clampComplexity(next); i++; } break;
 			case "--risk": if (next) { out.risk = next; i++; } break;
 			case "--quality-floor": if (next) { out.qualityFloor = Number(next); i++; } break;
 			case "--cost-aggressiveness": if (next) { out.costAggressiveness = Number(next); i++; } break;
@@ -4118,7 +4177,10 @@ export default function (pi: ExtensionAPI) {
 
 				const dirtyBefore = gitDirtySnapshot(cwd);
 				const headBefore = gitHead(cwd);
+				// `workerResults` carries the parent-owned recon dispatches; they must stay
+				// destructured here or the run stops billing them (plan Task 3).
 				const { leadResults, workerResults, architectResult, escalationResults } = await dispatchHierarchical(
+
 					cwd,
 					runId,
 					plan.plan_id,

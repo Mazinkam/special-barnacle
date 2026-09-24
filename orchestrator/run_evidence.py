@@ -9,6 +9,22 @@ outcomes, and orchestration overhead versus implementation spend.
 Rules that keep the numbers honest:
 - A model call, a verification marker, and a routing decision are counted separately;
   they are never pooled into one "samples" figure.
+- A verification marker is any row that *attests* a verdict (`records.verification_evidence` at
+  `ATTESTED` strength: `event: task_verified`/`task_failed`, or an outcomes-style verdict field).
+  The verdict itself is read through `records`, so a `task_verified` row whose `result` says
+  `fail` (how `engine.Engine.verify_task` reports a failed gate) fails the run here exactly as
+  it fails the task on the dashboard and in `history`. A dispatch `result: 'pass'` on a
+  `model_call` row is the subprocess exit code, not a verdict, and never makes a run `passed`.
+- Task verification is joined per `(run_id, task_id)` across *both* the metrics and outcomes
+  streams into one attempt timeline, and the chronologically latest attested verdict for the task
+  decides (`_attempt_order`, the same rule `history` applies): a later attested pass is a retry
+  that verified, a later attested `outcome: 'fail'` is a task that failed after its gate row.
+  Two verdicts at the same instant resolve to the failure, and undated rows sort before every
+  dated one and fail among themselves, so a missing timestamp can never upgrade a verdict.
+  Run-scoped outcomes (`verification_scope: 'run'`, the bridge's `${run}-qa` gate row, the
+  terminal `run-complete`/`run-failed` summaries) decide the run verdict once and are never
+  counted as a verified or failed *task*. Outcomes rows joined this way are verdicts only: they
+  never add a call, a cost, tokens, or a duration.
 - Missing cost, tokens, or duration is reported as missing (`None` / unmetered counts),
   never as zero. A call whose cost is "estimated" from zero tokens at $0 measured nothing
   and is unmetered (`economics.cost_class` is the single classifier shared with the
@@ -28,11 +44,12 @@ Rules that keep the numbers honest:
   unless every call in the run is priced under both views.
 """
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 import json
 
-from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, has_reported_tokens, is_call_row, is_session_ingest, row_cost, unique_records, verification_passed
+from . import records
+from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, has_reported_tokens, is_call_row, is_session_ingest, row_cost, unique_records
 
 ACTUAL = 'actual'
 COUNTERFACTUAL = 'counterfactual'
@@ -58,8 +75,46 @@ def _role(row: dict) -> str:
     return str(row.get('role') or row.get('capability_class') or 'unknown')
 
 
+def _attested_verdict(row: dict) -> str | None:
+    """The row's attested verdict (`records.VERIFIED`/`FAILED`/`PARTIAL`), or None if it attests nothing.
+
+    One vocabulary: the same `records.verification_evidence` the dashboard and `history` read, so the
+    engine's `task_verified` + `result: 'fail'` row is a failure in all three places and a bare
+    `task_verified` is a success in all three.
+    """
+    state, strength = records.verification_evidence(row)
+    return state if strength == records.ATTESTED else None
+
+
 def _is_verification_row(row: dict) -> bool:
-    return row.get('event') == 'task_verified' or row.get('result') == 'verified'
+    return _attested_verdict(row) is not None
+
+
+def _verification_passed(row: dict) -> bool:
+    return _attested_verdict(row) == records.VERIFIED
+
+
+def _is_run_scoped(row: dict) -> bool:
+    """A run-gate outcome row, never a task attempt: the terminal summaries, and the QA gate the bridge
+    writes as `${run}-qa` with `verification_scope: 'run'` (legacy rows lack the marker; the suffix
+    is the same contract). These feed the run-level verdict exactly once."""
+    tid = str(row.get('task_id') or '')
+    return row.get('verification_scope') == 'run' or tid in TERMINAL_OUTCOME_TASKS or tid.endswith('-qa')
+
+
+def _attempt_order(row: dict):
+    """Sort key for a task's attested attempts: by instant, with ties — and undated rows — failing.
+
+    Sorted ascending, the last row is the deciding attempt. A dated pass after a dated failure is a
+    retry that verified; two verdicts at the same instant put the failure last. Rows without a
+    parseable `ts` sort before every dated row, so a legacy undated pass never supersedes a dated
+    failure and, among undated rows, the failure wins whatever their stream order. Mirrors
+    `history._verification_order`; over-counting verified tasks is the error this exists to prevent.
+    """
+    dt = _parse_ts(row.get('ts'))
+    if dt is None: dt = datetime.min.replace(tzinfo=timezone.utc)
+    elif dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+    return (dt, not _verification_passed(row))
 
 
 def _terminal_fields(record: dict) -> dict[str, Any]:
@@ -180,6 +235,10 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
         if tid.endswith('-qa') or o.get('verification') is not None:
             passed = o.get('verification') if o.get('verification') is not None else o.get('outcome') == 'verified'
             verification[rid] = 'passed' if passed else 'failed'
+        # An ordinary task outcome is an attested verdict for `(run_id, task_id)`: join it into the same
+        # attempt timeline as the metrics-side `task_verified` rows. Run-scoped gate rows were counted
+        # above as the run verdict and must not reappear as a task. This adds a verdict, never a call.
+        if tid and not _is_run_scoped(o) and _is_verification_row(o): verifications[rid].append(o)
 
     # Earliest observed ts orders runs (stable on first-seen order for ties or missing ts).
     order = sorted(range(len(run_ids)), key=lambda i: (first_ts.get(run_ids[i]) is None, first_ts.get(run_ids[i]) or '', i))
@@ -200,14 +259,16 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
         durations = [_int_or_none(r.get('duration_ms')) for r in rows]
         known_durations = [d for d in durations if d is not None]
         tokens_known = sum(1 for r in rows if has_reported_tokens(r))
-        latest_verification = {str(v.get('task_id')): v for v in verifications[rid] if v.get('task_id') is not None}
-        verified_tasks = {tid for tid,v in latest_verification.items() if verification_passed(v)}
+        # Latest attested attempt per task decides; ties and undated rows fail (`_attempt_order`).
+        timeline = sorted((v for v in verifications[rid] if v.get('task_id') is not None), key=_attempt_order)
+        latest_verification = {str(v['task_id']): v for v in timeline}
+        verified_tasks = {tid for tid,v in latest_verification.items() if _verification_passed(v)}
         retries = len(retry_dispatches[rid]) or sum(1 for r in rows if _int_or_none(r.get('retry')))
         note = summary_note.get(rid, {})
         if retries == 0 and _int_or_none(note.get('retries')): retries = int(note['retries'])
         verdict = verification.get(rid)
         if verdict is None and note.get('verification_passed') is not None: verdict = 'passed' if note['verification_passed'] else 'failed'
-        if any(not verification_passed(v) for v in latest_verification.values()): verdict = 'failed'
+        if any(not _verification_passed(v) for v in latest_verification.values()): verdict = 'failed'
         if verdict is None and verified_tasks: verdict = 'passed'
         term = terminal.get(rid)
         elapsed_ms, elapsed_source = _elapsed(term)

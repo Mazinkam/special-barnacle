@@ -169,10 +169,14 @@ class VerificationVocabularyTests(unittest.TestCase):
         self.assertEqual(verification_state({'success': True, 'quality': .94}), 'verified')
         self.assertEqual(verification_state({'success': False, 'kind': 'delayed'}), 'failed')
 
-    def test_canonical_events_outrank_field_values(self):
+    def test_canonical_events_carry_their_verdict_but_an_explicit_failure_conservatively_wins(self):
         self.assertEqual(verification_state({'event': 'task_verified', 'task_id': 'T-1'}), 'verified')
         self.assertEqual(verification_state({'event': 'task_failed', 'task_id': 'T-1'}), 'failed')
-        self.assertEqual(verification_state({'event': 'task_verified', 'result': 'fail'}), 'verified')
+        # engine.Engine.verify_task emits `event: 'task_verified'` for BOTH outcomes and carries the real
+        # verdict in `result`, so an explicit failing result must never be inflated to verified...
+        self.assertEqual(verification_state({'event': 'task_verified', 'result': 'fail'}), 'failed')
+        # ...and a `task_failed` event is never rescued by a passing result on the same row.
+        self.assertEqual(verification_state({'event': 'task_failed', 'result': 'pass'}), 'failed')
 
     def test_outcome_outranks_result_and_success(self):
         row = {'outcome': 'partial', 'result': 'pass', 'success': True}
@@ -251,8 +255,14 @@ class EvidenceStrengthTests(unittest.TestCase):
                          VerificationEvidence('partial', ATTESTED))
         self.assertEqual(verification_evidence({'result': 'pass', 'success': False}),
                          VerificationEvidence('failed', ATTESTED))
+        # A canonical event with an explicit failing result stays ATTESTED but resolves to the
+        # conservative verdict: `task_verified` + `result: 'fail'` is an attested FAILURE, not a
+        # verified task, and `task_failed` + `result: 'pass'` is still an attested failure.
         self.assertEqual(verification_evidence({'event': 'task_verified', 'result': 'fail'}),
-                         VerificationEvidence('verified', ATTESTED))
+                         VerificationEvidence('failed', ATTESTED))
+        self.assertEqual(verification_evidence({'event': 'task_failed', 'result': 'pass'}),
+                         VerificationEvidence('failed', ATTESTED))
+        self.assertFalse(is_attested_verified({'event': 'task_verified', 'result': 'fail'}))
 
     def test_no_claim_has_neither_state_nor_strength(self):
         for row in ({}, PER_CALL_ROW, ROUTE_EXECUTED_ROW, {'status': 'implemented'},

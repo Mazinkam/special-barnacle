@@ -51,6 +51,12 @@ export interface ReconDispatchResult {
  * Read-only recon focuses, one per potential worker, ordered from most to
  * least universally useful. `workers_by_complexity` never asks for more than
  * five (see method.json), so five is enough to cover every band.
+ *
+ * SKILL.md Rule 2 also lists "recent related changes" as a candidate question.
+ * It is deliberately absent: answering it needs `git log`, which would mean
+ * granting `bash` and giving up the hard read-only tool boundary below. An
+ * unbypassable boundary is worth more than one extra question, so the two are
+ * kept consistent here and in SKILL.md rather than silently diverging.
  */
 const RECON_QUESTIONS: readonly string[] = [
 	"Identify the affected files, functions, and call sites this task must touch or reference. List exact paths and symbols.",
@@ -97,6 +103,13 @@ export function planReconTasks(input: ReconPlanInput): ReconTaskPlan[] {
 const TRUNCATION_MARKER = "…[truncated]";
 
 /**
+ * `evidence_packet_max_tokens` is the AGGREGATE budget for the one combined
+ * packet a lead receives, not a per-worker allowance — the cost being bounded
+ * is the lead's input prompt, which carries every worker's output at once. So
+ * `formatReconEvidence` splits `maxChars` into an equal per-worker share and
+ * re-caps the assembled packet at the total. See method.json
+ * `rules.pre_implementation_recon.evidence_packet_rationale`.
+ *
  * Truncate `text` to at most `maxChars` UTF-16 code units, appending an
  * explicit marker so a bounded evidence packet is never mistaken for a
  * complete one. Builds up by Unicode code point (not raw UTF-16 unit) so a
