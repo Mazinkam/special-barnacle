@@ -94,6 +94,7 @@ import {
 	type LeadSize,
 	userLayerWarnings,
 } from "./models.ts";
+import { bedrockFallbackFor, isQuotaError } from "./provider-fallback.ts";
 import { SpendCapTracker, capFor, type SpendCapVerdict } from "./spend-cap.ts";
 import { escalateLeadCapability, isLeadCapability, isLeadSize, leadSizeOf, sizeLead, type LeadSizeDecision } from "./lead-sizing.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
@@ -463,6 +464,8 @@ interface RunTags {
 	lead_size?: LeadSize;
 }
 let CURRENT_RUN_TAGS: RunTags = {};
+/** Alias table of the active run, for codex -> Bedrock quota fallback. */
+let CURRENT_ALIAS_TABLE: AliasTable | null = null;
 
 /** `<profile>-<sha256(canonical adapter)[:8]>`: stable for identical bindings. */
 export function policyIdFor(profileName: string, adapter: Record<string, Binding>): string {
@@ -2280,7 +2283,12 @@ export async function dispatchParallel(
 	adapter: Adapter,
 	ctx: ExtensionContext,
 	depth: number = 0,
-	deps: { recordEvent: typeof recordEvent; runProcess: typeof runSubagentProcess } = { recordEvent, runProcess: runSubagentProcess },
+	deps: {
+		recordEvent: typeof recordEvent;
+		runProcess: typeof runSubagentProcess;
+		/** Alias table for the codex -> Bedrock quota fallback; defaults to the active run's. */
+		aliasTable?: AliasTable | null;
+	} = { recordEvent, runProcess: runSubagentProcess },
 ): Promise<DispatchResult[]> {
 	if (tasks.length === 0) return [];
 
@@ -2340,14 +2348,14 @@ export async function dispatchParallel(
 			retry_of: input._retryOf,
 		});
 		try {
-			const r = await deps.runProcess({
+			const runOn = (model: string, taskId: string | undefined, label: string) => deps.runProcess({
 				cwd: input.cwd,
 				agentName: input.agent,
 				task: input.task,
-				model: input.model,
+				model,
 				effort: input.effort,
-				taskId: input._taskId,
-				label: shortId,
+				taskId,
+				label,
 				capability: input._capability,
 				depth,
 				// Recon overrides a potentially write-capable persona with an explicit
@@ -2355,6 +2363,36 @@ export async function dispatchParallel(
 				tools: input.tools,
 				ctx,
 			});
+			let r = await runOn(input.model, input._taskId, shortId);
+			// Codex first, Bedrock fallback: a quota/rate-limit failure on an
+			// openai-codex model is retried ONCE on the same model id under
+			// amazon-bedrock. Both attempts are billed (usage summed).
+			const table = deps.aliasTable === undefined ? CURRENT_ALIAS_TABLE : deps.aliasTable;
+			const twin = r.exitCode !== 0 && table && isQuotaError(`${r.stderr}\n${r.finalText}`)
+				? bedrockFallbackFor(input.model, table)
+				: null;
+			if (twin) {
+				deps.recordEvent("dispatch_finished", {
+					run_id: runId, task_id: input._taskId, capability: input._capability, model: r.model ?? input.model,
+					exit_code: r.exitCode, duration_ms: r.durationMs, cost_usd: r.costUsd, turns: r.usage.turns,
+					stop_reason: r.stopReason, log_dir: ACTIVE_RUN?.dir, superseded_by_fallback: true,
+				});
+				deps.recordEvent("route_degraded", {
+					run_id: runId, task_id: input._taskId, capability: input._capability,
+					from_model: input.model, to_model: twin, reason: "provider_quota",
+					detail: summarizeStderr(r.stderr, 240),
+				});
+				ACTIVE_RUN?.log(`${input._taskId}: ${input.model} hit a provider quota; retrying once on ${twin}`);
+				const first = r;
+				const second = await runOn(twin, input._taskId ? `${input._taskId}-fallback` : undefined, `${shortId}↻`);
+				r = {
+					...second,
+					usage: sumUsage(first.usage, second.usage),
+					costUsd: first.costUsd + second.costUsd,
+					costReported: first.costReported && second.costReported,
+					durationMs: first.durationMs + second.durationMs,
+				};
+			}
 			deps.recordEvent("dispatch_finished", {
 				run_id: runId,
 				task_id: input._taskId,
@@ -2898,6 +2936,18 @@ export function dispatchRecordsFor(
 		adaptive_mode: opts.mode,
 		...runTagFields(),
 	}];
+}
+
+function sumUsage(a: SubagentUsageStats, b: SubagentUsageStats): SubagentUsageStats {
+	return {
+		input: a.input + b.input,
+		output: a.output + b.output,
+		cacheRead: a.cacheRead + b.cacheRead,
+		cacheWrite: a.cacheWrite + b.cacheWrite,
+		cost: a.cost + b.cost,
+		contextTokens: Math.max(a.contextTokens, b.contextTokens),
+		turns: a.turns + b.turns,
+	};
 }
 
 function runTagFields(): Record<string, string> {
@@ -3829,6 +3879,7 @@ export default function (pi: ExtensionAPI) {
 			const session = new RunSession(runId, ctx, parsed.goal);
 			ACTIVE_RUN = session;
 			CURRENT_RUN_TAGS = { profile: resolved.profileName, policy_id: policyIdFor(resolved.profileName, adapter) };
+			CURRENT_ALIAS_TABLE = resolved.table;
 			session.log(`policy: ${CURRENT_RUN_TAGS.policy_id}`);
 			session.log(`models (profile "${resolved.profileName}"):\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
 			for (const n of resolved.notes) session.log(`note: ${n}`);
@@ -4309,6 +4360,7 @@ export default function (pi: ExtensionAPI) {
 				} finally {
 					ACTIVE_RUN = null;
 					CURRENT_RUN_TAGS = {};
+					CURRENT_ALIAS_TABLE = null;
 					session.finish();
 					closeTui?.();
 					if (tuiCompletion) await tuiCompletion.catch(() => {});
