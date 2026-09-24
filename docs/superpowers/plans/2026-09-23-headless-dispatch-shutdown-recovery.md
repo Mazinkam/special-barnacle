@@ -16,8 +16,9 @@
 - A failure before authoritative completion, a timeout, a spawn failure, or an error/aborted stop reason remains a failed dispatch.
 - Do not add a process-global uncaught exception or unhandled rejection handler.
 - Treat the bridge fixes in commit `39db7ec` as the current skill-side baseline; do not reimplement or overwrite them.
-- Preserve any concurrent uncommitted changes in the skill main checkout (currently `bridge/extensions/orchestrator/index.ts` and `index.test.ts`) and the untracked plan document; do not overwrite, stage, or transfer them into this branch.
+- Preserve any concurrent staged, unstaged, or untracked changes in the skill main checkout; do not overwrite, stage, or transfer them into this branch. At latest check its only local change is the plan document; other commits are already on main.
 - Preserve untracked `packages/coding-agent/test-prod-loader.mjs` in the HT main checkout; do not copy, edit, or clean it.
+- The skill feature branch is based at `39db7ec`; the skill main checkout has since advanced to `fbdd610` with concurrent bridge UI/worktree changes. Do not merge or rebase onto those commits until the user chooses integration.
 - Do not delete or modify unrelated scratch files or other worktrees.
 - Do not make speculative HUMAIN Terminal source changes if the reported shutdown failure cannot be reproduced.
 - Use one separate worktree per repository and keep changes/commits on the feature branches, not the main checkouts.
@@ -61,7 +62,7 @@ for repo in "$HOME/.local/share/agent-skills/hierarchical-agent-orchestrator" "$
  done
 ```
 
-Expected: record skill main at `39db7ec` with only this untracked plan document, and HT main at `c67014b9d` with only untracked `test-prod-loader.mjs`; do not stash, reset, or clean either checkout.
+Expected: record the current skill and HT main checkout states, including any staged/unstaged concurrent changes and untracked files; do not stash, reset, or clean either checkout.
 
 - [ ] **Step 2: Verify committed bridge work was incorporated**
 
