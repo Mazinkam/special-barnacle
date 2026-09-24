@@ -136,11 +136,19 @@ def test_release_commands_visible_without_creating_state(tmp_path):
 
 
 def test_legacy_benchmark_compares_equivalent_copied_workloads(tmp_path):
+    bench = load_benchmark_module()
     source=tmp_path/'fixture'; source.mkdir()
     for name in ('events.jsonl','metrics.jsonl','outcomes.jsonl'): (source/name).write_text('')
+    scales, repeat = (1, 2, 4), 1
+    # The driver spawns every planned child sequentially. Emulated Linux (amd64 image on an arm64 host)
+    # measured ~2.2s per child, so a flat 60s cannot hold the 36 planned children; budget per child
+    # with >2x headroom, bounded like the driver's own legacy timeout.
+    planned = bench.compare_legacy_process_count(scales=len(scales), repeat=repeat, batch_size=5)
+    timeout = bench.legacy_process_timeout(planned, seconds_per_process=5)
+    assert planned == 36 and timeout == 180
     result=subprocess.run([sys.executable,'-B',str(REPO/'scripts/benchmark_refresh.py'), '--source',str(source),
-                           '--compare-legacy',str(REPO),'--repeat','1','--scales','1,2,4','--json'],
-                          env=cli_env(tmp_path/'must-not-exist'),cwd=REPO,capture_output=True,text=True,timeout=60)
+                           '--compare-legacy',str(REPO),'--repeat',str(repeat),'--scales',','.join(map(str, scales)),'--json'],
+                          env=cli_env(tmp_path/'must-not-exist'),cwd=REPO,capture_output=True,text=True,timeout=timeout)
     assert result.returncode == 0, result.stderr
     report=json.loads(result.stdout)
     assert len(report['results'])==3
@@ -150,6 +158,7 @@ def test_legacy_benchmark_compares_equivalent_copied_workloads(tmp_path):
         assert row['equivalence']['dashboard_accounting'] is True
         assert row['before']['subprocesses']==5
         assert row['after']['subprocesses']==1
+        assert row['before']['median_s'] > 0 and row['after']['median_s'] > 0
     assert not (tmp_path/'must-not-exist').exists()
     assert all(p.read_bytes()==b'' for p in source.iterdir())
 
