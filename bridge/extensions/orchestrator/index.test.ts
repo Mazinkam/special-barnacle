@@ -1858,6 +1858,108 @@ describe("runSubagentProcess process/event handling", () => {
 		}
 	});
 
+	test("long minified-bundle-style source line surfaces the sentinel and a stack frame through a real Node parent", async () => {
+		// The two tests above spawn the long-line fixture directly from bun (the
+		// test runner), which happens to drain a fast-exiting child's stderr
+		// pipe in full — they pass on pre-fix code too, so they do not actually
+		// exercise the bug this file's fix commits address. HT's real parent
+		// process is Node, and Node's async pipe read is what silently drops
+		// the tail. This test runs the real `runSubagentProcess` inside a real
+		// `node` child. The outer bun<->node spawn/read below only carries a
+		// small JSON result file, never the megabyte-scale fixture stderr — the
+		// pipe under test is the inner one, between the fixture script and the
+		// bundled driver's real-Node parent.
+		const nodeBin = Bun.which("node");
+		if (!nodeBin) {
+			throw new Error(
+				"`node` binary not found on PATH — this regression test requires a real Node parent process " +
+					"(reproducing bun's own pipe-reading behavior does not exercise HT's actual failure mode).",
+			);
+		}
+
+		const { writeLongLineThrowFixture, SENTINEL } = await import("./fixtures/long-line-throw.mjs");
+		const fixtureDir = mkdtempSync(join(tmpdir(), "orch-long-line-node-fixture-"));
+		const scriptPath = join(fixtureDir, "long-line-throw.mjs");
+		writeLongLineThrowFixture(scriptPath);
+
+		const buildDir = mkdtempSync(join(tmpdir(), "orch-node-driver-build-"));
+		const nodeStateRoot = mkdtempSync(join(tmpdir(), "orch-node-driver-state-"));
+		const driverRepoDir = mkdtempSync(join(tmpdir(), "orch-node-driver-repo-"));
+		const outFile = join(buildDir, "result.json");
+		try {
+			// index.ts imports "@humain/terminal" for the persona/UI helpers, which
+			// only resolves inside HT's own runtime. index.test.ts's `bun:test`
+			// mock.module registers a virtual module for it, but that mock is a
+			// bun:test runtime feature and does not apply to a plain `Bun.build`
+			// bundle later run under real `node`. Stub it at build time instead —
+			// this test's code path (`agentName: "__no_persona__"`) never calls
+			// `discoverAgents`/`BorderedLoader`, so the stubs only need to satisfy
+			// the module's top-level named imports.
+			const build = await Bun.build({
+				entrypoints: [join(fixturesDir, "run-subagent-under-node.ts")],
+				outdir: buildDir,
+				target: "node",
+				format: "esm",
+				plugins: [
+					{
+						name: "stub-humain-terminal",
+						setup(b) {
+							b.onResolve({ filter: /^@humain\/terminal$/ }, () => ({
+								path: "@humain/terminal",
+								namespace: "stub-humain-terminal",
+							}));
+							b.onLoad({ filter: /.*/, namespace: "stub-humain-terminal" }, () => ({
+								contents: `
+									export const discoverAgents = () => ({ agents: [] });
+									export class BorderedLoader { constructor() {} }
+									export const renderTaskWithContext = (task) => task;
+								`,
+								loader: "js",
+							}));
+						},
+					},
+				],
+			});
+			if (!build.success) {
+				throw new Error(`Bun.build of the Node driver failed:\n${build.logs.map((l) => String(l.message ?? l)).join("\n")}`);
+			}
+
+			const driverPath = join(buildDir, "run-subagent-under-node.js");
+			execFileSync(nodeBin, [driverPath, driverRepoDir, scriptPath, "long-line-node", outFile], {
+				env: {
+					...process.env,
+					HUMAIN_ORCHESTRATOR_STATE_ROOT: nodeStateRoot,
+					HUMAIN_ORCHESTRATOR_SKILL_ROOT: fileURLToPath(new URL("../../../", import.meta.url)),
+				},
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+
+			const { stderrText, stderrLogPath, stderrLogSize } = JSON.parse(readFileSync(outFile, "utf8")) as {
+				stderrText: string;
+				stderrLogPath: string;
+				stderrLogSize: number;
+			};
+
+			expect(stderrText).toContain(SENTINEL);
+			expect(stderrText).toMatch(/\n\s+at /);
+
+			expect(stderrLogSize).toBeGreaterThan(0);
+			const logged = readFileSync(stderrLogPath, "utf8");
+			expect(logged).toContain(SENTINEL);
+			expect(logged).toMatch(/\n\s+at /);
+		} catch (err) {
+			const stderr = (err as { stderr?: Buffer | string }).stderr;
+			throw new Error(
+				`Node driver failed: ${(err as Error).message}${stderr ? `\n--- driver stderr ---\n${stderr}` : ""}`,
+			);
+		} finally {
+			rmSync(fixtureDir, { recursive: true, force: true });
+			rmSync(buildDir, { recursive: true, force: true });
+			rmSync(nodeStateRoot, { recursive: true, force: true });
+			rmSync(driverRepoDir, { recursive: true, force: true });
+		}
+	});
+
 	test("does not recover a result that never reaches agent_settled", async () => {
 		const result = await orchestrator.runSubagentProcess({
 			cwd: repoDir,
