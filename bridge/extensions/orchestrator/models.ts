@@ -14,8 +14,12 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 // the two runtimes. Edit the root file, never this one.
 import method from "./method.json";
 
-export type Tier = "cheap" | "mid" | "premium";
-export const TIERS: Tier[] = ["premium", "mid", "cheap"];
+export type Tier = "cheap" | "mid" | "premium" | "frontier";
+/** Display order, most expensive first. `METHOD.tiers` is the ascending cost order. */
+export const TIERS: Tier[] = ["frontier", "premium", "mid", "cheap"];
+
+export type LeadSize = "small" | "standard" | "large";
+export type SpendCapMode = "off" | "warn" | "enforce";
 
 export type RiskLevel = "low" | "medium" | "high" | "critical";
 
@@ -46,13 +50,24 @@ interface MethodFile {
 			evidence_packet_max_tokens: number;
 			skip_for_task_classes: string[];
 		};
+		lead_sizing: {
+			sizes: Record<LeadSize, string>;
+			by_complexity: { min: number; max: number; size: LeadSize }[];
+			risk_floor: Record<string, LeadSize>;
+			escalate_on_verification_failure: boolean;
+		};
+		dispatch_spend_cap: {
+			mode: SpendCapMode;
+			usd_by_capability: Record<string, number>;
+			default_usd: number;
+		};
 	};
 }
 
 export const METHOD = method as unknown as MethodFile;
 
 /** Which cost tier each abstract capability sits at. Derived from method.json. */
-export const TIER_CAPABILITIES: Record<Tier, string[]> = { cheap: [], mid: [], premium: [] };
+export const TIER_CAPABILITIES: Record<Tier, string[]> = { cheap: [], mid: [], premium: [], frontier: [] };
 for (const [cap, spec] of Object.entries(METHOD.capabilities)) TIER_CAPABILITIES[spec.tier].push(cap);
 export const ALL_CAPABILITIES = Object.keys(METHOD.capabilities);
 
@@ -78,8 +93,37 @@ export function tierOf(capability: string): Tier | undefined {
 	return (Object.keys(TIER_CAPABILITIES) as Tier[]).find((t) => TIER_CAPABILITIES[t].includes(capability));
 }
 
+/**
+ * Name-based tier guess, used only when the resolved adapter does not bind
+ * the model (tierOfModel prefers the adapter). Order matters: frontier and
+ * premium families are checked before the broader mid/cheap tokens.
+ */
+export function classifyModelName(model: string): Tier | "unknown" {
+	const n = (model.includes("/") ? model.slice(model.indexOf("/") + 1) : model).toLowerCase();
+	if (/\bfable\b|\bastra\b/.test(n)) return "frontier";
+	if (/\bopus\b|\bkimi-k3\b|\bultra\b/.test(n)) return "premium";
+	if (/\bsonnet\b|\bsol\b|\bterra\b|\bglm\b|\bminimax\b|\bmistral\b|\bflash\b/.test(n)) return "mid";
+	if (/\bluna\b|\bmini\b|\bnano\b|\blite\b|\bqwen3\.8\b/.test(n)) return "cheap";
+	return "unknown";
+}
+
+/**
+ * A model's tier = the highest tier of any capability the resolved adapter
+ * binds it to (gpt-6-sol bound to both mid and premium capabilities is
+ * premium). Unbound models fall back to classifyModelName.
+ */
+export function tierOfModel(model: string, adapter: Record<string, { model: string }>): Tier | "unknown" {
+	let best = -1;
+	for (const [cap, b] of Object.entries(adapter)) {
+		if (b?.model !== model) continue;
+		const t = tierOf(cap);
+		if (t && tierIndex(t) > best) best = tierIndex(t);
+	}
+	return best >= 0 ? METHOD.tiers[best] : classifyModelName(model);
+}
+
 export function isTier(s: string): s is Tier {
-	return s === "cheap" || s === "mid" || s === "premium";
+	return s === "cheap" || s === "mid" || s === "premium" || s === "frontier";
 }
 
 export function isThinkingLevel(s: string): s is ThinkingLevel {
@@ -112,7 +156,7 @@ export const DEFAULT_PROVIDER_PREFERENCE = ["openai-codex", "amazon-bedrock"];
 export const PROFILE_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 
 export function emptyProfilesFile(): ProfilesFile {
-	return { version: 1, active_profile: "default", profiles: { default: {} } };
+	return { version: 1, active_profile: "premium", profiles: { premium: {} } };
 }
 
 /**
@@ -169,7 +213,7 @@ export function parseProfileSpec(spec: unknown, where: string, problems: string[
 	if (s.tiers && typeof s.tiers === "object") {
 		out.tiers = {};
 		for (const [tier, v] of Object.entries(s.tiers as Record<string, unknown>)) {
-			if (!isTier(tier)) problems.push(`${where}.tiers: unknown tier "${tier}" (cheap|mid|premium)`);
+			if (!isTier(tier)) problems.push(`${where}.tiers: unknown tier "${tier}" (cheap|mid|premium|frontier)`);
 			else if (typeof v !== "string" || !v.trim()) problems.push(`${where}.tiers.${tier} must be a non-empty string`);
 			else out.tiers[tier] = v.trim();
 		}
@@ -529,8 +573,8 @@ export function formatAdapterTable(resolved: ResolvedAdapter): string[] {
 			byModel.set(key, [...(byModel.get(key) ?? []), cap]);
 		}
 		for (const [key, caps] of byModel) {
-			lines.push(`${tier.padEnd(7)} ${key}`);
-			lines.push(`        └ ${caps.join(", ")}`);
+			lines.push(`${tier.padEnd(8)} ${key}`);
+			lines.push(`         └ ${caps.join(", ")}`);
 		}
 	}
 	return lines;

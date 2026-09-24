@@ -1,3 +1,5 @@
+import { METHOD } from "./models.ts";
+
 const DEFAULT_DISPATCH_TIMEOUT_MS = 20 * 60 * 1000;
 const DEFAULT_LEAD_INACTIVITY_TIMEOUT_MS = 20 * 60 * 1000;
 const DEFAULT_LEAD_MAX_TIMEOUT_MS = 6 * 60 * 60 * 1000;
@@ -5,7 +7,16 @@ const LOOP_WINDOW_SIZE = 12;
 const TOOL_CALL_RECORD_LIMIT = 256;
 const NESTED_WORKER_LIMIT = 32;
 const EVICTED_WORKER_ID_LIMIT = 256;
-export const ORCHESTRATING_CAPABILITIES = new Set(["lead", "architect", "technical_lead"]);
+/**
+ * Capabilities that wait on their own children and therefore get the lead
+ * timeout policy. Every lead size from method.json `rules.lead_sizing`
+ * (lead_small / lead / lead_large) is included, not just "lead".
+ */
+export const ORCHESTRATING_CAPABILITIES = new Set([
+	"architect",
+	"technical_lead",
+	...Object.values(METHOD.rules.lead_sizing.sizes),
+]);
 
 type EnvLike = Record<string, string | undefined>;
 

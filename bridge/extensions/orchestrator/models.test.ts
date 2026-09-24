@@ -12,6 +12,10 @@ import {
 	shortName,
 	tiersToBindings,
 	userLayerWarnings,
+	METHOD,
+	TIERS,
+	isTier,
+	tierOf,
 	type AvailableModel,
 } from "./models.ts";
 
@@ -162,7 +166,7 @@ describe("mergeLayers", () => {
 			[
 				{ source: "flag", bindings: { architect: { model: "opus" } } },
 				{ source: "profile:default", bindings: { technical_review: { model: "astra" } } },
-				{ source: "profile:default", bindings: tiersToBindings({ premium: "fable-5-1", cheap: "haiku" }) },
+				{ source: "profile:default", bindings: tiersToBindings({ premium: "fable-5-1", cheap: "luna" }) },
 				dynamic,
 			],
 			TABLE,
@@ -174,9 +178,11 @@ describe("mergeLayers", () => {
 		expect(r.adapter.technical_review).toEqual({ model: "openai-codex/gpt-6-astra", effort: "high" });
 		expect(r.adapter.security_review.model).toBe("amazon-bedrock/global.anthropic.claude-fable-5-1");
 		expect(r.sources.security_review).toBe("profile:default");
-		expect(r.adapter.worker.model).toContain("haiku");
-		expect(r.adapter.lead.model).toBe("amazon-bedrock/global.anthropic.claude-sonnet-5");
-		expect(r.sources.lead).toBe("dynamic");
+		expect(r.adapter.worker.model).toContain("luna");
+		// `lead` is a premium-tier capability, so the profile's premium tier wins.
+		expect(r.adapter.lead.model).toBe("amazon-bedrock/global.anthropic.claude-fable-5-1");
+		expect(r.sources.lead).toBe("profile:default");
+		expect(r.adapter.qa_agent.model).toBe("amazon-bedrock/global.anthropic.claude-sonnet-5");
 		expect(r.notes.join()).toContain("astra");
 	});
 
@@ -198,7 +204,7 @@ describe("mergeLayers", () => {
 	test("formatAdapterTable shows alias → canonical and groups by tier", () => {
 		const r = mergeLayers([{ source: "profile:default", bindings: tiersToBindings({ premium: "fable-5-1" }) }, dynamic], TABLE, PREF);
 		const t = formatAdapterTable(r).join("\n");
-		expect(t).toContain("premium fable-5-1 → amazon-bedrock/global.anthropic.claude-fable-5-1 [profile:default]");
+		expect(t).toContain("premium  fable-5-1 → amazon-bedrock/global.anthropic.claude-fable-5-1 [profile:default]");
 		expect(t).toContain("architect, security_review");
 	});
 });
@@ -228,5 +234,169 @@ describe("method.json (canonical orchestration method)", () => {
 		expect(reconWorkers(8)).toBe(4);
 		expect(reconWorkers(10)).toBe(5);
 		expect(reconWorkers(9, "investigation")).toBe(0);
+	});
+});
+
+describe("tiers", () => {
+	test("frontier is a tier and orders above premium", () => {
+		expect(METHOD.tiers).toEqual(["cheap", "mid", "premium", "frontier"]);
+		expect(TIERS[0]).toBe("frontier");
+		expect(isTier("frontier")).toBe(true);
+		expect(isTier("ultra")).toBe(false);
+	});
+	test("lead sizes sit on mid/premium/frontier", () => {
+		expect(tierOf("lead_small")).toBe("mid");
+		expect(tierOf("lead")).toBe("premium");
+		expect(tierOf("lead_large")).toBe("frontier");
+	});
+	test("frontier tier binding reaches lead_large", () => {
+		expect(tiersToBindings({ frontier: "fable-5-1" }).lead_large).toEqual({ model: "fable-5-1" });
+	});
+	test("profile tiers accept frontier", () => {
+		const { problems, file } = parseProfilesFile({ version: 1, active_profile: "p", profiles: { p: { tiers: { frontier: "fable-5-1" } } } });
+		expect(problems).toEqual([]);
+		expect(file.profiles.p.tiers?.frontier).toBe("fable-5-1");
+	});
+});
+
+
+// ---------------------------------------------------------------------------
+// Shipped profiles (bridge/orchestrator-profiles.json)
+// ---------------------------------------------------------------------------
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { emptyProfilesFile, type ProfileSpec } from "./models.ts";
+
+const CATALOG: AvailableModel[] = [
+	{ provider: "amazon-bedrock", id: "global.anthropic.claude-fable-5-1" },
+	{ provider: "amazon-bedrock", id: "global.anthropic.claude-opus-5-5" },
+	{ provider: "amazon-bedrock", id: "global.anthropic.claude-opus-5" },
+	{ provider: "amazon-bedrock", id: "global.anthropic.claude-sonnet-5" },
+	{ provider: "amazon-bedrock", id: "global.anthropic.claude-haiku-4-5-20251001-v1:0" },
+	{ provider: "amazon-bedrock", id: "global.openai.gpt-6-astra" },
+	{ provider: "amazon-bedrock", id: "global.openai.gpt-6-sol" },
+	{ provider: "amazon-bedrock", id: "global.openai.gpt-6-luna" },
+	{ provider: "openai-codex", id: "gpt-6-astra" },
+	{ provider: "openai-codex", id: "gpt-5.6-sol" },
+	{ provider: "humain-node", id: "claude-sonnet-5" },
+	{ provider: "humain-node", id: "glm-5.2" },
+	{ provider: "humain-node", id: "minimax-m3" },
+	{ provider: "humain-node", id: "qwen3.8-27b" },
+	{ provider: "humain-node", id: "kimi-k3" },
+	{ provider: "humain-node", id: "humain-m3-research-preview" },
+];
+const SHIPPED_RAW = JSON.parse(readFileSync(join(import.meta.dir, "../../orchestrator-profiles.json"), "utf-8"));
+
+function resolveShipped(p: ProfileSpec, table = buildAliasTable(CATALOG), name = "p") {
+	return mergeLayers(
+		[
+			{ source: `profile:${name}`, bindings: Object.fromEntries(Object.entries(p.capabilities ?? {}).map(([c, m]) => [c, { model: m }])) },
+			{ source: `profile:${name}`, bindings: tiersToBindings(p.tiers) },
+		],
+		table,
+		["openai-codex", "amazon-bedrock"],
+		p.effort ?? {},
+	);
+}
+
+describe("shipped profiles", () => {
+	const { file, problems } = parseProfilesFile(SHIPPED_RAW);
+
+	test("parse cleanly with premium active and no default profile", () => {
+		expect(problems).toEqual([]);
+		expect(file.active_profile).toBe("premium");
+		expect(Object.keys(file.profiles).sort()).toEqual(["anthropic", "openai", "oss", "premium"]);
+		expect(file.provider_preference).toEqual(["openai-codex", "amazon-bedrock"]);
+	});
+
+	test("no haiku and no gpt-5.6 anywhere", () => {
+		const text = JSON.stringify(SHIPPED_RAW).toLowerCase();
+		expect(text).not.toContain("haiku");
+		expect(text).not.toContain("gpt-5.6");
+	});
+
+	for (const name of ["premium", "anthropic", "openai", "oss"]) {
+		test(`${name} resolves every capability from user layers, never haiku`, () => {
+			const r = resolveShipped(file.profiles[name], undefined, name);
+			expect(userLayerWarnings(r)).toEqual([]);
+			for (const cap of Object.keys(METHOD.capabilities)) {
+				expect(r.adapter[cap]?.model, `${name}.${cap}`).toBeDefined();
+				expect(r.adapter[cap].model).not.toContain("haiku");
+				expect(r.sources[cap]).toBe(`profile:${name}`);
+			}
+		});
+	}
+
+	test("premium binds the agreed lead ladder and cross-vendor review", () => {
+		const r = resolveShipped(file.profiles.premium);
+		expect(r.adapter.scout.model).toBe("amazon-bedrock/global.openai.gpt-6-luna");
+		expect(r.adapter.worker.model).toBe("amazon-bedrock/global.openai.gpt-6-luna");
+		expect(r.adapter.lead_small.model).toBe("amazon-bedrock/global.anthropic.claude-sonnet-5");
+		expect(r.adapter.implementation_strong.model).toBe("amazon-bedrock/global.anthropic.claude-sonnet-5");
+		expect(r.adapter.lead.model).toBe("amazon-bedrock/global.anthropic.claude-opus-5-5");
+		expect(r.adapter.architect.model).toBe("amazon-bedrock/global.anthropic.claude-opus-5-5");
+		expect(r.adapter.lead_large.model).toBe("amazon-bedrock/global.anthropic.claude-fable-5-1");
+		expect(r.adapter.technical_review.model).toBe("amazon-bedrock/global.openai.gpt-6-sol");
+		expect(r.adapter.security_review.model).toBe("openai-codex/gpt-6-astra");
+	});
+
+	test("anthropic is Anthropic-only with a low-effort sonnet cheap tier", () => {
+		const r = resolveShipped(file.profiles.anthropic);
+		for (const cap of Object.keys(METHOD.capabilities)) expect(r.adapter[cap].model).toContain("anthropic.claude-");
+		expect(r.adapter.scout).toEqual({ model: "amazon-bedrock/global.anthropic.claude-sonnet-5", effort: "low" });
+		expect(r.adapter.lead_large.model).toBe("amazon-bedrock/global.anthropic.claude-fable-5-1");
+	});
+
+	test("openai is OpenAI-only; premium tier is gpt-6-sol at high effort; codex first for astra", () => {
+		const r = resolveShipped(file.profiles.openai);
+		for (const cap of Object.keys(METHOD.capabilities)) expect(r.adapter[cap].model).toMatch(/openai/);
+		expect(r.adapter.lead).toEqual({ model: "amazon-bedrock/global.openai.gpt-6-sol", effort: "high" });
+		expect(r.adapter.lead_small.model).toBe("amazon-bedrock/global.openai.gpt-6-sol");
+		expect(r.adapter.lead_small.effort).toBeUndefined();
+		expect(r.adapter.lead_large.model).toBe("openai-codex/gpt-6-astra");
+		expect(r.adapter.scout.model).toBe("amazon-bedrock/global.openai.gpt-6-luna");
+	});
+
+	test("oss stays on humain-node", () => {
+		const r = resolveShipped(file.profiles.oss);
+		for (const cap of Object.keys(METHOD.capabilities)) expect(r.adapter[cap].model).toStartWith("humain-node/");
+	});
+
+	test("empty profiles file defaults to premium", () => {
+		expect(emptyProfilesFile().active_profile).toBe("premium");
+		expect(Object.keys(emptyProfilesFile().profiles)).toEqual(["premium"]);
+	});
+
+	test("an alias missing from the registry is a user-layer warning and leaves the capability unbound", () => {
+		const table = buildAliasTable(CATALOG.filter((m) => !m.id.includes("opus-5-5")));
+		const r = resolveShipped(file.profiles.premium, table);
+		expect(userLayerWarnings(r).some((w) => w.includes("opus-5-5"))).toBe(true);
+		expect(r.adapter.lead).toBeUndefined();
+	});
+});
+
+import { classifyModelName, tierOfModel } from "./models.ts";
+
+describe("tierOfModel", () => {
+	const adapter = {
+		scout: { model: "amazon-bedrock/global.openai.gpt-6-luna" },
+		lead_small: { model: "amazon-bedrock/global.openai.gpt-6-sol" },
+		lead: { model: "amazon-bedrock/global.openai.gpt-6-sol", effort: "high" },
+		lead_large: { model: "openai-codex/gpt-6-astra" },
+	};
+	test("highest tier of any capability bound to the model", () => {
+		expect(tierOfModel("amazon-bedrock/global.openai.gpt-6-sol", adapter)).toBe("premium");
+		expect(tierOfModel("openai-codex/gpt-6-astra", adapter)).toBe("frontier");
+		expect(tierOfModel("amazon-bedrock/global.openai.gpt-6-luna", adapter)).toBe("cheap");
+	});
+	test("falls back to name classification for unbound models", () => {
+		expect(tierOfModel("amazon-bedrock/global.anthropic.claude-fable-5-1", {})).toBe("frontier");
+		expect(classifyModelName("amazon-bedrock/global.anthropic.claude-opus-5-5")).toBe("premium");
+		expect(classifyModelName("global.anthropic.claude-sonnet-5")).toBe("mid");
+		expect(classifyModelName("gpt-6-sol")).toBe("mid");
+		expect(classifyModelName("openai-codex/gpt-6-astra")).toBe("frontier");
+		expect(classifyModelName("gpt-6-luna")).toBe("cheap");
+		expect(classifyModelName("humain-node/minimax-m3")).toBe("mid");
+		expect(classifyModelName("mystery-9")).toBe("unknown");
 	});
 });

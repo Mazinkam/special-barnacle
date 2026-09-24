@@ -308,7 +308,8 @@ def _role_kind(name: Any) -> str | None:
     key = str(name or '').strip().lower()
     if not key or key in _PRODUCTION_ROLES:
         return None
-    if key in {'lead', 'architect', 'technical_lead'} or key.endswith('_lead'):
+    # `lead_small` / `lead_large` are the triage lead sizes (method.json rules.lead_sizing).
+    if key in {'lead', 'architect', 'technical_lead'} or key.endswith('_lead') or key.startswith('lead_'):
         return COORDINATION
     if key in {'qa', 'qa_agent', 'qa_worker', 'reviewer', 'verifier'}:
         return VERIFICATION
@@ -329,6 +330,7 @@ def _role_sets() -> dict[str, frozenset[str]]:
     roles = method.roles()
     names.update(roles)
     names.update(roles.values())
+    names.update(method.capabilities())  # includes the lead sizes lead_small / lead_large
     return {
         COORDINATION: frozenset(n for n in names if _role_kind(n) == COORDINATION),
         VERIFICATION: frozenset(n for n in names if _role_kind(n) == VERIFICATION),

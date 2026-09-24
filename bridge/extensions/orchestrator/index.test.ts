@@ -9,7 +9,7 @@ import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionIngestScheduler } from "./ingest.ts";
 import { planReconTasks } from "./recon.ts";
-import { METHOD, TIER_CAPABILITIES } from "./models.ts";
+import { METHOD, TIER_CAPABILITIES, buildAliasTable } from "./models.ts";
 import type { DispatchResult, DispatchTask } from "./index.ts";
 import { RunCancellation } from "./cancellation.ts";
 
@@ -640,6 +640,12 @@ function dispatchResult(task: DispatchTask, exitCode = 0): DispatchResult {
 }
 
 const reconLeadInput = { runId: "run", goal: "repair flow", plan: planFixture, adapter: adapterFixture };
+/** Two independent leads, as the architect must now declare them (one wave). */
+const twoIndependentLeads = {
+	taskId: "run-architect", capability: "architect", model: "m", exitCode: 0, stderr: "",
+	stdout: "## Lead assignments\nLead 1: backend (depends on: none)\nLead 2: frontend (depends on: none)\n",
+	usage: {} as never, durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
+} as DispatchResult;
 
 /**
  * Explicit deadline for tests that await a rejection: a regression that stops
@@ -729,6 +735,7 @@ describe("parent-owned recon dispatch seam", () => {
 		let leadTasks: DispatchTask[] = [];
 		const run = orchestrator.dispatchReconAndLeads({ ...reconLeadInput,
 			plan: { ...planFixture, topology: { ...planFixture.topology, leads: 2 } },
+			architectResult: twoIndependentLeads,
 		}, {
 			dispatch: async (tasks) => {
 				if (tasks[0].capability === "lead") leadTasks = tasks;
@@ -757,6 +764,7 @@ describe("parent-owned recon dispatch seam", () => {
 		const pendingRecon = new Promise<DispatchResult[]>((resolve) => { finishRecon = resolve; });
 		const run = orchestrator.dispatchReconAndLeads({ ...reconLeadInput,
 			plan: { ...planFixture, topology: { ...planFixture.topology, leads: 2 } },
+			architectResult: twoIndependentLeads,
 		}, {
 			dispatch: async (tasks) => {
 				batches.push(tasks);
@@ -1499,6 +1507,114 @@ describe("runSubagentProcess process/event handling", () => {
 			expect(result.interruption?.reason).toBe("cancelled");
 		} finally {
 			child.emit("close", 137);
+			session.close();
+		}
+	});
+
+	test("spend cap enforce stops a dispatch once, on the first message that crosses it", async () => {
+		const { SpendCapTracker } = await import("./spend-cap.ts");
+		const session = createSession("spend-cap-enforce");
+		session.spendCaps = new SpendCapTracker({ mode: "enforce", usd_by_capability: { lead: 4 }, default_usd: 1 });
+		const kill = mock(() => true);
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill, pid: undefined });
+		const emit = (cost: number) => child.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: `turn ${cost}`, usage: { input: 1, output: 1, cost: { total: cost } } } })}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "capped-lead", session,
+				spawnChild: () => child as never,
+			});
+			emit(3);
+			emit(9); // one big jump from $3 to $12
+			const result = await pending;
+			expect(result.stopReason).toBe("spend_cap");
+			expect(result.exitCode).toBe(125);
+			expect(result.outcome).toBe("failed");
+			expect(result.costUsd).toBe(12);
+			expect(result.stderr).toContain("dispatch stopped (dispatch_spend_cap.mode=enforce)");
+			const log = readFileSync(session.file("run.log"), "utf8");
+			expect(log.match(/exceeded by capped-lead at \$\d+\.\d+ \(stopping it\)/g) ?? []).toHaveLength(1);
+			// Exactly one cancel for the single large jump, and the crossing turn's text is kept.
+			expect(kill).toHaveBeenCalledTimes(1);
+			expect(result.stdout).toContain("turn 9");
+		} finally {
+			child.emit("close", 137);
+			session.close();
+		}
+	});
+
+	test("spend cap enforce does not kill a turn that is already the final answer", async () => {
+		const { SpendCapTracker } = await import("./spend-cap.ts");
+		const session = createSession("spend-cap-final-turn");
+		session.spendCaps = new SpendCapTracker({ mode: "enforce", usd_by_capability: { lead: 4 }, default_usd: 1 });
+		const kill = mock(() => true);
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "final-turn-lead", session,
+				spawnChild: () => child as never,
+			});
+			emit({ type: "message_end", message: { role: "assistant", content: "final report\nSTATUS: completed", usage: { input: 1, output: 1, cost: { total: 9 } }, stopReason: "stop" } });
+			emit({ type: "agent_settled" });
+			child.emit("close", 0);
+			const result = await pending;
+			expect(kill).not.toHaveBeenCalled();
+			expect(result.exitCode).toBe(0);
+			expect(result.finalText).toContain("STATUS: completed");
+			expect(readFileSync(session.file("run.log"), "utf8")).toContain("warn only");
+		} finally {
+			session.close();
+		}
+	});
+
+	test("a provider error turn in json mode (exit 0) fails the dispatch and surfaces errorMessage in stderr", async () => {
+		const session = createSession("provider-error-exit0");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "openai-codex/gpt-6-astra",
+				ctx: {} as never, capability: "security_review", taskId: "quota-sec", session,
+				spawnChild: () => child as never,
+			});
+			emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "You have hit your usage limit. Try again later.", usage: { input: 0, output: 0, cost: { total: 0 } } } });
+			emit({ type: "agent_end", messages: [] });
+			emit({ type: "agent_settled" });
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.exitCode).toBe(1);
+			expect(result.outcome).toBe("failed");
+			expect(result.stderr).toContain("usage limit");
+		} finally {
+			session.close();
+		}
+	});
+
+	test("spend cap warn logs once and lets the dispatch finish", async () => {
+		const { SpendCapTracker } = await import("./spend-cap.ts");
+		const session = createSession("spend-cap-warn");
+		session.spendCaps = new SpendCapTracker({ mode: "warn", usd_by_capability: { lead: 4 }, default_usd: 1 });
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "warned-lead", session,
+				spawnChild: () => child as never,
+			});
+			for (const cost of [5, 5]) emit({ type: "message_end", message: { role: "assistant", content: "w", usage: { input: 1, output: 1, cost: { total: cost } } } });
+			emit({ type: "message_end", message: { role: "assistant", content: "done", usage: { input: 1, output: 1, cost: { total: 0 } }, stopReason: "stop" } });
+			emit({ type: "agent_settled" });
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.exitCode).toBe(0);
+			expect(result.stopReason).toBe("stop");
+			const log = readFileSync(session.file("run.log"), "utf8");
+			expect(log.match(/exceeded by warned-lead/g) ?? []).toHaveLength(1);
+			expect(log).toContain("warn only");
+		} finally {
 			session.close();
 		}
 	});
@@ -2429,10 +2545,36 @@ describe("final triage and shutdown integration", () => {
 		}
 		return { handler, shutdown };
 	}
-	function registry() { return { getAvailable: () => [{ provider: "amazon-bedrock", id: "anthropic.claude-haiku-4-5", name: "Haiku" }] }; }
+	// The models FALLBACK_ADAPTER binds (mirrors the shipped premium profile).
+	function registry() {
+		return { getAvailable: () => [
+			"global.openai.gpt-6-luna", "global.openai.gpt-6-sol", "global.anthropic.claude-sonnet-5",
+			"global.anthropic.claude-opus-5-5", "global.anthropic.claude-fable-5-1",
+		].map((id) => ({ provider: "amazon-bedrock", id })) };
+	}
 	function readRows(name: string): any[] {
 		return readFileSync(join(pythonStateRoot, name), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
 	}
+
+	test("a shipped-profile alias missing from the registry aborts /orchestrate before any dispatch", async () => {
+		const profilesPath = process.env.HUMAIN_ORCHESTRATOR_PROFILES_FILE!;
+		writeFileSync(profilesPath, readFileSync(join(import.meta.dir, "..", "..", "orchestrator-profiles.json"), "utf8"));
+		const { handler } = activate();
+		const notices: string[] = [];
+		const spawned = spyOn(childProcess, "spawn");
+		try {
+			const noOpus = { getAvailable: () => registry().getAvailable().filter((m) => !m.id.includes("opus-5-5")) };
+			await handler("do a thing --task-class implementation --complexity 5 --risk low", {
+				modelRegistry: noOpus, ui: { notify: (n: string) => notices.push(n), setWidget() {}, setStatus() {} },
+			} as never);
+			expect(notices.join("\n")).toContain("Model configuration is invalid — nothing was dispatched");
+			expect(notices.join("\n")).toContain("opus-5-5");
+			expect(spawned.mock.calls.filter(([, args]) => (args as string[] | undefined)?.includes("--mode"))).toHaveLength(0);
+		} finally {
+			spawned.mockRestore();
+			rmSync(profilesPath, { force: true });
+		}
+	});
 	for (const { model, costs, source, expected } of [
 		{ model: "unknown-final-model", costs: [undefined], source: "unmetered", expected: undefined },
 		{ model: "claude-sonnet-4-5", costs: [undefined], source: "estimated-from-reported-tokens", expected: .0039 },
@@ -2708,3 +2850,269 @@ describe("archived run diagnostics lookup", () => {
 		expect(orchestrator.describeRunArtifact(join(runDir, "never.txt"))).toBe(`${join(runDir, "never.txt")} (missing)`);
 	});
 });
+
+describe("lead sizing wiring (Phase A)", () => {
+	const lowPlan = { ...planFixture, complexity: 2, risk: "low", topology: { depth: 2, leads: 1, workers: 0, shape: "lead-workers" } };
+	const fakeResult = (t: DispatchTask) => ({
+		taskId: t.taskId, capability: t.capability, model: "m", exitCode: 0, stdout: "STATUS: completed", stderr: "",
+		usage: {} as never, durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
+	} as DispatchResult);
+
+	test("--lead-size parses and rejects junk", () => {
+		expect(orchestrator.parseArgs("do x --lead-size small").leadSize).toBe("small");
+		expect(orchestrator.parseArgs("do x --lead-size small").goal).toBe("do x");
+		const bad = orchestrator.parseArgs("do x --lead-size huge");
+		expect(bad.leadSize).toBeUndefined();
+		expect(bad.unknownFlags.join()).toContain("--lead-size huge");
+		expect(orchestrator.parseArgs("do x --lead-size").unknownFlags.join()).toContain("missing value");
+	});
+
+	test("dispatchReconAndLeads dispatches the sized lead capability", async () => {
+		const dispatched: string[] = [];
+		await orchestrator.dispatchReconAndLeads(
+			{ runId: "r1", goal: "g", plan: lowPlan, adapter: { lead_small: { model: "p/sonnet-5" } }, leadCapability: "lead_small" },
+			{
+				dispatch: async (tasks) => { dispatched.push(...tasks.map((t) => t.capability)); return tasks.map(fakeResult); },
+				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+			},
+		);
+		expect(dispatched).toEqual(["lead_small"]);
+	});
+
+	test("failed verification escalates the lead one size per retry, capped at large", () => {
+		const t = (capability: string) => [{ capability, task: "t", taskId: "r-lead-0" }];
+		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_small"), 2, "low", 0)[0].capability).toBe("lead");
+		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_small"), 2, "low", 1)[0].capability).toBe("lead_large");
+		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_large"), 9, "low", 0)[0].capability).toBe("lead_large");
+		expect(orchestrator.planEscalationForTest(["tests failed"], t("technical_review"), 5, "low", 0)[0].capability).toBe("technical_review");
+		expect(orchestrator.planEscalationForTest(["x"], t("lead"), 5, "high", 0)[0].task).toContain("at least the premium tier");
+	});
+
+	test("policyIdFor is stable for identical bindings and changes with them", () => {
+		const a = { lead: { model: "x/opus-5-5" }, scout: { model: "x/luna", effort: "low" } };
+		expect(orchestrator.policyIdFor("premium", a)).toBe(orchestrator.policyIdFor("premium", { scout: a.scout, lead: a.lead }));
+		expect(orchestrator.policyIdFor("premium", a)).toMatch(/^premium-[0-9a-f]{8}$/);
+		expect(orchestrator.policyIdFor("premium", { ...a, lead: { model: "x/fable-5-1" } })).not.toBe(orchestrator.policyIdFor("premium", a));
+	});
+
+	test("leadSelfImplemented flags a lead that changed files without dispatching implementers", () => {
+		expect(orchestrator.leadSelfImplemented({ filesChanged: ["a.ts"], stdout: "I edited a.ts" })).toBe(true);
+		expect(orchestrator.leadSelfImplemented({ filesChanged: ["a.ts"], stdout: "dispatched orch-implementation-strong" })).toBe(false);
+		expect(orchestrator.leadSelfImplemented({ filesChanged: [], stdout: "" })).toBe(false);
+	});
+
+	test("lead prompt states the delegation rule and the STATUS contract", () => {
+		const p = orchestrator.leadPrompt("goal", planFixture, undefined, "", 0, 1, adapterFixture);
+		expect(p).toContain(orchestrator.LEAD_DELEGATION_RULE);
+		expect(p).toContain(orchestrator.LEAD_STATUS_CONTRACT);
+	});
+
+	test("lead persona cannot write or edit", () => {
+		const persona = readFileSync(new URL("../../agents/orchestrator-lead.md", import.meta.url), "utf8");
+		const tools = /^tools:\s*(.+)$/m.exec(persona)?.[1].split(",").map((t) => t.trim()) ?? [];
+		expect(tools).toContain("subagent");
+		expect(tools).not.toContain("write");
+		expect(tools).not.toContain("edit");
+	});
+});
+
+describe("codex -> Bedrock quota fallback (Phase A)", () => {
+	const table = buildAliasTable([
+		{ provider: "openai-codex", id: "gpt-6-astra" },
+		{ provider: "amazon-bedrock", id: "global.openai.gpt-6-astra" },
+		{ provider: "openai-codex", id: "gpt-5.3-codex-spark" },
+	]);
+	const proc = (over: Partial<Awaited<ReturnType<typeof orchestrator.runSubagentProcess>>>) => ({
+		exitCode: 0, stdout: "ok", finalText: "ok", rawStdout: "", personaCanMutate: false, stderr: "",
+		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.01, contextTokens: 0, turns: 1 },
+		costUsd: 0.01, costReported: true, durationMs: 5, outcome: "completed" as const, processExitCode: 0, ...over,
+	});
+	const task = (model: string): DispatchTask[] => [{ capability: "security_review", task: "review", taskId: "run-sec" }];
+
+	test("quota failure on codex retries once on the Bedrock twin and records route_degraded", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const models: string[] = [];
+		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
+			{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, 0, {
+				recordEvent: (e, p) => { events.push([e, p]); },
+				aliasTable: table,
+				runProcess: async (opts) => {
+					models.push(opts.model);
+					return models.length === 1
+						? proc({ exitCode: 1, stderr: "usage limit reached for this account", costUsd: 0, costReported: true,
+							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 } })
+						: proc({ model: "amazon-bedrock/global.openai.gpt-6-astra" });
+				},
+			});
+		expect(models).toEqual(["openai-codex/gpt-6-astra", "amazon-bedrock/global.openai.gpt-6-astra"]);
+		expect(result.exitCode).toBe(0);
+		expect(result.model).toBe("amazon-bedrock/global.openai.gpt-6-astra");
+		expect(result.taskId).toBe("run-sec");
+		const degraded = events.filter(([e]) => e === "route_degraded");
+		expect(degraded).toHaveLength(1);
+		expect(degraded[0][1]).toMatchObject({ from_model: "openai-codex/gpt-6-astra", to_model: "amazon-bedrock/global.openai.gpt-6-astra", reason: "provider_quota" });
+	});
+
+	test("no Bedrock twin: the original failure is returned, no redispatch", async () => {
+		let calls = 0;
+		const events: string[] = [];
+		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
+			{ security_review: { model: "openai-codex/gpt-5.3-codex-spark" } }, {} as never, 0, {
+				recordEvent: (e) => { events.push(e); },
+				aliasTable: table,
+				runProcess: async () => { calls++; return proc({ exitCode: 1, stderr: "429 Too Many Requests" }); },
+			});
+		expect(calls).toBe(1);
+		expect(result.exitCode).toBe(1);
+		expect(events).not.toContain("route_degraded");
+	});
+
+	test("non-quota failure is not retried", async () => {
+		let calls = 0;
+		await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
+			{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, 0, {
+				recordEvent: () => {}, aliasTable: table,
+				runProcess: async () => { calls++; return proc({ exitCode: 1, stderr: "TypeError: boom" }); },
+			});
+		expect(calls).toBe(1);
+	});
+});
+
+describe("orchestrator fixes from run ht-orch-1790237987755-lyjkn8 (A8)", () => {
+	const threeLeadPlan = { ...planFixture, complexity: 8, topology: { depth: 3, leads: 3, workers: 0, shape: "multi_lead" } };
+	const architect = (text: string) => ({
+		taskId: "r-architect", capability: "architect", model: "m", exitCode: 0, stdout: text, stderr: "",
+		usage: {} as never, durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
+	} as DispatchResult);
+	const run = async (architectText: string, statusFor: (taskId: string) => string) => {
+		const batches: string[][] = [];
+		const phases: string[] = [];
+		const { leadResults, skippedLeads } = await orchestrator.dispatchReconAndLeads(
+			{ runId: "r", goal: "g", plan: { ...threeLeadPlan, task_class: "investigation" }, adapter: { lead: { model: "p/opus-5-5" } }, architectResult: architect(architectText) },
+			{
+				dispatch: async (tasks) => {
+					batches.push(tasks.map((t) => t.taskId));
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "m", exitCode: 0, stdout: `report\nSTATUS: ${statusFor(t.taskId)}`,
+						stderr: "", usage: {} as never, durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
+					} as DispatchResult));
+				},
+				capture: async () => {}, setPhase: (p) => phases.push(p), throwIfCancelled: () => {},
+			},
+		);
+		return { batches, phases, leadResults, skipped: skippedLeads };
+	};
+	const chain = "## Lead assignments\nLead 1: phase 0 (depends on: none)\nLead 2: A1-A3 (depends on: 1)\nLead 3: A4-A7 (depends on: 2)\n";
+
+	test("dependent leads run in sequential waves, each with its scope", async () => {
+		const { batches, leadResults } = await run(chain, () => "completed");
+		expect(batches).toEqual([["r-lead-0"], ["r-lead-1"], ["r-lead-2"]]);
+		expect(leadResults).toHaveLength(3);
+	});
+
+	test("a blocked lead stops the leads that depend on it", async () => {
+		const { batches, phases, leadResults } = await run(chain, (id) => (id === "r-lead-0" ? "blocked" : "completed"));
+		expect(batches).toEqual([["r-lead-0"]]);
+		expect(leadResults).toHaveLength(1);
+		expect(phases.join("\n")).toContain("not starting lead(s) 2");
+		expect((await run(chain, (id) => (id === "r-lead-0" ? "blocked" : "completed"))).skipped).toBe(2);
+	});
+
+	test("no valid Lead assignments collapses to a single lead instead of N clones", async () => {
+		const { batches, phases } = await run("## Tasks\n1. do it", () => "completed");
+		expect(batches).toEqual([["r-lead-0"]]);
+		expect(phases.join("\n")).toContain("running a single lead");
+	});
+
+	test("architect is asked for Lead assignments only when there are several leads", () => {
+		expect(orchestrator.architectPrompt("g", threeLeadPlan)).toContain("## Lead assignments");
+		expect(orchestrator.architectPrompt("g", planFixture)).not.toContain("## Lead assignments");
+	});
+
+	test("lead prompt carries the assigned scope and its dependencies", () => {
+		const p = orchestrator.leadPrompt("g", threeLeadPlan, undefined, "", 1, 3, adapterFixture, { index: 1, scope: "A1-A3", dependsOn: [0] });
+		expect(p).toContain("Your scope (from the architect's Lead assignments): A1-A3");
+		expect(p).toContain("Leads 1 ran before you");
+	});
+
+	test("a blocked run is recorded as blocked, not fail or verified", () => {
+		expect(orchestrator.runCompletionOutcomeFor("r", { blocked: true, verification_passed: false }).outcome).toBe("blocked");
+		expect(orchestrator.runCompletionOutcomeFor("r", { verification_passed: false }).outcome).toBe("fail");
+		expect(orchestrator.runCompletionOutcomeFor("r", { verification_passed: true }).outcome).toBe("verified");
+	});
+
+	test("QA is told to stay in scope and not debug the environment", () => {
+		expect(orchestrator.QA_SCOPE_RULES.join(" ")).toContain("verify ONLY the files listed above");
+		expect(orchestrator.QA_SCOPE_RULES.join(" ")).toContain("after 2 attempts");
+	});
+});
+
+describe("review fixes (Phase A review)", () => {
+	test("every lead size runs the orchestrator-lead persona with the lead timeout policy", async () => {
+		const { ORCHESTRATING_CAPABILITIES, resolveDispatchTimeoutPolicy } = await import("./dispatch-progress.ts");
+		for (const cap of ["lead_small", "lead", "lead_large"]) {
+			expect(orchestrator.agentNameFor(cap)).toBe("orchestrator-lead");
+			expect(ORCHESTRATING_CAPABILITIES.has(cap)).toBe(true);
+			expect(resolveDispatchTimeoutPolicy(cap, {}).mode).toBe("lead");
+		}
+		expect(orchestrator.agentNameFor("scout")).toBe("orch-scout");
+	});
+
+	test("re-review escalation picks a model from a capability that belongs to the target tier", () => {
+		// oss-like: `lead` (premium capability) overridden to a mid model must not
+		// become the premium escalation target; premium-like: security_review
+		// overridden to another vendor is not preferred for technical re-review.
+		const adapter = {
+			technical_review: { model: "humain-node/kimi-k3" },
+			implementation_strong: { model: "humain-node/minimax-m3" },
+			lead: { model: "humain-node/minimax-m3" },
+			analysis_strong: { model: "humain-node/glm-5.2" },
+			architect: { model: "humain-node/glm-5.2" },
+			security_review: { model: "openai-codex/gpt-6-astra" },
+			lead_large: { model: "amazon-bedrock/global.anthropic.claude-fable-5-1" },
+		};
+		const picked = orchestrator.pickModelForTest("technical_review", adapter, 1, "medium");
+		expect(picked).toBe("humain-node/glm-5.2");
+	});
+
+	test("quota fallback is not attempted for a timed-out or cancelled dispatch, or for quota words only in the model's prose", async () => {
+		const table = buildAliasTable([
+			{ provider: "openai-codex", id: "gpt-6-astra" },
+			{ provider: "amazon-bedrock", id: "global.openai.gpt-6-astra" },
+		]);
+		const base = {
+			exitCode: 124, stdout: "", finalText: "", rawStdout: "", personaCanMutate: false, stderr: "usage limit reached",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			costUsd: 0, costReported: false, durationMs: 1, processExitCode: 124,
+		};
+		for (const over of [
+			{ outcome: "timed_out" as const },
+			{ outcome: "cancelled" as const, exitCode: 137 },
+			{ outcome: "failed" as const, exitCode: 125, stopReason: "spend_cap" },
+			{ outcome: "failed" as const, exitCode: 1, stderr: "exit 1", finalText: "the API returned 429 rate limit earlier" },
+		]) {
+			let calls = 0;
+			await orchestrator.dispatchParallel(process.cwd(), "run", [{ capability: "security_review", task: "t", taskId: "run-sec" }],
+				{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, 0, {
+					recordEvent: () => {}, aliasTable: table,
+					runProcess: async () => { calls++; return { ...base, ...over }; },
+				});
+			expect(calls).toBe(1);
+		}
+	});
+});
+
+describe("effort telemetry vocabulary", () => {
+	test("thinking levels map onto method.json efforts", () => {
+		expect(orchestrator.methodEffortFor(undefined)).toBe("standard");
+		expect(orchestrator.methodEffortFor("medium")).toBe("standard");
+		expect(orchestrator.methodEffortFor("low")).toBe("low");
+		expect(orchestrator.methodEffortFor("high")).toBe("high");
+		expect(orchestrator.methodEffortFor("xhigh")).toBe("maximum");
+		expect(orchestrator.methodEffortFor("off")).toBe("minimal");
+		for (const t of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+			expect(METHOD.effort_levels).toContain(orchestrator.methodEffortFor(t));
+		}
+	});
+});
+

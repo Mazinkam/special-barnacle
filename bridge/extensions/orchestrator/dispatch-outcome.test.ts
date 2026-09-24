@@ -51,6 +51,18 @@ describe("classifyDispatchOutcome", () => {
 		expect(classifyDispatchOutcome({ ...recoveredInput, spawnFailed: true }).status).toBe("failed");
 	});
 
+	// HT's --mode json exits 0 even when the final turn is a provider error
+	// (print-mode only sets exit 1 in text mode), so the stop reason decides.
+	for (const lastStopReason of ["error", "aborted"]) {
+		test(`a zero exit whose final turn ended in ${lastStopReason} is a failure`, () => {
+			expect(classifyDispatchOutcome({ ...recoveredInput, exitCode: 0, lastStopReason, stderrSummary: "usage limit reached" })).toEqual({
+				status: "failed",
+				effectiveExitCode: 1,
+				note: "usage limit reached",
+			});
+		});
+	}
+
 	test("keeps a zero exit as completed", () => {
 		expect(classifyDispatchOutcome({ ...recoveredInput, exitCode: 0 })).toEqual({
 			status: "completed",

@@ -54,17 +54,26 @@ TIER_BOUNDARIES = {
 # `claude-opus-5` tomorrow) without editing this table.
 #
 # When a preference is active, tier assignment for the matched capability is
-# driven by FAMILY RANK (cheapest=haiku, mid=sonnet, expensive=opus), not by
-# TIER_BOUNDARIES. Cost-boundary bucketing alone would put claude-haiku-4-5
-# (output $5.5/Mtok) in the `mid` tier, so it could never win a `cheapest`
-# capability even when it's the intended cheapest family member.
+# driven by FAMILY RANK (cheapest=sonnet, mid=sonnet, expensive=opus; haiku is
+# deliberately not used by this skill), not by TIER_BOUNDARIES. Profiles are
+# the primary routing source; this preset is only the no-profile fallback.
 MODEL_FAMILY_PRESETS: dict[str, dict[str, str]] = {
     "anthropic": {
-        "cheapest":  "claude-haiku",
+        "cheapest":  "claude-sonnet",
         "mid":       "claude-sonnet",
         "expensive": "claude-opus",
     },
 }
+
+# Model families this skill never routes to, in any mode (preset or pure
+# cost bucketing). Matched against the normalised catalog id prefix.
+EXCLUDED_MODEL_PREFIXES: tuple[str, ...] = ("claude-haiku",)
+
+
+def is_excluded_model(model: dict[str, Any]) -> bool:
+    ident = str(model.get("id") or "").lower()
+    return any(ident.startswith(prefix) for prefix in EXCLUDED_MODEL_PREFIXES)
+
 
 # Env var that overrides the model-family preference. Follows the repo's
 # CODING_AGENT_ORCHESTRATOR_* naming convention (see orchestrator/runtime.py:
@@ -317,7 +326,7 @@ def resolve_adapter(model_family: str | None = None) -> dict[str, dict[str, Any]
     Otherwise selection falls back to the existing cost-tier logic, and the
     fallback reason is recorded in `_explanations`.
     """
-    models = resolve_models()
+    models = {k: m for k, m in resolve_models().items() if not is_excluded_model(m)}
     if not models:
         return {}
 

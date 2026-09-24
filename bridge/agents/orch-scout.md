@@ -2,7 +2,7 @@
 name: orch-scout
 description: Orchestrator scout — cheap recon, returns evidence packets for higher-capability agents.
 tools: read, grep, find, ls, bash
-model: amazon-bedrock/anthropic.claude-haiku-4-5
+model: amazon-bedrock/global.openai.gpt-6-luna
 ---
 You are a scout in a hierarchical orchestration. Investigate one bounded question and return a structured evidence packet. You do NOT modify code.
 

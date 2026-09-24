@@ -14,7 +14,7 @@ class TestMethod(unittest.TestCase):
     def test_loads_and_validates(self):
         m = method.load_method()
         self.assertEqual(m["schema_version"], 1)
-        self.assertEqual(m["tiers"], ["cheap", "mid", "premium"])
+        self.assertEqual(m["tiers"], ["cheap", "mid", "premium", "frontier"])
 
     def test_every_capability_has_known_tier_and_effort(self):
         m = method.load_method()
@@ -80,6 +80,52 @@ class TestMethod(unittest.TestCase):
         for band in recon["workers_by_complexity"]:
             self.assertRegex(text, rf"\|\s*{band['min']}[–-]{band['max']}\s*\|\s*{band['workers']}\s*\|")
         self.assertIn("orchestrator/method.json", text)
+
+    def test_lead_capabilities_and_tiers(self):
+        self.assertEqual(method.tier_of("lead_small"), "mid")
+        self.assertEqual(method.tier_of("lead"), "premium")
+        self.assertEqual(method.tier_of("lead_large"), "frontier")
+        self.assertEqual(method.rereview_floor("critical")["tier_min"], "frontier")
+        self.assertEqual(method.rereview_floor("high")["tier_min"], "premium")
+
+    def test_lead_size(self):
+        self.assertEqual(method.lead_size(2, "low"), "small")
+        self.assertEqual(method.lead_size(5, "low"), "standard")
+        self.assertEqual(method.lead_size(8, "low"), "large")
+        self.assertEqual(method.lead_size(2, "medium"), "standard")
+        self.assertEqual(method.lead_size(2, "high"), "large")
+        self.assertEqual(method.lead_size(2, "critical"), "large")
+        self.assertEqual(method.lead_size(99, "bogus"), "large")
+        self.assertEqual(method.lead_size(-4, "bogus"), "standard")
+        self.assertEqual(method.lead_size(float("nan"), "low"), "standard")
+        self.assertEqual(method.lead_size(9, "critical", override="small"), "small")
+
+    def test_lead_size_rounding_and_non_finite_match_the_bridge(self):
+        # TS uses Math.round (half up) and treats non-finite input as 5.
+        self.assertEqual(method.lead_size(6.5, "low"), "large")
+        self.assertEqual(method.lead_size(3.5, "low"), "standard")
+        self.assertEqual(method.lead_size(float("inf"), "low"), "standard")
+        self.assertEqual(method.lead_size(float("-inf"), "low"), "standard")
+        self.assertEqual(method.lead_size("7", "low"), "large")
+
+    def test_lead_size_parity_with_bridge_cases(self):
+        cases = [(1, "low", "small"), (3, "low", "small"), (4, "low", "standard"), (6, "low", "standard"),
+                 (7, "low", "large"), (10, "low", "large"), (2, "medium", "standard"), (2, "high", "large"),
+                 (2, "critical", "large"), (5, "high", "large"), (2, "weird", "standard")]
+        for c, r, size in cases:
+            self.assertEqual(method.lead_size(c, r), size, (c, r))
+
+    def test_spend_cap_rule(self):
+        cap = method.rule("dispatch_spend_cap")
+        self.assertIn(cap["mode"], ("off", "warn", "enforce"))
+        self.assertEqual(cap["mode"], "warn")
+        self.assertEqual(cap["usd_by_capability"]["lead_large"], 10.0)
+
+    def test_no_haiku_in_family_presets(self):
+        from orchestrator.dynamic_adapter import MODEL_FAMILY_PRESETS
+        for preset in MODEL_FAMILY_PRESETS.values():
+            for prefix in preset.values():
+                self.assertNotIn("haiku", prefix)
 
 
 if __name__ == "__main__":
