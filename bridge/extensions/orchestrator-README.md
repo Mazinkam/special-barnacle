@@ -185,8 +185,31 @@ then `recon: K/N completed; dispatching lead(s)`, or
 | `run.log` | human-readable timeline: phases, every dispatch start/end, every tool call, verdicts |
 | `<taskId>.prompt.md` | the exact prompt sent to that child (recon workers are `<runId>-recon-<n>`, leads `<runId>-lead-<n>`) |
 | `<taskId>.events.jsonl` | the child's raw `--mode json` stream |
-| `<taskId>.stderr.log` | the child's stderr (only written when non-empty) |
+| `<taskId>.stderr.log` | the child's stderr, captured via a real file descriptor rather than a pipe (only written when non-empty) |
 | `lead-report.md` | the lead(s)' final reports |
+
+Child stderr is opened as a real fd on `stdio[2]`, not a pipe. On an uncaught
+exception Node prints the offending source line first, then the error's
+name/message/stack; HT's minified bundle can have source lines up to ~650 KB,
+and Node's async pipe read can silently drop everything past its ~64 KiB
+buffer once a fast-exiting child closes — exactly where that name/message/stack
+lives. A real fd has no such loss: the child writes straight to the file, and
+the bytes are durably there once the write syscall returns, regardless of how
+fast the child exits afterward.
+
+Each `<taskId>.stderr.log` is capped on disk at 8 MiB (`MAX_CHILD_STDERR_DISK_BYTES`
+in `dispatch-outcome.ts`): generous enough for many multiples of one bundled
+crash dump plus a full head/tail, while keeping each dispatch's disk cost small
+and fixed even against a chatty or malicious child. A file that grows past the
+cap is rewritten in place to a head + marker + tail that fits within it — the
+tail is kept, not dropped, since that is almost always where the actual error
+text is. The in-memory `stderr` returned to callers stays bounded the same way
+it always has (a small head/tail capture), independent of the on-disk cap.
+
+A dispatch with no owning run (e.g. triage) has no `<taskId>.stderr.log` to
+write to; its child's stderr instead goes to a private mode-0600 temp file
+(`fs.mkdtemp` under the OS temp dir) that is read back and removed once the
+child exits, on spawn error, and on timeout/cancellation.
 
 The Python EventStore additionally receives `dispatch_plan_confirmed`,
 `dispatch_started`, and `dispatch_finished` events (with model, cost, exit code,
