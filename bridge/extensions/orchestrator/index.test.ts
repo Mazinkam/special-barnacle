@@ -332,6 +332,12 @@ describe("parent-owned recon dispatch seam", () => {
 		expect(result.workerResults).toEqual([]);
 		expect(billed).toEqual(result.leadResults);
 		expect(phases[0]).toContain("no parent-owned recon required");
+		expect(phases[0]).toContain(
+			complexity < METHOD.rules.pre_implementation_recon.min_complexity
+				? `complexity ${complexity} is below the Rule-2 threshold`
+				: `task class "${taskClass}" is exempt`,
+		);
+		if (complexity >= METHOD.rules.pre_implementation_recon.min_complexity) expect(phases[0]).not.toContain("below");
 		expect(phases.join("\n")).not.toContain("0/0");
 	});
 

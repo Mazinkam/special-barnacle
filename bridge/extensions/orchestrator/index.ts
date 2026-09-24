@@ -2266,9 +2266,13 @@ export async function dispatchReconAndLeads(
 	effects.throwIfCancelled();
 	let workerResults: DispatchResult[] = [];
 	if (reconTasks.length === 0) {
-		effects.setPhase(
-			`no parent-owned recon required (complexity ${plan.complexity} below Rule-2 threshold ${METHOD.rules.pre_implementation_recon.min_complexity}, or task class "${plan.task_class}" is exempt)`,
-		);
+		// Name the actual reason; "below threshold OR exempt" made the operator
+		// guess, and read as false for an exempt class at high complexity.
+		const rule = METHOD.rules.pre_implementation_recon;
+		const reason = plan.complexity < rule.min_complexity
+			? `complexity ${plan.complexity} is below the Rule-2 threshold ${rule.min_complexity}`
+			: `task class "${plan.task_class}" is exempt (skip_for_task_classes)`;
+		effects.setPhase(`no parent-owned recon required: ${reason}`);
 	} else {
 		effects.setPhase(`recon: 0/${reconTasks.length} starting`);
 		workerResults = await effects.dispatch(reconTasks);
@@ -3094,7 +3098,9 @@ export default function (pi: ExtensionAPI) {
 						? []
 						: [
 								`first failure: ${(() => {
-									const failed = billedResults.find((r) => r.exitCode !== 0);
+									// The run FAILED because no lead succeeded, so name a lead first;
+									// recon/architect failures are reported on their own lines.
+									const failed = leadResults.find((r) => r.exitCode !== 0) ?? billedResults.find((r) => r.exitCode !== 0);
 									if (!failed) return "(no dispatch attempted)";
 									return `${failed.taskId.replace(`${runId}-`, "")} exit ${failed.exitCode}: ${summarizeStderr(failed.stderr, 300) || "(no output)"}`;
 								})()}`,
