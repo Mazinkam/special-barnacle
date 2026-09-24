@@ -758,7 +758,7 @@ class BenchmarkHarnessTests(SyntheticRootTestCase):
 
     def test_measure_reports_measured_bytes_not_only_fixture_sizes(self):
         write_synthetic_history(self.root, runs=3)
-        args = argparse.Namespace(batch_size=2, repeat=1)
+        args = argparse.Namespace(batch_size=2, repeat=1, checkout=REPO)
         result = self.bench.measure(self.root, 1, args, tag='t')
         self.assertIn('fixture_bytes', result); self.assertNotIn('bytes', result)
         for op in ('batch', 'dashboard', 'per_record_legacy', 'cold_first_batch', 'engine_boundary'):

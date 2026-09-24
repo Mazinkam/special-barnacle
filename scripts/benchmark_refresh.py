@@ -322,7 +322,7 @@ def measure(root: Path, scale: int, args: argparse.Namespace, tag: str) -> dict:
     from orchestrator.runtime import iter_jsonl
 
     size = args.batch_size
-    checkout = getattr(args, 'checkout', REPO)
+    checkout = args.checkout
     cli = partial(run_cli, checkout=checkout)
     # Freeze input accounting before any workload contaminates it with synthetic billing rows.
     rows = {}; fixture_bytes = {}; digests = {}
@@ -420,7 +420,8 @@ def main() -> None:
     if args.runs < 1 or args.repeat < 1: ap.error('--runs and --repeat must be positive')
     if not 1 <= args.batch_size <= MAX_BATCH_RECORDS: ap.error(f'--batch-size must be 1..{MAX_BATCH_RECORDS}')
     args.checkout = args.checkout.expanduser().resolve()
-    if not (args.checkout / 'orchestrator/cli.py').is_file(): ap.error('--checkout must contain orchestrator/cli.py')
+    for module in ('cli', 'engine'):  # both workloads' child entry points; fail before any workload runs
+        if not (args.checkout / f'orchestrator/{module}.py').is_file(): ap.error(f'--checkout must contain orchestrator/{module}.py')
     if args.source is not None:
         args.source = args.source.expanduser().resolve()
         if not args.source.is_dir() or not any((args.source / n).is_file() for n in STREAMS):

@@ -152,13 +152,15 @@ def test_benchmark_copies_source_and_reports_pre_append_coverage(tmp_path):
     (source / 'metrics.jsonl').write_text('{"event":"model_call","run_id":"R","cost_usd":0.25,"cost_source":"reported"}\n')
     (source / 'outcomes.jsonl').write_text('')
     before = snapshot(source)
+    inherited = tmp_path / 'unused'  # the driver's own environment must never become a workload state root
     result = subprocess.run([sys.executable, '-B', str(REPO / 'scripts/benchmark_refresh.py'),
                              '--source', str(source), '--repeat', '1', '--scales', '1,2,4',
                              '--checkout', str(REPO), '--json'],
-                            env=cli_env(tmp_path / 'unused'), cwd=REPO, capture_output=True, text=True, timeout=120)
+                            env=cli_env(inherited), cwd=REPO, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout)
     assert snapshot(source) == before
+    assert not inherited.exists(), 'a successful benchmark must not create the inherited state root'
     for scale, row in zip((1, 2, 4), report['results']):
         assert row['input_evidence']['runs'] == scale
         assert row['input_evidence']['call_rows'] == scale
@@ -199,4 +201,19 @@ def test_benchmark_rejects_invalid_inputs_without_state_writes(tmp_path, args):
                             env=cli_env(root), cwd=REPO, capture_output=True, text=True, timeout=60)
     assert result.returncode == 2
     assert 'error:' in result.stderr
+    assert not root.exists()
+
+
+def test_benchmark_rejects_checkout_missing_engine_before_any_workload(tmp_path):
+    # The engine-boundary workload imports orchestrator.engine from the checkout; a CLI-only tree
+    # must be refused at argument parsing, not after the batch/dashboard workloads have already run.
+    checkout = tmp_path / 'cli-only'
+    (checkout / 'orchestrator').mkdir(parents=True)
+    (checkout / 'orchestrator/cli.py').write_text('')
+    root = tmp_path / 'state'
+    result = subprocess.run([sys.executable, '-B', str(REPO / 'scripts/benchmark_refresh.py'),
+                             '--checkout', str(checkout)],
+                            env=cli_env(root), cwd=REPO, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 2
+    assert 'orchestrator/engine.py' in result.stderr
     assert not root.exists()
