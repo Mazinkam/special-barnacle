@@ -1,0 +1,58 @@
+import { describe, expect, test } from "bun:test";
+import { classifyRunOutcome, externalChangeFiles, parseLeadFilesChanged, parseLeadStatus } from "./run-outcome.ts";
+
+const report = (status: string, files = "None.") => `## Completed\nstuff\n\n## Files Changed\n${files}\n\n## Open items\n- x\n\n${status}`;
+
+describe("parseLeadStatus", () => {
+	test("reads the last STATUS line", () => {
+		expect(parseLeadStatus(report("STATUS: blocked"))).toBe("blocked");
+		expect(parseLeadStatus(report("STATUS: completed"))).toBe("completed");
+		expect(parseLeadStatus("STATUS: partial\n")).toBe("partial");
+		expect(parseLeadStatus("**STATUS: BLOCKED**")).toBe("blocked");
+		expect(parseLeadStatus("STATUS: completed\nlater\nSTATUS: blocked")).toBe("blocked");
+	});
+	test("missing or invalid status is unknown", () => {
+		expect(parseLeadStatus("no status here")).toBe("unknown");
+		expect(parseLeadStatus("STATUS: great")).toBe("unknown");
+		expect(parseLeadStatus("")).toBe("unknown");
+	});
+});
+
+describe("parseLeadFilesChanged", () => {
+	test("explicit none", () => {
+		expect(parseLeadFilesChanged(report("STATUS: blocked", "None."))).toEqual({ kind: "none" });
+		expect(parseLeadFilesChanged(report("STATUS: blocked", "- None"))).toEqual({ kind: "none" });
+		expect(parseLeadFilesChanged(report("STATUS: blocked", "None; nothing was implemented."))).toEqual({ kind: "none" });
+	});
+	test("a list of paths", () => {
+		expect(parseLeadFilesChanged(report("STATUS: completed", "- `src/a.ts` — added x\n- `src/b.ts` — fixed y"))).toEqual({ kind: "list", files: ["src/a.ts", "src/b.ts"] });
+	});
+	test("no section is unknown", () => {
+		expect(parseLeadFilesChanged("## Completed\nx")).toEqual({ kind: "unknown" });
+	});
+});
+
+describe("classifyRunOutcome", () => {
+	test("all leads blocked -> blocked, even if git shows changes", () => {
+		expect(classifyRunOutcome({ leadStatuses: ["blocked", "blocked", "blocked"], succeededLeads: 3, leads: 3 })).toBe("blocked");
+	});
+	test("mixed or completed -> dispatched", () => {
+		expect(classifyRunOutcome({ leadStatuses: ["blocked", "completed"], succeededLeads: 2, leads: 2 })).toBe("dispatched");
+		expect(classifyRunOutcome({ leadStatuses: ["unknown"], succeededLeads: 1, leads: 1 })).toBe("dispatched");
+	});
+	test("no lead succeeded -> failed", () => {
+		expect(classifyRunOutcome({ leadStatuses: ["unknown"], succeededLeads: 0, leads: 1 })).toBe("failed");
+		expect(classifyRunOutcome({ leadStatuses: [], succeededLeads: 0, leads: 0 })).toBe("failed");
+	});
+});
+
+describe("externalChangeFiles", () => {
+	test("every lead said None -> all git-changed files are external", () => {
+		expect(externalChangeFiles(["a.py", "b.py"], [report("STATUS: completed"), report("STATUS: blocked")])).toEqual(["a.py", "b.py"]);
+	});
+	test("any lead that listed files or omitted the section -> nothing is classed external", () => {
+		expect(externalChangeFiles(["a.py"], [report("STATUS: completed", "- `a.py` — x"), report("STATUS: blocked")])).toEqual([]);
+		expect(externalChangeFiles(["a.py"], ["## Completed\nno files section"])).toEqual([]);
+		expect(externalChangeFiles(["a.py"], [])).toEqual([]);
+	});
+});

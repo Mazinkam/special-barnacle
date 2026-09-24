@@ -905,6 +905,12 @@ function dispatchResult(task: DispatchTask, exitCode = 0): DispatchResult {
 }
 
 const reconLeadInput = { runId: "run", goal: "repair flow", plan: planFixture, adapter: adapterFixture };
+/** Two independent leads, as the architect must now declare them (one wave). */
+const twoIndependentLeads = {
+	taskId: "run-architect", capability: "architect", model: "m", exitCode: 0, stderr: "",
+	stdout: "## Lead assignments\nLead 1: backend (depends on: none)\nLead 2: frontend (depends on: none)\n",
+	usage: {} as never, durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
+} as DispatchResult;
 
 /**
  * Explicit deadline for tests that await a rejection: a regression that stops
@@ -994,6 +1000,7 @@ describe("parent-owned recon dispatch seam", () => {
 		let leadTasks: DispatchTask[] = [];
 		const run = orchestrator.dispatchReconAndLeads({ ...reconLeadInput,
 			plan: { ...planFixture, topology: { ...planFixture.topology, leads: 2 } },
+			architectResult: twoIndependentLeads,
 		}, {
 			dispatch: async (tasks) => {
 				if (tasks[0].capability === "lead") leadTasks = tasks;
@@ -1022,6 +1029,7 @@ describe("parent-owned recon dispatch seam", () => {
 		const pendingRecon = new Promise<DispatchResult[]>((resolve) => { finishRecon = resolve; });
 		const run = orchestrator.dispatchReconAndLeads({ ...reconLeadInput,
 			plan: { ...planFixture, topology: { ...planFixture.topology, leads: 2 } },
+			architectResult: twoIndependentLeads,
 		}, {
 			dispatch: async (tasks) => {
 				batches.push(tasks);
@@ -2805,5 +2813,73 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 				runProcess: async () => { calls++; return proc({ exitCode: 1, stderr: "TypeError: boom" }); },
 			});
 		expect(calls).toBe(1);
+	});
+});
+
+describe("orchestrator fixes from run ht-orch-1790237987755-lyjkn8 (A8)", () => {
+	const threeLeadPlan = { ...planFixture, complexity: 8, topology: { depth: 3, leads: 3, workers: 0, shape: "multi_lead" } };
+	const architect = (text: string) => ({
+		taskId: "r-architect", capability: "architect", model: "m", exitCode: 0, stdout: text, stderr: "",
+		usage: {} as never, durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
+	} as DispatchResult);
+	const run = async (architectText: string, statusFor: (taskId: string) => string) => {
+		const batches: string[][] = [];
+		const phases: string[] = [];
+		const { leadResults } = await orchestrator.dispatchReconAndLeads(
+			{ runId: "r", goal: "g", plan: { ...threeLeadPlan, task_class: "investigation" }, adapter: { lead: { model: "p/opus-5-5" } }, architectResult: architect(architectText) },
+			{
+				dispatch: async (tasks) => {
+					batches.push(tasks.map((t) => t.taskId));
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "m", exitCode: 0, stdout: `report\nSTATUS: ${statusFor(t.taskId)}`,
+						stderr: "", usage: {} as never, durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
+					} as DispatchResult));
+				},
+				capture: async () => {}, setPhase: (p) => phases.push(p), throwIfCancelled: () => {},
+			},
+		);
+		return { batches, phases, leadResults };
+	};
+	const chain = "## Lead assignments\nLead 1: phase 0 (depends on: none)\nLead 2: A1-A3 (depends on: 1)\nLead 3: A4-A7 (depends on: 2)\n";
+
+	test("dependent leads run in sequential waves, each with its scope", async () => {
+		const { batches, leadResults } = await run(chain, () => "completed");
+		expect(batches).toEqual([["r-lead-0"], ["r-lead-1"], ["r-lead-2"]]);
+		expect(leadResults).toHaveLength(3);
+	});
+
+	test("a blocked lead stops the leads that depend on it", async () => {
+		const { batches, phases, leadResults } = await run(chain, (id) => (id === "r-lead-0" ? "blocked" : "completed"));
+		expect(batches).toEqual([["r-lead-0"]]);
+		expect(leadResults).toHaveLength(1);
+		expect(phases.join("\n")).toContain("not starting lead(s) 2");
+	});
+
+	test("no valid Lead assignments collapses to a single lead instead of N clones", async () => {
+		const { batches, phases } = await run("## Tasks\n1. do it", () => "completed");
+		expect(batches).toEqual([["r-lead-0"]]);
+		expect(phases.join("\n")).toContain("running a single lead");
+	});
+
+	test("architect is asked for Lead assignments only when there are several leads", () => {
+		expect(orchestrator.architectPrompt("g", threeLeadPlan)).toContain("## Lead assignments");
+		expect(orchestrator.architectPrompt("g", planFixture)).not.toContain("## Lead assignments");
+	});
+
+	test("lead prompt carries the assigned scope and its dependencies", () => {
+		const p = orchestrator.leadPrompt("g", threeLeadPlan, undefined, "", 1, 3, adapterFixture, { index: 1, scope: "A1-A3", dependsOn: [0] });
+		expect(p).toContain("Your scope (from the architect's Lead assignments): A1-A3");
+		expect(p).toContain("Leads 1 ran before you");
+	});
+
+	test("a blocked run is recorded as blocked, not fail or verified", () => {
+		expect(orchestrator.runCompletionOutcomeFor("r", { blocked: true, verification_passed: false }).outcome).toBe("blocked");
+		expect(orchestrator.runCompletionOutcomeFor("r", { verification_passed: false }).outcome).toBe("fail");
+		expect(orchestrator.runCompletionOutcomeFor("r", { verification_passed: true }).outcome).toBe("verified");
+	});
+
+	test("QA is told to stay in scope and not debug the environment", () => {
+		expect(orchestrator.QA_SCOPE_RULES.join(" ")).toContain("verify ONLY the files listed above");
+		expect(orchestrator.QA_SCOPE_RULES.join(" ")).toContain("after 2 attempts");
 	});
 });

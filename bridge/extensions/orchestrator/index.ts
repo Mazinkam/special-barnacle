@@ -95,6 +95,8 @@ import {
 	userLayerWarnings,
 } from "./models.ts";
 import { bedrockFallbackFor, isQuotaError } from "./provider-fallback.ts";
+import { parseLeadAssignments, planLeadWaves, type LeadAssignment } from "./lead-plan.ts";
+import { classifyRunOutcome, externalChangeFiles, parseLeadStatus } from "./run-outcome.ts";
 import { SpendCapTracker, capFor, type SpendCapVerdict } from "./spend-cap.ts";
 import { escalateLeadCapability, isLeadCapability, isLeadSize, leadSizeOf, sizeLead, type LeadSizeDecision } from "./lead-sizing.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
@@ -2149,7 +2151,9 @@ export function runCompletionOutcomeFor(runId: string, summary: Record<string, u
 	return {
 		run_id: runId,
 		task_id: "run-complete",
-		outcome: summary.verification_passed === false ? "fail" : "verified",
+		// A blocked run stopped at a precondition: neither a verified success nor
+		// a quality failure of the route, so it must not train routing either way.
+		outcome: summary.blocked === true ? "blocked" : summary.verification_passed === false ? "fail" : "verified",
 		verification_scope: "run",
 		quality: summary.success_rate ?? 0,
 		note: JSON.stringify(summary),
@@ -3010,6 +3014,7 @@ async function runVerification(
 		...filesChanged.map((f) => `- \`${f}\``),
 		"",
 		"Run typecheck, unit tests, integration tests, lint as applicable.",
+		...QA_SCOPE_RULES,
 		"Respond with the standard QA output format.",
 	].join("\n");
 
@@ -3231,14 +3236,7 @@ export async function dispatchReconAndLeads(
 	},
 ): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[] }> {
 	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars = RECON_EVIDENCE_MAX_CHARS, leadCapability = "lead" } = input;
-	const { leads } = plan.topology;
-	// `Math.max(1, leads)` returns NaN when the plan omits `topology.leads` or
-	// sends a non-number, and `Array.from({ length: NaN })` is empty — that is
-	// how a run reported "leads: 0/0 succeeded" with nothing dispatched. Coerce
-	// first, then floor at 1.
-	const leadCount = Number.isFinite(leads)
-		? Math.min(MAX_LEADS, Math.max(1, Math.trunc(leads)))
-		: 1;
+	const requestedLeadCount = effectiveLeadCount(plan);
 
 	// Rule 2: parent-owned, read-only recon dispatched directly by the bridge
 	// (not left to a lead's discretion) so it is an observable, billed dispatch
@@ -3287,11 +3285,20 @@ export async function dispatchReconAndLeads(
 		? `DEGRADED: all ${workerResults.length} parent-owned recon worker(s) failed; no verified recon evidence is available for this run. Raw diagnostics follow for context only:\n\n${reconEvidenceBody}`
 		: reconEvidenceBody;
 
-	const leadTasks: DispatchTask[] = Array.from({ length: leadCount }, (_, i) => ({
+	// Several leads need the architect's Lead assignments (scope + depends on).
+	// Without them, run ONE lead with the whole goal rather than N clones.
+	const architectText = architectResult && architectResult.exitCode === 0 ? architectResult.stdout : "";
+	const assignments = requestedLeadCount > 1 ? parseLeadAssignments(architectText, requestedLeadCount) : null;
+	const leadCount = assignments ? requestedLeadCount : 1;
+	if (requestedLeadCount > 1 && !assignments) {
+		effects.setPhase(`topology asked for ${requestedLeadCount} leads but the architect gave no valid Lead assignments; running a single lead`);
+	}
+	const waves = assignments ? planLeadWaves(assignments) : [[0]];
+	const leadTaskFor = (i: number): DispatchTask => ({
 		capability: leadCapability,
-		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter),
+		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter, assignments?.[i]),
 		taskId: `${runId}-lead-${i}`,
-	}));
+	});
 
 	const completedReconCount = workerResults.filter((r) => r.exitCode === 0).length;
 	const reconPhaseNote =
@@ -3300,12 +3307,29 @@ export async function dispatchReconAndLeads(
 			: "no parent-owned recon packets (not required for this task)";
 	effects.throwIfCancelled();
 	effects.setPhase(
-		`${leadCount} lead(s) executing on ${shortName(adapter[leadCapability]?.model ?? "?")} with ${reconPhaseNote}; nested subagent calls inside a lead are not authoritative worker accounting`,
+		`${leadCount} lead(s) in ${waves.length} wave(s) executing on ${shortName(adapter[leadCapability]?.model ?? "?")} with ${reconPhaseNote}; nested subagent calls inside a lead are not authoritative worker accounting`,
 	);
-	const leadResults = await effects.dispatch(leadTasks);
-	for (const r of leadResults) await effects.capture(r);
-	// Same contract as recon: bill every finished lead, then honour cancellation.
-	effects.throwIfCancelled();
+	const leadResults: DispatchResult[] = [];
+	const stopped = new Set<number>();
+	for (const [w, wave] of waves.entries()) {
+		// A lead whose dependency failed or reported STATUS: blocked is not started.
+		const runnable = wave.filter((i) => !(assignments?.[i]?.dependsOn ?? []).some((d) => stopped.has(d)));
+		for (const i of wave) if (!runnable.includes(i)) stopped.add(i);
+		const skipped = wave.filter((i) => !runnable.includes(i));
+		if (skipped.length > 0) {
+			effects.setPhase(`wave ${w + 1}: not starting lead(s) ${skipped.map((i) => i + 1).join(", ")} — a lead they depend on failed or was blocked`);
+		}
+		if (runnable.length === 0) continue;
+		if (waves.length > 1) effects.setPhase(`wave ${w + 1}/${waves.length}: lead(s) ${runnable.map((i) => i + 1).join(", ")}`);
+		const results = await effects.dispatch(runnable.map(leadTaskFor));
+		for (const r of results) await effects.capture(r);
+		// Same contract as recon: bill every finished lead, then honour cancellation.
+		effects.throwIfCancelled();
+		for (const [k, r] of results.entries()) {
+			if (r.exitCode !== 0 || parseLeadStatus(r.stdout) === "blocked") stopped.add(runnable[k]);
+		}
+		leadResults.push(...results);
+	}
 
 	// Recon is parent-owned and returned for billing/reporting. Any further
 	// fan-out a lead performs via HT's own subagent tool happens inside that
@@ -3360,7 +3384,7 @@ function complexityNeedsArchitect(complexity: number): boolean {
 	return complexity >= METHOD.rules.pre_implementation_recon.min_complexity;
 }
 
-function architectPrompt(goal: string, plan: PlanResponse): string {
+export function architectPrompt(goal: string, plan: PlanResponse): string {
 	return [
 		`You are the architect for this orchestration. Produce a concrete task plan.`,
 		"",
@@ -3379,9 +3403,35 @@ function architectPrompt(goal: string, plan: PlanResponse): string {
 		"## Dependencies",
 		"Which tasks block which.",
 		"",
+		...leadAssignmentInstructions(plan),
 		"## Done When",
 		"Observable end-state.",
 	].join("\n");
+}
+
+/** Clamp the planner's lead count the same way dispatchReconAndLeads does. */
+/** Keeps QA on this run's files and stops it from debugging the environment. */
+export const QA_SCOPE_RULES = [
+	"Scope: verify ONLY the files listed above and the tests that cover them. Do not read or judge other files, even if they look modified.",
+	"Environment: use the project's documented test commands. If they cannot run after 2 attempts (missing interpreter, dependency, or service), stop and report FAIL with check name `environment` and the exact error; do not try alternative interpreters or install anything.",
+];
+
+function effectiveLeadCount(plan: PlanResponse): number {
+	const { leads } = plan.topology;
+	return Number.isFinite(leads) ? Math.min(MAX_LEADS, Math.max(1, Math.trunc(leads))) : 1;
+}
+
+function leadAssignmentInstructions(plan: PlanResponse): string[] {
+	const n = effectiveLeadCount(plan);
+	if (n <= 1) return [];
+	return [
+		"## Lead assignments",
+		`The topology has ${n} leads. Assign each lead a distinct, non-overlapping scope, one line per lead, exactly:`,
+		"Lead 1: <scope> (depends on: none)",
+		"Lead 2: <scope> (depends on: 1)",
+		"A lead that needs another lead's output MUST list it under depends on; dependent leads run after the leads they depend on, never in parallel. If the work cannot be split into independent or clearly ordered scopes, give Lead 1 the whole goal and give the other leads `(depends on: 1)` scopes that only verify or extend it. Without this section the orchestrator runs a single lead.",
+		"",
+	];
 }
 
 /**
@@ -3415,6 +3465,7 @@ export function leadPrompt(
 	leadIndex: number,
 	leadCount: number,
 	adapter: Adapter,
+	assignment?: LeadAssignment,
 ): string {
 	// Only forward a plan the architect actually produced. A failed architect
 	// dispatch used to be pasted in as an empty "Architect's plan:" section,
@@ -3424,9 +3475,17 @@ export function leadPrompt(
 			? `\nArchitect's plan:\n\n${architectResult.stdout.slice(0, 3000)}\n`
 			: "";
 	const scopeNote =
-		leadCount > 1
-			? `You are lead ${leadIndex + 1} of ${leadCount}. Focus on your assigned sub-domain; other leads handle parallel sub-domains.`
-			: "You are the sole lead for this orchestration.";
+		leadCount > 1 && assignment
+			? [
+				`You are lead ${leadIndex + 1} of ${leadCount}. Your scope (from the architect's Lead assignments): ${assignment.scope}`,
+				assignment.dependsOn.length > 0
+					? `Leads ${assignment.dependsOn.map((d) => d + 1).join(", ")} ran before you and completed; build on their work, do not redo it.`
+					: "No other lead's work is a precondition for your scope.",
+				"Do only your scope; other leads own the rest.",
+			].join("\n")
+			: leadCount > 1
+				? `You are lead ${leadIndex + 1} of ${leadCount}. Focus on your assigned sub-domain; other leads handle parallel sub-domains.`
+				: "You are the sole lead for this orchestration.";
 	// The orchestrator already dispatched and billed the required Rule-2 recon
 	// workers before this lead ever started (see dispatchHierarchical). State
 	// that plainly, whether evidence exists or not, instead of letting the lead
@@ -4119,10 +4178,35 @@ export default function (pi: ExtensionAPI) {
 				};
 				let allFiles = changedSince("lead phase", leadResults);
 
+				// Run outcome from the leads' own STATUS lines. All leads blocked =>
+				// BLOCKED: no QA, no PASS. Files git shows as changed while every
+				// lead reports "Files Changed: None" belong to someone else (a
+				// concurrent session) and are excluded from this run's QA scope.
+				const leadStatuses = leadResults.map((r) => parseLeadStatus(r.stdout));
+				const runOutcome = classifyRunOutcome({
+					leadStatuses,
+					succeededLeads: leadResults.filter((r) => r.exitCode === 0).length,
+					leads: leadResults.length,
+				});
+				const externalFiles = runOutcome === "blocked"
+					? [...allFiles]
+					: externalChangeFiles(allFiles, leadResults.filter((r) => r.exitCode === 0).map((r) => r.stdout));
+				if (externalFiles.length > 0) {
+					session.log(
+						`${externalFiles.length} file(s) changed during the run but no lead reported changing them (likely a concurrent session); excluded from QA: ${externalFiles.join(", ")}`,
+					);
+					recordEvent("external_changes_detected", { run_id: runId, files: externalFiles, lead_statuses: leadStatuses });
+					allFiles = allFiles.filter((f) => !externalFiles.includes(f));
+				}
+				if (runOutcome === "blocked") {
+					session.log(`all ${leadResults.length} lead(s) reported STATUS: blocked; skipping QA`);
+					recordEvent("run_blocked", { run_id: runId, leads: leadResults.length });
+				}
+
 				let retries = 0;
 				let lastVerification: VerificationResult | null = null;
 				const verificationResults: DispatchResult[] = [];
-				while (retries <= parsed.maxRetries) {
+				while (runOutcome !== "blocked" && retries <= parsed.maxRetries) {
 					if (allFiles.length > 0) {
 						session.setPhase(
 							retries === 0
@@ -4255,6 +4339,9 @@ export default function (pi: ExtensionAPI) {
 				const telemetry = await completeRun(runId, {
 					success_rate: succeededLeads / Math.max(1, leadResults.length),
 					verification_passed: passedVerification,
+					blocked: runOutcome === "blocked",
+					lead_statuses: leadStatuses,
+					external_changes: externalFiles.length,
 					total_cost_usd: totalCost,
 					files_changed: allFiles,
 					retries,
@@ -4294,7 +4381,9 @@ export default function (pi: ExtensionAPI) {
 						: [];
 				const reportTruncated = showFullReport && firstReport.split("\n").length > 40;
 
-				const verdict = !dispatchOk
+				const verdict = runOutcome === "blocked"
+					? "NOT RUN (blocked: every lead stopped at a stop condition or precondition)"
+					: !dispatchOk
 					? "NOT RUN (no lead succeeded)"
 					: verificationSkipped
 						? allFiles.length === 0
@@ -4305,9 +4394,9 @@ export default function (pi: ExtensionAPI) {
 							: "FAIL";
 
 				const summary = [
-					`Orchestration ${dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(Date.now() - Number(runId.split("-")[2]))}.`,
+					`Orchestration ${runOutcome === "blocked" ? "BLOCKED" : dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(Date.now() - Number(runId.split("-")[2]))}.`,
 					`run_id: ${runId}`,
-					`leads: ${succeededLeads}/${leadResults.length} succeeded · retries: ${retries} · files: ${allFiles.length} changed`,
+					`leads: ${succeededLeads}/${leadResults.length} ${runOutcome === "blocked" ? "blocked" : "succeeded"} · retries: ${retries} · files: ${allFiles.length} changed${externalFiles.length > 0 ? ` (+${externalFiles.length} changed by someone else, not verified)` : ""}`,
 					summarizeReconWorkers(workerResults),
 					`verification: ${verdict}`,
 					`total cost: $${totalCost.toFixed(4)} (${billedResults.length + (triageCost.usd > 0 ? 1 : 0)} dispatches)`,
