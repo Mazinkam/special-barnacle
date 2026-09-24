@@ -45,7 +45,7 @@ git log --oneline -1
 | `pyproject.toml` | Python package metadata (`name = "hierarchical-agent-orchestrator"`, `v0.3.0`) |
 | `orchestrator/` | Reference runtime: engine, scheduler, adaptive, dashboard, ingest, CLI |
 | `bridge/` | HUMAIN Terminal integration: extension TS + agent definitions + `install.sh` |
-| `bridge/extensions/` | `orchestrator.ts`, `cross-review-demo.ts` |
+| `bridge/extensions/` | `orchestrator/`, `orchestrator-README.md` |
 | `bridge/agents/` | `orch-*.md` agent definitions (one per capability) + the hierarchical `orchestrator-lead.md` |
 | `install.sh` | Symlinks `bridge/` into `~/.humain-terminal/agent/` for runtime loading |
 | `adapters/` | Example adapter configs (claude-code, codex, generic) |

@@ -7,6 +7,13 @@ from pathlib import Path
 
 
 class InstallSweepTests(unittest.TestCase):
+    def test_explicit_agent_links_cover_every_agent_markdown_file(self):
+        repository = Path(__file__).resolve().parents[1]
+        script = (repository / 'install.sh').read_text(encoding='utf-8')
+        listed = set(__import__('re').findall(r'"\$AGENTS_SRC/([^|]+)\|', script))
+        present = {path.name for path in (repository / 'bridge/agents').glob('*.md')}
+        self.assertEqual(listed, present)
+
     def test_install_plist_forwards_configured_interval_without_touching_user_dirs(self):
         repository = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temp:

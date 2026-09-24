@@ -39,15 +39,23 @@ log() { printf '[install] %s\n' "$*"; }
 warn() { printf '[install] WARN: %s\n' "$*" >&2; }
 fail() { printf '[install] ERROR: %s\n' "$*" >&2; exit 1; }
 
-# Mapping: "source_file|dest_dir" — keeps the two sides in sync and easy to audit.
-map_entries() {
-    local src_dir="$1" dst_dir="$2"
-    [ -d "$src_dir" ] || return 0
-    for entry in "$src_dir"/*; do
-        [ -e "$entry" ] || continue
-        printf '%s|%s\n' "$entry" "$dst_dir/$(basename "$entry")"
-    done
+# Explicit managed paths: additions to bridge/ must be deliberately reviewed here.
+managed_entries() {
+    printf '%s\n' \
+        "$EXTENSIONS_SRC/orchestrator|$EXTENSIONS_DST/orchestrator" \
+        "$EXTENSIONS_SRC/orchestrator-README.md|$EXTENSIONS_DST/orchestrator-README.md" \
+        "$AGENTS_SRC/orch-architect.md|$AGENTS_DST/orch-architect.md" \
+        "$AGENTS_SRC/orch-implementation-fast.md|$AGENTS_DST/orch-implementation-fast.md" \
+        "$AGENTS_SRC/orch-implementation-strong.md|$AGENTS_DST/orch-implementation-strong.md" \
+        "$AGENTS_SRC/orch-qa-agent.md|$AGENTS_DST/orch-qa-agent.md" \
+        "$AGENTS_SRC/orch-scout.md|$AGENTS_DST/orch-scout.md" \
+        "$AGENTS_SRC/orch-security-review.md|$AGENTS_DST/orch-security-review.md" \
+        "$AGENTS_SRC/orch-technical-lead.md|$AGENTS_DST/orch-technical-lead.md" \
+        "$AGENTS_SRC/orch-technical-review.md|$AGENTS_DST/orch-technical-review.md" \
+        "$AGENTS_SRC/orch-worker.md|$AGENTS_DST/orch-worker.md" \
+        "$AGENTS_SRC/orchestrator-lead.md|$AGENTS_DST/orchestrator-lead.md"
 }
+
 
 install_one() {
     local src="$1" dst="$2"
@@ -230,7 +238,11 @@ main() {
         while IFS='|' read -r src dst; do
             [ -n "${src:-}" ] || continue
             uninstall_one "$src" "$dst"
-        done < <(map_entries "$EXTENSIONS_SRC" "$EXTENSIONS_DST"; map_entries "$AGENTS_SRC" "$AGENTS_DST")
+        done < <(managed_entries)
+        if [ -L "$EXTENSIONS_DST/cross-review-demo.ts" ]; then
+            rm "$EXTENSIONS_DST/cross-review-demo.ts"
+            log "uninstall cross-review-demo.ts (stale managed symlink)"
+        fi
         uninstall_launchd
         log ""
         log "uninstall done. reload HT to drop the registered commands."
@@ -246,8 +258,9 @@ main() {
     fi
     while IFS='|' read -r src dst; do
         [ -n "${src:-}" ] || continue
+        if [ ! -e "$src" ]; then warn "missing source $src; skipping"; continue; fi
         install_one "$src" "$dst"
-    done < <(map_entries "$EXTENSIONS_SRC" "$EXTENSIONS_DST"; map_entries "$AGENTS_SRC" "$AGENTS_DST")
+    done < <(managed_entries)
     install_profiles
     [ "${HUMAIN_ORCHESTRATOR_SKIP_LAUNCHD:-0}" = "1" ] || install_launchd
     log ""

@@ -12,7 +12,6 @@ bridge/
 ├── extensions/
 │   ├── orchestrator.ts                the /orchestrate extension
 │   ├── orchestrator-README.md         orchestrator-specific install notes
-│   └── cross-review-demo.ts           /cross-review-demo extension
 └── agents/
     ├── orchestrator-lead.md           hierarchical lead (drives fan-out)
     ├── orch-architect.md
@@ -66,7 +65,6 @@ After install, restart HT (or `/reload`) to pick up the new commands:
 /reload
 /orchestrate <goal> [--task-class T] [--complexity N] [--risk R] [--fan-out] [--max-retries N]
 /orchestrator-roi
-/cross-review-demo
 ```
 
 ## Dispatch timeouts
@@ -104,15 +102,14 @@ tsconfig pointing at it, and runs `tsc` with three distinct exit codes:
 | 1 | type errors | FAIL — fix the code |
 | 2 | HT workspace / tsc / bun-types not found | SKIPPED — environment, **not** a code failure |
 
-Scope is `bridge/extensions/orchestrator/*.ts`. `cross-review-demo.ts` is
-excluded: it carries pre-existing diagnostics, and keeping the gate at exactly
+Scope is `bridge/extensions/orchestrator/*.ts`; keeping the gate at exactly
 zero means any new error is unambiguous.
 
 ## Why a bridge directory?
 
 The Python orchestrator (`../orchestrator/`) is the model-agnostic routing
 runtime. The files in this directory are the HT-specific bindings — agent
-definitions, the dispatch extension, the demo extension — that pair the runtime
+definitions, the dispatch extension — that pair the runtime
 with HT's command/subagent model.
 
 Keeping them in this repo under a single `bridge/` directory means one `git pull`

@@ -71,8 +71,8 @@ Open:
 ~/.local/state/coding-agent-orchestrator/dashboard.html
 ```
 
-In HUMAIN Terminal, the bridge exposes `/orchestrate`, `/orchestrator-roi`,
-and `/cross-review-demo` (after `/reload`). Saved interactive usage is ingested from
+In HUMAIN Terminal, the bridge exposes `/orchestrate`, `/orchestrator-models`, `/orchestrator-roi`,
+and `/orchestrate-cancel` (after `/reload`). Saved interactive usage is ingested from
 `~/.humain-terminal/agent/sessions/<project>/*.jsonl` after settled turns; the login/15-minute
 sweep catches missed hooks. Message text and ephemeral `--no-session` work are excluded from
 this session-log path. The dashboard refreshes every five seconds while visible, restores scroll,
@@ -372,16 +372,8 @@ Before release:
   (`--orchestrator` by default, `--all` for the `bridge/**/*.ts` scope this gate means; exit 2
   means the environment is incomplete, which is *not* a code failure — see `bridge/README.md`).
   Both scopes report **0 diagnostics**.
-  The 6 previously accepted demo diagnostics in `bridge/extensions/cross-review-demo.ts` are
-  fixed rather than accepted, because one of them was masking a real runtime bug:
-  - TS2352 at `:73`, `:105`, `:138` — the `AgentToolResult<SubagentDetails>` returned by
-    `execute()` was asserted to `SubagentDetails`. The details live on `.details`, so
-    `implDetails.results` was `undefined` at runtime and all three phases would have thrown.
-    Now destructured as `{ details }`, with no assertion.
-  - TS2554 at `:78`, `:110`, `:143` — a 5th `ctx` argument was passed to an `AgentTool.execute`
-    that declares 4. The wrapper forwards an optional `ExtensionContext`, but the subagent tool
-    reads it only as `ctx?.cwd`/`ctx?.model` fallbacks and every task already passes both
-    explicitly, so the undeclared argument was dropped rather than cast around.
+  (`bridge/extensions/cross-review-demo.ts` has since been removed; it was broken and not part of
+  the product.)
   The three TS2683 implicit-`this` errors formerly at `orchestrator/index.test.ts:722,723,733`
   were **introduced on this branch**, not pre-program debt; typed mocks now fix them.
 - [ ] Installed-HT reload/shutdown smoke, supported Python (>=3.10), and Linux checks remain
@@ -422,13 +414,13 @@ silently overwrites existing raw files.
 ```text
 orchestrator/             Python reference runtime (CLI + EventStore + scheduler; archive.py = opt-in run-diagnostic archival)
 bridge/                    HUMAIN Terminal integration (paired with orchestrator/)
-  extensions/              orchestrator.ts + cross-review-demo.ts
+  extensions/              orchestrator/ (the /orchestrate bridge) + orchestrator-README.md
   agents/                  one .md per capability + orchestrator-lead.md
   README.md                install + adapter notes
 install.sh                 symlinks bridge/ into ~/.humain-terminal/agent/
 adapters/                  example adapter configs (claude-code, codex, generic)
 docs/                      V3 features, adaptive routing, integration, telemetry
-scripts/                   init / rebuild-ledger / regenerate-dashboard / dynamic_adapter
+scripts/                   rebuild-ledger / regenerate-dashboard / dynamic_adapter / maintenance tools
 tests/                     Python tests for the reference runtime
 ~/.local/state/coding-agent-orchestrator/   runtime state (events, ledger, dashboard)
 ```

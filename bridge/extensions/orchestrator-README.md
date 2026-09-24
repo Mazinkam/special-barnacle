@@ -20,7 +20,6 @@ After install, restart HT (or `/reload`):
 /orchestrate [flags] <goal> [flags]   # e.g. <goal> [--task-class T] [--complexity N] [--risk R] [--cheap P/M] [--mid P/M] [--premium P/M] [--model cap=P/M] [--max-retries N] [--interactive]
 /orchestrator-models [list|set|use|pick|validate --live]
 /orchestrator-roi
-/cross-review-demo
 ```
 
 Flags are read only from before and after the goal text. A `--flag` between goal words is part of the goal and has no effect, so goals may mention flags ("keep --interactive working").
@@ -38,7 +37,6 @@ spend logged without any manual step; see `docs/TELEMETRY.md`.
 | `extensions/orchestrator/` (`index.ts`, `models.ts`, `ingest.ts`) | `bridge/extensions/orchestrator/` |
 | `~/Library/LaunchAgents/com.humain.orchestrator-ingest.plist` (rendered, macOS) | `install.sh` |
 | `extensions/orchestrator-README.md` | `bridge/extensions/orchestrator-README.md` |
-| `extensions/cross-review-demo.ts` | `bridge/extensions/cross-review-demo.ts` |
 | `agents/orchestrator-lead.md` | `bridge/agents/orchestrator-lead.md` |
 | `agents/orch-{architect,implementation-strong,implementation-fast,worker,scout,technical-lead,technical-review,security-review,qa-agent}.md` | `bridge/agents/` |
 
