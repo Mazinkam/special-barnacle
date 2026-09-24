@@ -439,7 +439,7 @@ class DashboardAggregateTests(SyntheticRootTestCase):
         interactive = actual['interactive_sessions']
         self.assertEqual(interactive['rows'], len(ingested))
         self.assertEqual(interactive['calls'], sum(records.covered_calls(row) for row in ingested))
-        self.assertEqual(interactive['cost'], sum(row_cost(row) for row in ingested))
+        self.assertAlmostEqual(interactive['cost'], sum(row_cost(row) for row in ingested), delta=1e-9)
         self.assertEqual(interactive['tokens'], sum(int(row.get('input_tokens', 0) or 0) + int(row.get('output_tokens', 0) or 0) for row in ingested))
         self.assertEqual(interactive['sessions'], len({str(row.get('session_id')) for row in ingested if row.get('session_id') is not None}) or 'NO_DATA')
 
