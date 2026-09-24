@@ -1458,29 +1458,6 @@ function reserveFallbackName(diagnostics: RunDiagnostics, stderrName: string): s
 }
 
 /**
- * Read `length` bytes starting at byte offset `start` from `path` and decode
- * as UTF-8. Used only for the small, bounded delta of real child bytes that
- * can land on the backing file between settle and 'close' (see runSubagentProcess);
- * not a general-purpose reader.
- */
-function readFileRangeUtf8(path: string, start: number, length: number): string {
-	if (length <= 0) return "";
-	const fd = openSync(path, "r");
-	try {
-		const buffer = Buffer.alloc(length);
-		let offset = 0;
-		while (offset < length) {
-			const n = readSync(fd, buffer, offset, length - offset, start + offset);
-			if (n <= 0) break;
-			offset += n;
-		}
-		return buffer.subarray(0, offset).toString("utf8");
-	} finally {
-		closeSync(fd);
-	}
-}
-
-/**
  * Open the destination for a child's stderr as a real file descriptor,
  * never a pipe. Node prints the offending source line first on an uncaught
  * exception, then the error's name/message/stack; HT's minified bundle has
@@ -2178,23 +2155,59 @@ export async function runSubagentProcess(opts: {
 						if (fileBytes > 0 || (isFallback && currentStderrFileBytes() > 0)) {
 							// Real child bytes exist on the backing file - either observed at
 							// settle, or (fallback only) arrived since. Persist them with the
-							// recovered-result prefix LEADING, not trailing (BLOCKING 2): read
-							// the (possibly on-disk-capped) content once and write prefix+content
-							// as a single write, then append our own notes after it.
-							const capped = capChildStderrFile(stderrTarget!.path, MAX_CHILD_STDERR_DISK_BYTES);
-							const content = capped ?? readFileSync(stderrTarget!.path, "utf8");
-							diagnosticWriter.write(persistName, `${stderrPrefix}${content}`);
+							// recovered-result prefix LEADING, not trailing (BLOCKING 2, review
+							// round 2): read the (possibly on-disk-capped) content once and
+							// write prefix+content, then append our own notes after it. Reserve
+							// room for the prefix and the notes in the cap itself (WARNING,
+							// review round 3) so the composed prefix+content+notes never
+							// exceeds MAX_CHILD_STDERR_DISK_BYTES even though only `content` is
+							// capped directly.
 							const notes = stderrCapture.text();
-							if (notes) diagnosticWriter.append(persistName, `\n${notes}`);
+							const notesSuffix = notes ? `\n${notes}` : "";
+							const reserveBytes = Buffer.byteLength(stderrPrefix, "utf8") + Buffer.byteLength(notesSuffix, "utf8");
+							const budget = Math.max(0, MAX_CHILD_STDERR_DISK_BYTES - reserveBytes);
+							const capped = capChildStderrFile(stderrTarget!.path, budget);
+							if (isFallback) {
+								// The backing file is a private temp file distinct from
+								// persistName's real file (see openStderrTarget's fallback):
+								// its content must actually be copied over. `capped` already
+								// read it through bounded, fixed-position reads when it's
+								// over budget; when under budget, `size <= budget` by
+								// definition of capChildStderrFile, so this read is bounded
+								// by the same cap - never an unbounded whole-file load.
+								const content = capped ?? readFileSync(stderrTarget!.path, "utf8");
+								diagnosticWriter.write(persistName, `${stderrPrefix}${content}`);
+								if (notes) diagnosticWriter.append(persistName, notesSuffix);
+							} else if (capped !== undefined || stderrPrefix) {
+								// Same physical file as persistName: only rewrite it when
+								// something must actually change (a prefix to prepend, or
+								// on-disk content that must shrink to fit the cap) - never an
+								// unconditional read-then-truncate-then-write, which would
+								// open a window where a concurrently-writing escaped
+								// descendant's bytes land between the read and the truncate
+								// and are lost (WARNING, review round 3).
+								const content = capped ?? readFileSync(stderrTarget!.path, "utf8");
+								diagnosticWriter.write(persistName, `${stderrPrefix}${content}`);
+								if (notes) diagnosticWriter.append(persistName, notesSuffix);
+							} else if (notes) {
+								// Nothing to prepend and nothing to cap: the child's bytes are
+								// already exactly where they belong: only the notes are new.
+								diagnosticWriter.append(persistName, notesSuffix);
+							}
 						} else if (!isFallback && noteWriteBytes !== undefined && currentStderrFileBytes() > noteWriteBytes) {
 							// finish() already wrote our notes into the real backing file
-							// (settle saw 0 bytes there), but the child kept writing real bytes
-							// for a moment before actually exiting. Preserve them by appending
-							// just the delta - never a truncating rewrite, which would discard
-							// them (WARNING, review round 2).
-							const lateBytes = currentStderrFileBytes() - noteWriteBytes;
-							const delta = readFileRangeUtf8(stderrTarget!.path, noteWriteBytes, lateBytes);
-							if (delta) diagnosticWriter.append(persistName, delta);
+							// (settle saw 0 bytes there), and the child kept writing real
+							// bytes for a moment before actually exiting. Those bytes landed
+							// through the same O_APPEND fd as everything else in this
+							// (non-fallback) file - persistName IS stderrTarget.path here - so
+							// they are already exactly where they belong. Re-reading and
+							// re-appending them (as review round 2 did, via an unbounded
+							// Buffer.alloc(lateBytes) with no cap check) duplicated them in
+							// the sealed log and could allocate without bound (BLOCKING,
+							// review round 3). Only cap the file if it has now grown past the
+							// limit; otherwise leave it untouched.
+							const capped = capChildStderrFile(stderrTarget!.path, MAX_CHILD_STDERR_DISK_BYTES);
+							if (capped !== undefined) diagnosticWriter.write(persistName, capped);
 						} else {
 							// Nothing real ever landed in the backing file (a test double that
 							// bypasses stdio entirely): fall back to persisting stderrCapture's

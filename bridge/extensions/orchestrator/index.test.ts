@@ -12,6 +12,7 @@ import { planReconTasks } from "./recon.ts";
 import { METHOD, TIER_CAPABILITIES, buildAliasTable } from "./models.ts";
 import type { DispatchResult, DispatchTask } from "./index.ts";
 import { RunCancellation } from "./cancellation.ts";
+import { MAX_CHILD_STDERR_DISK_BYTES } from "./dispatch-outcome.ts";
 
 mock.module("@humain/terminal", () => ({
 	BorderedLoader: class {
@@ -2330,6 +2331,134 @@ describe("runSubagentProcess process/event handling", () => {
 			// The orchestrator's own note must remain a prefix; the late bytes are
 			// appended after it, never overwriting it.
 			expect(log.indexOf("UNVERIFIED PARTIAL WORK")).toBeLessThan(log.indexOf("late child bytes after settle"));
+			// The late bytes already landed in place on the backing file through the
+			// same O_APPEND fd as everything else in this (non-fallback) log; the
+			// close handler must never re-read and re-append them, or they show up
+			// twice in the sealed log (BLOCKING, review round 3).
+			const occurrences = log.split("late child bytes after settle").length - 1;
+			expect(occurrences).toBe(1);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 3 / BLOCKING: late bytes that push the backing file past the disk cap are capped in place, never unboundedly duplicated", async () => {
+		const session = createSession("late-bytes-over-cap");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "late-bytes-over-cap", session,
+				leadTimeouts: { inactivityMs: 50, maxMs: 5000 },
+				spawnChild: () => child as never,
+			});
+			// Settle at 0 bytes observed on the backing file, exactly like the WARNING
+			// test above, but this time the "late bytes" that land afterward through
+			// the independent O_APPEND fd exceed MAX_CHILD_STDERR_DISK_BYTES on their
+			// own. The close handler must cap the file (bounded head/tail reads via
+			// capChildStderrFile), never allocate a same-sized in-memory buffer for
+			// the whole delta and never duplicate any of it.
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			const tailMarker = "HAO_LATE_BYTES_TAIL_SENTINEL_9c1a";
+			const oversized = "L".repeat(MAX_CHILD_STDERR_DISK_BYTES + 1024) + tailMarker;
+			const fd = openSync(session.file("late-bytes-over-cap.stderr.log"), "a");
+			try { writeSync(fd, oversized); } finally { closeSync(fd); }
+			child.emit("close", 137);
+			const result = await pending;
+
+			expect(result.outcome).toBe("timed_out");
+			const log = readFileSync(session.file("late-bytes-over-cap.stderr.log"), "utf8");
+			expect(log).toContain("UNVERIFIED PARTIAL WORK");
+			// Capped, not duplicated: the sentinel that marks the true end of the
+			// late bytes appears exactly once, and the whole file stays within the
+			// disk cap (plus the small, fixed marker/note overhead).
+			const occurrences = log.split(tailMarker).length - 1;
+			expect(occurrences).toBe(1);
+			expect(Buffer.byteLength(log, "utf8")).toBeLessThanOrEqual(MAX_CHILD_STDERR_DISK_BYTES + 4096);
+			expect(log).toMatch(/bytes elided \(on-disk stderr exceeded the \d+-byte cap\)/);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 3 / WARNING: a recovered result's persisted log reserves room for the prefix when capping oversized real content", async () => {
+		const session = createSession("cap-with-prefix");
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "cap-with-prefix", session,
+				// A real Node child (not a test double) whose stderr fd is oversized
+				// (well past MAX_CHILD_STDERR_DISK_BYTES) before it settles and then
+				// exits non-zero after a terminal result, exercising the
+				// completed_after_process_error prefix together with the cap.
+				spawnChild: spawnInlineScript(
+					`process.stderr.write("B".repeat(${MAX_CHILD_STDERR_DISK_BYTES} + 65536) + "HAO_CAP_PREFIX_TAIL_SENTINEL\\n");` +
+						`const e=[{type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:"done"}]}},{type:"agent_end",messages:[]},{type:"agent_settled"}];` +
+						`for(const x of e)process.stdout.write(JSON.stringify(x)+"\\n");` +
+						`process.exitCode=1;`,
+				),
+			});
+
+			expect(result.outcome).toBe("completed_after_process_error");
+			const prefix = "[orchestrator] child produced a terminal result";
+			expect(result.stderr.startsWith(prefix)).toBe(true);
+			const log = readFileSync(session.file("cap-with-prefix.stderr.log"), "utf8");
+			expect(log.startsWith(prefix)).toBe(true);
+			expect(log).toContain("HAO_CAP_PREFIX_TAIL_SENTINEL");
+			expect(log.split("HAO_CAP_PREFIX_TAIL_SENTINEL").length - 1).toBe(1);
+			// The prefix itself must be reserved room for, not squeezed out by the
+			// content cap: the whole persisted file (prefix + capped content) stays
+			// within MAX_CHILD_STDERR_DISK_BYTES.
+			expect(Buffer.byteLength(log, "utf8")).toBeLessThanOrEqual(MAX_CHILD_STDERR_DISK_BYTES);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("REVIEW ROUND 3 / WARNING: a fallback target's persisted log reserves room for both the content cap and the interruption notes", async () => {
+		const session = createSession("cap-with-notes-fallback");
+		const child1 = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			// First dispatch reserves the real backing file for this taskId.
+			const first = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, taskId: "cap-with-notes-fallback", session,
+				spawnChild: () => child1 as never,
+			});
+			child1.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: "first" } })}\n`);
+			child1.emit("close", 0);
+			await first;
+
+			// Second dispatch reuses the same taskId (forcing the collision fallback
+			// to a private temp file) with a real child that writes oversized real
+			// content, then times out via inactivity (producing an interruption
+			// note). Both the cap and the note must be reserved for in the same
+			// persisted-file budget.
+			const tailMarker = "HAO_CAP_NOTES_TAIL_SENTINEL";
+			const second = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "cap-with-notes-fallback", session,
+				leadTimeouts: { inactivityMs: 100, maxMs: 5000 },
+				spawnChild: spawnInlineScript(
+					`process.stderr.write("C".repeat(${MAX_CHILD_STDERR_DISK_BYTES} + 65536) + "${tailMarker}\\n");` +
+						"setInterval(() => {}, 1000);",
+				),
+			});
+			const result = await second;
+			// finish() resolves the promise from the timeout handler, which races the
+			// real process's actual SIGKILL + 'close' event; the close handler's own
+			// diagnosticWriter work (including this test's fallback file) runs after
+			// that event fires, not before the promise settles. Give the real OS
+			// process time to actually exit and 'close' to fire.
+			await new Promise((resolve) => setTimeout(resolve, 500));
+
+			expect(result.outcome).toBe("timed_out");
+			expect(readFileSync(session.file("run.log"), "utf8")).toContain("fell back to a private temp file");
+			const fallback = readFileSync(session.file("cap-with-notes-fallback.stderr.log.fallback"), "utf8");
+			expect(fallback).toContain("UNVERIFIED PARTIAL WORK");
+			expect(fallback).toContain(tailMarker);
+			expect(fallback.split(tailMarker).length - 1).toBe(1);
+			expect(Buffer.byteLength(fallback, "utf8")).toBeLessThanOrEqual(MAX_CHILD_STDERR_DISK_BYTES);
 		} finally {
 			session.close();
 		}
