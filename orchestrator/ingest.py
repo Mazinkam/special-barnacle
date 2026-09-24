@@ -11,7 +11,9 @@ only unrecorded call IDs and persist those IDs as `covered_call_ids` alongside t
 checkpoint (`ingest_checkpoint`) remembers the verified byte offset of the log, every call id the
 log has ever shown, and the `session_ingest` rows already known for its sessions. Unchanged sources
 need only edge checks; growth verifies the whole checkpointed prefix before parsing the suffix.
-The event stream stays the single authoritative record: every checkpoint is a
+The event stream durably binds fallback identities to their explicit logical sessions, even when
+promotion emits no new usage. Initial metrics retain the scanned source's device/inode, so
+checkpoint loss cannot turn a replacement file into a fallback promotion. Metrics remain authoritative for paid coverage; every checkpoint is a
 rebuildable cache, and settle → check → append → checkpoint runs under the one writer lock so
 competing ingesters serialize instead of double counting. Each log is read through one open file
 (identity, prefix check, scan and fingerprints all see the same inode). Totals-only legacy history
@@ -349,7 +351,8 @@ def call_id_for(runtime: str, session_id: str, native_id: str) -> str:
 
 def _reconcile_source_calls(calls: list[dict[str, Any]], *, runtime: str, path: Path,
                             live: set[str], history: dict[tuple[str, str], dict[str, Any]],
-                            ledger: IngestLedger, resumable: bool,
+                            ledger: IngestLedger, resumable: bool, promotions: dict[str, dict[str, Any]],
+                            source_identity: list[int], checkpoint_identity: list[int] | None,
                             alias_targets: dict[str, set[str]] | None = None
                             ) -> tuple[set[str], dict[str, set[str]]]:
     """Resolve orphaned session IDs by exact source call coverage, never by token totals.
@@ -362,6 +365,31 @@ def _reconcile_source_calls(calls: list[dict[str, Any]], *, runtime: str, path: 
     complete matching coverage and per-model usage as well: reused IDs with missing or changed
     calls are ambiguous. Totals validate an identity match; they never pay for unmatched IDs.
     """
+    if not calls:
+        return set(), {}  # no identity to reconcile; keep seeded Codex ledgers incremental
+    if not resumable:
+        # Live IDs bypass alias reconciliation below, but their paid hashes are not
+        # proof of continuity across an inode replacement for fallback identities,
+        # whether still headerless or promoted to explicit IDs. Check provenance
+        # BEFORE comparing any paid IDs, including same-session IDs.
+        # Explicit-only sessions still support rotation with call-ID deduplication.
+        source_states = ledger.source_states(runtime, path)
+        current_generation = {tuple(source_identity)}
+        fallback_sessions = {str(call['session_id']) for call in calls if call.get('session_origin') == 'fallback'}
+        for sid in {str(call['session_id']) for call in calls}:
+            state = source_states.get(sid)
+            if not state:
+                continue  # no target coverage to inherit; a rotated target can be billed in full
+            fallback_origin = sid in fallback_sessions or 'fallback' in state.get('session_origins', set())
+            rotated_target = any(bound['to_session_id'] == sid and bound['source_identity'] != source_identity
+                                 for bound in promotions.values())
+            if ((fallback_origin or rotated_target)
+                    and state.get('source_identities', set()) != current_generation):
+                # A binding can predate a fully billed replacement. Only rows wholly
+                # from that replacement permit its retries; mixed/missing generations
+                # cannot establish which same-session calls were actually paid.
+                raise SourceConflict(f'{path}: session {sid}: ambiguous source generation for a live fallback or promoted identity; '
+                                     'reconcile source identities before retrying; nothing was written.')
     # Missing/old checkpoints are not permission to alias explicit logical sessions.
     # Rebuild eligibility from source-scoped authoritative rows. Unknown legacy origins
     # remain candidates only so an overlapping identity is rejected, never guessed paid/new.
@@ -369,16 +397,49 @@ def _reconcile_source_calls(calls: list[dict[str, Any]], *, runtime: str, path: 
     if alias_targets is None:
         source_states = ledger.source_states(runtime, path)
         fallback = set()
+        explicit_history = any('explicit' in state.get('session_origins', set()) for state in source_states.values())
         for sid in (set(source_states) | {sid for sid, _ in history}) - live:
             origins = source_states.get(sid, {}).get('session_origins', set())
             if origins == {'fallback'}:
                 fallback.add(sid)
+                if sid not in promotions and (explicit_history or source_states[sid].get('legacy_promotions')):
+                    # An older writer may already have consumed this fallback in a
+                    # promotion, even one with zero new metrics. Without a protocol
+                    # marker or binding, origins cannot name its target; do not guess.
+                    unknown_origins.add(sid)
             elif origins != {'explicit'}:
                 unknown_origins.add(sid)
         alias_targets = {sid: set(unknown_origins) for sid in live}
         for call in calls:
             if call.get('session_origin') == 'explicit':
                 alias_targets[str(call['session_id'])].update(fallback)
+    # Durable bindings constrain even a stale checkpoint's proposed aliases. A paid
+    # fallback can belong to only one explicit logical session, never its successor.
+    for target, ids in alias_targets.items():
+        ids.difference_update(sid for sid, bound in promotions.items() if bound['to_session_id'] != target)
+        ids.update(sid for sid, bound in promotions.items() if bound['to_session_id'] == target and sid not in live)
+    unknown_origins.difference_update(promotions)
+    eligible = {sid for ids in alias_targets.values() for sid in ids}
+    unknown_generations: set[str] = set()
+    for sid in eligible:
+        binding = promotions.get(sid)
+        if binding is not None and binding['source_identity'] != source_identity:
+            same_generation = False
+        elif checkpoint_identity is not None and any(old_sid == sid for old_sid, _ in history):
+            same_generation = checkpoint_identity == source_identity
+        else:
+            # Native IDs and equal usage can recur at the same path on a new inode.
+            # All source-scoped rows must establish continuity; missing/mixed legacy
+            # generations cannot be filled in from a different row or a binding.
+            generations = ledger.source_states(runtime, path).get(sid, {}).get('source_identities', set())
+            current = tuple(source_identity)
+            same_generation = generations == {current}
+            if not same_generation and (not generations or None in generations or current in generations):
+                unknown_generations.add(sid)
+                continue
+        if not same_generation:
+            for ids in alias_targets.values():
+                ids.discard(sid)
     eligible = {sid for ids in alias_targets.values() for sid in ids}
     candidates: dict[str, set[str]] = {}
     evidence = []
@@ -409,6 +470,9 @@ def _reconcile_source_calls(calls: list[dict[str, Any]], *, runtime: str, path: 
         if unknown_origins.intersection(matches):
             raise SourceConflict(f'{path}: ambiguous session provenance in source history after session ID drift; '
                                  'restore provenance or reconcile the legacy rows before retrying; nothing was written.')
+        if unknown_generations.intersection(matches):
+            raise SourceConflict(f'{path}: ambiguous source generation after session ID drift; restore a matching '
+                                 'checkpoint or reconcile metric source identities before retrying; nothing was written.')
         # Historical hashes do not distinguish HT's numeric positional fallback from an
         # explicit numeric ID. Neither can safely establish cross-session identity.
         positional = runtime == HUMAIN_TERMINAL and call['native_id'].isdecimal()
@@ -416,6 +480,8 @@ def _reconcile_source_calls(calls: list[dict[str, Any]], *, runtime: str, path: 
             raise SourceConflict(f'{path}: ambiguous source-native call identity after session ID drift; '
                                  'restore unambiguous source history before retrying; nothing was written.')
         sid, call_id = next(iter(matches.items()))
+        if any(sid in ids and other != target for other, ids in aliases.items()):
+            raise SourceConflict(f'{path}: ambiguous session promotion to multiple explicit sessions; nothing was written.')
         # Retain the original session-qualified identity for old calls only. New calls keep
         # the session the reader found; no tokens move between recorded session buckets.
         call['session_id'] = sid
@@ -455,10 +521,12 @@ def _tally(summary: dict[str, Any], record: dict[str, Any]) -> None:
         summary['zero_usage'] = summary.get('zero_usage', 0) + (int(record.get('covers_calls') or 1))
 
 
-def _base_metric(call: dict[str, Any], *, runtime: str, path: Path, repository: str | None) -> dict[str, Any]:
+def _base_metric(call: dict[str, Any], *, runtime: str, path: Path, repository: str | None,
+                 source_identity: list[int]) -> dict[str, Any]:
     metric = {k: v for k, v in call.items() if k != 'native_id' and not k.startswith('_') and v is not None}
     metric.update({'event': 'model_call', 'agent_runtime': runtime, 'role': 'interactive_session',
-                   'source': 'session_ingest', 'ingest_source': str(path)})
+                   'source': 'session_ingest', 'ingest_source': str(path), 'promotion_version': ckpt.PROMOTION_VERSION,
+                   'source_identity': source_identity})
     # Precedence: explicit override, then the repository the log itself recorded, then
     # EventStore's env-based attribution. Never the ingesting process's cwd, which is wherever
     # the CLI happened to run and has nothing to do with where the work was done.
@@ -707,9 +775,15 @@ def _ingest_open_source(source: BinaryIO, path: Path, root: Path, *, checkpoint:
         for sid in live:
             if reader_state['session_provenance'].get(sid) == 'explicit' and sid not in provenance:
                 alias_targets[sid].update(fallback)
+    try:
+        promotions = ledger.source_promotions(resolved, path) if calls else {}
+    except ValueError as error:
+        raise SourceConflict(str(error)) from error
     drift_paid, matched_aliases = _reconcile_source_calls(calls, runtime=resolved, path=path, live=live,
                                                          history=history, ledger=ledger, resumable=resumable,
-                                                         alias_targets=alias_targets)
+                                                         promotions=promotions, alias_targets=alias_targets,
+                                                         source_identity=opened['identity'],
+                                                         checkpoint_identity=known['identity'] if known else None)
     for sid, ids in matched_aliases.items():
         aliases.setdefault(sid, set()).update(ids)
     observed_after = _observe(history, calls, runtime=resolved)
@@ -743,7 +817,8 @@ def _ingest_open_source(source: BinaryIO, path: Path, root: Path, *, checkpoint:
             summary['duplicates'] = 1
         metrics = []
         for row in rows:
-            metric = _base_metric(row, runtime=resolved, path=path, repository=repository)
+            metric = _base_metric(row, runtime=resolved, path=path, repository=repository,
+                                  source_identity=opened['identity'])
             metric.update({'granularity': SESSION, 'covers_calls': int(row['calls']),
                            'call_id': call_id_for(resolved, str(row['session_id']), row['native_id'])})
             metric.pop('calls', None)
@@ -761,24 +836,33 @@ def _ingest_open_source(source: BinaryIO, path: Path, root: Path, *, checkpoint:
             session_id = str(call['session_id'])
             # A usage block of all zeros is a measurement gap, not free work.
             call_id = call_id_for(resolved, session_id, call['native_id'])
-            metric = _base_metric(call, runtime=resolved, path=path, repository=repository)
+            metric = _base_metric(call, runtime=resolved, path=path, repository=repository,
+                                  source_identity=opened['identity'])
             metric.update({'call_id': call_id, 'granularity': CALL})
             metrics.append(metric)
     if previous_granularity not in (None, granularity) or reconciled:
         summary['granularity_transition'] = {'from': previous_granularity, 'to': granularity, 'offset': offset,
                                              'reconciled_calls': reconciled}
 
-    records = [{'stream': 'metric', 'record_id': metric['call_id'], **metric} for metric in metrics]
+    # Commit the binding first, under the same writer lock, before any metric chunks.
+    # A crash may leave just the event: retry reuses that proof and bills missing calls.
+    records = [ckpt.promotion_record(resolved, path, opened['identity'], sid, target)
+               for target, ids in sorted(matched_aliases.items()) for sid in sorted(ids) if sid not in promotions]
+    records.extend({'stream': 'metric', 'record_id': metric['call_id'], **metric} for metric in metrics)
     if dry_run:
         built = [build_record(record) for record in records]
         ledger.stage(built)  # the rest of this sweep previews against what this file would have written
-        for record in built:
+        for spec, record in zip(records, built):
+            if spec['stream'] != 'metric':
+                continue
             summary['emitted'] += 1
             _tally(summary, record)
         return summary, {}
     for chunk in _chunks(records, MAX_BATCH_RECORDS):
         result = write_batch(root, chunk, refresh=False, lock=False)
         for status, record in zip(result['statuses'], result['records']):
+            if status['stream'] != 'metric':
+                continue
             if status['status'] == 'persisted':
                 summary['emitted'] += 1
                 _tally(summary, record)

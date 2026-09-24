@@ -5,7 +5,7 @@ from typing import Any
 import hashlib
 
 from .history import bucket_complexity
-from .scheduler import DEFAULT_PACKAGES, EFFORTS, recommend_package, topology_for, package_history
+from .scheduler import DEFAULT_PACKAGES, EFFORTS, recommend_package, topology_for, package_history, measured
 
 
 def _unit_interval(seed: str) -> float:
@@ -69,10 +69,11 @@ def route_evidence(stats: list[dict[str, Any]], *, task_class: str, complexity: 
     """Evidence behind a package recommendation, counted in verified tasks and runs, not metric rows.
 
     Legacy stats that predate the split fields carry no `verified_tasks`; they count as zero
-    evidence so the gate stays conservative rather than trusting a row count.
+    evidence so the gate stays conservative rather than trusting a row count. `records.NO_DATA` in
+    any of these fields is likewise zero evidence (`scheduler.measured`), never a number.
     """
     hist = package_history(stats, task_class=task_class, complexity=complexity, risk=risk, package=package) or {}
-    return {key: int(hist.get(key) or 0) for key in ('verified_tasks', 'run_samples', 'call_samples')}
+    return {key: int(measured(hist.get(key)) or 0) for key in ('verified_tasks', 'run_samples', 'call_samples')}
 
 
 def configured_min_samples(features: dict[str, Any], default: int = 12) -> int:
@@ -104,15 +105,17 @@ def recommend_topology(*, task_class: str, complexity: float, risk: str, couplin
     candidates=[]
     skipped_missing=0
     for s in comparable:
-        quality=s.get('avg_quality_evidence')
-        cost=s.get('verified_cost_usd')
+        # `measured` folds `records.NO_DATA` into None: an unmeasured quality score or verified cost is
+        # a gap in the history, not a value to compare against the floor (which raised TypeError).
+        quality=measured(s.get('avg_quality_evidence'))
+        cost=measured(s.get('verified_cost_usd'))
         if quality is None or cost is None:
             skipped_missing+=1
             continue
-        verified_tasks=int(s.get('verified_tasks') or 0)
+        verified_tasks=int(measured(s.get('verified_tasks')) or 0)
         candidates.append({
-            'shape':s.get('topology_shape'), 'samples':s.get('samples',0), 'verified_tasks':verified_tasks,
-            'run_samples':int(s.get('run_samples') or 0), 'verified_cost_usd':cost,
+            'shape':s.get('topology_shape'), 'samples':measured(s.get('samples')) or 0, 'verified_tasks':verified_tasks,
+            'run_samples':int(measured(s.get('run_samples')) or 0), 'verified_cost_usd':cost,
             'quality_evidence':quality, 'meets_quality_floor':quality >= quality_floor,
             'sufficient':verified_tasks >= min_samples, 'feasible':quality >= quality_floor and verified_tasks >= min_samples,
             'depth':s.get('topology_depth'), 'workers':s.get('topology_workers'), 'leads':s.get('topology_leads'),

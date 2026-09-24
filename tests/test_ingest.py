@@ -365,10 +365,13 @@ class IncrementalContractTests(unittest.TestCase):
                 ingest_file(log, state_root=root)
             rows = load_jsonl(root / 'metrics.jsonl')
             self.assertEqual([r['record_id'] for r in rows], [r['call_id'] for r in rows])
+            identity = [log.stat().st_dev, log.stat().st_ino]
+            self.assertTrue(all(row.get('source_identity') == identity for row in rows))
             with self._env(root):
                 ingest_file(log, state_root=Path(d, 'other'), granularity='session')
             aggregate = load_jsonl(Path(d, 'other', 'metrics.jsonl'))[0]
             self.assertEqual(aggregate['record_id'], aggregate['call_id'])
+            self.assertEqual(aggregate.get('source_identity'), identity)
 
 
 class RepositoryDecodingTests(unittest.TestCase):
@@ -530,17 +533,15 @@ class DedupeHardeningTests(unittest.TestCase):
                 rows = load_jsonl(root / 'metrics.jsonl')
                 for row in rows:
                     row.pop('covered_call_ids', None)
+                    row.pop('session_origin', None)  # legacy rows predate durable provenance too
                 metrics = root / 'metrics.jsonl'
                 metrics.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
                 checkpoint_path(root, log).unlink()
                 log.write_text(log.read_text().replace('sess-1', 'sess-2'), encoding='utf-8')
                 before = metrics.read_bytes()
-                second = ingest_file(log, state_root=root, granularity=SESSION)
-                self.assertEqual(second['emitted'], 1, 'an explicit replacement session has its own usage identity')
-                final_rows = load_jsonl(metrics)
-                self.assertEqual(sum(row['input_tokens'] for row in final_rows if row['session_id'] == 'sess-1'), 1002)
-                self.assertEqual(sum(row['input_tokens'] for row in final_rows if row['session_id'] == 'sess-2'), 1002)
-                self.assertNotEqual(metrics.read_bytes(), before)
+                with self.assertRaises(SourceConflict):
+                    ingest_file(log, state_root=root, granularity=SESSION)
+                self.assertEqual(metrics.read_bytes(), before)
 
     def test_drift_rejects_reused_native_id_with_changed_usage(self):
         from orchestrator.ingest import SourceConflict

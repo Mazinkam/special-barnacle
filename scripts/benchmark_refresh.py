@@ -522,7 +522,6 @@ def assert_equivalent_roots(before: Path, after: Path) -> dict:
 
 def compare_legacy(source: Path, scale: int, args: argparse.Namespace) -> dict:
     """Same input and records, old per-record CLI versus final batch; alternating trial order."""
-    from orchestrator.records import to_json as records_to_json
     from orchestrator.economics import cost_attribution
     from orchestrator.run_evidence import evidence_coverage, summarize_runs
     from orchestrator.runtime import iter_jsonl
@@ -559,8 +558,8 @@ def compare_legacy(source: Path, scale: int, args: argparse.Namespace) -> dict:
             return {'subprocesses':len(trials[0]),'median_s':round(seconds,4),
                     'median_peak_rss_mib':round(statistics.median(max(rss_mib(r.ru_maxrss) for r in group) for group in trials),1),
                     'records_per_s':round(args.batch_size/seconds,2),'io':io_summary(trials)}
-        return {'scale':f'{scale}x','fixture_sha256':hashes,'fixture_bytes':sizes,'input_evidence':records_to_json(evidence),
-                'input_billing_including_sessions':records_to_json(billing),'equivalence':equivalence,
+        return {'scale':f'{scale}x','fixture_sha256':hashes,'fixture_bytes':sizes,'input_evidence':evidence,
+                'input_billing_including_sessions':billing,'equivalence':equivalence,
                 'before':summary(groups['before']),'after':summary(groups['after']),
                 'cold':{side:summary([runs]) for side,runs in cold.items()}}
 
@@ -581,6 +580,7 @@ def _io_cells(io: dict) -> str:
 
 def main() -> None:
     from tests.test_dashboard_refresh import write_synthetic_history  # lazy: children and tests must not pay for it
+    from orchestrator.records import json_default  # `records.NO_DATA` (e.g. billing coverage of an empty fixture) -> null, never 0
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--runs', type=int, default=500, help='synthetic runs at 1x (~12 events, ~12 metrics, ~5 outcomes each)')
@@ -612,7 +612,7 @@ def main() -> None:
         print(json.dumps({'meta':{'before':str(args.compare_legacy),'after':str(args.checkout),'repeat':args.repeat,
                                  'python':sys.version.split()[0],'platform':sys.platform,'order':'alternating; cold excluded',
                                  'scope':'copied fixture; old per-record vs final batch; no model spend or causal savings claim'},
-                          'results':results},indent=2))
+                          'results':results},indent=2,default=json_default))
         return
     results = []
     with tempfile.TemporaryDirectory(prefix='orchestrator-bench-') as tmp:
@@ -628,7 +628,7 @@ def main() -> None:
             'fixture': 'copy of ' + str(args.source) if args.source else f'synthetic runs={args.runs} seed={args.seed}',
             'io': {'logical': LOGICAL_SOURCE, 'physical': next((r['batch']['io']['physical']['source'] for r in results if r['batch']['io']['physical']), None)}}
     if args.json:
-        print(json.dumps({'meta': meta, 'results': results}, indent=2)); return
+        print(json.dumps({'meta': meta, 'results': results}, indent=2, default=json_default)); return
     print(f"# refresh benchmark — {meta['fixture']} — python {meta['python']} {meta['platform']} — repeat={args.repeat} batch={args.batch_size}")
     print(f"# checkout: {meta['checkout']}; use --json for input hashes and billing/duration/verification coverage")
     print(f"# logical bytes: {meta['io']['logical']}; physical bytes: {meta['io']['physical'] or 'unavailable on this platform'}")

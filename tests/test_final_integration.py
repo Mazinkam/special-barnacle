@@ -127,7 +127,7 @@ def test_ingest_retry_refreshes_after_durable_append_and_settles_events(tmp_path
     program = '''
 import os, sys
 from orchestrator import cli
-cli.refresh = lambda *_args, **_kwargs: os._exit(19)
+cli.refresh = lambda root: os._exit(19)  # production `process_ingest` calls `refresh(root)`
 sys.argv = ['cli', 'ingest', sys.argv[1], '--runtime', 'humain-terminal']
 cli.main()
 '''
@@ -204,3 +204,38 @@ def test_engine_history_fallback_threshold_and_emitted_counts(tmp_path, monkeypa
     assert row['run_samples'] == 0
     assert row['call_samples'] == 0
     assert row['min_samples'] == 23
+
+
+def test_bounded_ingest_error_keeps_head_and_actionable_tail():
+    from orchestrator.cli import INGEST_ERROR_LIMIT, _bound_error, make_ingest_status
+    short = 'ValueError: unreadable log'
+    assert _bound_error(short) == short
+    remedy = 'Switching to --granularity session cannot establish identity; nothing was written.'
+    long = 'GranularityConflict: /var/tmp/x/session.jsonl: ingestion cannot identify the recorded calls — ' + 'z' * 400 + ' ' + remedy
+    bounded = _bound_error(long)
+    assert len(bounded) == INGEST_ERROR_LIMIT == 240
+    assert bounded.startswith('GranularityConflict: /var/tmp/x/session.jsonl')
+    assert bounded.endswith(remedy) and ' ... ' in bounded
+    # The status file uses the same bound, and redaction happens before the cut so no partial path leaks.
+    status = make_ingest_status({}, {'failures': [{'error': long.replace('/var/tmp/x', '/Users/alice/p')}], 'files_scanned': 1, 'emitted': 0})
+    assert len(status['error']) == 240 and '--granularity session' in status['error']
+    assert '/Users/alice' not in status['error'] and '<path>' in status['error']
+
+
+def test_ingest_conflict_stderr_is_bounded_and_keeps_granularity_hint(tmp_path):
+    from orchestrator.runtime import EventStore
+    from tests.test_ingest_checkpoint import aggregate_row, ht_session
+    root = tmp_path/'state'; root.mkdir()
+    # A long directory name guarantees the redacted message exceeds the stderr bound.
+    logs = tmp_path/('very-long-session-directory-name-'*4); logs.mkdir()
+    log = ht_session(logs/'session.jsonl', 3)
+    ok = run_cli(root, 'ingest', str(log), '--runtime', 'humain-terminal', '--granularity', 'session', '--quiet')
+    assert ok.returncode == 0, ok.stderr
+    EventStore(root).metric(**aggregate_row('sess-1', covers=1, input_tokens=123))  # no prefix of the log sums to this
+    conflict = run_cli(root, 'ingest', str(log), '--runtime', 'humain-terminal', '--granularity', 'call', '--quiet')
+    assert conflict.returncode != 0
+    lines = conflict.stderr.strip().splitlines()
+    assert len(lines) == 1 and len(lines[0]) == 240, conflict.stderr
+    assert lines[0].startswith('1 file(s) failed; first: GranularityConflict:')
+    assert '--granularity session' in lines[0]
+    assert json.loads(conflict.stdout)['failures'][0]['error'].endswith('nothing was written.')

@@ -192,6 +192,124 @@ class VerificationAndReworkTests(unittest.TestCase):
         self.assertEqual(r['overhead_by_role'],{'lead':.5,'qa_agent':.2})
 
 
+class OutcomeJoinTests(unittest.TestCase):
+    """Ordinary `(run_id, task_id)` outcomes are attested verdicts and must join the run's attempt timeline.
+
+    The shared resolver (`records.resolve_task_verification`, used by the dashboard) and `history`
+    both read an outcomes-stream `outcome: 'fail'` for a task as that task failing. Run evidence
+    reading only the metrics-side `task_verified` row and reporting the run `passed` was the one
+    place the three disagreed.
+    """
+    T0='2026-09-23T10:00:00+00:00'; T1='2026-09-23T10:05:00+00:00'; T2='2026-09-23T10:10:00+00:00'
+
+    def test_outcome_fail_after_metrics_verified_fails_the_run(self):
+        metrics=[call('R','T',cost_usd=.1,cost_source='reported',ts=self.T0),
+                 {'event':'task_verified','run_id':'R','task_id':'T','ts':self.T1}]
+        outcomes=[{'run_id':'R','task_id':'T','outcome':'fail','ts':self.T2}]
+        r=by_run(summarize_runs(metrics,[],outcomes))['R']
+        self.assertEqual(r['verification'],'failed')
+        self.assertEqual(r['verified_tasks'],0)
+        self.assertEqual(r['verification_rows'],2)
+
+    def test_outcome_joins_by_run_and_task_not_task_alone(self):
+        # The same task id failing in another run says nothing about this run.
+        metrics=[call('R','T',cost_usd=.1,cost_source='reported',ts=self.T0),
+                 {'event':'task_verified','run_id':'R','task_id':'T','ts':self.T1}]
+        outcomes=[{'run_id':'other','task_id':'T','outcome':'fail','ts':self.T2}]
+        runs=by_run(summarize_runs(metrics,[],outcomes))
+        self.assertEqual(runs['R']['verification'],'passed')
+        self.assertEqual(runs['R']['verified_tasks'],1)
+        self.assertEqual(runs['other']['verification'],'failed')
+        # Nor does a failure on a different task of this run get pinned on T; it fails the run on its own.
+        outcomes=[{'run_id':'R','task_id':'U','outcome':'fail','ts':self.T2}]
+        r=by_run(summarize_runs(metrics,[],outcomes))['R']
+        self.assertEqual(r['verification'],'failed')
+        self.assertEqual(r['verified_tasks'],1)
+
+    def test_latest_attested_verdict_wins_across_streams(self):
+        # A later attested pass (a retry that verified) supersedes an earlier attested failure...
+        metrics=[call('R','T',cost_usd=.1,cost_source='reported',ts=self.T0),
+                 {'event':'task_verified','run_id':'R','task_id':'T','ts':self.T2}]
+        outcomes=[{'run_id':'R','task_id':'T','outcome':'fail','ts':self.T1}]
+        r=by_run(summarize_runs(metrics,[],outcomes))['R']
+        self.assertEqual(r['verification'],'passed')
+        self.assertEqual(r['verified_tasks'],1)
+        # ...regardless of which stream carried which verdict.
+        metrics=[call('R','T',cost_usd=.1,cost_source='reported',ts=self.T0),
+                 {'event':'task_verified','run_id':'R','task_id':'T','result':'fail','ts':self.T1}]
+        outcomes=[{'run_id':'R','task_id':'T','outcome':'verified','ts':self.T2}]
+        r=by_run(summarize_runs(metrics,[],outcomes))['R']
+        self.assertEqual(r['verification'],'passed')
+        self.assertEqual(r['verified_tasks'],1)
+
+    def test_same_instant_contradiction_fails_conservatively(self):
+        metrics=[{'event':'task_verified','run_id':'R','task_id':'T','ts':self.T1}]
+        outcomes=[{'run_id':'R','task_id':'T','outcome':'fail','ts':self.T1}]
+        r=by_run(summarize_runs(metrics,[],outcomes))['R']
+        self.assertEqual(r['verification'],'failed')
+        self.assertEqual(r['verified_tasks'],0)
+        # Stream order must not decide a tie: two same-instant rows resolve the same way in either order.
+        pair=[{'event':'task_verified','run_id':'R','task_id':'T','ts':self.T1},
+              {'event':'task_verified','run_id':'R','task_id':'T','result':'fail','ts':self.T1}]
+        self.assertEqual(by_run(summarize_runs(pair,[],[]))['R']['verification'],'failed')
+        self.assertEqual(by_run(summarize_runs(pair[::-1],[],[]))['R']['verification'],'failed')
+        pair=[{'run_id':'R','task_id':'T','outcome':'verified','ts':self.T1},{'run_id':'R','task_id':'T','outcome':'fail','ts':self.T1}]
+        self.assertEqual(by_run(summarize_runs([],[],pair))['R']['verification'],'failed')
+        self.assertEqual(by_run(summarize_runs([],[],pair[::-1]))['R']['verification'],'failed')
+
+    def test_missing_timestamps_never_upgrade_a_verdict(self):
+        # Undated legacy rows cannot establish that a pass came after a failure: they sort before every
+        # dated row and, among themselves, the failure wins whatever the stream order.
+        undated_pass={'event':'task_verified','run_id':'R','task_id':'T'}
+        undated_fail={'run_id':'R','task_id':'T','outcome':'fail'}
+        self.assertEqual(by_run(summarize_runs([undated_pass],[],[undated_fail]))['R']['verification'],'failed')
+        self.assertEqual(by_run(summarize_runs([{**undated_fail,'event':'task_failed'}],[],[{'run_id':'R','task_id':'T','outcome':'verified'}]))['R']['verification'],'failed')
+        # A dated verdict supersedes an undated one in either direction.
+        dated_fail={'run_id':'R','task_id':'T','outcome':'fail','ts':self.T1}
+        dated_pass={'run_id':'R','task_id':'T','outcome':'verified','ts':self.T1}
+        self.assertEqual(by_run(summarize_runs([undated_pass],[],[dated_fail]))['R']['verification'],'failed')
+        self.assertEqual(by_run(summarize_runs([],[],[undated_fail,dated_pass]))['R']['verification'],'passed')
+        # Garbage timestamps are treated as missing, not raised.
+        self.assertEqual(by_run(summarize_runs([{**undated_pass,'ts':'not-a-time'}],[],[{**undated_fail,'ts':None}]))['R']['verification'],'failed')
+
+    def test_run_scoped_qa_outcome_is_a_run_verdict_not_a_task_verification(self):
+        # The bridge's `${run}-qa` gate row and the terminal summary carry `verification_scope: 'run'`;
+        # they decide the run verdict once and never appear as a verified/failed *task*.
+        metrics=[call('R','T',cost_usd=.1,cost_source='reported',ts=self.T0),
+                 {'event':'task_verified','run_id':'R','task_id':'T','ts':self.T1}]
+        outcomes=[{'run_id':'R','task_id':'R-qa','outcome':'verified','verification_scope':'run','ts':self.T2},
+                  {'run_id':'R','task_id':'run-complete','outcome':'verified','verification_scope':'run','ts':self.T2,
+                   'note':json.dumps({'verification_passed':True})}]
+        r=by_run(summarize_runs(metrics,[],outcomes))['R']
+        self.assertEqual(r['verification'],'passed')
+        self.assertEqual(r['verified_tasks'],1)
+        self.assertEqual(r['verification_rows'],1)
+        # A legacy `-qa` row without the scope marker is still the run gate, not a second task.
+        outcomes=[{'run_id':'R','task_id':'R-qa','outcome':'verified','ts':self.T2}]
+        r=by_run(summarize_runs(metrics,[],outcomes))['R']
+        self.assertEqual(r['verification'],'passed')
+        self.assertEqual(r['verified_tasks'],1)
+        self.assertEqual(r['verification_rows'],1)
+        # And a failing run gate fails the run even when every task verified.
+        outcomes=[{'run_id':'R','task_id':'R-qa','outcome':'fail','verification_scope':'run','ts':self.T2}]
+        r=by_run(summarize_runs(metrics,[],outcomes))['R']
+        self.assertEqual(r['verification'],'failed')
+        self.assertEqual(r['verified_tasks'],1)
+
+    def test_joined_outcomes_add_no_cost_rows(self):
+        metrics=[call('R','T',cost_usd=.1,cost_source='reported',input_tokens=10,output_tokens=5,duration_ms=100,ts=self.T0)]
+        before=by_run(summarize_runs(metrics,[],[]))['R']
+        outcomes=[{'run_id':'R','task_id':'T','outcome':'fail','cost_usd':9.0,'input_tokens':999,'duration_ms':999,'ts':self.T1},
+                  {'run_id':'R','task_id':'U','outcome':'verified','ts':self.T1}]
+        after=by_run(summarize_runs(metrics,[],outcomes))['R']
+        for k in ('call_rows','metered_calls','unmetered_calls','cost_known_usd','cost_reported_usd','input_tokens','output_tokens',
+                  'dispatch_duration_ms_total','duration_missing_calls','tasks','roles','overhead_cost_usd','implementation_cost_usd'):
+            self.assertEqual(after[k],before[k],k)
+        self.assertEqual(after['verification'],'failed')
+        self.assertEqual(after['verified_tasks'],1)
+        self.assertEqual(after['verification_rows'],2)
+
+
 class CounterfactualTests(unittest.TestCase):
     def test_flat_baseline_is_labelled_counterfactual_and_never_claims_savings_without_coverage(self):
         metrics=[

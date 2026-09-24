@@ -159,6 +159,10 @@ def test_legacy_benchmark_compares_equivalent_copied_workloads(tmp_path):
         assert row['before']['subprocesses']==5
         assert row['after']['subprocesses']==1
         assert row['before']['median_s'] > 0 and row['after']['median_s'] > 0
+        # Empty fixture: no row is accountable for cost, so coverage is NO_DATA on the wire as `null`,
+        # never a fabricated `0`; the measured call count stays a real 0.
+        assert row['input_billing_including_sessions']['coverage'] is None
+        assert row['input_billing_including_sessions']['call_rows'] == 0
     assert not (tmp_path/'must-not-exist').exists()
     assert all(p.read_bytes()==b'' for p in source.iterdir())
 
