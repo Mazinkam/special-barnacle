@@ -88,6 +88,7 @@ import {
 	type Tier,
 	TIER_CAPABILITIES,
 	tierIndex,
+	tierOf,
 	tierOfModel,
 	TIERS,
 	tiersToBindings,
@@ -1667,8 +1668,6 @@ export async function runSubagentProcess(opts: {
 				costReported = (usage.turns === 1 || costReported) && cost !== undefined;
 				usage.cost += cost ?? 0;
 				usage.contextTokens = msg.usage.totalTokens || usage.contextTokens;
-				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", usage.cost) ?? "ok";
-				if (verdict !== "ok") handleSpendCap(verdict);
 			}
 			if (msg.stopReason) stopReason = msg.stopReason;
 			if (Array.isArray(msg.content)) {
@@ -1680,6 +1679,14 @@ export async function runSubagentProcess(opts: {
 				if (text) assistantTexts.push(text);
 			} else if (typeof msg.content === "string" && msg.content.trim()) {
 				assistantTexts.push(msg.content.trim());
+			}
+			// Spend cap is checked AFTER the message text is kept, so an enforced
+			// stop never discards the turn that crossed the cap. A final turn
+			// (stopReason "stop") is only warned about: killing it would throw away
+			// a finished report to save nothing.
+			if (msg.usage) {
+				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", usage.cost) ?? "ok";
+				if (verdict !== "ok") handleSpendCap(verdict === "stop" && msg.stopReason === "stop" ? "warn" : verdict);
 			}
 		};
 
@@ -2330,6 +2337,8 @@ export interface DispatchResult {
 	timeoutReason?: "inactivity" | "absolute";
 	interruption?: InterruptionReport;
 	filesChanged: string[];
+	/** HT thinking level the dispatch ran at (from the binding), when one was set. */
+	effort?: string;
 }
 
 export async function dispatchParallel(
@@ -2431,9 +2440,12 @@ export async function dispatchParallel(
 			// openai-codex model is retried ONCE on the same model id under
 			// amazon-bedrock. Both attempts are billed (usage summed).
 			const table = deps.aliasTable === undefined ? CURRENT_ALIAS_TABLE : deps.aliasTable;
-			const twin = r.exitCode !== 0 && table && isQuotaError(`${r.stderr}\n${r.finalText}`)
-				? bedrockFallbackFor(input.model, table)
-				: null;
+			// Only a genuine provider rejection qualifies: not a timeout, a user
+			// cancel, or a spend-cap stop (those would re-run finished work), and
+			// only when stderr (not the model's own prose) names the quota.
+			const eligible = r.exitCode !== 0 && r.outcome !== "timed_out" && r.outcome !== "cancelled" &&
+				r.stopReason !== "spend_cap" && !ACTIVE_RUN?.cancellation.isCancelled;
+			const twin = eligible && table && isQuotaError(r.stderr) ? bedrockFallbackFor(input.model, table) : null;
 			if (twin) {
 				deps.recordEvent("dispatch_finished", {
 					run_id: runId, task_id: input._taskId, capability: input._capability, model: r.model ?? input.model,
@@ -2491,6 +2503,7 @@ export async function dispatchParallel(
 				// parseFilesChanged scrapes the child's prose, so a read-only reviewer
 				// or QA agent would "report" every path it merely mentioned.
 				filesChanged: r.personaCanMutate ? parseFilesChanged(r.stdout) : [],
+				...(input.effort ? { effort: input.effort } : {}),
 			};
 		} catch (err) {
 			return {
@@ -2523,7 +2536,9 @@ export async function dispatchParallel(
 // Review capabilities intentionally collapse onto the reviewer personas so the
 // read-only tool allow-list in their frontmatter keeps applying.
 const CAPABILITY_AGENT_ALIASES: Record<string, string> = {
-	lead: "orchestrator-lead",
+	// Every lead size (lead_small / lead / lead_large) runs the same
+	// orchestrator-lead persona: no write/edit tools, delegation rule, STATUS line.
+	...Object.fromEntries(Object.values(METHOD.rules.lead_sizing.sizes).map((cap) => [cap, "orchestrator-lead"])),
 	analysis_mid: "orch-technical-lead",
 	analysis_strong: "orch-architect",
 	integration_review: "orch-technical-review",
@@ -2532,7 +2547,7 @@ const CAPABILITY_AGENT_ALIASES: Record<string, string> = {
 	api_contract_review: "orch-technical-review",
 };
 
-function agentNameFor(capability: string): string {
+export function agentNameFor(capability: string): string {
 	return CAPABILITY_AGENT_ALIASES[capability] ?? `orch-${capability.replace(/_/g, "-")}`;
 }
 
@@ -2840,21 +2855,28 @@ function cheapestAtTier(adapter: Adapter, tier: string, preferredCapability: str
 	// security_review which the dynamic adapter tends to map to the premium
 	// tier. Without the fallback, "mid -> premium" escalation has nothing to
 	// escalate to because every review-capability sits at the same tier.
+	// Within a tier, general-purpose capabilities come before specialised ones
+	// (security_review is often overridden to a different vendor on purpose).
 	const candidates = [
 		preferredCapability,
 		"implementation_strong",
 		"technical_review",
-		"security_review",
 		"analysis_mid",
 		"analysis_strong",
 		"architect",
+		"lead",
+		"security_review",
 		"lead_large",
 		"worker",
 	];
-	for (const cap of candidates) {
+	// Pick from capabilities that BELONG to the target tier (method.json), not
+	// from any model that happens to be bound somewhere at that tier: a profile
+	// override (e.g. oss binding `lead` to a mid model) must not turn that model
+	// into the "premium" escalation target.
+	for (const cap of [...candidates, ...TIER_CAPABILITIES[tier as Tier] ?? []]) {
+		if (tierOf(cap) !== tier) continue;
 		const binding = adapter[cap];
-		if (!binding || !binding.model) continue;
-		if (tierOfModel(binding.model, adapter) === tier) return binding.model;
+		if (binding?.model) return binding.model;
 	}
 	return null;
 }
@@ -2954,7 +2976,7 @@ export function dispatchRecordsFor(
 		agent_runtime: "humain-terminal",
 		provider,
 		model,
-		effort: "standard",
+		effort: result?.effort ?? "standard",
 		verification_depth: "targeted",
 		// HT input excludes cache reads; the telemetry/pricing contract includes them.
 		input_tokens: (usage.input ?? 0) + (usage.cacheRead ?? 0),
@@ -2983,7 +3005,7 @@ export function dispatchRecordsFor(
 		risk: opts.risk,
 		capability_class: result?.capability ?? "unknown",
 		executed_model: model,
-		executed_effort: "standard",
+		executed_effort: result?.effort ?? "standard",
 		executed_verification_depth: "targeted",
 		...(hasReportedCost ? { executed_cost_usd: result.costUsd } : {}),
 		executed_input_tokens: (usage.input ?? 0) + (usage.cacheRead ?? 0),
@@ -3211,6 +3233,8 @@ async function dispatchHierarchical(
 ): Promise<{
 	leadResults: DispatchResult[];
 	workerResults: DispatchResult[];
+	/** Leads not started because a dependency failed or was blocked. */
+	skippedLeads: number;
 	/** The architect dispatch, when the topology called for one. Billed by the caller. */
 	architectResult?: DispatchResult;
 	/** Mutable sink the caller appends escalation dispatches to, so they get billed. */
@@ -3293,7 +3317,7 @@ export async function dispatchReconAndLeads(
 		setPhase: (phase: string) => void;
 		throwIfCancelled: () => void;
 	},
-): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[] }> {
+): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number }> {
 	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars = RECON_EVIDENCE_MAX_CHARS, leadCapability = "lead" } = input;
 	const requestedLeadCount = effectiveLeadCount(plan);
 
@@ -3394,7 +3418,9 @@ export async function dispatchReconAndLeads(
 	// fan-out a lead performs via HT's own subagent tool happens inside that
 	// lead's own context window; the bridge has no visibility into it and does
 	// not count it as part of this run's authoritative worker accounting.
-	return { leadResults, workerResults };
+	// Leads never started because a lead they depend on failed or was blocked.
+	const skippedLeads = [...stopped].filter((i) => !leadResults.some((r) => r.taskId === `${runId}-lead-${i}`)).length;
+	return { leadResults, workerResults, skippedLeads };
 }
 
 /**
@@ -4179,7 +4205,7 @@ export default function (pi: ExtensionAPI) {
 				const headBefore = gitHead(cwd);
 				// `workerResults` carries the parent-owned recon dispatches; they must stay
 				// destructured here or the run stops billing them (plan Task 3).
-				const { leadResults, workerResults, architectResult, escalationResults } = await dispatchHierarchical(
+				const { leadResults, workerResults, architectResult, escalationResults, skippedLeads } = await dispatchHierarchical(
 
 					cwd,
 					runId,
@@ -4250,9 +4276,10 @@ export default function (pi: ExtensionAPI) {
 					succeededLeads: leadResults.filter((r) => r.exitCode === 0).length,
 					leads: leadResults.length,
 				});
-				const externalFiles = runOutcome === "blocked"
-					? [...allFiles]
-					: externalChangeFiles(allFiles, leadResults.filter((r) => r.exitCode === 0).map((r) => r.stdout));
+				// Only when EVERY lead exited 0 and says it changed nothing: a lead that
+				// failed, timed out or hit the spend cap may have edited files it never
+				// got to report, and those must still be verified.
+				const externalFiles = runOutcome === "blocked" ? [...allFiles] : externalChangeFiles(allFiles, leadResults);
 				if (externalFiles.length > 0) {
 					session.log(
 						`${externalFiles.length} file(s) changed during the run but no lead reported changing them (likely a concurrent session); excluded from QA: ${externalFiles.join(", ")}`,
@@ -4324,6 +4351,8 @@ export default function (pi: ExtensionAPI) {
 								run_id: runId,
 								complexity: effectiveComplexity,
 								risk: effectiveRisk,
+								band_size: leadDecision.bandSize,
+								risk_floor_size: leadDecision.riskFloorSize,
 								size: escalatedSize,
 								capability: t.capability,
 								model: escalatedModel,
@@ -4363,7 +4392,7 @@ export default function (pi: ExtensionAPI) {
 					allFiles = changedSince(`escalation retry ${retries}`, thisRound, [
 						...leadResults,
 						...escalationResults.slice(0, roundStart),
-					]);
+					]).filter((f) => !externalFiles.includes(f));
 					if (allFiles.length === 0) {
 						// Nothing left to verify, but QA already failed this run. Re-running
 						// against an empty list would return `skipped: true` and record the
@@ -4458,7 +4487,7 @@ export default function (pi: ExtensionAPI) {
 				const summary = [
 					`Orchestration ${runOutcome === "blocked" ? "BLOCKED" : dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(Date.now() - Number(runId.split("-")[2]))}.`,
 					`run_id: ${runId}`,
-					`leads: ${succeededLeads}/${leadResults.length} ${runOutcome === "blocked" ? "blocked" : "succeeded"} · retries: ${retries} · files: ${allFiles.length} changed${externalFiles.length > 0 ? ` (+${externalFiles.length} changed by someone else, not verified)` : ""}`,
+					`leads: ${succeededLeads}/${leadResults.length} ${runOutcome === "blocked" ? "blocked" : "succeeded"}${skippedLeads > 0 ? ` (+${skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${retries} · files: ${allFiles.length} changed${externalFiles.length > 0 ? ` (+${externalFiles.length} changed by someone else, not verified)` : ""}`,
 					summarizeReconWorkers(workerResults),
 					`verification: ${verdict}`,
 					`total cost: $${totalCost.toFixed(4)} (${billedResults.length + (triageCost.usd > 0 ? 1 : 0)} dispatches)`,
@@ -4794,3 +4823,5 @@ export default function (pi: ExtensionAPI) {
 
 /** Test seam: planEscalation is internal; exported under a test-only name. */
 export const planEscalationForTest = planEscalation;
+/** Test seam: pickModel is internal; exported under a test-only name. */
+export const pickModelForTest = pickModel;

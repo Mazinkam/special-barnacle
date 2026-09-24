@@ -181,6 +181,9 @@ class RoleVocabularyTests(unittest.TestCase):
         self.assertIn('lead', coordination_roles())
         self.assertIn('technical_lead', coordination_roles())
         self.assertIn('architect', coordination_roles())
+        # Every triage lead size is coordination spend, not just `lead`.
+        self.assertIn('lead_small', coordination_roles())
+        self.assertIn('lead_large', coordination_roles())
 
     def test_review_is_verification_not_coordination(self):
         for role in ('technical_review', 'integration_review', 'security_review', 'qa_agent', 'qa',

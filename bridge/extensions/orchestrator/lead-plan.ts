@@ -16,7 +16,7 @@ export interface LeadAssignment {
 }
 
 const LINE_RE = /^[\s>*-]*\**\s*Lead\s+(\d+)\s*:?\**\s*:?\s*(.+?)\s*$/i;
-const DEPS_RE = /\(\s*depends\s+on\s*:\s*([^)]*)\)\s*$/i;
+const DEPS_RE = /\(\s*depends\s+on\s*:\s*([^)]*)\)/i;
 
 export function parseLeadAssignments(architectText: string, leadCount: number): LeadAssignment[] | null {
 	const section = /^##\s*Lead assignments\s*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/im.exec(architectText)?.[1];
@@ -28,15 +28,15 @@ export function parseLeadAssignments(architectText: string, leadCount: number): 
 		const index = Number(m[1]) - 1;
 		let rest = m[2].replace(/^\**\s*/, "");
 		let dependsOn: number[] = [];
+		// The deps parenthesis may sit anywhere in the line and be followed by
+		// punctuation or more prose; "Lead 1", "1 and 2" and "1, 2" all work.
 		const deps = DEPS_RE.exec(rest);
 		if (deps) {
-			rest = rest.slice(0, deps.index).trim();
-			const raw = deps[1].trim();
-			if (!/^none$/i.test(raw) && raw !== "") {
-				dependsOn = raw.split(/[,\s]+/).filter(Boolean).map((d) => Number(d.replace(/\D/g, "")) - 1);
-			}
+			rest = `${rest.slice(0, deps.index)} ${rest.slice(deps.index + deps[0].length)}`;
+			dependsOn = [...deps[1].matchAll(/\d+/g)].map((d) => Number(d[0]) - 1);
 		}
-		out.push({ index, scope: rest.replace(/\*+$/, "").trim(), dependsOn });
+		const scope = rest.replace(/\s+/g, " ").replace(/\*+/g, "").trim().replace(/^[\s.;,]+|[\s.;,]+$/g, "");
+		out.push({ index, scope, dependsOn });
 	}
 	if (out.length !== leadCount) return null;
 	const indices = new Set(out.map((a) => a.index));

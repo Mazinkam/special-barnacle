@@ -45,3 +45,16 @@ describe("planLeadWaves", () => {
 		])).toEqual([[0, 1], [2]]);
 	});
 });
+
+describe("parseLeadAssignments — natural architect wording (review fixes)", () => {
+	test("trailing punctuation or text after the deps parenthesis still yields the dependency", () => {
+		const a = parseLeadAssignments(plan("Lead 1: parser (depends on: none).\nLead 2: cli (depends on: 1) — after parser"), 2);
+		expect(a?.map((x) => x.dependsOn)).toEqual([[], [0]]);
+		expect(a?.[1].scope).toBe("cli — after parser");
+		expect(a?.[0].scope).toBe("parser");
+	});
+	test("'Lead 1' and '1 and 2' forms parse as dependencies", () => {
+		const a = parseLeadAssignments(plan("Lead 1: a\nLead 2: b (depends on: Lead 1)\nLead 3: c (depends on: 1 and 2)"), 3);
+		expect(a?.map((x) => x.dependsOn)).toEqual([[], [0], [0, 1]]);
+	});
+});

@@ -100,6 +100,14 @@ class TestMethod(unittest.TestCase):
         self.assertEqual(method.lead_size(float("nan"), "low"), "standard")
         self.assertEqual(method.lead_size(9, "critical", override="small"), "small")
 
+    def test_lead_size_rounding_and_non_finite_match_the_bridge(self):
+        # TS uses Math.round (half up) and treats non-finite input as 5.
+        self.assertEqual(method.lead_size(6.5, "low"), "large")
+        self.assertEqual(method.lead_size(3.5, "low"), "standard")
+        self.assertEqual(method.lead_size(float("inf"), "low"), "standard")
+        self.assertEqual(method.lead_size(float("-inf"), "low"), "standard")
+        self.assertEqual(method.lead_size("7", "low"), "large")
+
     def test_lead_size_parity_with_bridge_cases(self):
         cases = [(1, "low", "small"), (3, "low", "small"), (4, "low", "standard"), (6, "low", "standard"),
                  (7, "low", "large"), (10, "low", "large"), (2, "medium", "standard"), (2, "high", "large"),

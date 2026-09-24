@@ -1534,8 +1534,37 @@ describe("runSubagentProcess process/event handling", () => {
 			expect(result.stderr).toContain("dispatch stopped (dispatch_spend_cap.mode=enforce)");
 			const log = readFileSync(session.file("run.log"), "utf8");
 			expect(log.match(/exceeded by capped-lead at \$\d+\.\d+ \(stopping it\)/g) ?? []).toHaveLength(1);
+			// Exactly one cancel for the single large jump, and the crossing turn's text is kept.
+			expect(kill).toHaveBeenCalledTimes(1);
+			expect(result.stdout).toContain("turn 9");
 		} finally {
 			child.emit("close", 137);
+			session.close();
+		}
+	});
+
+	test("spend cap enforce does not kill a turn that is already the final answer", async () => {
+		const { SpendCapTracker } = await import("./spend-cap.ts");
+		const session = createSession("spend-cap-final-turn");
+		session.spendCaps = new SpendCapTracker({ mode: "enforce", usd_by_capability: { lead: 4 }, default_usd: 1 });
+		const kill = mock(() => true);
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "final-turn-lead", session,
+				spawnChild: () => child as never,
+			});
+			emit({ type: "message_end", message: { role: "assistant", content: "final report\nSTATUS: completed", usage: { input: 1, output: 1, cost: { total: 9 } }, stopReason: "stop" } });
+			emit({ type: "agent_settled" });
+			child.emit("close", 0);
+			const result = await pending;
+			expect(kill).not.toHaveBeenCalled();
+			expect(result.exitCode).toBe(0);
+			expect(result.finalText).toContain("STATUS: completed");
+			expect(readFileSync(session.file("run.log"), "utf8")).toContain("warn only");
+		} finally {
 			session.close();
 		}
 	});
@@ -2503,6 +2532,26 @@ describe("final triage and shutdown integration", () => {
 	function readRows(name: string): any[] {
 		return readFileSync(join(pythonStateRoot, name), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
 	}
+
+	test("a shipped-profile alias missing from the registry aborts /orchestrate before any dispatch", async () => {
+		const profilesPath = process.env.HUMAIN_ORCHESTRATOR_PROFILES_FILE!;
+		writeFileSync(profilesPath, readFileSync(join(import.meta.dir, "..", "..", "orchestrator-profiles.json"), "utf8"));
+		const { handler } = activate();
+		const notices: string[] = [];
+		const spawned = spyOn(childProcess, "spawn");
+		try {
+			const noOpus = { getAvailable: () => registry().getAvailable().filter((m) => !m.id.includes("opus-5-5")) };
+			await handler("do a thing --task-class implementation --complexity 5 --risk low", {
+				modelRegistry: noOpus, ui: { notify: (n: string) => notices.push(n), setWidget() {}, setStatus() {} },
+			} as never);
+			expect(notices.join("\n")).toContain("Model configuration is invalid — nothing was dispatched");
+			expect(notices.join("\n")).toContain("opus-5-5");
+			expect(spawned.mock.calls.filter(([, args]) => (args as string[] | undefined)?.includes("--mode"))).toHaveLength(0);
+		} finally {
+			spawned.mockRestore();
+			rmSync(profilesPath, { force: true });
+		}
+	});
 	for (const { model, costs, source, expected } of [
 		{ model: "unknown-final-model", costs: [undefined], source: "unmetered", expected: undefined },
 		{ model: "claude-sonnet-4-5", costs: [undefined], source: "estimated-from-reported-tokens", expected: .0039 },
@@ -2915,7 +2964,7 @@ describe("orchestrator fixes from run ht-orch-1790237987755-lyjkn8 (A8)", () => 
 	const run = async (architectText: string, statusFor: (taskId: string) => string) => {
 		const batches: string[][] = [];
 		const phases: string[] = [];
-		const { leadResults } = await orchestrator.dispatchReconAndLeads(
+		const { leadResults, skippedLeads } = await orchestrator.dispatchReconAndLeads(
 			{ runId: "r", goal: "g", plan: { ...threeLeadPlan, task_class: "investigation" }, adapter: { lead: { model: "p/opus-5-5" } }, architectResult: architect(architectText) },
 			{
 				dispatch: async (tasks) => {
@@ -2928,7 +2977,7 @@ describe("orchestrator fixes from run ht-orch-1790237987755-lyjkn8 (A8)", () => 
 				capture: async () => {}, setPhase: (p) => phases.push(p), throwIfCancelled: () => {},
 			},
 		);
-		return { batches, phases, leadResults };
+		return { batches, phases, leadResults, skipped: skippedLeads };
 	};
 	const chain = "## Lead assignments\nLead 1: phase 0 (depends on: none)\nLead 2: A1-A3 (depends on: 1)\nLead 3: A4-A7 (depends on: 2)\n";
 
@@ -2943,6 +2992,7 @@ describe("orchestrator fixes from run ht-orch-1790237987755-lyjkn8 (A8)", () => 
 		expect(batches).toEqual([["r-lead-0"]]);
 		expect(leadResults).toHaveLength(1);
 		expect(phases.join("\n")).toContain("not starting lead(s) 2");
+		expect((await run(chain, (id) => (id === "r-lead-0" ? "blocked" : "completed"))).skipped).toBe(2);
 	});
 
 	test("no valid Lead assignments collapses to a single lead instead of N clones", async () => {
@@ -2971,5 +3021,60 @@ describe("orchestrator fixes from run ht-orch-1790237987755-lyjkn8 (A8)", () => 
 	test("QA is told to stay in scope and not debug the environment", () => {
 		expect(orchestrator.QA_SCOPE_RULES.join(" ")).toContain("verify ONLY the files listed above");
 		expect(orchestrator.QA_SCOPE_RULES.join(" ")).toContain("after 2 attempts");
+	});
+});
+
+describe("review fixes (Phase A review)", () => {
+	test("every lead size runs the orchestrator-lead persona with the lead timeout policy", async () => {
+		const { ORCHESTRATING_CAPABILITIES, resolveDispatchTimeoutPolicy } = await import("./dispatch-progress.ts");
+		for (const cap of ["lead_small", "lead", "lead_large"]) {
+			expect(orchestrator.agentNameFor(cap)).toBe("orchestrator-lead");
+			expect(ORCHESTRATING_CAPABILITIES.has(cap)).toBe(true);
+			expect(resolveDispatchTimeoutPolicy(cap, {}).mode).toBe("lead");
+		}
+		expect(orchestrator.agentNameFor("scout")).toBe("orch-scout");
+	});
+
+	test("re-review escalation picks a model from a capability that belongs to the target tier", () => {
+		// oss-like: `lead` (premium capability) overridden to a mid model must not
+		// become the premium escalation target; premium-like: security_review
+		// overridden to another vendor is not preferred for technical re-review.
+		const adapter = {
+			technical_review: { model: "humain-node/kimi-k3" },
+			implementation_strong: { model: "humain-node/minimax-m3" },
+			lead: { model: "humain-node/minimax-m3" },
+			analysis_strong: { model: "humain-node/glm-5.2" },
+			architect: { model: "humain-node/glm-5.2" },
+			security_review: { model: "openai-codex/gpt-6-astra" },
+			lead_large: { model: "amazon-bedrock/global.anthropic.claude-fable-5-1" },
+		};
+		const picked = orchestrator.pickModelForTest("technical_review", adapter, 1, "medium");
+		expect(picked).toBe("humain-node/glm-5.2");
+	});
+
+	test("quota fallback is not attempted for a timed-out or cancelled dispatch, or for quota words only in the model's prose", async () => {
+		const table = buildAliasTable([
+			{ provider: "openai-codex", id: "gpt-6-astra" },
+			{ provider: "amazon-bedrock", id: "global.openai.gpt-6-astra" },
+		]);
+		const base = {
+			exitCode: 124, stdout: "", finalText: "", rawStdout: "", personaCanMutate: false, stderr: "usage limit reached",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			costUsd: 0, costReported: false, durationMs: 1, processExitCode: 124,
+		};
+		for (const over of [
+			{ outcome: "timed_out" as const },
+			{ outcome: "cancelled" as const, exitCode: 137 },
+			{ outcome: "failed" as const, exitCode: 125, stopReason: "spend_cap" },
+			{ outcome: "failed" as const, exitCode: 1, stderr: "exit 1", finalText: "the API returned 429 rate limit earlier" },
+		]) {
+			let calls = 0;
+			await orchestrator.dispatchParallel(process.cwd(), "run", [{ capability: "security_review", task: "t", taskId: "run-sec" }],
+				{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, 0, {
+					recordEvent: () => {}, aliasTable: table,
+					runProcess: async () => { calls++; return { ...base, ...over }; },
+				});
+			expect(calls).toBe(1);
+		}
 	});
 });

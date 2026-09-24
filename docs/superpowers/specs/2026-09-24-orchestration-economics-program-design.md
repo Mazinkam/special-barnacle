@@ -89,8 +89,13 @@ A canonical copy is versioned in the repo at `bridge/orchestrator-profiles.json`
 | technical/integration/migration/performance/api-contract review | gpt-6-sol | sonnet-5 | gpt-6-sol | kimi-k3 |
 | security_review | astra | opus-5-5 | gpt-6-sol @ high | glm-5.2 |
 | qa_agent | sonnet-5 (mid) | sonnet-5 | gpt-6-sol | humain-m3-research-preview |
+| lead_small (mid) | sonnet-5 | sonnet-5 | gpt-6-sol | minimax-m3 |
+| lead (premium) | opus-5-5 | opus-5-5 | gpt-6-sol @ high | minimax-m3 (override, see below) |
+| lead_large (frontier) | fable-5-1 | fable-5-1 | astra | glm-5.2 |
 
 `premium` implements on Anthropic and reviews on OpenAI so review is vendor-independent at mid price.
+
+`oss` keeps its original "MiniMax M3 leadership" choice by binding `lead` to minimax-m3 (a mid-priced model on the premium capability); `lead_large` uses GLM 5.2. Re-review escalation picks targets from capabilities that belong to the target tier, so this override does not make minimax-m3 a "premium" escalation target.
 `provider_preference` is `["openai-codex", "amazon-bedrock"]`.
 
 ## Phase 0 — Land in-flight work
@@ -158,7 +163,9 @@ stderr/final error matches `/usage limit|quota|rate.?limit|credit cap|\b429\b/i`
 with `from_model`, `to_model`, `reason`. No fallback when no Bedrock equivalent exists.
 
 **Tagging.** Every `model_call` / `route_executed` from the bridge carries `policy_id` (profile name
-+ short hash of the resolved adapter), `profile`, `lead_size`, `task_class`, `complexity`, `risk`.
++ short hash of the resolved adapter), `profile`, `task_class`, `complexity`, `risk`, and — from the
+moment the lead is sized onward — `lead_size`. Triage runs before sizing, so triage rows carry no
+`lead_size`. Rows also record the effort the dispatch actually ran at.
 
 Done: lead cost per run and verified-pass rate reported per size on the dashboard; pass rate for the
 new routing ≥ the fable-lead baseline (11/17) over ≥ 10 runs.

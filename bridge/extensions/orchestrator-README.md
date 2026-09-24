@@ -158,7 +158,7 @@ profile was retired); run `install.sh` to install the shipped profiles.
 /orchestrator-models set premium fable-5-1 [--profile P]
 /orchestrator-models set technical_review astra
 /orchestrator-models effort technical_review high
-/orchestrator-models new work --from default
+/orchestrator-models new work --from premium
 /orchestrator-models use work
 /orchestrator-models pick                  interactive: three tier picks, then optional per-capability overrides
 /orchestrator-models validate [P]          offline: every binding resolves to a configured model

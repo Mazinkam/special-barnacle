@@ -41,6 +41,19 @@ The script symlinks the contents of `bridge/extensions/` into
 (refusing to overwrite protects any in-flight edits); move them away and re-run
 if you want the symlink to land.
 
+It also copies the shipped model profiles, `bridge/orchestrator-profiles.json`
+(active profile `premium`; also `anthropic`, `openai`, `oss`), to
+`~/.humain-terminal/agent/orchestrator-profiles.json`. A missing file is
+installed; a legacy file (the retired `default` profile, or no `frontier` tier)
+is backed up to `orchestrator-profiles.json.bak-<UTC>` and replaced; a file you
+have edited since is kept unless you run
+`HUMAIN_ORCHESTRATOR_RESET_PROFILES=1 ./install.sh`.
+
+Triage sizes the lead from the task (`lead_small` → mid tier, `lead` → premium,
+`lead_large` → frontier); override with `/orchestrate <goal> --lead-size small|standard|large`.
+See `extensions/orchestrator-README.md` for profiles, the spend cap, and the
+codex → Bedrock quota fallback.
+
 Override the install target with `HUMAIN_TERMINAL_AGENT_DIR`:
 
 ```bash

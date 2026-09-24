@@ -105,14 +105,37 @@ install_profiles() {
     [ -f "$PROFILES_SRC" ] || { warn "no $PROFILES_SRC; skipping profiles"; return 0; }
     mkdir -p "$TARGET_DIR"
     if [ -L "$PROFILES_DST" ]; then
+        log "replace   orchestrator-profiles.json (was a symlink -> $(readlink "$PROFILES_DST"))"
         rm "$PROFILES_DST"
     elif [ -f "$PROFILES_DST" ]; then
         if cmp -s "$PROFILES_SRC" "$PROFILES_DST"; then
             log "ok        orchestrator-profiles.json (already current)"
             return 0
         fi
+        # Replace only a legacy file (the retired "default" profile, or no
+        # frontier tier anywhere) or on explicit request. A file the user has
+        # since edited with /orchestrator-models is kept.
+        local legacy=0
+        if "$PYTHON_BIN" - "$PROFILES_DST" <<'PY' >/dev/null 2>&1
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)  # unparseable: treat as legacy, it gets backed up
+profiles = d.get("profiles") or {}
+has_frontier = any("frontier" in (p.get("tiers") or {}) for p in profiles.values() if isinstance(p, dict))
+sys.exit(0 if (d.get("active_profile") == "default" or "default" in profiles or not has_frontier) else 1)
+PY
+        then legacy=1; fi
+        if [ "$legacy" -eq 0 ] && [ "${HUMAIN_ORCHESTRATOR_RESET_PROFILES:-0}" != "1" ]; then
+            log "keep      orchestrator-profiles.json (your edited profiles; HUMAIN_ORCHESTRATOR_RESET_PROFILES=1 ./install.sh replaces them)"
+            return 0
+        fi
         local backup
-        backup="$PROFILES_DST.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+        local base n=1
+        base="$PROFILES_DST.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+        backup="$base"
+        while [ -e "$backup" ]; do backup="$base-$n"; n=$((n + 1)); done
         cp -p "$PROFILES_DST" "$backup"
         log "backup    orchestrator-profiles.json -> $(basename "$backup")"
     fi

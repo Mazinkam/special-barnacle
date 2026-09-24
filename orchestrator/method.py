@@ -9,6 +9,7 @@ state lives under ~/.local/state/coding-agent-orchestrator/.
 from __future__ import annotations
 
 import json
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -126,9 +127,10 @@ def lead_size(complexity: float, risk: str, override: str | None = None) -> str:
         c = float(complexity)
     except (TypeError, ValueError):
         c = 5.0
-    if c != c:  # NaN
+    if not math.isfinite(c):  # NaN / +-inf, like the bridge's Number.isFinite guard
         c = 5.0
-    c = max(1.0, min(10.0, float(round(c))))
+    # Half-up rounding to match JavaScript Math.round (Python's round() is half-even).
+    c = max(1.0, min(10.0, float(math.floor(c + 0.5))))
     band = next((b["size"] for b in r["by_complexity"] if b["min"] <= c <= b["max"]), r["by_complexity"][-1]["size"])
     floor = r["risk_floor"].get(risk, r["risk_floor"]["medium"])
     return max(band, floor, key=LEAD_SIZE_ORDER.index)

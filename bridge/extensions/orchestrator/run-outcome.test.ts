@@ -36,6 +36,9 @@ describe("classifyRunOutcome", () => {
 	test("all leads blocked -> blocked, even if git shows changes", () => {
 		expect(classifyRunOutcome({ leadStatuses: ["blocked", "blocked", "blocked"], succeededLeads: 3, leads: 3 })).toBe("blocked");
 	});
+	test("a blocked lead that did not exit cleanly does not make the run blocked", () => {
+		expect(classifyRunOutcome({ leadStatuses: ["blocked", "blocked"], succeededLeads: 1, leads: 2 })).toBe("dispatched");
+	});
 	test("mixed or completed -> dispatched", () => {
 		expect(classifyRunOutcome({ leadStatuses: ["blocked", "completed"], succeededLeads: 2, leads: 2 })).toBe("dispatched");
 		expect(classifyRunOutcome({ leadStatuses: ["unknown"], succeededLeads: 1, leads: 1 })).toBe("dispatched");
@@ -47,12 +50,37 @@ describe("classifyRunOutcome", () => {
 });
 
 describe("externalChangeFiles", () => {
-	test("every lead said None -> all git-changed files are external", () => {
-		expect(externalChangeFiles(["a.py", "b.py"], [report("STATUS: completed"), report("STATUS: blocked")])).toEqual(["a.py", "b.py"]);
+	const ok = (stdout: string) => ({ exitCode: 0, stdout });
+	test("every lead exited 0 and said None -> all git-changed files are external", () => {
+		expect(externalChangeFiles(["a.py", "b.py"], [ok(report("STATUS: completed")), ok(report("STATUS: blocked"))])).toEqual(["a.py", "b.py"]);
 	});
 	test("any lead that listed files or omitted the section -> nothing is classed external", () => {
-		expect(externalChangeFiles(["a.py"], [report("STATUS: completed", "- `a.py` — x"), report("STATUS: blocked")])).toEqual([]);
-		expect(externalChangeFiles(["a.py"], ["## Completed\nno files section"])).toEqual([]);
+		expect(externalChangeFiles(["a.py"], [ok(report("STATUS: completed", "- `a.py` — x")), ok(report("STATUS: blocked"))])).toEqual([]);
+		expect(externalChangeFiles(["a.py"], [ok("## Completed\nno files section")])).toEqual([]);
 		expect(externalChangeFiles(["a.py"], [])).toEqual([]);
+	});
+	test("a lead that failed, timed out or hit the spend cap keeps every file in QA", () => {
+		for (const exitCode of [1, 124, 125]) {
+			expect(externalChangeFiles(["a.py"], [{ exitCode, stdout: "" }, ok(report("STATUS: completed"))])).toEqual([]);
+		}
+	});
+});
+
+describe("report parsing — formatting variants (review fixes)", () => {
+	test("bold or code-formatted STATUS values", () => {
+		expect(parseLeadStatus("**STATUS:** blocked")).toBe("blocked");
+		expect(parseLeadStatus("STATUS: `blocked`")).toBe("blocked");
+		expect(parseLeadStatus("- **STATUS**: completed")).toBe("completed");
+	});
+	test("a STATUS quoted mid-sentence does not count", () => {
+		expect(parseLeadStatus("I will not report STATUS: blocked here.\nSTATUS: completed")).toBe("completed");
+		expect(parseLeadStatus("The goal says to write STATUS: blocked if stuck.")).toBe("unknown");
+	});
+	test("inline '## Files Changed: None' is none", () => {
+		expect(parseLeadFilesChanged("## Completed\nx\n## Files Changed: None\n\nSTATUS: completed")).toEqual({ kind: "none" });
+	});
+	test("a section that starts with 'None of …' but lists files is a list, not none", () => {
+		expect(parseLeadFilesChanged("## Files Changed\nNone of the API files; updated:\n- `src/a.ts` — fix\n\nSTATUS: completed"))
+			.toEqual({ kind: "list", files: ["src/a.ts"] });
 	});
 });

@@ -14,7 +14,9 @@
 export type LeadStatus = "completed" | "partial" | "blocked" | "unknown";
 
 export function parseLeadStatus(report: string): LeadStatus {
-	const matches = [...report.matchAll(/^[\s>*_`]*STATUS:\s*([a-z]+)/gim)];
+	// Line-anchored (a STATUS quoted mid-sentence does not count); tolerates
+	// list markers, bold/italic/code around the key and the value.
+	const matches = [...report.matchAll(/^[\s>*_`-]*STATUS[*_`]*\s*:[\s*_`]*([a-z]+)/gim)];
 	const last = matches.at(-1)?.[1]?.toLowerCase();
 	return last === "completed" || last === "partial" || last === "blocked" ? last : "unknown";
 }
@@ -22,28 +24,36 @@ export function parseLeadStatus(report: string): LeadStatus {
 export type LeadFilesChanged = { kind: "none" } | { kind: "list"; files: string[] } | { kind: "unknown" };
 
 export function parseLeadFilesChanged(report: string): LeadFilesChanged {
-	const section = /^##\s*Files Changed\s*\n([\s\S]*?)(?=^##\s|^[\s>*_`]*STATUS:|(?![\s\S]))/im.exec(report)?.[1]?.trim();
-	if (section === undefined) return { kind: "unknown" };
+	const m = /^##\s*Files Changed\s*:?[ \t]*([^\n]*)\n?([\s\S]*?)(?=^##\s|^[\s>*_`-]*STATUS[*_`]*\s*:|(?![\s\S]))/im.exec(report);
+	if (!m) return { kind: "unknown" };
+	const section = `${m[1]}\n${m[2]}`.trim();
+	// Listed paths win over any leading "None of …" wording.
+	const files = [...section.matchAll(/^[-*]\s+`?([^`\s—]+)`?/gm)].map((f) => f[1]).filter((f) => !/^(none|n\/a|nothing)\b/i.test(f));
+	if (files.length > 0) return { kind: "list", files };
 	if (section === "" || /^[-*\s]*(none|n\/a|nothing)\b/i.test(section)) return { kind: "none" };
-	const files = [...section.matchAll(/^[-*]\s+`?([^`\s—]+)`?/gm)].map((m) => m[1]);
-	return files.length > 0 ? { kind: "list", files } : { kind: "unknown" };
+	return { kind: "unknown" };
 }
 
 export type RunOutcome = "blocked" | "dispatched" | "failed";
 
 export function classifyRunOutcome(input: { leadStatuses: LeadStatus[]; succeededLeads: number; leads: number }): RunOutcome {
 	if (input.leads === 0 || input.succeededLeads === 0) return "failed";
-	if (input.leadStatuses.length > 0 && input.leadStatuses.every((s) => s === "blocked")) return "blocked";
+	// BLOCKED only when every lead exited cleanly AND reported blocked; a lead
+	// that crashed after writing "STATUS: blocked" may have changed files.
+	if (input.succeededLeads === input.leads && input.leadStatuses.length === input.leads &&
+		input.leadStatuses.every((s) => s === "blocked")) return "blocked";
 	return "dispatched";
 }
 
 /**
- * Git-changed files that no lead claims: only when EVERY lead report states
- * explicitly that it changed nothing. Any list or missing section keeps the
- * conservative default (the run owns what git shows).
+ * Git-changed files that no lead claims: only when EVERY lead exited 0 AND
+ * its report states explicitly that it changed nothing. A lead that failed,
+ * timed out or hit the spend cap may have edited files it never reported, so
+ * any such lead — or any list / missing section — keeps the conservative
+ * default: the run owns what git shows and QA verifies it.
  */
-export function externalChangeFiles(gitChanged: string[], leadReports: string[]): string[] {
-	if (leadReports.length === 0) return [];
-	const allNone = leadReports.every((r) => parseLeadFilesChanged(r).kind === "none");
-	return allNone ? [...gitChanged] : [];
+export function externalChangeFiles(gitChanged: string[], leads: Array<{ exitCode: number; stdout: string }>): string[] {
+	if (leads.length === 0) return [];
+	const allCleanNone = leads.every((l) => l.exitCode === 0 && parseLeadFilesChanged(l.stdout).kind === "none");
+	return allCleanNone ? [...gitChanged] : [];
 }

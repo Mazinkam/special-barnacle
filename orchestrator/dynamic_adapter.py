@@ -65,6 +65,16 @@ MODEL_FAMILY_PRESETS: dict[str, dict[str, str]] = {
     },
 }
 
+# Model families this skill never routes to, in any mode (preset or pure
+# cost bucketing). Matched against the normalised catalog id prefix.
+EXCLUDED_MODEL_PREFIXES: tuple[str, ...] = ("claude-haiku",)
+
+
+def is_excluded_model(model: dict[str, Any]) -> bool:
+    ident = str(model.get("id") or "").lower()
+    return any(ident.startswith(prefix) for prefix in EXCLUDED_MODEL_PREFIXES)
+
+
 # Env var that overrides the model-family preference. Follows the repo's
 # CODING_AGENT_ORCHESTRATOR_* naming convention (see orchestrator/runtime.py:
 # CODING_AGENT_ORCHESTRATOR_HOME). Accepted values: a key in
@@ -316,7 +326,7 @@ def resolve_adapter(model_family: str | None = None) -> dict[str, dict[str, Any]
     Otherwise selection falls back to the existing cost-tier logic, and the
     fallback reason is recorded in `_explanations`.
     """
-    models = resolve_models()
+    models = {k: m for k, m in resolve_models().items() if not is_excluded_model(m)}
     if not models:
         return {}
 

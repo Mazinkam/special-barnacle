@@ -128,6 +128,24 @@ class ResolveAdapterFamilyPreferenceTests(unittest.TestCase):
         for cap in ("implementation_fast", "worker", "scout"):
             self.assertNotIn("model_family=anthropic", adapter["_explanations"][cap])
 
+    def test_cost_mode_never_selects_an_excluded_family(self):
+        # With the family preset disabled, pure cost bucketing must still never
+        # route to haiku: the skill excludes that family from every routing path.
+        store = fake_ht_store()
+        for provider_models in store.values():
+            if isinstance(provider_models, dict):
+                provider_models.pop("gpt-5.6-luna", None)  # haiku becomes the cheapest model
+        catalog = fake_catalog()
+        for m in catalog:
+            if m["id"] == "claude-haiku-4-5":
+                m["output_cost_per_m"] = 1.0  # cheapest bucket, and the only model in it
+        self._patch_sources(store, catalog)
+        adapter = da.resolve_adapter(model_family="none")
+        self.assertTrue(adapter)
+        for cap, binding in adapter.items():
+            if not cap.startswith("_"):
+                self.assertNotIn("haiku", binding["model"], cap)
+
     def test_disable_via_env_var(self):
         self._patch_sources(fake_ht_store(), fake_catalog())
         with patch.dict(os.environ, {da.MODEL_FAMILY_ENV_VAR: "cost"}):

@@ -53,6 +53,8 @@ The orchestrator never needs to know concrete model names. It asks for capabilit
 
 The active harness adapter maps those capabilities and abstract effort levels to concrete models/settings.
 
+For HUMAIN Terminal the mapping lives in named profiles (`bridge/orchestrator-profiles.json`, installed by `install.sh`): `premium` (default, mixed vendor), `anthropic`, `openai` and `oss`. Tiers are `cheap < mid < premium < frontier`. Triage picks a lead size — `lead_small` (mid), `lead` (premium) or `lead_large` (frontier) — from complexity and risk (`method.json` `rules.lead_sizing`; `--lead-size` overrides), and the lead delegates implementation instead of editing files itself. A per-dispatch spend cap (`rules.dispatch_spend_cap`, `warn` by default) and a one-shot codex → Bedrock retry on provider quota errors bound cost and outages.
+
 ## Quick start
 
 ```bash
