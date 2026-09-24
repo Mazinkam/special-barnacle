@@ -1,6 +1,28 @@
 # Integrating `feat/enforced-worker-topology` into `main`
 
-**Status: BLOCKED. Not attempted. Requires an owner decision.**
+**Status: DONE.** Merged into local `main` as `8f145a4` (`--no-ff`). Not pushed.
+
+Both blockers below cleared and the merge was carried out:
+
+1. Blocker 1 resolved itself — the owner of the `feat/orchestrator-efficiency`
+   merge committed it as `eaa9278`, leaving `main` clean.
+2. Blocker 2 was resolved by hand in the feature worktree (`4f328c4`), then
+   merged forward. The resolution rationale for each judgement call is in that
+   commit message; the conflict map below is what it was resolved against.
+
+Verification on merged `main`: `bun test` 260 pass / 0 fail, `pytest` 628 passed,
+`./scripts/typecheck-bridge.sh` exit 0, `main`'s 4 unrelated dirty doc files
+preserved, feature worktree lock preserved.
+
+One real defect surfaced by the merge: `costReported` had become required on
+`DispatchResult`, which this branch's test fixture no longer satisfied.
+
+**Remaining: the push is deliberately not done — see "Push" at the end.**
+
+---
+
+## Original analysis (kept as the record of what the merge was resolved against)
+
 
 The feature itself is finished and green (`bun test` 90/0, `pytest` 77/77,
 `./scripts/typecheck-bridge.sh` exit 0). What follows is everything needed to
@@ -135,3 +157,30 @@ Not "should this merge" — it should. It is:
    a row?
 
 Automation should not answer either. That is why both runs stopped here.
+
+## Push
+
+`main` is **55 commits ahead of `origin/main` and 0 behind**, so a normal
+non-force push is mechanically safe. It was still not performed, on purpose.
+
+Those 55 commits are not all this feature: they include the
+`feat/orchestrator-efficiency` merge and other owners' in-flight work that has
+been accumulating locally. Pushing would publish all of it, which is a
+publication decision for the repo owner, not a side effect of integrating one
+branch. It is also the only irreversible step in this whole sequence.
+
+When you want it:
+
+```bash
+git rev-list --left-right --count origin/main...main   # confirm left side is still 0
+git push origin main                                   # never --force
+```
+
+### Rollback
+
+`main` before this merge was `eaa9278`. While nothing has been committed on top
+and nothing has been pushed:
+
+```bash
+git reset --hard eaa9278
+```
