@@ -20,10 +20,9 @@
 #   1  type errors found  -> a real failure, fix the code
 #   2  cannot run here    -> environment incomplete, report as SKIPPED not FAIL
 #
-# Scope: bridge/extensions/orchestrator/*.ts only. bridge/extensions/
-# cross-review-demo.ts has 6 known pre-existing diagnostics documented as
-# baseline debt in bridge/extensions/orchestrator-README.md; it is out of scope
-# so this gate stays at zero and any new error is unambiguous.
+# Scope: bridge/extensions/orchestrator/*.ts by default. Pass --all to check
+# every bridge/**/*.ts, which is the scope the README's "Before release" gate
+# refers to. Both are expected at zero diagnostics.
 #
 # Override discovery with HUMAIN_TERMINAL_ROOT=/path/to/humain-terminal.
 set -uo pipefail
@@ -31,9 +30,24 @@ set -uo pipefail
 SKIP=2
 say() { printf '%s\n' "$*" >&2; }
 
+scope="orchestrator"
+for arg in "$@"; do
+	case "$arg" in
+		--all) scope="all" ;;
+		--orchestrator) scope="orchestrator" ;;
+		-h|--help) say "usage: typecheck-bridge.sh [--orchestrator|--all]"; exit 0 ;;
+		*) say "typecheck: unknown option '$arg' (expected --orchestrator or --all)"; exit "$SKIP" ;;
+	esac
+done
+
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TARGET_DIR="$REPO_ROOT/bridge/extensions/orchestrator"
 [ -d "$TARGET_DIR" ] || { say "typecheck: missing $TARGET_DIR"; exit "$SKIP"; }
+if [ "$scope" = "all" ]; then
+	INCLUDE_GLOB="$REPO_ROOT/bridge/**/*.ts"
+else
+	INCLUDE_GLOB="$TARGET_DIR/*.ts"
+fi
 
 # --- locate the installed HT workspace ---------------------------------------
 # Marker is the built type declaration the extension imports as @humain/terminal.
@@ -133,13 +147,13 @@ cat >"$config" <<JSON
     }
   },
   "files": ["$bun_types/index.d.ts"],
-  "include": ["$TARGET_DIR/*.ts"]
+  "include": ["$INCLUDE_GLOB"]
 }
 JSON
 
 say "typecheck: HT workspace   $ht_root"
 say "typecheck: bun types      $bun_types"
-say "typecheck: target         $TARGET_DIR/*.ts"
+say "typecheck: target         $INCLUDE_GLOB"
 
 output=$("${tsc_cmd[@]}" -p "$config" 2>&1)
 status=$?

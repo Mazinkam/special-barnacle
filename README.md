@@ -310,6 +310,7 @@ python3 -B scripts/benchmark_refresh.py --source "$SCRATCH/frozen" \
 
 python3 -B -m pytest -p no:cacheprovider -q
 bun test ./bridge  # when Bun is available; fake/test workers only
+./scripts/typecheck-bridge.sh --all  # strict typecheck; exit 0 clean, 1 errors, 2 env incomplete
 # Keep the JSON reports and frozen inputs for comparison; remove only your scratch directory later.
 ```
 
@@ -363,17 +364,24 @@ distinct ID-less rows remain distinct, and canonical files are never rewritten t
 
 Before release:
 
-- [ ] Full Python and bridge tests pass; run strict TypeScript checking against the installed
-  HT API where available and explicitly list any unresolved diagnostics (there is no checked-in
-  package/tsconfig runner). Do not equate passing runtime tests with a clean typecheck.
-  **This gate is currently red.** Full strict checking over `bridge/**/*.ts` reports **6
-  pre-existing demo diagnostics**, reproduced byte-identically at the pre-program baseline
-  `1141a3c` after normalizing the checkout prefix. Production `bridge/extensions/orchestrator/**/*.ts`
-  (tests excluded) typechecks clean. Fix or explicitly accept the demo debt before release:
-  - `bridge/extensions/cross-review-demo.ts:73`, `:105`, `:138` — TS2352: `AgentToolResult<SubagentDetails>`
-    asserted to `SubagentDetails`.
-  - `bridge/extensions/cross-review-demo.ts:78`, `:110`, `:143` — TS2554: five arguments passed;
-    the installed API accepts 2–4.
+- [x] Full Python and bridge tests pass; run strict TypeScript checking against the installed
+  HT API where available and explicitly list any unresolved diagnostics. Do not equate passing
+  runtime tests with a clean typecheck.
+  **This gate is now green.** There is still no checked-in package/tsconfig, so
+  `scripts/typecheck-bridge.sh` resolves the installed HT workspace and runs strict `tsc`
+  (`--orchestrator` by default, `--all` for the `bridge/**/*.ts` scope this gate means; exit 2
+  means the environment is incomplete, which is *not* a code failure — see `bridge/README.md`).
+  Both scopes report **0 diagnostics**.
+  The 6 previously accepted demo diagnostics in `bridge/extensions/cross-review-demo.ts` are
+  fixed rather than accepted, because one of them was masking a real runtime bug:
+  - TS2352 at `:73`, `:105`, `:138` — the `AgentToolResult<SubagentDetails>` returned by
+    `execute()` was asserted to `SubagentDetails`. The details live on `.details`, so
+    `implDetails.results` was `undefined` at runtime and all three phases would have thrown.
+    Now destructured as `{ details }`, with no assertion.
+  - TS2554 at `:78`, `:110`, `:143` — a 5th `ctx` argument was passed to an `AgentTool.execute`
+    that declares 4. The wrapper forwards an optional `ExtensionContext`, but the subagent tool
+    reads it only as `ctx?.cwd`/`ctx?.model` fallbacks and every task already passes both
+    explicitly, so the undeclared argument was dropped rather than cast around.
   The three TS2683 implicit-`this` errors formerly at `orchestrator/index.test.ts:722,723,733`
   were **introduced on this branch**, not pre-program debt; typed mocks now fix them.
 - [ ] Installed-HT reload/shutdown smoke, supported Python (>=3.10), and Linux checks remain

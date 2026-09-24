@@ -14,7 +14,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { createSubagentTool, type ExtensionAPI, type ExtensionContext, type SubagentDetails } from "@humain/terminal";
+import { createSubagentTool, type ExtensionAPI, type ExtensionContext } from "@humain/terminal";
 
 // Three-way cross-review using the human-node models the user asked for.
 // Each implementer is reviewed by a model from a DIFFERENT family than theirs.
@@ -70,13 +70,19 @@ export default function (pi: ExtensionAPI) {
 				cwd,
 			}));
 
-			const implDetails = (await tool.execute(
+			// `execute()` resolves to an AgentToolResult wrapper; the SubagentDetails
+			// live on `.details`. Casting the whole result to SubagentDetails (as this
+			// did) type-checked nothing and left `.results` undefined at runtime.
+			// No 5th argument: `AgentTool.execute` declares 4. The wrapper happens to
+			// forward an optional ExtensionContext, but the subagent tool only reads
+			// `ctx?.cwd` and `ctx?.model` as fallbacks, and every task below passes
+			// both explicitly — so relying on an undeclared parameter bought nothing.
+			const { details: implDetails } = await tool.execute(
 				runId + "-impl",
 				{ tasks: implTasks },
 				undefined,
 				undefined,
-				ctx,
-			)) as SubagentDetails;
+			);
 
 			// Phase 2: each implementation is reviewed by a DIFFERENT model.
 			ctx.ui.notify("Phase 2: cross-reviewing each implementation…", "info");
@@ -102,13 +108,12 @@ export default function (pi: ExtensionAPI) {
 				};
 			});
 
-			const reviewDetails = (await tool.execute(
+			const { details: reviewDetails } = await tool.execute(
 				runId + "-review",
 				{ tasks: reviewTasks },
 				undefined,
 				undefined,
-				ctx,
-			)) as SubagentDetails;
+			);
 
 			// Phase 3: lead synthesizes.
 			ctx.ui.notify("Phase 3: synthesis…", "info");
@@ -135,13 +140,12 @@ export default function (pi: ExtensionAPI) {
 				},
 			];
 
-			const synthDetails = (await tool.execute(
+			const { details: synthDetails } = await tool.execute(
 				runId + "-synth",
 				{ tasks: synthTasks },
 				undefined,
 				undefined,
-				ctx,
-			)) as SubagentDetails;
+			);
 
 			// Per-phase cost attribution. Capture each dispatch's `model_call`
 			// record via the Python CLI so the orchestrator's history sees them.
