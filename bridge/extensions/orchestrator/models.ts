@@ -127,7 +127,7 @@ export const DEFAULT_PROVIDER_PREFERENCE = ["openai-codex", "amazon-bedrock"];
 export const PROFILE_NAME_RE = /^[a-z0-9_-]{1,32}$/;
 
 export function emptyProfilesFile(): ProfilesFile {
-	return { version: 1, active_profile: "default", profiles: { default: {} } };
+	return { version: 1, active_profile: "premium", profiles: { premium: {} } };
 }
 
 /**

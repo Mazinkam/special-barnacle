@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "active_profile": "premium",
+  "provider_preference": ["openai-codex", "amazon-bedrock"],
+  "profiles": {
+    "premium": {
+      "description": "Mixed vendor (default): gpt-6-luna scouts/workers, Anthropic lead ladder sonnet-5 / opus-5-5 / fable-5-1 chosen by triage, gpt-6-sol reviews, astra security review.",
+      "tiers": {
+        "cheap": "gpt-6-luna",
+        "mid": "sonnet-5",
+        "premium": "opus-5-5",
+        "frontier": "fable-5-1"
+      },
+      "capabilities": {
+        "technical_review": "gpt-6-sol",
+        "integration_review": "gpt-6-sol",
+        "migration_review": "gpt-6-sol",
+        "performance_review": "gpt-6-sol",
+        "api_contract_review": "gpt-6-sol",
+        "security_review": "astra"
+      }
+    },
+    "anthropic": {
+      "description": "Anthropic only. The cheap tier is sonnet-5 at low effort.",
+      "tiers": {
+        "cheap": "sonnet-5",
+        "mid": "sonnet-5",
+        "premium": "opus-5-5",
+        "frontier": "fable-5-1"
+      },
+      "effort": {
+        "scout": "low",
+        "worker": "low",
+        "implementation_fast": "low"
+      }
+    },
+    "openai": {
+      "description": "OpenAI only: gpt-6-luna cheap, gpt-6-sol mid and premium (premium capabilities at high effort), astra frontier. Codex first, Bedrock fallback.",
+      "tiers": {
+        "cheap": "gpt-6-luna",
+        "mid": "gpt-6-sol",
+        "premium": "gpt-6-sol",
+        "frontier": "astra"
+      },
+      "effort": {
+        "lead": "high",
+        "architect": "high",
+        "analysis_strong": "high",
+        "security_review": "high"
+      }
+    },
+    "oss": {
+      "description": "HUMAIN-node open models: Qwen workers, MiniMax M3 leads and implementation, GLM 5.2 architecture/security/frontier, Kimi review, HUMAIN M3 Research QA.",
+      "tiers": {
+        "cheap": "humain-node/qwen3.8-27b",
+        "mid": "humain-node/minimax-m3",
+        "premium": "humain-node/glm-5.2",
+        "frontier": "humain-node/glm-5.2"
+      },
+      "capabilities": {
+        "lead": "humain-node/minimax-m3",
+        "technical_review": "humain-node/kimi-k3",
+        "qa_agent": "humain-node/humain-m3-research-preview"
+      }
+    }
+  }
+}

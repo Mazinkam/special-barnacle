@@ -37,6 +37,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	renameSync,
@@ -44,6 +45,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 // TypeBox 1.x: `Type` is a namespace (`Type.Object`, `Type.Array`, ...);
 // the validation function moved to a separate `typebox/value` module.
 import { Type } from "typebox";
@@ -73,7 +75,6 @@ import {
 	listShortcuts,
 	mergeLayers,
 	METHOD,
-	migrateAdapterToProfile,
 	parseProfilesFile,
 	PROFILE_NAME_RE,
 	type ProfileSpec,
@@ -141,6 +142,19 @@ const PROFILES_PATH =
 const LEGACY_ADAPTER_PATH =
 	process.env.HUMAIN_ORCHESTRATOR_ADAPTER_FILE ??
 	join(homedir(), ".humain-terminal", "agent", "orchestrator-adapter.json");
+
+/**
+ * The profiles shipped with the skill (`bridge/orchestrator-profiles.json`).
+ * Resolved through the real path of this module because install.sh symlinks
+ * the extension directory into ~/.humain-terminal/agent/extensions/.
+ */
+function shippedProfilesPath(): string {
+	try {
+		return join(dirname(realpathSync(fileURLToPath(import.meta.url))), "..", "..", "orchestrator-profiles.json");
+	} catch {
+		return join(dirname(fileURLToPath(import.meta.url)), "..", "..", "orchestrator-profiles.json");
+	}
+}
 
 /** Where per-run logs land: `<STATE_ROOT>/runs/<runId>/`. */
 function runsDir(): string {
@@ -405,39 +419,31 @@ export async function confirmStep(
 }
 
 /**
- * Capability -> concrete model + optional effort override. This IS the runtime
- * binding that turns the orchestrator's abstract capability requests into HT
- * subagent model picks. Mirrors the measured-savings pattern in
- * `policy_overlay.json.history.measured_performance`:
- *
- *   - implementation_strong -> sonnet-5 (kept 100% pass rate)
- *   - technical_review      -> sonnet-4-5 (saved $67.38 vs sonnet-flat)
- *   - security_review       -> opus-4-5 (policy Rule 1: high/critical -> opus)
- *   - implementation_fast   -> haiku-4-5 (cheapest sufficient)
- *
- * Override via `~/.humain-terminal/agent/orchestrator-adapter.json` to swap in
- * your own model picks without editing this file.
+ * Last-resort bindings, used only when neither a profile nor the dynamic
+ * resolver yields a model for a capability. Mirrors the shipped `premium`
+ * profile (bridge/orchestrator-profiles.json).
  */
 const FALLBACK_ADAPTER: Record<string, { model: string; effort?: string }> = {
-	architect:            { model: "amazon-bedrock/anthropic.claude-opus-4-5" },
-	technical_lead:       { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
-	implementation_strong:{ model: "amazon-bedrock/anthropic.claude-sonnet-5" },
-	implementation_fast:  { model: "amazon-bedrock/anthropic.claude-haiku-4-5" },
-	worker:               { model: "amazon-bedrock/anthropic.claude-haiku-4-5" },
-	scout:                { model: "amazon-bedrock/anthropic.claude-haiku-4-5" },
-	analysis_mid:         { model: "amazon-bedrock/anthropic.claude-sonnet-4-5" },
-	analysis_strong:      { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
-	technical_review:     { model: "amazon-bedrock/anthropic.claude-sonnet-4-5" },
-	integration_review:   { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
-	security_review:      { model: "amazon-bedrock/anthropic.claude-opus-4-5" },
-	migration_review:     { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
-	performance_review:   { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
-	api_contract_review:  { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
-	qa_agent:             { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
-	lead:                 { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
+	scout:                { model: "amazon-bedrock/global.openai.gpt-6-luna" },
+	worker:               { model: "amazon-bedrock/global.openai.gpt-6-luna" },
+	implementation_fast:  { model: "amazon-bedrock/global.openai.gpt-6-luna" },
+	analysis_mid:         { model: "amazon-bedrock/global.anthropic.claude-sonnet-5" },
+	technical_lead:       { model: "amazon-bedrock/global.anthropic.claude-sonnet-5" },
+	lead_small:           { model: "amazon-bedrock/global.anthropic.claude-sonnet-5" },
+	implementation_strong:{ model: "amazon-bedrock/global.anthropic.claude-sonnet-5" },
+	qa_agent:             { model: "amazon-bedrock/global.anthropic.claude-sonnet-5" },
+	technical_review:     { model: "amazon-bedrock/global.openai.gpt-6-sol" },
+	integration_review:   { model: "amazon-bedrock/global.openai.gpt-6-sol" },
+	migration_review:     { model: "amazon-bedrock/global.openai.gpt-6-sol" },
+	performance_review:   { model: "amazon-bedrock/global.openai.gpt-6-sol" },
+	api_contract_review:  { model: "amazon-bedrock/global.openai.gpt-6-sol" },
+	lead:                 { model: "amazon-bedrock/global.anthropic.claude-opus-5-5" },
+	architect:            { model: "amazon-bedrock/global.anthropic.claude-opus-5-5" },
+	analysis_strong:      { model: "amazon-bedrock/global.anthropic.claude-opus-5-5" },
+	security_review:      { model: "amazon-bedrock/global.anthropic.claude-opus-5-5" },
+	lead_large:           { model: "amazon-bedrock/global.anthropic.claude-fable-5-1" },
 };
 
-const RULE_REVIEW_AFTER_FIX_MIN_TIER = "sonnet";
 
 type Adapter = Record<string, Binding>;
 
@@ -536,21 +542,14 @@ function loadProfiles(): LoadedProfiles {
 			};
 		}
 	}
+	// No profiles file: run on the dynamic resolver + fallback bindings and say
+	// how to get the shipped profiles. Loading never writes: install.sh copies
+	// bridge/orchestrator-profiles.json (active "premium"), backing up any file
+	// it replaces. The legacy adapter is no longer migrated into a "default"
+	// profile; that profile was retired.
+	notes.push(`${PROFILES_PATH} not found; using dynamic/fallback bindings. Run install.sh to install the shipped profiles (${shippedProfilesPath()}).`);
 	if (existsSync(LEGACY_ADAPTER_PATH)) {
-		try {
-			const { spec, notes: migrationNotes } = migrateAdapterToProfile(JSON.parse(readFileSync(LEGACY_ADAPTER_PATH, "utf-8")));
-			const file: ProfilesFile = { version: 1, active_profile: "default", profiles: { default: spec } };
-			writeProfilesFile(file);
-			notes.push(`migrated ${LEGACY_ADAPTER_PATH} → ${PROFILES_PATH} (profile "default")${migrationNotes.length ? `: ${migrationNotes.join("; ")}` : ""}`);
-			return { file, present: true, problems: [], notes };
-		} catch (err) {
-			return {
-				file: emptyProfilesFile(),
-				present: false,
-				problems: [`${LEGACY_ADAPTER_PATH} could not be migrated: ${(err as Error).message}`],
-				notes,
-			};
-		}
+		notes.push(`${LEGACY_ADAPTER_PATH} is ignored; the shipped profiles replace it.`);
 	}
 	return { file: emptyProfilesFile(), present: false, problems: [], notes };
 }
@@ -3268,7 +3267,7 @@ function architectPrompt(goal: string, plan: PlanResponse): string {
  * The model table the lead must forward to HT's `subagent` tool. The subagent
  * tool ignores the `model:` frontmatter in the orch-* persona files and runs
  * every child on the PARENT's model unless the call passes `model` explicitly —
- * so without this block every "haiku worker" silently ran on the lead's sonnet.
+ * so without this block every cheap worker silently ran on the lead's model.
  */
 function modelTableForLead(adapter: Adapter): string[] {
 	const row = (agent: string, cap: string) =>
@@ -3516,7 +3515,7 @@ const USAGE =
 	"Usage: /orchestrate <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical]\n" +
 	"       [--profile NAME] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--frontier ALIAS] [--model <capability>=ALIAS] [--effort LEVEL]\n" +
 	"       [--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--interactive]\n" +
-	"ALIAS is a short name (fable-5-1, sonnet, haiku, astra, terra) or provider/model. Profiles: " + PROFILES_PATH + "  (see /orchestrator-models)";
+	"ALIAS is a short name (fable-5-1, opus-5-5, sonnet-5, gpt-6-sol, gpt-6-luna, astra) or provider/model. Profiles: " + PROFILES_PATH + "  (see /orchestrator-models)";
 
 const MODELS_USAGE = [
 	"Usage:",
@@ -4187,7 +4186,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("orchestrator-models", {
 		description:
 			"Manage which models /orchestrate uses. Subcommands: show|list|validate [--live]|check|set|effort|use|new|pick. " +
-			"Aliases like fable-5-1, sonnet, haiku, astra, terra resolve against your configured models.",
+			"Aliases like fable-5-1, opus-5-5, sonnet-5, gpt-6-sol, gpt-6-luna, astra resolve against your configured models.",
 		handler: async (args, ctx) => {
 			const tokens = args.trim().split(/\s+/).filter(Boolean);
 			const sub = tokens[0] && !tokens[0].startsWith("--") ? tokens[0] : "show";

@@ -2339,7 +2339,13 @@ describe("final triage and shutdown integration", () => {
 		}
 		return { handler, shutdown };
 	}
-	function registry() { return { getAvailable: () => [{ provider: "amazon-bedrock", id: "anthropic.claude-haiku-4-5", name: "Haiku" }] }; }
+	// The models FALLBACK_ADAPTER binds (mirrors the shipped premium profile).
+	function registry() {
+		return { getAvailable: () => [
+			"global.openai.gpt-6-luna", "global.openai.gpt-6-sol", "global.anthropic.claude-sonnet-5",
+			"global.anthropic.claude-opus-5-5", "global.anthropic.claude-fable-5-1",
+		].map((id) => ({ provider: "amazon-bedrock", id })) };
+	}
 	function readRows(name: string): any[] {
 		return readFileSync(join(pythonStateRoot, name), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
 	}

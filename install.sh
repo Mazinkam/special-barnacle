@@ -23,6 +23,8 @@ EXTENSIONS_SRC="$BRIDGE_DIR/extensions"
 EXTENSIONS_DST="$TARGET_DIR/extensions"
 AGENTS_SRC="$BRIDGE_DIR/agents"
 AGENTS_DST="$TARGET_DIR/agents"
+PROFILES_SRC="$BRIDGE_DIR/orchestrator-profiles.json"
+PROFILES_DST="$TARGET_DIR/orchestrator-profiles.json"
 
 STATE_ROOT="${HUMAIN_ORCHESTRATOR_STATE_ROOT:-$HOME/.local/state/coding-agent-orchestrator}"
 PYTHON_BIN="${HUMAIN_ORCHESTRATOR_PYTHON:-$(command -v python3 || echo python3)}"
@@ -93,6 +95,29 @@ uninstall_one() {
     if [ -e "$dst" ]; then
         log "skip      $name (real file/dir — leaving alone)"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Model profiles. Copied (not symlinked): /orchestrator-models edits the file in
+# place. A differing existing file is backed up first, never silently lost.
+# ---------------------------------------------------------------------------
+install_profiles() {
+    [ -f "$PROFILES_SRC" ] || { warn "no $PROFILES_SRC; skipping profiles"; return 0; }
+    mkdir -p "$TARGET_DIR"
+    if [ -L "$PROFILES_DST" ]; then
+        rm "$PROFILES_DST"
+    elif [ -f "$PROFILES_DST" ]; then
+        if cmp -s "$PROFILES_SRC" "$PROFILES_DST"; then
+            log "ok        orchestrator-profiles.json (already current)"
+            return 0
+        fi
+        local backup
+        backup="$PROFILES_DST.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+        cp -p "$PROFILES_DST" "$backup"
+        log "backup    orchestrator-profiles.json -> $(basename "$backup")"
+    fi
+    cp "$PROFILES_SRC" "$PROFILES_DST"
+    log "install   orchestrator-profiles.json (active profile: premium)"
 }
 
 # ---------------------------------------------------------------------------
@@ -200,7 +225,8 @@ main() {
         [ -n "${src:-}" ] || continue
         install_one "$src" "$dst"
     done < <(map_entries "$EXTENSIONS_SRC" "$EXTENSIONS_DST"; map_entries "$AGENTS_SRC" "$AGENTS_DST")
-    install_launchd
+    install_profiles
+    [ "${HUMAIN_ORCHESTRATOR_SKIP_LAUNCHD:-0}" = "1" ] || install_launchd
     log ""
     log "install done. run /reload in HT (or restart) to pick up the new commands:"
     log "  /reload"
