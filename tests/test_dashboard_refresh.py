@@ -2,9 +2,12 @@
 
 Every test runs on a throwaway state root filled with a deterministic synthetic history
 (`write_synthetic_history`, also used by `scripts/benchmark_refresh.py`). The aggregate-equality
-test compares `dashboard.build_data` with `reference_build_data`, a verbatim copy of the pre-change
-implementation that loads whole files into memory: the new streaming build must produce the same
-full-history aggregates and UI fields, only the recent-row retention is bounded.
+test compares `dashboard.build_data` with `reference_build_data`, an independent whole-file
+re-derivation of the same accounting: it loads each stream into memory once, deduplicates by
+`record_id`, and then computes every field with plain list comprehensions and `x / y if y else None`
+arithmetic instead of the streaming pass's running counters, deques, generator-fed reducers and
+`records.NO_DATA` helpers. The two must agree on every full-history aggregate and UI field
+(including `ingest_status` and `instrumentation`); only the recent-row retention is bounded.
 """
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ import json
 import os
 import random
 import re
+import signal
 import statistics
 import subprocess
 import sys
@@ -27,9 +31,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from orchestrator import dashboard, records, runtime
+from orchestrator import dashboard, outcomes as outcomes_module, records, runtime
 from orchestrator.economics import (ESTIMATED, REPORTED, UNMETERED, cost_attribution, cost_class, fanout_rework,
-                                    is_call_row, is_session_ingest, orchestration_overhead, row_cost, waste_cost)
+                                    is_call_row, is_session_ingest, orchestration_overhead, row_cost, unique_records,
+                                    waste_cost)
 from orchestrator.features import feature_inventory
 from orchestrator.history import build_route_stats
 from orchestrator.outcomes import outcome_summary
@@ -154,7 +159,11 @@ def edge_case_rows() -> dict[str, list[dict]]:
     Each one exercises a branch the streaming pass and the whole-file oracle must agree on: costs
     carried only by `ci_cost_usd`/`human_cost_usd`, `null` cost and usage (unmetered, not free),
     the legacy `runtime` key instead of `agent_runtime` (orchestrated and ingested rows), a verified
-    row without a task id, a row without any timestamp, and events with no `run_id`.
+    row without a task id, a row without any timestamp, events with no `run_id`, a duplicate
+    `record_id` that must bill once, a session aggregate on each side of the ingest split
+    (`covers_calls` / `legacy_source`), the engine's failed verdict (`task_verified` + `result: fail`)
+    contradicting a dispatch pass for the same task, `route_executed` spend that no cost field sees,
+    and cost-rate provenance fields on an estimated row.
     """
     run = {'run_id': 'R-edge', 'repository': '/work/forge'}
     ts = lambda s: f'2025-08-15T10:{s:02d}:00+00:00'  # noqa: E731 - later than every generated row
@@ -169,22 +178,68 @@ def edge_case_rows() -> dict[str, list[dict]]:
         {'ts': ts(3), 'record_id': 'edge-legacy-runtime', 'event': 'model_call', 'task_id': 'R-edge-T1', 'role': 'worker',
          'model': 'anthropic/claude-haiku-4-5', 'cost_usd': .25, 'cost_source': 'reported', 'input_tokens': 100, 'output_tokens': 10,
          'runtime': 'claude-code', 'review_wait_ms': 2500, **run},
+        # Same record_id as the row above with a different cost: a replayed append must bill once.
+        {'ts': ts(3), 'record_id': 'edge-legacy-runtime', 'event': 'model_call', 'task_id': 'R-edge-T1', 'role': 'worker',
+         'model': 'anthropic/claude-haiku-4-5', 'cost_usd': 999.0, 'cost_source': 'reported', 'input_tokens': 100, 'output_tokens': 10,
+         'runtime': 'claude-code', **run},
         {'ts': ts(4), 'record_id': 'edge-legacy-session', 'event': 'model_call', 'source': 'session_ingest', 'role': 'interactive_session',
          'session_id': 42, 'runtime': 'claude-code', 'model': 'openai/gpt-5', 'cost_usd': None, 'input_tokens': None, 'output_tokens': 500,
          'repository': '/work/other'},
+        {'ts': ts(4), 'record_id': 'edge-session-aggregate', 'event': 'model_call', 'source': 'session_ingest', 'role': 'interactive_session',
+         'session_id': 'agg-1', 'granularity': 'session', 'covers_calls': 40, 'agent_runtime': 'codex', 'model': 'openai/gpt-5',
+         'cost_usd': 6.5, 'cost_source': 'estimated', 'input_tokens': 900000, 'output_tokens': 40000, 'repository': '/work/other'},
         {'ts': ts(5), 'record_id': 'edge-verified-no-task', 'event': 'task_verified', 'role': 'qa', 'result': 'verified',
          'quality_evidence_score': .9, 'agent_runtime': 'humain-terminal', **run},
+        # Dispatch exit 0 for R-edge-T2, then the engine's gate verdict for the same task: `task_verified`
+        # carrying `result: 'fail'`. The task is attested-failed, not verified and not a dispatch pass.
+        {'ts': ts(5), 'record_id': 'edge-dispatch-pass', 'event': 'model_call', 'task_id': 'R-edge-T2', 'role': 'worker',
+         'model': 'openai/gpt-5', 'cost_usd': .11, 'cost_source': 'reported', 'input_tokens': 10, 'output_tokens': 5, 'result': 'pass',
+         'policy_id': 'pol-edge', 'agent_runtime': 'codex', **run},
+        {'ts': ts(6), 'record_id': 'edge-engine-failed-verdict', 'event': 'task_verified', 'task_id': 'R-edge-T2', 'result': 'fail',
+         'quality_evidence_score': .2, 'agent_runtime': 'codex', **run},
+        # A dispatch pass with no attestation at all: counted under `dispatch_pass`, never `verified`.
+        {'ts': ts(6), 'record_id': 'edge-dispatch-only', 'event': 'model_call', 'task_id': 'R-edge-T3', 'role': 'worker',
+         'model': 'openai/gpt-5', 'cost_usd': .07, 'cost_source': 'reported', 'input_tokens': 10, 'output_tokens': 5, 'result': 'pass',
+         'policy_id': 'pol-edge', 'agent_runtime': 'codex', **run},
+        # Orchestrated session aggregate (legacy import): counted as spend, excluded from per-call stats.
+        {'ts': ts(7), 'record_id': 'edge-legacy-aggregate', 'event': 'model_call', 'legacy_source': 'metrics-v1', 'covers_calls': 12,
+         'role': 'worker', 'model': 'openai/gpt-5', 'cost_usd': 4.0, 'cost_source': 'estimated', 'input_tokens': 300000,
+         'output_tokens': 20000, 'agent_runtime': 'codex', **run},
+        # Bridge-executed spend: real dollars that every `cost_usd` field reads as $0.
+        {'ts': ts(7), 'record_id': 'edge-route-executed', 'event': 'route_executed', 'task_id': 'R-edge-T1', 'executed_cost_usd': .3,
+         'executed_passes': True, 'agent_runtime': 'codex', **run},
+        {'ts': ts(7), 'record_id': 'edge-route-executed-legacy', 'event': 'route_executed', 'task_id': 'R-edge-T2', 'executed_cost_usd': .2,
+         'runtime': 'claude-code', **run},
+        # An estimated row whose rate provenance is declared and verified.
+        {'ts': ts(8), 'record_id': 'edge-rate-verified', 'event': 'model_call', 'task_id': 'R-edge-T1', 'role': 'worker',
+         'model': 'openai/gpt-5', 'cost_rate_model': 'gpt-5', 'cost_rate_source': 'openai pricing page', 'cost_rate_verified_on': '2025-08-01',
+         'cost_usd': .05, 'cost_source': 'estimated-from-reported-tokens', 'input_tokens': 1000, 'output_tokens': 100,
+         'agent_runtime': 'codex', **run},
         {'record_id': 'edge-bare', 'event': 'model_call', 'cost_usd': .01, **run},
     ]
     events = [
         {'ts': ts(0), 'record_id': 'edge-ev-start', 'event': 'run_started', 'started_at': ts(0), 'runtime': 'claude-code', **run},
         {'ts': ts(1), 'record_id': 'edge-ev-no-run', 'event': 'orchestrator_initialized', 'schema_version': 3},
         {'ts': ts(2), 'record_id': 'edge-ev-conflict-no-run', 'event': 'merge_conflict_resolution'},
+        {'ts': ts(2), 'record_id': 'edge-ev-invalidated-no-run', 'event': 'decision_invalidated', 'decision_id': 'D-edge', 'affected_tasks': 2},
         {'ts': ts(6), 'record_id': 'edge-ev-end', 'event': 'run_completed', 'started_at': ts(0), 'finished_at': ts(6),
          'elapsed_ms': 360000, 'elapsed_source': 'monotonic', **run},
     ]
     outcomes = [{'ts': ts(6), 'record_id': 'edge-outcome', 'task_id': 'run-complete', 'note': 'not json', 'completed_at': None, **run}]
     return {'events.jsonl': events, 'metrics.jsonl': metrics, 'outcomes.jsonl': outcomes}
+
+
+#: A fresh, well-formed `ingest_status.json` as `cli.process_ingest` writes it. `last_*` are filled in
+#: at write time so the sweep is never stale relative to the test's clock; `build_ingest_status`'s
+#: staleness and validation rules have their own unit tests in `tests/test_dashboard_metrics.py`.
+INGEST_STATUS_FIXTURE = {'status': 'ok', 'emitted': 7, 'failure_count': 1, 'error': None, 'sweep_interval_seconds': 600}
+
+
+def write_ingest_status(root: Path) -> dict:
+    now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    status = {**INGEST_STATUS_FIXTURE, 'last_attempt_at': now, 'last_success_at': now}
+    (root / 'ingest_status.json').write_text(json.dumps(status), encoding='utf-8')
+    return status
 
 
 def append_rows(root: Path, rows_by_stream: dict[str, list[dict]]) -> None:
@@ -206,121 +261,266 @@ def write_synthetic_history(root: Path, runs: int, seed: int = 7) -> dict[str, i
 
 
 # --------------------------------------------------------------------------------------------
-# Oracle: the pre-change build_data, verbatim (whole-file loads, three quantile sorts, ...)
+# Oracle: an independent whole-file re-derivation of the merged build_data accounting
 # --------------------------------------------------------------------------------------------
+#
+# Deliberately *not* streaming: every stream is loaded into a list, deduplicated once by
+# `record_id`, and each figure is computed by a separate pass over those lists with
+# `x / y if y else None` arithmetic (`None` is what `records.NO_DATA` becomes on the wire). The
+# list-based reducers both sides share (`waste_cost`, `cost_attribution`, `build_route_stats`,
+# `summarize_runs`, `outcome_summary`, `flaky_stats`, ...) are called on the complete lists, so the
+# comparison checks that the streaming pass feeds them the same cohorts, and everything the
+# streaming pass accumulates inline (session folding, role/runtime/policy/day breakdowns, per-call
+# percentiles, adaptive counters, instrumentation sample counts, display tails) is re-derived here.
 
 def _ref_quantile(xs, p):
-    if not xs: return 0.0
+    if not xs: return None
     xs = sorted(xs); k = (len(xs) - 1) * p; lo = int(k); hi = min(len(xs) - 1, lo + 1); return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
 
 
+def _ref_ratio(numerator, denominator):
+    return numerator / denominator if denominator else None
+
+
+def _ref_mean(xs):
+    return sum(xs) / len(xs) if xs else None
+
+
+def _ref_num(value) -> float:
+    if value is None or isinstance(value, bool): return 0.0
+    try: return float(value or 0)
+    except (TypeError, ValueError): return 0.0
+
+
+def _ref_tokens(row) -> int:
+    return int(_ref_num(row.get('input_tokens'))) + int(_ref_num(row.get('output_tokens')))
+
+
+def _ref_runtime(row) -> str:
+    return str(row.get('agent_runtime') or row.get('runtime') or 'unknown')
+
+
+def _ref_ingest_status(root: Path) -> dict:
+    """What the page must say about the sweep. Only the two shapes this test writes are modelled."""
+    raw = read_json(root / 'ingest_status.json', None)
+    if not isinstance(raw, dict) or not raw:
+        return {'status': 'unknown', 'last_attempt_at': None, 'last_success_at': None, 'emitted': 0, 'failure_count': 0,
+                'error': None, 'stale_after_seconds': 1800}
+    return {'status': raw['status'], 'last_attempt_at': raw['last_attempt_at'], 'last_success_at': raw['last_success_at'],
+            'emitted': int(raw.get('emitted') or 0), 'failure_count': int(raw.get('failure_count') or 0),
+            'error': raw.get('error'), 'stale_after_seconds': 2 * int(raw.get('sweep_interval_seconds') or 900)}
+
+
+def _ref_instrumentation(samples: dict[str, int]) -> dict[str, dict]:
+    """Per-card instrumentation state from whole-history sample counts (see `dashboard.INSTRUMENTATION`)."""
+    state = {}
+    for key, field in dashboard.INSTRUMENTATION.items():
+        instrumented = records.is_instrumented(field); count = samples[key]
+        state[key] = {'field': field, 'instrumented': instrumented, 'samples': count,
+                      'label': None if instrumented and count > 0 else ('not emitted' if instrumented else 'not instrumented'),
+                      'note': (records.UNINSTRUMENTED_FIELDS.get(field) or records.INSTRUMENTED_FIELDS.get(field)
+                               or dashboard._FIELD_NOTES.get(field) or '')}
+    return state
+
+
 def reference_build_data(root: Path, config: dict | None = None):
-    config = config or read_json(Path(dashboard.__file__).with_name('config.json'), {})
-    metrics = load_jsonl(root / 'metrics.jsonl'); events = load_jsonl(root / 'events.jsonl'); outcomes = load_jsonl(root / 'outcomes.jsonl')
+    config = config or read_json(Path(dashboard.__file__).with_name('config.json'), {})  # `{}` falls back like build_data
+    events = list(unique_records(load_jsonl(root / 'events.jsonl')))
+    metrics = list(unique_records(load_jsonl(root / 'metrics.jsonl')))
+    outcomes = list(unique_records(load_jsonl(root / 'outcomes.jsonl')))
     ingested = [r for r in metrics if is_session_ingest(r)]
     orchestrated = [r for r in metrics if not is_session_ingest(r)]
-    costs = [float(r.get('cost_usd', 0) or 0) + float(r.get('ci_cost_usd', 0) or 0) + float(r.get('human_cost_usd', 0) or 0) for r in orchestrated]
-    verified = {r.get('task_id') for r in orchestrated if r.get('result') == 'verified' or r.get('event') == 'task_verified'} - {None}
-    total = sum(costs); waste = waste_cost(orchestrated)
-    attribution = cost_attribution(orchestrated)
-    role = defaultdict(lambda: {'cost': 0, 'calls': 0, 'tokens': 0})
-    rt_agg = defaultdict(lambda: {'cost': 0, 'calls': 0, 'reported_cost': 0.0, 'estimated_cost': 0.0, 'metered_calls': 0, 'unmetered_calls': 0})
-    policies = defaultdict(lambda: {'cost': 0, 'calls': 0, 'verified': set(), 'quality': [], 'aggr': []})
-    adaptive = []
-    for r in orchestrated:
-        rr = r.get('role') or r.get('capability_class') or 'unknown'
-        role[rr]['cost'] += float(r.get('cost_usd', 0) or 0); role[rr]['calls'] += 1
-        role[rr]['tokens'] += int(r.get('input_tokens', 0) or 0) + int(r.get('output_tokens', 0) or 0)
-        agent_runtime = r.get('agent_runtime') or r.get('runtime') or 'unknown'; rt = rt_agg[agent_runtime]
-        rt['cost'] += float(r.get('cost_usd', 0) or 0); rt['calls'] += 1
-        if is_call_row(r):
-            provenance = cost_class(r)
-            if provenance == REPORTED: rt['reported_cost'] += float(r.get('cost_usd', 0) or 0); rt['metered_calls'] += 1
-            elif provenance == ESTIMATED: rt['estimated_cost'] += float(r.get('cost_usd', 0) or 0); rt['metered_calls'] += 1
-            else: rt['unmetered_calls'] += 1
-        pid = r.get('policy_id') or 'unknown'; p = policies[pid]
-        p['cost'] += float(r.get('cost_usd', 0) or 0); p['calls'] += 1
-        if r.get('result') == 'verified' or r.get('event') == 'task_verified': p['verified'].add(r.get('task_id'))
-        if r.get('quality_evidence_score') is not None: p['quality'].append(float(r['quality_evidence_score']))
-        if r.get('cost_aggressiveness') is not None: p['aggr'].append(float(r['cost_aggressiveness']))
-        if r.get('event') == 'adaptive_route_decision': adaptive.append(r)
+
+    # -- spend ---------------------------------------------------------------------------------
+    total = sum(row_cost(r) for r in orchestrated)
+    waste = waste_cost(orchestrated); attribution = cost_attribution(orchestrated)
+    per_call = [row_cost(r) for r in orchestrated if records.is_per_call_cost_row(r)]
+    session_rows = [r for r in orchestrated if records.classify(r) == records.SESSION]
+    p50 = _ref_quantile(per_call, .5); p99 = _ref_quantile(per_call, .99)
+    tail_ratio = p99 / p50 if len(per_call) >= dashboard.MIN_TAIL_SAMPLES and p50 else None
+
+    # -- verification: one verdict per task over every row of both streams ---------------------
+    by_task = defaultdict(list)
+    for r in orchestrated + outcomes:
+        if r.get('task_id') is not None: by_task[str(r['task_id'])].append(r)
+    verdicts = {tid: records.resolve_task_verification(rows) for tid, rows in by_task.items()}
+    verified = {tid for tid, v in verdicts.items() if v == (records.VERIFIED, records.ATTESTED)}
+    dispatch_passed = {tid for tid, v in verdicts.items() if v == (records.VERIFIED, records.DISPATCH)}
+    task_of = lambda r: str(r['task_id']) if r.get('task_id') is not None else None  # noqa: E731
+
+    # -- breakdowns ----------------------------------------------------------------------------
+    roles = sorted({r.get('role') or r.get('capability_class') or 'unknown' for r in orchestrated}, key=str)
+    by_role = {}
+    for name in roles:
+        rows = [r for r in orchestrated if (r.get('role') or r.get('capability_class') or 'unknown') == name]
+        calls = [r for r in rows if is_call_row(r)]
+        by_role[name] = {'cost': sum(row_cost(r) for r in rows), 'rows': len(rows), 'call_rows': len(calls),
+                         'session_rows': sum(1 for r in rows if records.classify(r) == records.SESSION),
+                         'covered_calls': sum(records.covered_calls(r) for r in calls), 'tokens': sum(_ref_tokens(r) for r in rows)}
+    by_runtime = {}
+    for name in sorted({_ref_runtime(r) for r in orchestrated}):
+        rows = [r for r in orchestrated if _ref_runtime(r) == name]
+        calls = [r for r in rows if is_call_row(r)]
+        reported = [r for r in calls if cost_class(r) == REPORTED]; estimated = [r for r in calls if cost_class(r) == ESTIMATED]
+        by_runtime[name] = {'cost': sum(row_cost(r) for r in rows), 'rows': len(rows), 'call_rows': len(calls),
+                            'session_rows': sum(1 for r in rows if records.classify(r) == records.SESSION),
+                            'covered_calls': sum(records.covered_calls(r) for r in calls),
+                            'reported_cost': sum(row_cost(r) for r in reported), 'estimated_cost': sum(row_cost(r) for r in estimated),
+                            'metered_calls': len(reported) + len(estimated), 'unmetered_calls': len(calls) - len(reported) - len(estimated)}
     policy_rows = []
-    for pid, p in policies.items():
-        vn = len(p['verified']); policy_rows.append({'policy_id': pid, 'cost': p['cost'], 'calls': p['calls'], 'verified': vn,
-            'verified_cost': p['cost'] / vn if vn else None, 'quality': sum(p['quality']) / len(p['quality']) if p['quality'] else None,
-            'cost_aggressiveness': sum(p['aggr']) / len(p['aggr']) if p['aggr'] else None})
+    for pid in dict.fromkeys(str(r.get('policy_id') or 'unknown') for r in orchestrated):  # first-seen order, like the stream
+        rows = [r for r in orchestrated if str(r.get('policy_id') or 'unknown') == pid]
+        quality = [float(r['quality_evidence_score']) for r in rows if r.get('quality_evidence_score') is not None]
+        aggr = [float(r['cost_aggressiveness']) for r in rows if r.get('cost_aggressiveness') is not None]
+        cost = sum(row_cost(r) for r in rows); vn = len({task_of(r) for r in rows} & verified)
+        policy_rows.append({'policy_id': pid, 'cost': cost, 'rows': len(rows), 'call_rows': sum(1 for r in rows if is_call_row(r)),
+                            'verified': vn, 'verified_cost': _ref_ratio(cost, vn), 'dispatch_pass': len({task_of(r) for r in rows} & dispatch_passed),
+                            'quality': _ref_mean(quality), 'cost_aggressiveness': _ref_mean(aggr)})
+    trends = []
+    for day in sorted({str(r.get('ts', ''))[:10] or 'unknown' for r in orchestrated}):
+        rows = [r for r in orchestrated if (str(r.get('ts', ''))[:10] or 'unknown') == day]
+        quality = [float(r['quality_evidence_score']) for r in rows if r.get('quality_evidence_score') is not None]
+        aggr = [float(r['cost_aggressiveness']) for r in rows if r.get('cost_aggressiveness') is not None]
+        cost = sum(row_cost(r) for r in rows); vn = len({task_of(r) for r in rows} & verified)
+        trends.append({'day': day, 'cost': cost, 'rows': len(rows), 'call_rows': sum(1 for r in rows if is_call_row(r)), 'verified': vn,
+                       'verified_cost': _ref_ratio(cost, vn), 'dispatch_pass': len({task_of(r) for r in rows} & dispatch_passed),
+                       'quality': _ref_mean(quality), 'cost_aggressiveness': _ref_mean(aggr),
+                       'retries': sum(int(_ref_num(r.get('retry'))) for r in rows),
+                       'adaptive': sum(1 for r in rows if r.get('event') == 'adaptive_route_decision')})
+
+    # -- signals with or without a producer ----------------------------------------------------
     context_misses = sum(1 for r in orchestrated if r.get('event') in {'context_packet_miss', 'context_refetch'})
     context_packets = sum(1 for r in orchestrated if r.get('event') == 'context_packet')
     conflicts = sum(1 for e in events if e.get('event') in {'merge_conflict', 'merge_conflict_resolution'})
-    review_wait = [float(r.get('review_wait_ms', 0) or 0) / 1000 for r in orchestrated if r.get('review_wait_ms') is not None]
+    invalidations = sum(1 for e in events if e.get('event') == 'decision_invalidated')
+    review_wait = [_ref_num(r.get('review_wait_ms')) / 1000 for r in orchestrated if r.get('review_wait_ms') is not None]
     shadow = [r for r in orchestrated if r.get('event') == 'shadow_review']
     false_pass = sum(1 for r in shadow if r.get('normal_pass') is True and r.get('shadow_pass') is False)
     over_reject = sum(1 for r in shadow if r.get('normal_pass') is False and r.get('shadow_pass') is True)
+    quality_samples = sum(1 for r in orchestrated if r.get('quality_evidence_score') is not None)
+    retry_samples = sum(1 for r in orchestrated if 'retry' in r)
     outsum = outcome_summary(root); mature30 = [x for x in outsum if x['mature_30d']]
     delayed_bad = sum(1 for x in mature30 if x['bad_outcome'])
+
+    # -- adaptive routing ----------------------------------------------------------------------
+    adaptive = [r for r in orchestrated if r.get('event') == 'adaptive_route_decision']
     actions = defaultdict(int)
     for r in adaptive: actions[str(r.get('route_action', 'unknown'))] += 1
-    runs = summarize_runs(orchestrated, events, outcomes)
-    run_cov = evidence_coverage(runs)
-    summary = {'total_cost': total, 'reported_cost': attribution[REPORTED]['cost'], 'estimated_cost': attribution[ESTIMATED]['cost'],
-        'unmetered_calls': attribution[UNMETERED]['calls'], 'call_rows': attribution['call_rows'], 'cost_coverage': attribution['coverage'],
+    action_names = ('recommended_only', 'empirical_enforced', 'static_default', 'fallback_insufficient_history')
+
+    # -- bridge-executed spend and rate provenance ---------------------------------------------
+    executed = [r for r in orchestrated if r.get('event') == 'route_executed']
+    executed_by_runtime = {}
+    for r in executed: executed_by_runtime[_ref_runtime(r)] = executed_by_runtime.get(_ref_runtime(r), 0.0) + _ref_num(r.get('executed_cost_usd'))
+    executed_cost = sum(executed_by_runtime.values())
+    paired = sum(row_cost(r) for r in orchestrated if r.get('event') == 'model_call' and _ref_runtime(r) in executed_by_runtime)
+    executed_spend = {'cost': executed_cost, 'rows': len(executed), 'by_runtime': executed_by_runtime, 'model_call_cost_same_runtimes': paired,
+                      'mirrors_model_call_cost': executed_cost > 0 and paired > 0 and abs(executed_cost - paired) <= dashboard.EXECUTED_MIRROR_TOLERANCE * max(executed_cost, paired),
+                      'counted_in_total_cost': False}
+    estimated_rows = [r for r in metrics if cost_class(r) == ESTIMATED]  # orchestrated + ingested
+    rate_models = []
+    for name in dict.fromkeys(str(r.get('cost_rate_model') or r.get('model') or 'unknown') for r in estimated_rows):
+        rows = [r for r in estimated_rows if str(r.get('cost_rate_model') or r.get('model') or 'unknown') == name]
+        sources = [str(r['cost_rate_source']) for r in rows if r.get('cost_rate_source')]
+        verified_on = [str(r['cost_rate_verified_on']) for r in rows if r.get('cost_rate_verified_on')]
+        rate_models.append({'model': name, 'rows': len(rows), 'cost': sum(row_cost(r) for r in rows),
+                            'source': sources[0] if sources else None, 'verified_on': verified_on[-1] if verified_on else None})
+    rate_models.sort(key=lambda m: -m['cost'])
+    dominant = rate_models[0] if rate_models else None
+    rate_provenance = {'scope': 'all metric rows (orchestrated + ingested)', 'estimated_cost': sum(m['cost'] for m in rate_models),
+                       'rate_rows': len(estimated_rows), 'verified_rate_rows': sum(1 for r in estimated_rows if r.get('cost_rate_verified_on')),
+                       'unverified_rate_cost': sum(m['cost'] for m in rate_models if not m['verified_on']),
+                       'dominant_model': dominant['model'] if dominant else None, 'dominant_rows': dominant['rows'] if dominant else None,
+                       'dominant_cost': dominant['cost'] if dominant else None, 'models': rate_models[:8]}
+
+    # -- runs ----------------------------------------------------------------------------------
+    runs = summarize_runs(orchestrated, events, outcomes); run_cov = evidence_coverage(runs)
+    overhead = orchestration_overhead(orchestrated)
+
+    summary = {
+        'total_cost': total, 'reported_cost': attribution[REPORTED]['cost'], 'estimated_cost': attribution[ESTIMATED]['cost'],
+        'unmetered_calls': attribution[UNMETERED]['calls'], 'call_rows': attribution['call_rows'], 'covered_calls': attribution['covered_calls'],
+        'cost_coverage': attribution['coverage'],
         'runs': run_cov['runs'], 'runs_fully_priced': run_cov['runs_fully_priced'], 'runs_with_elapsed': run_cov['runs_with_elapsed'],
         'priced_run_coverage': run_cov['priced_run_coverage'], 'duration_coverage': run_cov['duration_coverage'],
         'verification_coverage': run_cov['verification_coverage'], 'cost_provenance': run_cov['cost_provenance'],
-        'verified_tasks': len(verified), 'verified_cost': total / len(verified) if verified else None,
-        'waste_cost': sum(waste.values()), 'waste_rate': sum(waste.values()) / total if total else 0,
-        'orchestration_overhead': orchestration_overhead(orchestrated), 'fanout_rework': fanout_rework(events),
-        'context_miss_rate': context_misses / context_packets if context_packets else 0, 'conflicts': conflicts,
-        'review_wait_p90_s': _ref_quantile(review_wait, .9), 'shadow_false_pass_rate': false_pass / len(shadow) if shadow else None,
-        'shadow_over_reject_rate': over_reject / len(shadow) if shadow else None,
-        'stable_30d_failure_rate': delayed_bad / len(mature30) if mature30 else None,
-        'p50_cost': _ref_quantile(costs, .5), 'p90_cost': _ref_quantile(costs, .9), 'p99_cost': _ref_quantile(costs, .99),
-        'tail_ratio': _ref_quantile(costs, .99) / max(1e-9, _ref_quantile(costs, .5)) if costs else 0,
+        'verified_tasks': len(verified), 'verified_cost': _ref_ratio(total, len(verified)),
+        'dispatch_pass_tasks': len(dispatch_passed), 'dispatch_pass_cost': _ref_ratio(total, len(dispatch_passed)),
+        'waste_cost': sum(waste.values()), 'waste_rate': _ref_ratio(sum(waste.values()), total),
+        'orchestration_overhead': overhead, 'coordination_rate': overhead['coordination_rate'], 'verification_rate': overhead['verification_rate'],
+        'coordination_cost': overhead['coordination_cost'], 'verification_cost': overhead['verification_cost'],
+        'fanout_rework': fanout_rework(events), 'context_miss_rate': _ref_ratio(context_misses, context_packets),
+        'conflicts': conflicts or None, 'review_wait_p90_s': _ref_quantile(review_wait, .9),
+        'shadow_reviews': len(shadow), 'shadow_false_pass_rate': _ref_ratio(false_pass, len(shadow)), 'shadow_over_reject_rate': _ref_ratio(over_reject, len(shadow)),
+        'stable_30d_failure_rate': _ref_ratio(delayed_bad, len(mature30)),
+        'per_call_samples': len(per_call), 'per_call_cost': sum(per_call), 'mean_call_cost': _ref_mean(per_call),
+        'p50_cost': p50, 'p90_cost': _ref_quantile(per_call, .9), 'p99_cost': p99, 'max_call_cost': max(per_call) if per_call else None,
+        'session_rows': len(session_rows), 'session_cost': sum(row_cost(r) for r in session_rows),
+        'tail_ratio': tail_ratio, 'tail_ratio_min_samples': dashboard.MIN_TAIL_SAMPLES,
+        'executed_spend': executed_spend, 'rate_provenance': rate_provenance,
         'adaptive_decisions': len(adaptive), 'adaptive_actions': dict(actions),
-        'exploration_rate_observed': sum(1 for x in adaptive if x.get('explored')) / len(adaptive) if adaptive else None,
-        'history_sufficient_rate': sum(1 for x in adaptive if x.get('history_sufficient')) / len(adaptive) if adaptive else None}
-    daily = defaultdict(lambda: {'cost': 0.0, 'calls': 0, 'verified': set(), 'quality': [], 'aggr': [], 'retries': 0, 'adaptive': 0})
-    for r in orchestrated:
-        day = str(r.get('ts', ''))[:10] or 'unknown'; d = daily[day]; d['cost'] += float(r.get('cost_usd', 0) or 0); d['calls'] += 1; d['retries'] += int(r.get('retry', 0) or 0)
-        if r.get('event') == 'adaptive_route_decision': d['adaptive'] += 1
-        if r.get('result') == 'verified' or r.get('event') == 'task_verified': d['verified'].add(r.get('task_id'))
-        if r.get('quality_evidence_score') is not None: d['quality'].append(float(r['quality_evidence_score']))
-        if r.get('cost_aggressiveness') is not None: d['aggr'].append(float(r['cost_aggressiveness']))
-    trends = []
-    for day, d in sorted(daily.items()):
-        vn = len(d['verified']); trends.append({'day': day, 'cost': d['cost'], 'calls': d['calls'], 'verified': vn,
-            'verified_cost': d['cost'] / vn if vn else None, 'quality': sum(d['quality']) / len(d['quality']) if d['quality'] else None,
-            'cost_aggressiveness': sum(d['aggr']) / len(d['aggr']) if d['aggr'] else None, 'retries': d['retries'], 'adaptive': d['adaptive']})
-    interactive_sessions = {
-        'calls': len(ingested),
-        'cost': sum(row_cost(r) for r in ingested),
-        'tokens': sum(int(r.get('input_tokens', 0) or 0) + int(r.get('output_tokens', 0) or 0) for r in ingested),
-        'by_runtime': {},
-        'sessions': len({str(r.get('session_id')) for r in ingested if r.get('session_id') is not None}) or None,
+        'adaptive_action_counts': {name: (actions.get(name, 0) if adaptive else None) for name in action_names},
+        'exploration_rate_observed': _ref_ratio(sum(1 for x in adaptive if x.get('explored')), len(adaptive)),
+        'history_sufficient_rate': _ref_ratio(sum(1 for x in adaptive if x.get('history_sufficient')), len(adaptive)),
     }
-    for r in ingested:
-        agent_runtime = r.get('agent_runtime') or r.get('runtime') or 'unknown'
-        br = interactive_sessions['by_runtime'].setdefault(agent_runtime, {'calls': 0, 'cost': 0.0})
-        br['calls'] += 1; br['cost'] += row_cost(r)
-    last_event_ts = max((str(e.get('ts', '')) for e in events), default=None) or None
-    last_metric_ts = max((str(r.get('ts', '')) for r in metrics), default=None) or None
+
+    # -- interactive sessions: rows are not calls ----------------------------------------------
+    interactive_sessions = {
+        'rows': len(ingested), 'calls': sum(records.covered_calls(r) for r in ingested),
+        'aggregate_rows': sum(1 for r in ingested if records.classify(r) == records.SESSION),
+        'cost': sum(row_cost(r) for r in ingested), 'tokens': sum(_ref_tokens(r) for r in ingested), 'by_runtime': {},
+        'sessions': len({str(r['session_id']) for r in ingested if r.get('session_id') is not None}) or None,
+    }
+    for name in dict.fromkeys(_ref_runtime(r) for r in ingested):
+        rows = [r for r in ingested if _ref_runtime(r) == name]
+        interactive_sessions['by_runtime'][name] = {'rows': len(rows), 'calls': sum(records.covered_calls(r) for r in rows), 'cost': sum(row_cost(r) for r in rows)}
+
     return {'generated_at': None,
-        'last_event_ts': last_event_ts, 'last_metric_ts': last_metric_ts,
-        'event_count': len(events), 'metric_count': len(metrics),
-        'summary': summary, 'waste': waste, 'by_role': role, 'by_runtime': rt_agg, 'policies': policy_rows, 'trends': trends,
-        'routes': build_route_stats(orchestrated, outcomes), 'outcomes': outsum,
-        'run_evidence': run_cov, 'runs': runs[-200:],
-        'flaky': flaky_stats(orchestrated),
-        'interactive_sessions': interactive_sessions,
-        'features': feature_inventory(config.get('features', {})), 'adaptive': adaptive[-500:],
-        'events': events[-500:], 'metrics': metrics[-2000:]}
+            'last_event_ts': max((str(e.get('ts', '')) for e in events), default=None) or None,
+            'last_metric_ts': max((str(r.get('ts', '')) for r in metrics), default=None) or None,
+            'event_count': len(events), 'metric_count': len(metrics),
+            'summary': summary, 'waste': waste, 'by_role': by_role, 'by_runtime': by_runtime, 'policies': policy_rows, 'trends': trends,
+            'instrumentation': _ref_instrumentation({
+                'review_wait_p90_s': len(review_wait), 'context_miss_rate': context_packets, 'fanout_rework': invalidations,
+                'conflicts': conflicts, 'shadow_false_pass_rate': len(shadow), 'shadow_over_reject_rate': len(shadow),
+                'quality': quality_samples, 'avg_quality_evidence': quality_samples, 'retry_rate': retry_samples}),
+            'routes': build_route_stats(orchestrated, outcomes), 'outcomes': outsum,
+            'run_evidence': run_cov, 'runs': runs[-dashboard.RECENT_RUNS:],
+            'flaky': flaky_stats(orchestrated),
+            'interactive_sessions': interactive_sessions,
+            'ingest_status': _ref_ingest_status(root),
+            'features': feature_inventory(config.get('features', {})), 'adaptive': adaptive[-dashboard.RECENT_ADAPTIVE:],
+            'events': events[-dashboard.RECENT_EVENTS:], 'metrics': metrics[-dashboard.RECENT_METRICS:]}
 
 
 def normalized(data: dict) -> dict:
-    """JSON round trip (defaultdicts, key order) with the volatile timestamp removed."""
-    data = json.loads(json.dumps(data, sort_keys=True, default=str))
+    """Wire form: `NO_DATA` -> null, defaultdicts/key order flattened, the volatile timestamp removed."""
+    data = json.loads(json.dumps(records.to_json(data), sort_keys=True, default=records.json_default))
     data.pop('generated_at', None)
     return data
+
+
+#: Dollar figures are summed in a different order by the streaming pass (interactive rows are folded
+#: as they are read) and by the oracle (one `sum` per cohort); Python 3.14 exposed the resulting
+#: representation drift on `interactive_sessions.cost`. A nanodollar is far below anything a reader
+#: can act on; a cent is not.
+FLOAT_DELTA = 1e-9
+
+
+def assert_same_data(test: unittest.TestCase, actual, expected, path: str = 'D') -> None:
+    """Deep equality with `FLOAT_DELTA` for floats; everything else (keys, ints, strings, nulls) exact."""
+    if isinstance(expected, dict):
+        test.assertIsInstance(actual, dict, path)
+        test.assertEqual(sorted(actual), sorted(expected), f'{path}: key set diverged')
+        for key in expected: assert_same_data(test, actual[key], expected[key], f'{path}.{key}')
+    elif isinstance(expected, list):
+        test.assertIsInstance(actual, list, path)
+        test.assertEqual(len(actual), len(expected), f'{path}: length diverged')
+        for i, (a, e) in enumerate(zip(actual, expected)): assert_same_data(test, a, e, f'{path}[{i}]')
+    elif isinstance(expected, float) and not isinstance(expected, bool) and isinstance(actual, (int, float)) and not isinstance(actual, bool):
+        test.assertAlmostEqual(actual, expected, delta=FLOAT_DELTA, msg=path)
+    else:
+        test.assertEqual(actual, expected, path)
 
 
 def embedded_data(html: str) -> dict:
@@ -335,6 +535,23 @@ class SyntheticRootTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name, 'state')
         self.addCleanup(self._tmp.cleanup)
+
+    def freeze_outcome_clock(self):
+        """Pin `outcome_summary`'s `now` for the rest of the test.
+
+        `age_days` is `(now - completed_at).days`; the oracle and the streaming build run a second
+        apart over ~2k outcomes with random times of day, so about one run in forty saw one
+        outcome's age tick over between the two calls. Both sides must see the same instant.
+        """
+        frozen = datetime.now(timezone.utc)
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen if tz is None else frozen.astimezone(tz)
+
+        patcher = patch.object(outcomes_module, 'datetime', FrozenDateTime)
+        patcher.start(); self.addCleanup(patcher.stop)
 
 
 # --------------------------------------------------------------------------------------------
@@ -363,86 +580,66 @@ class DashboardAggregateTests(SyntheticRootTestCase):
         counts = write_synthetic_history(self.root, runs=450)
         self.assertGreater(counts['metrics.jsonl'], 2000); self.assertGreater(counts['events.jsonl'], 500)
         append_rows(self.root, edge_case_rows())
+        ingest_status = write_ingest_status(self.root)
+        self.freeze_outcome_clock()
         expected = normalized(reference_build_data(self.root, config={}))
         actual = normalized(dashboard.build_data(self.root, config={}))
-        # Compare the streaming reducer to the whole-file oracle for fields whose semantics did
-        # not change. The current dashboard deliberately adds ingest health/instrumentation and
-        # distinguishes rows, calls, and attested verification where the older oracle did not.
-        stable_keys = ('adaptive', 'event_count', 'events', 'features', 'flaky', 'last_event_ts',
-                       'last_metric_ts', 'metric_count', 'metrics', 'outcomes', 'routes',
-                       'run_evidence', 'runs', 'waste')
-        for key in stable_keys:
-            self.assertEqual(actual[key], expected[key], f'dashboard field {key!r} diverged from the reference')
-        # Recompute row-oriented aggregates from a fully materialized input. The reference oracle
-        # predates CI/human cost components and the rows-vs-calls distinction, so use current shared
-        # record classifiers with the whole-file population as an independent streaming oracle.
-        all_metrics = load_jsonl(self.root / 'metrics.jsonl')
-        orchestrated = [row for row in all_metrics if not is_session_ingest(row)]
-        ingested = [row for row in all_metrics if is_session_ingest(row)]
-        attribution = cost_attribution(orchestrated)
-        for key in ('total_cost', 'reported_cost', 'estimated_cost', 'unmetered_calls',
-                    'call_rows', 'cost_coverage'):
-            if key == 'total_cost':
-                expected_value = sum(row_cost(row) for row in orchestrated)
-            elif key == 'reported_cost':
-                expected_value = attribution[REPORTED]['cost']
-            elif key == 'estimated_cost':
-                expected_value = attribution[ESTIMATED]['cost']
-            elif key == 'unmetered_calls':
-                expected_value = attribution[UNMETERED]['calls']
-            elif key == 'cost_coverage':
-                expected_value = attribution['coverage']
-            else:
-                expected_value = attribution[key]
-            self.assertEqual(actual['summary'][key], expected_value, f'summary {key}')
-        for key in ('runs', 'runs_fully_priced', 'runs_with_elapsed'):
-            self.assertEqual(actual['summary'][key], expected['summary'][key], f'summary {key}')
+        self.assertEqual(sorted(actual), sorted(expected))
+        for key in expected:
+            with self.subTest(field=key):
+                assert_same_data(self, actual[key], expected[key], key)
 
-        roles = defaultdict(lambda: {'rows': 0, 'cost': 0.0, 'tokens': 0})
-        runtimes = defaultdict(lambda: {'rows': 0, 'cost': 0.0, 'reported_cost': 0.0,
-                                        'estimated_cost': 0.0, 'metered_calls': 0, 'unmetered_calls': 0})
-        policies = defaultdict(lambda: {'rows': 0, 'cost': 0.0})
-        trends = defaultdict(lambda: {'rows': 0, 'cost': 0.0})
-        for row in orchestrated:
-            role = row.get('role') or row.get('capability_class') or 'unknown'
-            runtime = row.get('agent_runtime') or row.get('runtime') or 'unknown'
-            cost = row_cost(row)
-            roles[role]['rows'] += 1; roles[role]['cost'] += cost
-            roles[role]['tokens'] += int(row.get('input_tokens', 0) or 0) + int(row.get('output_tokens', 0) or 0)
-            runtimes[runtime]['rows'] += 1; runtimes[runtime]['cost'] += cost
-            if is_call_row(row):
-                kind = cost_class(row)
-                if kind == REPORTED:
-                    runtimes[runtime]['reported_cost'] += cost; runtimes[runtime]['metered_calls'] += 1
-                elif kind == ESTIMATED:
-                    runtimes[runtime]['estimated_cost'] += cost; runtimes[runtime]['metered_calls'] += 1
-                else:
-                    runtimes[runtime]['unmetered_calls'] += 1
-            policy = row.get('policy_id') or 'unknown'
-            policies[policy]['rows'] += 1; policies[policy]['cost'] += cost
-            day = str(row.get('ts', ''))[:10] or 'unknown'
-            trends[day]['rows'] += 1; trends[day]['cost'] += cost
-        for role, expected_row in roles.items():
-            for key, value in expected_row.items():
-                self.assertEqual(actual['by_role'][role][key], value, f'role {role}: {key}')
-        for runtime, expected_row in runtimes.items():
-            for key, value in expected_row.items():
-                self.assertEqual(actual['by_runtime'][runtime][key], value, f'runtime {runtime}: {key}')
-        for policy, expected_row in policies.items():
-            for key, value in expected_row.items():
-                self.assertEqual(next(row for row in actual['policies'] if row['policy_id'] == policy)[key],
-                                 value, f'policy {policy}: {key}')
-        for day, expected_row in trends.items():
-            current = next(row for row in actual['trends'] if row['day'] == day)
-            for key, value in expected_row.items():
-                self.assertEqual(current[key], value, f'trend {day}: {key}')
-        interactive = actual['interactive_sessions']
-        self.assertEqual(interactive['rows'], len(ingested))
-        self.assertEqual(interactive['calls'], sum(records.covered_calls(row) for row in ingested))
-        self.assertAlmostEqual(interactive['cost'], sum(row_cost(row) for row in ingested), delta=1e-9)
-        self.assertEqual(interactive['tokens'], sum(int(row.get('input_tokens', 0) or 0) + int(row.get('output_tokens', 0) or 0) for row in ingested))
-        self.assertEqual(interactive['sessions'], len({str(row.get('session_id')) for row in ingested if row.get('session_id') is not None}) or 'NO_DATA')
+        # The oracle is only meaningful if the fixture drives the branches it re-derives; pin the
+        # shape of the accounting so a regression on either side cannot pass by both being empty.
+        summary = actual['summary']; events = load_jsonl(self.root / 'events.jsonl')
+        self.assertGreater(summary['per_call_samples'], dashboard.MIN_TAIL_SAMPLES)
+        self.assertIsInstance(summary['tail_ratio'], float); self.assertLess(summary['tail_ratio'], 100)
+        self.assertGreater(summary['p50_cost'], 0, 'per-call percentiles exclude the $0 event rows')
+        self.assertEqual(summary['session_rows'], 1); self.assertAlmostEqual(summary['session_cost'], 4.0)
+        self.assertGreater(summary['verified_tasks'], 0)
+        # R-edge-T2: dispatch pass + engine `task_verified`/`result: fail` -> neither verified nor a dispatch pass.
+        # R-edge-T3: dispatch pass with no attestation -> the one dispatch pass.
+        self.assertEqual(summary['dispatch_pass_tasks'], 1)
+        edge_policy = next(p for p in actual['policies'] if p['policy_id'] == 'pol-edge')
+        self.assertEqual((edge_policy['verified'], edge_policy['dispatch_pass']), (0, 1))
+        self.assertEqual(summary['conflicts'], sum(1 for e in events if e.get('event') in {'merge_conflict', 'merge_conflict_resolution'}))
+        invalidated = [e for e in events if e.get('event') == 'decision_invalidated']
+        self.assertAlmostEqual(summary['fanout_rework'], sum(int(e['affected_tasks']) for e in invalidated) / len(invalidated))
+        self.assertEqual(summary['executed_spend']['rows'], 2); self.assertAlmostEqual(summary['executed_spend']['cost'], .5)
+        self.assertFalse(summary['executed_spend']['mirrors_model_call_cost']); self.assertFalse(summary['executed_spend']['counted_in_total_cost'])
+        self.assertEqual(summary['rate_provenance']['verified_rate_rows'], 1)
+        self.assertIn('gpt-5', {m['model'] for m in summary['rate_provenance']['models']})
+        # A replayed record_id bills once: the $999 duplicate is exactly what the naive sum over-counts.
+        naive_rows = [r for r in load_jsonl(self.root / 'metrics.jsonl') if not is_session_ingest(r)]
+        self.assertAlmostEqual(sum(row_cost(r) for r in naive_rows) - summary['total_cost'], 999.0)
+        self.assertAlmostEqual(sum(row_cost(r) for r in naive_rows if (r.get('agent_runtime') or r.get('runtime')) == 'claude-code')
+                               - actual['by_runtime']['claude-code']['cost'], 999.0)
+        self.assertEqual(actual['metric_count'], counts['metrics.jsonl'] + len(edge_case_rows()['metrics.jsonl']) - 1)
+        # Session aggregates are counted as calls, not rows.
+        sessions = actual['interactive_sessions']
+        self.assertEqual(sessions['aggregate_rows'], 1); self.assertEqual(sessions['calls'], sessions['rows'] + 39)
+        self.assertEqual(sessions['by_runtime']['codex']['calls'], sessions['by_runtime']['codex']['rows'] + 39)
+        # Cards say *why* a value is missing, from the whole history's sample counts.
+        instrumentation = actual['instrumentation']
+        self.assertEqual(instrumentation['review_wait_p90_s']['label'], 'not instrumented')
+        self.assertGreater(instrumentation['review_wait_p90_s']['samples'], 0)
+        self.assertIsNone(instrumentation['quality']['label']); self.assertGreater(instrumentation['quality']['samples'], 100)
+        self.assertIsNone(instrumentation['retry_rate']['label']); self.assertGreater(instrumentation['retry_rate']['samples'], 100)
+        self.assertEqual(instrumentation['fanout_rework']['samples'], len(invalidated))
+        # Sweep health is what the fixture wrote, fresh, with the doubled sweep interval as the staleness bound.
+        self.assertEqual(actual['ingest_status'], {'status': 'ok', 'last_attempt_at': ingest_status['last_attempt_at'],
+                                                   'last_success_at': ingest_status['last_success_at'], 'emitted': 7,
+                                                   'failure_count': 1, 'error': None, 'stale_after_seconds': 1200})
 
+    def test_streaming_build_matches_the_reference_without_a_sweep_status_file(self):
+        write_synthetic_history(self.root, runs=20)
+        self.freeze_outcome_clock()
+        expected = normalized(reference_build_data(self.root, config={}))
+        actual = normalized(dashboard.build_data(self.root, config={}))
+        assert_same_data(self, actual, expected)
+        self.assertEqual(actual['ingest_status']['status'], 'unknown')
+        self.assertEqual(actual['summary']['executed_spend']['rows'], 0)
+        self.assertFalse(actual["summary"]["executed_spend"]["mirrors_model_call_cost"])
     def test_recent_rows_are_bounded_to_the_stream_tail(self):
         write_synthetic_history(self.root, runs=450)
         events = load_jsonl(self.root / 'events.jsonl'); metrics = load_jsonl(self.root / 'metrics.jsonl')
@@ -521,10 +718,8 @@ class AtomicPublicationTests(SyntheticRootTestCase):
             with self.assertRaises(OSError):
                 dashboard.generate_dashboard(self.root, config={})
         self.assertEqual(out.read_bytes(), previous, 'a torn render must not replace the published page')
-        sidecars = {'dashboard.lock', 'dashboard.version.json'}
-        leftovers = [p.name for p in self.root.iterdir()
-                     if p.name != 'dashboard.html' and p.name not in sidecars and 'dashboard' in p.name]
-        self.assertEqual(leftovers, [], 'no temporary file may be left behind')
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.endswith('.tmp') and 'dashboard' in p.name], [],
+                         'no temporary file may be left behind')
         # A later refresh catches up with a complete document.
         again = dashboard.generate_dashboard(self.root, config={})
         self.assertEqual(again, out)
@@ -540,10 +735,16 @@ class AtomicPublicationTests(SyntheticRootTestCase):
 
         with patch('io.open', self._torn_write_open(observe)):
             dashboard.generate_dashboard(self.root, config={})
+        final = out.read_bytes()
         self.assertTrue(observed)
-        self.assertTrue(all(seen == previous for seen in observed), 'the published page changed before the new one was complete')
+        self.assertTrue(final.endswith(b'</html>'))
+        # Every write the hook saw happened while the page was one complete document: the previous
+        # one for the page's own temp-file writes, and (only after the rename) the new one for the
+        # `dashboard.version.json` receipt written next. Never a partial page.
+        self.assertEqual(observed[0], previous, 'the page was replaced before the first byte of the new one was written')
+        for i, seen in enumerate(observed):
+            self.assertIn(seen, (previous, final), f'observation {i}: readers saw a page that is neither the old nor the new complete document')
         self.assertNotEqual(out.stat().st_ino, previous_inode, 'the page must be replaced by rename, not rewritten in place')
-        self.assertTrue(out.read_text(encoding='utf-8').endswith('</html>'))
 
 
 class SurrogateTests(SyntheticRootTestCase):
@@ -666,6 +867,105 @@ class BenchmarkHarnessTests(SyntheticRootTestCase):
         run = self._run_child_bounded([sys.executable, '-c', 'import sys; sys.exit(7)'], env=dict(os.environ))
         self.assertEqual(run.returncode, 7)
 
+    def test_run_child_preserves_nonzero_exit_when_timeout_is_configured(self):
+        run = self.bench.run_child([sys.executable, '-c', 'import sys; sys.exit(7)'], env=dict(os.environ), timeout=10)
+        self.assertEqual(run.returncode, 7)
+
+    def test_run_child_raises_timeout_for_a_hung_process(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.bench.run_child([sys.executable, '-c', 'import time; time.sleep(10)'], env=dict(os.environ), timeout=0.05)
+
+    def test_run_child_with_timeout_blocks_on_the_child_instead_of_sampling_it(self):
+        # Only the legacy side carries a timeout. A WNOHANG/sleep poll adds up to one sampling interval
+        # to that side's measured elapsed time and nothing to the batch side, biasing the comparison.
+        wait4 = os.wait4; options_seen = []
+        def recording_wait4(pid, options):
+            options_seen.append(options); return wait4(pid, options)
+        with patch.object(self.bench.time, 'sleep', side_effect=AssertionError('the harness must not sleep while a measured child runs')), \
+             patch.object(self.bench.os, 'wait4', recording_wait4):
+            run = self.bench.run_child([sys.executable, '-c', 'import time; time.sleep(0.2)'], env=dict(os.environ), timeout=10)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(options_seen, [0], 'one blocking reap per child; never WNOHANG sampling')
+        self.assertGreaterEqual(run.elapsed_s, 0.2)
+
+    def test_run_child_timeout_kills_and_reaps_the_child_in_a_worker_thread(self):
+        # The benchmark tests drive the harness from helper threads; the supervisor must not depend on
+        # main-thread-only signal handlers, and a timed-out child must be reaped (no zombie, no
+        # ResourceWarning from an un-waited Popen).
+        outcome = []
+        def run():
+            try: self.bench.run_child([sys.executable, '-c', 'import time; time.sleep(10)'], env=dict(os.environ), timeout=0.1)
+            except BaseException as exc: outcome.append(exc)
+        thread = threading.Thread(target=run, daemon=True); thread.start(); thread.join(10)
+        self.assertFalse(thread.is_alive(), 'timeout supervisor did not fire from a worker thread')
+        self.assertIsInstance(outcome[0], subprocess.TimeoutExpired)
+
+    def _run_child_with_failing_timer_start(self, exc: BaseException, *, after_start: bool):
+        """Drive run_child(timeout=...) with a Timer whose start() raises `exc`, optionally after the thread is running.
+
+        Returns (pid, timer, kills): the child's pid, the Timer the supervisor built, and every
+        (pid, sig) the harness sent through os.kill. The Timer is armed with a deadline far shorter
+        than the child's lifetime, so an un-disarmed supervisor would fire during the test.
+        """
+        bench = self.bench; timers = []; kills = []; pids = []
+        class FailingStart(threading.Timer):
+            def start(self):
+                timers.append(self)
+                if after_start: super().start()  # the interrupt lands after the thread is already running
+                raise exc
+        real_popen = bench.subprocess.Popen
+        def spy_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs); pids.append(proc.pid); return proc
+        real_kill = bench.os.kill
+        def spy_kill(pid, sig):
+            kills.append((pid, sig)); return real_kill(pid, sig)
+        with patch.object(bench.threading, 'Timer', FailingStart), patch.object(bench.subprocess, 'Popen', spy_popen), \
+             patch.object(bench.os, 'kill', spy_kill), self.assertRaises(type(exc)) as ctx:
+            bench.run_child([sys.executable, '-c', 'import time; time.sleep(10)'], env=dict(os.environ), timeout=0.05)
+        self.assertIs(ctx.exception, exc)
+        self.assertEqual(len(pids), 1); self.assertEqual(len(timers), 1)
+        return pids[0], timers[0], kills
+
+    def _assert_child_reaped_and_supervisor_disarmed(self, pid, timer, kills):
+        # No zombie: the pid is no longer a child of this process (a zombie would return (pid, status);
+        # a live child (0, 0)). Popen was told about the reap, so its destructor issues no second waitpid.
+        with self.assertRaises(ChildProcessError): os.waitpid(pid, os.WNOHANG)
+        # No late signal: the supervisor is closed and its thread, if it ever ran, has exited. The
+        # one kill is the cleanup path's own, sent before the reap; nothing else may be sent, even
+        # if the timer callback were still to run.
+        self.assertFalse(timer.is_alive(), 'supervisor thread outlived close()')
+        self.assertTrue(timer.finished.is_set(), 'supervisor timer was not cancelled')
+        self.assertEqual(kills, [(pid, signal.SIGKILL)])
+        deadline = timer.function.__self__
+        deadline._expire()  # a late fire after close() must be a no-op: the pid may already belong to someone else
+        self.assertEqual(kills, [(pid, signal.SIGKILL)]); self.assertFalse(deadline.expired)
+
+    def test_run_child_reaps_the_child_and_disarms_when_timer_start_raises(self):
+        # threading.Timer.start() can fail (RuntimeError: can't start new thread). The supervisor was
+        # built outside run_child's cleanup try, so the child stayed unreaped: a zombie until Popen's
+        # destructor reaped it behind the harness's back.
+        pid, timer, kills = self._run_child_with_failing_timer_start(RuntimeError("can't start new thread"), after_start=False)
+        self._assert_child_reaped_and_supervisor_disarmed(pid, timer, kills)
+
+    def test_run_child_disarms_a_running_timer_when_start_is_interrupted(self):
+        # Thread.start() blocks on the new thread's started-event; a KeyboardInterrupt delivered there
+        # leaves the timer thread running while start() raises. Previously the supervisor reference
+        # was lost, so nothing cancelled it: the child was left unreaped and the armed SIGKILL could
+        # later hit whatever process the kernel had given the recycled pid.
+        pid, timer, kills = self._run_child_with_failing_timer_start(KeyboardInterrupt(), after_start=True)
+        self._assert_child_reaped_and_supervisor_disarmed(pid, timer, kills)
+
+    def test_legacy_timeout_budget_scales_with_planned_processes_and_is_capped(self):
+        self.assertEqual(self.bench.legacy_process_timeout(1), 60)
+        self.assertEqual(self.bench.legacy_process_timeout(120), 120)
+        self.assertEqual(self.bench.legacy_process_timeout(500), 240)
+        # The outer test budgets the driver's whole compare-legacy workload per (possibly emulated) child
+        # from the same planned count the driver uses, inside the same 60..240s bounds.
+        self.assertEqual(self.bench.compare_legacy_process_count(scales=3, repeat=1, batch_size=5), 36)
+        self.assertEqual(self.bench.legacy_process_timeout(36, seconds_per_process=5), 180)
+        self.assertEqual(self.bench.legacy_process_timeout(36, seconds_per_process=10), 240)
+        self.assertEqual(self.bench.legacy_process_timeout(2, seconds_per_process=5), 60)
+
     def test_run_child_keeps_the_exit_code_when_the_io_report_is_truncated(self):
         # A child that dies mid-report leaves a syntactically incomplete file: the harness must report
         # the child's exit code and `io=None`, never raise a decode error that masks the failure.
@@ -682,7 +982,7 @@ class BenchmarkHarnessTests(SyntheticRootTestCase):
         code = ('import os, sys; open(os.environ["ORCHESTRATOR_BENCH_IO_REPORT"], "w").write(\'{"python_file_io\'); sys.exit(5)')
         self.bench.cli_argv = lambda *args: [sys.executable, '-c', code]
         with self.assertRaises(SystemExit) as ctx:
-            self.bench.run_cli(self.root, 'dashboard')
+            self.bench.run_cli(self.root, 'dashboard', timeout=10)
         self.assertIn('failed (5)', str(ctx.exception))
 
     def _child(self, io):
@@ -753,13 +1053,19 @@ class BenchmarkHarnessTests(SyntheticRootTestCase):
         self.assertEqual(run.stdout.strip(), str(self.root / 'dashboard.html'))
         self.assertGreaterEqual(run.io['python_file_io']['read_bytes'], stream_bytes, 'a dashboard render reads every stream once')
         self.assertGreaterEqual(run.io['python_file_io']['write_bytes'], (self.root / 'dashboard.html').stat().st_size)
-        self.assertFalse([p for p in self.root.iterdir() if p.name == 'io.json'],
-                         'the benchmark I/O report never lands in the state root')
+        self.assertFalse([p for p in self.root.iterdir() if p.suffix == '.json' and 'io' in p.name and p.name != 'dashboard.version.json'], 'the I/O report never lands in the state root')
 
     def test_measure_reports_measured_bytes_not_only_fixture_sizes(self):
         write_synthetic_history(self.root, runs=3)
         args = argparse.Namespace(batch_size=2, repeat=1, checkout=REPO)
-        result = self.bench.measure(self.root, 1, args, tag='t')
+        timeouts = []
+        run_child = self.bench.run_child
+        def record_timeout(*argv, **kwargs):
+            if kwargs.get('timeout') is not None: timeouts.append(kwargs['timeout'])
+            return run_child(*argv, **kwargs)
+        with patch.object(self.bench, 'run_child', record_timeout):
+            result = self.bench.measure(self.root, 1, args, tag='t')
+        self.assertEqual(timeouts, [60, 60], 'the two per-record legacy children receive the bounded planned-workload timeout')
         self.assertIn('fixture_bytes', result); self.assertNotIn('bytes', result)
         for op in ('batch', 'dashboard', 'per_record_legacy', 'cold_first_batch', 'engine_boundary'):
             io = result[op]['io']
