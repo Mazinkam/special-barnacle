@@ -103,6 +103,7 @@ import { classifyRunOutcome, externalChangeFiles, parseLeadStatus } from "./run-
 import { SpendCapTracker, capFor, type SpendCapVerdict } from "./spend-cap.ts";
 import { NestedCostTracker } from "./nested-cost.ts";
 import { escalateLeadCapability, isLeadCapability, isLeadSize, leadSizeOf, sizeLead, type LeadSizeDecision } from "./lead-sizing.ts";
+import { planEscalation, type EscalationLeadInput } from "./escalation.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
 import {
 	BoundedCapture,
@@ -3663,59 +3664,11 @@ function parseFailedChecks(text: string): string[] {
 	return Array.from(new Set(fails));
 }
 
-/**
- * Decide how to escalate a failed verification. Returns a list of new
- * DispatchTask entries to add to the next pass, or empty if we're done.
- *
- * The model for each retry is chosen by pickModel, which applies method.json
- * Rule 1 (`rules.review_after_fix`) for the run's risk.
- */
-function planEscalation(
-	failedChecks: string[],
-	originalTasks: DispatchTask[],
-	complexity: number,
-	risk: string,
-	retryCount: number,
-): DispatchTask[] {
-	if (retryCount >= 2) return []; // stop-loss
-	if (failedChecks.length === 0) return [];
-
-	const isHighRisk = risk === "high" || risk === "critical";
-
-	// For verification failures, we re-dispatch the original tasks with bumped
-	// reviewer tier (handled by pickModel when retryCount > 0). For now we add
-	// a single retry task that re-runs verification with more careful scope.
-	const target = originalTasks[0];
-	if (!target) return [];
-
-	// A lead that failed verification is retried one size up per retry
-	// (lead_small -> lead -> lead_large), capped at the largest size. The
-	// original tasks are the first-attempt leads, so retry N climbs N sizes.
-	let capability = target.capability;
-	if (METHOD.rules.lead_sizing.escalate_on_verification_failure && isLeadCapability(capability)) {
-		for (let i = 0; i <= retryCount; i++) capability = escalateLeadCapability(capability) ?? capability;
-	}
-
-	return [
-		{
-			...target,
-			capability,
-			taskId: `${target.taskId}-retry-${retryCount + 1}`,
-			retryOf: target.taskId,
-			retryCount: retryCount + 1,
-			task: [
-				target.task,
-				"",
-				`[Escalation: retry #${retryCount + 1}]`,
-				`Previous attempt failed verification with:`,
-				...failedChecks.map((c) => `- ${c}`),
-				isHighRisk
-					? "Risk is high/critical: re-review MUST use at least the premium tier."
-					: "Re-review must use at least the mid tier.",
-			].join("\n"),
-		},
-	];
-}
+// planEscalation now lives in escalation.ts as a pure, independently tested
+// module (see BUG 2 fix note there): it keeps the original lead task/prompt
+// intact on retry instead of substituting the failed lead's report, retries
+// every lead the failure is or might be attributable to (not just lead 0),
+// and stops at the caller's own `maxRetries` instead of a hard-coded 2.
 
 // -----------------------------------------------------------------------------
 // Hierarchical dispatch
@@ -3753,6 +3706,8 @@ async function dispatchHierarchical(
 	architectResult?: DispatchResult;
 	/** Mutable sink the caller appends escalation dispatches to, so they get billed. */
 	escalationResults: DispatchResult[];
+	/** Original DispatchTask objects dispatched for each lead, paired with leadResults by taskId — needed to build faithful retry prompts (BUG 2). */
+	leadTasks: DispatchTask[];
 }> {
 	const { depth } = plan.topology;
 
@@ -3831,7 +3786,7 @@ export async function dispatchReconAndLeads(
 		setPhase: (phase: string) => void;
 		throwIfCancelled: () => void;
 	},
-): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number }> {
+): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[] }> {
 	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars = RECON_EVIDENCE_MAX_CHARS, leadCapability = "lead" } = input;
 	const requestedLeadCount = effectiveLeadCount(plan);
 
@@ -3907,6 +3862,12 @@ export async function dispatchReconAndLeads(
 		`${leadCount} lead(s) in ${waves.length} wave(s) executing on ${shortName(adapter[leadCapability]?.model ?? "?")} with ${reconPhaseNote}; nested subagent calls inside a lead are not authoritative worker accounting`,
 	);
 	const leadResults: DispatchResult[] = [];
+	// The exact DispatchTask objects dispatched for each lead, in the same
+	// order/identity as leadResults (paired by taskId). BUG 2: escalation
+	// retries were built from the failed lead's REPORT because the original
+	// prompt was never kept anywhere past this function; callers now use this
+	// to recover the lead's original goal/scope/model-routing prompt on retry.
+	const leadTasks: DispatchTask[] = [];
 	const stopped = new Set<number>();
 	for (const [w, wave] of waves.entries()) {
 		// A lead whose dependency failed or reported STATUS: blocked is not started.
@@ -3918,7 +3879,8 @@ export async function dispatchReconAndLeads(
 		}
 		if (runnable.length === 0) continue;
 		if (waves.length > 1) effects.setPhase(`wave ${w + 1}/${waves.length}: lead(s) ${runnable.map((i) => i + 1).join(", ")}`);
-		const results = await effects.dispatch(runnable.map(leadTaskFor));
+		const tasks = runnable.map(leadTaskFor);
+		const results = await effects.dispatch(tasks);
 		for (const r of results) await effects.capture(r);
 		// Same contract as recon: bill every finished lead, then honour cancellation.
 		effects.throwIfCancelled();
@@ -3926,6 +3888,7 @@ export async function dispatchReconAndLeads(
 			if (r.exitCode !== 0 || parseLeadStatus(r.stdout) === "blocked") stopped.add(runnable[k]);
 		}
 		leadResults.push(...results);
+		leadTasks.push(...tasks);
 	}
 
 	// Recon is parent-owned and returned for billing/reporting. Any further
@@ -3934,7 +3897,7 @@ export async function dispatchReconAndLeads(
 	// not count it as part of this run's authoritative worker accounting.
 	// Leads never started because a lead they depend on failed or was blocked.
 	const skippedLeads = [...stopped].filter((i) => !leadResults.some((r) => r.taskId === `${runId}-lead-${i}`)).length;
-	return { leadResults, workerResults, skippedLeads };
+	return { leadResults, workerResults, skippedLeads, leadTasks };
 }
 
 /**
@@ -4226,7 +4189,7 @@ function consumeFlag(tokens: string[], start: number, out: OrchestrateArgs): num
 			case "--quality-floor": if (next) { out.qualityFloor = Number(next); i++; } break;
 			case "--cost-aggressiveness": if (next) { out.costAggressiveness = Number(next); i++; } break;
 			case "--fan-out": out.fanOut = true; break;
-			case "--max-retries": if (next) { out.maxRetries = Number(next) || 2; i++; } break;
+			case "--max-retries": if (next) { const n = Number(next); out.maxRetries = Number.isFinite(n) && n >= 0 ? n : 2; i++; } break;
 			case "--interactive": out.interactive = true; break;
 			// Kept as a no-op for existing scripts: auto-approval is now the default.
 			case "--yes": case "-y": break;
@@ -4796,7 +4759,7 @@ export default function (pi: ExtensionAPI) {
 				const headBefore = gitHead(cwd);
 				// `workerResults` carries the parent-owned recon dispatches; they must stay
 				// destructured here or the run stops billing them (plan Task 3).
-				const { leadResults, workerResults, architectResult, escalationResults, skippedLeads } = await dispatchHierarchical(
+				const { leadResults, workerResults, architectResult, escalationResults, skippedLeads, leadTasks } = await dispatchHierarchical(
 
 					cwd,
 					runId,
@@ -4908,21 +4871,29 @@ export default function (pi: ExtensionAPI) {
 					if (lastVerification.passed) break;
 
 					session.log(`verification failed: ${lastVerification.failedChecks.join(", ") || "(unparsed)"}`);
+					// Pair each lead's ORIGINAL dispatch task (goal/scope/model-routing
+					// prompt) with its own outcome so planEscalation can retry with the
+					// real prompt instead of the failed report (BUG 2), and can decide
+					// per-lead whether a retry is warranted instead of only ever
+					// retrying lead 0.
+					const leadsForEscalation: EscalationLeadInput[] = leadResults.map((r) => {
+						const task = leadTasks.find((t) => t.taskId === r.taskId) ?? { capability: r.capability, task: r.stdout, taskId: r.taskId };
+						return { task, result: { exitCode: r.exitCode, stdout: r.stdout, filesChanged: r.filesChanged } };
+					});
 					const escalationTasks = planEscalation(
 						lastVerification.failedChecks,
-						leadResults.map((r) => ({
-							capability: r.capability,
-							task: r.stdout,
-							taskId: r.taskId,
-						})),
+						leadsForEscalation,
 						plan.complexity,
 						plan.risk,
 						retries,
+						parsed.maxRetries,
 					);
 					if (escalationTasks.length === 0) break;
 
 					// Re-run escalations with bumped models (handled by pickModel when
-					// retryCount > 0 via adapter override).
+					// retryCount > 0 via adapter override). One or many retry tasks (one
+					// per retried lead) run sequentially here; each still gets its own
+					// adapter override for its own capability.
 					const roundStart = escalationResults.length;
 					for (const t of escalationTasks) {
 						const binding = adapter[t.capability] ?? adapter.worker;
@@ -5450,7 +5421,7 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 
-/** Test seam: planEscalation is internal; exported under a test-only name. */
+/** Test seam: planEscalation now lives in escalation.ts; re-exported here under the pre-existing test-only name for index.test.ts callers. */
 export const planEscalationForTest = planEscalation;
 /** Test seam: pickModel is internal; exported under a test-only name. */
 export const pickModelForTest = pickModel;

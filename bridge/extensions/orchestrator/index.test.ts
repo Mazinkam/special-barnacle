@@ -3978,6 +3978,14 @@ describe("lead sizing wiring (Phase A)", () => {
 		expect(orchestrator.parseArgs("do x --bogus").unknownFlags).toEqual(["--bogus"]);
 	});
 
+	test("--max-retries 0 is honoured, not coerced to the default", () => {
+		expect(orchestrator.parseArgs("do x --max-retries 0").maxRetries).toBe(0);
+		expect(orchestrator.parseArgs("do x --max-retries 4").maxRetries).toBe(4);
+		expect(orchestrator.parseArgs("do x --max-retries -1").maxRetries).toBe(2);
+		expect(orchestrator.parseArgs("do x --max-retries nope").maxRetries).toBe(2);
+		expect(orchestrator.parseArgs("do x").maxRetries).toBe(2);
+	});
+
 	test("dispatchReconAndLeads dispatches the sized lead capability", async () => {
 		const dispatched: string[] = [];
 		await orchestrator.dispatchReconAndLeads(
@@ -3991,12 +3999,14 @@ describe("lead sizing wiring (Phase A)", () => {
 	});
 
 	test("failed verification escalates the lead one size per retry, capped at large", () => {
-		const t = (capability: string) => [{ capability, task: "t", taskId: "r-lead-0" }];
-		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_small"), 2, "low", 0)[0].capability).toBe("lead");
-		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_small"), 2, "low", 1)[0].capability).toBe("lead_large");
-		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_large"), 9, "low", 0)[0].capability).toBe("lead_large");
-		expect(orchestrator.planEscalationForTest(["tests failed"], t("technical_review"), 5, "low", 0)[0].capability).toBe("technical_review");
-		expect(orchestrator.planEscalationForTest(["x"], t("lead"), 5, "high", 0)[0].task).toContain("at least the premium tier");
+		const t = (capability: string) => [
+			{ task: { capability, task: "t", taskId: "r-lead-0" }, result: { exitCode: 0, stdout: "report", filesChanged: [] } },
+		];
+		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_small"), 2, "low", 0, 2)[0].capability).toBe("lead");
+		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_small"), 2, "low", 1, 2)[0].capability).toBe("lead_large");
+		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_large"), 9, "low", 0, 2)[0].capability).toBe("lead_large");
+		expect(orchestrator.planEscalationForTest(["tests failed"], t("technical_review"), 5, "low", 0, 2)[0].capability).toBe("technical_review");
+		expect(orchestrator.planEscalationForTest(["x"], t("lead"), 5, "high", 0, 2)[0].task).toContain("at least the premium tier");
 	});
 
 	test("policyIdFor is stable for identical bindings and changes with them", () => {
