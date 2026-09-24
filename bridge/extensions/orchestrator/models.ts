@@ -14,8 +14,12 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 // the two runtimes. Edit the root file, never this one.
 import method from "./method.json";
 
-export type Tier = "cheap" | "mid" | "premium";
-export const TIERS: Tier[] = ["premium", "mid", "cheap"];
+export type Tier = "cheap" | "mid" | "premium" | "frontier";
+/** Display order, most expensive first. `METHOD.tiers` is the ascending cost order. */
+export const TIERS: Tier[] = ["frontier", "premium", "mid", "cheap"];
+
+export type LeadSize = "small" | "standard" | "large";
+export type SpendCapMode = "off" | "warn" | "enforce";
 
 export type RiskLevel = "low" | "medium" | "high" | "critical";
 
@@ -46,13 +50,24 @@ interface MethodFile {
 			evidence_packet_max_tokens: number;
 			skip_for_task_classes: string[];
 		};
+		lead_sizing: {
+			sizes: Record<LeadSize, string>;
+			by_complexity: { min: number; max: number; size: LeadSize }[];
+			risk_floor: Record<string, LeadSize>;
+			escalate_on_verification_failure: boolean;
+		};
+		dispatch_spend_cap: {
+			mode: SpendCapMode;
+			usd_by_capability: Record<string, number>;
+			default_usd: number;
+		};
 	};
 }
 
 export const METHOD = method as unknown as MethodFile;
 
 /** Which cost tier each abstract capability sits at. Derived from method.json. */
-export const TIER_CAPABILITIES: Record<Tier, string[]> = { cheap: [], mid: [], premium: [] };
+export const TIER_CAPABILITIES: Record<Tier, string[]> = { cheap: [], mid: [], premium: [], frontier: [] };
 for (const [cap, spec] of Object.entries(METHOD.capabilities)) TIER_CAPABILITIES[spec.tier].push(cap);
 export const ALL_CAPABILITIES = Object.keys(METHOD.capabilities);
 
@@ -79,7 +94,7 @@ export function tierOf(capability: string): Tier | undefined {
 }
 
 export function isTier(s: string): s is Tier {
-	return s === "cheap" || s === "mid" || s === "premium";
+	return s === "cheap" || s === "mid" || s === "premium" || s === "frontier";
 }
 
 export function isThinkingLevel(s: string): s is ThinkingLevel {
@@ -169,7 +184,7 @@ export function parseProfileSpec(spec: unknown, where: string, problems: string[
 	if (s.tiers && typeof s.tiers === "object") {
 		out.tiers = {};
 		for (const [tier, v] of Object.entries(s.tiers as Record<string, unknown>)) {
-			if (!isTier(tier)) problems.push(`${where}.tiers: unknown tier "${tier}" (cheap|mid|premium)`);
+			if (!isTier(tier)) problems.push(`${where}.tiers: unknown tier "${tier}" (cheap|mid|premium|frontier)`);
 			else if (typeof v !== "string" || !v.trim()) problems.push(`${where}.tiers.${tier} must be a non-empty string`);
 			else out.tiers[tier] = v.trim();
 		}
@@ -529,8 +544,8 @@ export function formatAdapterTable(resolved: ResolvedAdapter): string[] {
 			byModel.set(key, [...(byModel.get(key) ?? []), cap]);
 		}
 		for (const [key, caps] of byModel) {
-			lines.push(`${tier.padEnd(7)} ${key}`);
-			lines.push(`        └ ${caps.join(", ")}`);
+			lines.push(`${tier.padEnd(8)} ${key}`);
+			lines.push(`         └ ${caps.join(", ")}`);
 		}
 	}
 	return lines;

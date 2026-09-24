@@ -54,13 +54,12 @@ TIER_BOUNDARIES = {
 # `claude-opus-5` tomorrow) without editing this table.
 #
 # When a preference is active, tier assignment for the matched capability is
-# driven by FAMILY RANK (cheapest=haiku, mid=sonnet, expensive=opus), not by
-# TIER_BOUNDARIES. Cost-boundary bucketing alone would put claude-haiku-4-5
-# (output $5.5/Mtok) in the `mid` tier, so it could never win a `cheapest`
-# capability even when it's the intended cheapest family member.
+# driven by FAMILY RANK (cheapest=sonnet, mid=sonnet, expensive=opus; haiku is
+# deliberately not used by this skill), not by TIER_BOUNDARIES. Profiles are
+# the primary routing source; this preset is only the no-profile fallback.
 MODEL_FAMILY_PRESETS: dict[str, dict[str, str]] = {
     "anthropic": {
-        "cheapest":  "claude-haiku",
+        "cheapest":  "claude-sonnet",
         "mid":       "claude-sonnet",
         "expensive": "claude-opus",
     },

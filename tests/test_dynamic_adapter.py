@@ -92,10 +92,15 @@ class ResolveAdapterFamilyPreferenceTests(unittest.TestCase):
         self._patch_sources(fake_ht_store(), fake_catalog())
         adapter = da.resolve_adapter()
 
-        self.assertEqual(adapter["implementation_fast"]["model"], "claude-haiku-4-5")
+        # The skill never routes to haiku: the anthropic preset fills the
+        # cheapest tier with sonnet even though haiku is in the catalog.
+        self.assertEqual(adapter["implementation_fast"]["model"], "claude-sonnet-5")
         self.assertEqual(adapter["implementation_fast"]["tier"], "cheapest")
-        self.assertEqual(adapter["worker"]["model"], "claude-haiku-4-5")
-        self.assertEqual(adapter["scout"]["model"], "claude-haiku-4-5")
+        self.assertEqual(adapter["worker"]["model"], "claude-sonnet-5")
+        self.assertEqual(adapter["scout"]["model"], "claude-sonnet-5")
+        for cap, binding in adapter.items():
+            if not cap.startswith("_"):
+                self.assertNotIn("haiku", binding["model"], cap)
 
         self.assertEqual(adapter["technical_lead"]["model"], "claude-sonnet-5")
         self.assertEqual(adapter["technical_lead"]["tier"], "mid")
@@ -131,11 +136,11 @@ class ResolveAdapterFamilyPreferenceTests(unittest.TestCase):
 
     def test_fallback_with_explanation_when_family_member_missing(self):
         # Opus isn't in the configured+catalog intersection (HT store has no
-        # bedrock opus entries), but haiku/sonnet still are.
+        # bedrock opus entries), but sonnet still is.
         self._patch_sources(fake_ht_store(include_opus=False), fake_catalog())
         adapter = da.resolve_adapter()
 
-        self.assertEqual(adapter["implementation_fast"]["model"], "claude-haiku-4-5")
+        self.assertEqual(adapter["implementation_fast"]["model"], "claude-sonnet-5")
         self.assertEqual(adapter["technical_lead"]["model"], "claude-sonnet-5")
 
         # architect (expensive) falls back to cost-tier selection since no

@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "description": "Canonical orchestration method: capability vocabulary, cost tiers, effort levels, role aliases, and the three routing rules. Read by both the Python engine (orchestrator/method.py) and the HT bridge (bridge/extensions/orchestrator/models.ts via a symlink). Editing this file edits the method; SKILL.md summarises it for humans and must not contradict it. Runtime config (pricing, features, budgets, persistence) stays in config.json; runtime state (history, measured ROI) stays in ~/.local/state/coding-agent-orchestrator/.",
+  "description": "Canonical orchestration method: capability vocabulary, cost tiers, effort levels, role aliases, and the three routing rules. Read by both the Python engine (orchestrator/method.py) and the HT bridge (bridge/extensions/orchestrator/models.ts via a symlink). Editing this file edits the method; SKILL.md summarises it for humans and must not contradict it. Runtime config (pricing, features, persistence) stays in config.json; per-dispatch spend caps are method policy (rules.dispatch_spend_cap); runtime state (history, measured ROI) stays in ~/.local/state/coding-agent-orchestrator/.",
 
-  "tiers": ["cheap", "mid", "premium"],
+  "tiers": ["cheap", "mid", "premium", "frontier"],
 
   "capabilities": {
     "scout":                 { "tier": "cheap",   "default_effort": "low" },
@@ -10,7 +10,9 @@
     "implementation_fast":   { "tier": "cheap",   "default_effort": "low" },
     "analysis_mid":          { "tier": "mid",     "default_effort": "standard" },
     "technical_lead":        { "tier": "mid",     "default_effort": "standard" },
-    "lead":                  { "tier": "mid",     "default_effort": "standard" },
+    "lead_small":            { "tier": "mid",      "default_effort": "standard" },
+    "lead":                  { "tier": "premium",  "default_effort": "standard" },
+    "lead_large":            { "tier": "frontier", "default_effort": "standard" },
     "implementation_strong": { "tier": "mid",     "default_effort": "standard" },
     "technical_review":      { "tier": "mid",     "default_effort": "standard" },
     "integration_review":    { "tier": "mid",     "default_effort": "high" },
@@ -49,7 +51,7 @@
         "low":      { "capability": "implementation_strong", "tier_min": "mid",     "verification_depth": "targeted" },
         "medium":   { "capability": "technical_review",      "tier_min": "mid",     "verification_depth": "targeted" },
         "high":     { "capability": "security_review",       "tier_min": "premium", "verification_depth": "full" },
-        "critical": { "capability": "security_review",       "tier_min": "premium", "verification_depth": "full", "independent_review": true }
+        "critical": { "capability": "security_review",       "tier_min": "frontier","verification_depth": "full", "independent_review": true }
       },
       "rationale": "After a fix, the code under review has changed. The cheap tier confirmed 4/4 re-reviews in early data, but downstream tasks proceeded without issue only because the fixes were small. A single regression missed by a cheap re-reviewer costs more in rework and escaped defects than the entire cheap re-review savings to date ($0.31)."
     },
@@ -91,6 +93,26 @@
         "spec_synthesis": { "worker": "analysis_strong",     "lead": "architect" }
       },
       "rationale": "The ht-codex-modularization-status run proved this topology: 4 parallel mid-tier scouts produced complete evidence packets at near-zero cost, and a single premium synthesis produced the status report. Sending the premium model to do the investigation itself would have cost 5-10x more."
+    },
+
+    "lead_sizing": {
+      "summary": "Triage picks a lead size; profiles bind sizes to models through tiers.",
+      "sizes": { "small": "lead_small", "standard": "lead", "large": "lead_large" },
+      "by_complexity": [
+        { "min": 1, "max": 3,  "size": "small" },
+        { "min": 4, "max": 6,  "size": "standard" },
+        { "min": 7, "max": 10, "size": "large" }
+      ],
+      "risk_floor": { "low": "small", "medium": "standard", "high": "large", "critical": "large" },
+      "escalate_on_verification_failure": true,
+      "rationale": "2026-09-24: fable-5-1 leads cost $90.71 over 17 runs (11 verified pass); sonnet-5 leads cost $1.04 over 21 runs (19 verified pass). Size the lead to the task and escalate on failure instead of pinning the frontier model."
+    },
+
+    "dispatch_spend_cap": {
+      "summary": "Per-dispatch USD ceiling on live reported cost. warn notifies once; enforce also cancels the dispatch; off disables.",
+      "mode": "warn",
+      "usd_by_capability": { "lead_small": 1.5, "lead": 4.0, "lead_large": 10.0, "architect": 2.0 },
+      "default_usd": 1.0
     }
   }
 }

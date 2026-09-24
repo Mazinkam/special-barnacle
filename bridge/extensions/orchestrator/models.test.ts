@@ -12,6 +12,10 @@ import {
 	shortName,
 	tiersToBindings,
 	userLayerWarnings,
+	METHOD,
+	TIERS,
+	isTier,
+	tierOf,
 	type AvailableModel,
 } from "./models.ts";
 
@@ -162,7 +166,7 @@ describe("mergeLayers", () => {
 			[
 				{ source: "flag", bindings: { architect: { model: "opus" } } },
 				{ source: "profile:default", bindings: { technical_review: { model: "astra" } } },
-				{ source: "profile:default", bindings: tiersToBindings({ premium: "fable-5-1", cheap: "haiku" }) },
+				{ source: "profile:default", bindings: tiersToBindings({ premium: "fable-5-1", cheap: "luna" }) },
 				dynamic,
 			],
 			TABLE,
@@ -174,9 +178,11 @@ describe("mergeLayers", () => {
 		expect(r.adapter.technical_review).toEqual({ model: "openai-codex/gpt-6-astra", effort: "high" });
 		expect(r.adapter.security_review.model).toBe("amazon-bedrock/global.anthropic.claude-fable-5-1");
 		expect(r.sources.security_review).toBe("profile:default");
-		expect(r.adapter.worker.model).toContain("haiku");
-		expect(r.adapter.lead.model).toBe("amazon-bedrock/global.anthropic.claude-sonnet-5");
-		expect(r.sources.lead).toBe("dynamic");
+		expect(r.adapter.worker.model).toContain("luna");
+		// `lead` is a premium-tier capability, so the profile's premium tier wins.
+		expect(r.adapter.lead.model).toBe("amazon-bedrock/global.anthropic.claude-fable-5-1");
+		expect(r.sources.lead).toBe("profile:default");
+		expect(r.adapter.qa_agent.model).toBe("amazon-bedrock/global.anthropic.claude-sonnet-5");
 		expect(r.notes.join()).toContain("astra");
 	});
 
@@ -198,7 +204,7 @@ describe("mergeLayers", () => {
 	test("formatAdapterTable shows alias → canonical and groups by tier", () => {
 		const r = mergeLayers([{ source: "profile:default", bindings: tiersToBindings({ premium: "fable-5-1" }) }, dynamic], TABLE, PREF);
 		const t = formatAdapterTable(r).join("\n");
-		expect(t).toContain("premium fable-5-1 → amazon-bedrock/global.anthropic.claude-fable-5-1 [profile:default]");
+		expect(t).toContain("premium  fable-5-1 → amazon-bedrock/global.anthropic.claude-fable-5-1 [profile:default]");
 		expect(t).toContain("architect, security_review");
 	});
 });
@@ -230,3 +236,26 @@ describe("method.json (canonical orchestration method)", () => {
 		expect(reconWorkers(9, "investigation")).toBe(0);
 	});
 });
+
+describe("tiers", () => {
+	test("frontier is a tier and orders above premium", () => {
+		expect(METHOD.tiers).toEqual(["cheap", "mid", "premium", "frontier"]);
+		expect(TIERS[0]).toBe("frontier");
+		expect(isTier("frontier")).toBe(true);
+		expect(isTier("ultra")).toBe(false);
+	});
+	test("lead sizes sit on mid/premium/frontier", () => {
+		expect(tierOf("lead_small")).toBe("mid");
+		expect(tierOf("lead")).toBe("premium");
+		expect(tierOf("lead_large")).toBe("frontier");
+	});
+	test("frontier tier binding reaches lead_large", () => {
+		expect(tiersToBindings({ frontier: "fable-5-1" }).lead_large).toEqual({ model: "fable-5-1" });
+	});
+	test("profile tiers accept frontier", () => {
+		const { problems, file } = parseProfilesFile({ version: 1, active_profile: "p", profiles: { p: { tiers: { frontier: "fable-5-1" } } } });
+		expect(problems).toEqual([]);
+		expect(file.profiles.p.tiers?.frontier).toBe("fable-5-1");
+	});
+});
+

@@ -3361,7 +3361,7 @@ interface OrchestrateArgs {
 	interactive: boolean;
 	/** /orchestrator-models only: dispatch a one-turn probe on every distinct model. */
 	check: boolean;
-	/** Per-tier / per-capability model overrides from --cheap/--mid/--premium/--model. */
+	/** Per-tier / per-capability model overrides from --cheap/--mid/--premium/--frontier/--model. */
 	models: ModelOverrides;
 	/** Flags we did not recognize — reported instead of silently swallowed. */
 	unknownFlags: string[];
@@ -3409,6 +3409,7 @@ export function parseArgs(args: string): OrchestrateArgs {
 			case "--cheap": if (next) { out.models.tiers.cheap = next; i++; } break;
 			case "--mid": if (next) { out.models.tiers.mid = next; i++; } break;
 			case "--premium": if (next) { out.models.tiers.premium = next; i++; } break;
+			case "--frontier": if (next) { out.models.tiers.frontier = next; i++; } break;
 			case "--model": {
 				// --model <capability>=<alias|provider/model>
 				if (next) {
@@ -3494,7 +3495,7 @@ async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Pr
 		const summary = [
 			`Live model check: ${probes.length - failed}/${probes.length} model(s) answered · $${total.toFixed(4)}`,
 			...lines,
-			...(failed > 0 ? ["", `Fix the failing binding(s) with /orchestrator-models set <capability|tier> <alias>, or pass --premium/--mid/--cheap/--model; /orchestrate would abort on these.`] : []),
+			...(failed > 0 ? ["", `Fix the failing binding(s) with /orchestrator-models set <capability|tier> <alias>, or pass --frontier/--premium/--mid/--cheap/--model; /orchestrate would abort on these.`] : []),
 			`log: ${session.file("run.log")}`,
 		];
 		session.log(summary.join("\n"));
@@ -3513,7 +3514,7 @@ async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Pr
 
 const USAGE =
 	"Usage: /orchestrate <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical]\n" +
-	"       [--profile NAME] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--model <capability>=ALIAS] [--effort LEVEL]\n" +
+	"       [--profile NAME] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--frontier ALIAS] [--model <capability>=ALIAS] [--effort LEVEL]\n" +
 	"       [--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--interactive]\n" +
 	"ALIAS is a short name (fable-5-1, sonnet, haiku, astra, terra) or provider/model. Profiles: " + PROFILES_PATH + "  (see /orchestrator-models)";
 
@@ -3684,7 +3685,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Plan and dispatch a hierarchical agent run. " +
 			"Args: <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical] " +
-			"[--profile NAME] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--model <capability>=ALIAS] [--effort LEVEL] " +
+			"[--profile NAME] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--frontier ALIAS] [--model <capability>=ALIAS] [--effort LEVEL] " +
 			"[--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--interactive]\n\n" +
 			"With no triage flags, an LLM triage call (cheapest configured model) " +
 			"auto-fills task_class, complexity, and risk from the goal text. " +
@@ -4191,7 +4192,7 @@ export default function (pi: ExtensionAPI) {
 			const tokens = args.trim().split(/\s+/).filter(Boolean);
 			const sub = tokens[0] && !tokens[0].startsWith("--") ? tokens[0] : "show";
 			const rest = tokens[0] && !tokens[0].startsWith("--") ? tokens.slice(1) : tokens;
-			const VALUE_FLAGS = new Set(["--profile", "--from", "--effort", "--cheap", "--mid", "--premium", "--model"]);
+			const VALUE_FLAGS = new Set(["--profile", "--from", "--effort", "--cheap", "--mid", "--premium", "--frontier", "--model"]);
 			const positional = rest.filter((t, i) => !t.startsWith("--") && !VALUE_FLAGS.has(rest[i - 1] ?? ""));
 			// Flags (--profile, --live, ...) come from the same parser as /orchestrate;
 			// bare words land in `goal`, which we ignore here in favour of `positional`.
@@ -4292,11 +4293,11 @@ export default function (pi: ExtensionAPI) {
 				case "set": {
 					const [target, spec] = positional;
 					if (!target || !spec) {
-						ctx.ui.notify(`Usage: /orchestrator-models set <capability|cheap|mid|premium> <alias|provider/model> [--profile P]\n${MODELS_USAGE}`, "error");
+						ctx.ui.notify(`Usage: /orchestrator-models set <capability|cheap|mid|premium|frontier> <alias|provider/model> [--profile P]\n${MODELS_USAGE}`, "error");
 						return;
 					}
 					if (!isTier(target) && !ALL_CAPABILITIES.includes(target)) {
-						ctx.ui.notify(`"${target}" is not a tier (cheap|mid|premium) or capability (${ALL_CAPABILITIES.join(", ")})`, "error");
+						ctx.ui.notify(`"${target}" is not a tier (cheap|mid|premium|frontier) or capability (${ALL_CAPABILITIES.join(", ")})`, "error");
 						return;
 					}
 					const profiles = loadProfiles();
