@@ -2005,6 +2005,22 @@ describe("runSubagentProcess process/event handling", () => {
 								path: "@humain/terminal",
 								namespace: "stub-humain-terminal",
 							}));
+							// Same reason as above for `typebox` (see the mock.module stub at the top of this file):
+							// it only resolves inside HT, and this path never builds the status tool's schema.
+							b.onResolve({ filter: /^typebox$/ }, () => ({ path: "typebox", namespace: "stub-typebox" }));
+							b.onLoad({ filter: /.*/, namespace: "stub-typebox" }, () => ({
+								contents: `
+									const schema = (extra) => (options) => ({ ...extra, ...options });
+									export const Type = {
+										Object: (properties, options) => ({ type: "object", properties, ...options }),
+										Optional: (inner) => ({ ...inner, optional: true }),
+										Number: schema({ type: "number" }),
+										String: schema({ type: "string" }),
+										Boolean: schema({ type: "boolean" }),
+									};
+								`,
+								loader: "js",
+							}));
 							b.onLoad({ filter: /.*/, namespace: "stub-humain-terminal" }, () => ({
 								contents: `
 									export const discoverAgents = () => ({ agents: [] });
@@ -2279,7 +2295,7 @@ describe("runSubagentProcess process/event handling", () => {
 
 			// The collision must not have invalidated the first dispatch's own
 			// release()-time snapshot: sealing the run must still succeed.
-			session.close(true);
+			session.close();
 			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(true);
 		} finally {
 			session.close();
@@ -2320,7 +2336,7 @@ describe("runSubagentProcess process/event handling", () => {
 			expect(firstLogAfter).toBe(firstLogBefore);
 			expect(firstLogAfter.length).toBeGreaterThan(0);
 
-			session.close(true);
+			session.close();
 			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(true);
 		} finally {
 			session.close();
@@ -2362,7 +2378,7 @@ describe("runSubagentProcess process/event handling", () => {
 			const fallback = readFileSync(session.file("collide-timeout.stderr.log.fallback"), "utf8");
 			expect(fallback).toContain("UNVERIFIED PARTIAL WORK");
 
-			session.close(true);
+			session.close();
 			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(true);
 		} finally {
 			session.close();
@@ -2595,7 +2611,7 @@ describe("runSubagentProcess process/event handling", () => {
 			// Earlier content must not have been overwritten at offset 0.
 			expect(afterGrandchild.startsWith(beforeGrandchild)).toBe(true);
 			expect(afterGrandchild).toContain("grandchild wrote after settle");
-			session.close(true);
+			session.close();
 			// The file changed after the orchestrator's own final write; seal must veto.
 			expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(false);
 		} finally {
