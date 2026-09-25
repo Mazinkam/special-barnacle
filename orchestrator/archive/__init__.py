@@ -30,7 +30,8 @@ This used to be one 659-line module (B3, `docs/architecture-review.md`); it is n
 * `seal.py` — HT owner/seal metadata (`load_seal`).
 * `plan.py` — read-only selection of archivable runs (`plan_run`, `plan_archive`,
   `terminal_outcomes`).
-* `execute.py` — archiving under `archive.lock` (`archive_runs`, `_execute_run`, `_archive_file`).
+* `execute.py` — archiving under `archive.lock` (`archive_runs`, `_execute_run`, `_archive_file`),
+  plus `summarize_archive_results`, the CLI summary aggregation moved out of `cli.py`.
 * `restore.py` — restoring archived files and locating a run diagnostic (`restore_run`,
   `locate_run_file`, `locate_path`).
 
@@ -91,6 +92,7 @@ from .execute import (
     _run_storage_bytes,
     archive_lock,
     archive_runs,
+    summarize_archive_results,
 )
 from .manifest import (
     ARCHIVE_SUFFIX,
@@ -153,7 +155,7 @@ __all__ = [
     # planning
     'plan_run', 'plan_archive',
     # execution
-    'archive_lock', 'archive_runs',
+    'archive_lock', 'archive_runs', 'summarize_archive_results',
     # restore / lookup
     'restore_run', 'locate_run_file', 'locate_path',
     # submodules (for patch targets)

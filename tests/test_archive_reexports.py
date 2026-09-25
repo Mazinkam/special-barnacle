@@ -185,5 +185,20 @@ class ArchiveReexportTests(unittest.TestCase):
             self.assertIs(getattr(archive, name), module)
 
 
+class CliArchiveSummaryReexportTests(unittest.TestCase):
+    """`summarize_archive_results` moved from `cli._archive_runs_command` to
+    `orchestrator.archive.execute` (B3); `cli.py` calls it explicitly rather than re-implementing
+    the aggregation inline.
+    """
+
+    def test_summarize_archive_results_is_importable_from_the_archive_package(self):
+        self.assertTrue(hasattr(archive, 'summarize_archive_results'))
+        self.assertIs(archive.summarize_archive_results, execute.summarize_archive_results)
+
+    def test_cli_uses_the_moved_summary_function(self):
+        from orchestrator import cli
+        self.assertIs(cli.summarize_archive_results, execute.summarize_archive_results)
+
+
 if __name__ == '__main__':
     unittest.main()

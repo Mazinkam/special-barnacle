@@ -176,3 +176,26 @@ def archive_runs(root: Path, *, older_than_days: float = DEFAULT_OLDER_THAN_DAYS
         for entry in entries:
             if entry['status'] == 'eligible': _execute_run(Path(entry['path']), entry)
     return entries
+
+
+def summarize_archive_results(entries: list[dict[str, Any]], *, executed: bool, older_than_days: float, state_root: Path) -> dict[str, Any]:
+    """Aggregate `archive_runs` entries into the totals `cli._archive_runs_command` prints/emits.
+
+    Moved out of `cli.py` (B3, `docs/architecture-review.md`) so the archive package owns its own
+    summary shape; `cli.py` keeps only argument handling and printing, and computes `failed`
+    (`executed and summary['not_archived_files'] > 0`) itself from the returned dict.
+    """
+    planned = [e for e in entries if e['files']]
+    skipped = [e for e in entries if e['status'] == 'skipped']
+    return {'executed': executed, 'older_than_days': older_than_days, 'state_root': str(state_root), 'runs': entries,
+            'originals_retained': all(e.get('originals_retained', True) for e in planned),
+            'reclaimed_bytes': max(0, -sum(e.get('storage_delta_bytes', 0) for e in planned)),
+            'storage_delta_bytes': sum(e.get('storage_delta_bytes', 0) for e in planned),
+            'raw_bytes_removed': sum(e.get('raw_bytes_removed', 0) for e in planned),
+            'eligible_runs': len(planned), 'skipped_runs': len(skipped),
+            'eligible_raw_bytes': sum(e['raw_bytes'] for e in planned),
+            'eligible_estimated_compressed_bytes': sum(e['estimated_compressed_bytes'] for e in planned),
+            'archived_files': sum(1 for e in planned for f in e['files'] if f['status'] == 'archived'),
+            'archived_raw_bytes': sum(f['raw_bytes'] for e in planned for f in e['files'] if f['status'] == 'archived'),
+            'compressed_bytes': sum(e.get('compressed_bytes', 0) for e in planned),
+            'not_archived_files': sum(1 for e in planned for f in e['files'] if f['status'] != 'archived')}

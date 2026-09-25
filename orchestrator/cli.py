@@ -17,6 +17,7 @@ from .ingest.service import INGEST_ERROR_LIMIT, _bound_error, _redact_paths, mak
 from .ingest.service import process_ingest as _ingest_process_ingest
 from .dynamic_adapter import resolve_adapter
 from .archive import DEFAULT_OLDER_THAN_DAYS, RESTORE_COMMAND, archive_runs, restore_run
+from .archive.execute import summarize_archive_results
 from .contract import (
     EXIT_APPEND_FAILED as CONTRACT_EXIT_APPEND_FAILED,
     EXIT_INVALID as CONTRACT_EXIT_INVALID,
@@ -289,20 +290,7 @@ def _archive_runs_command(args,root:Path|None=None)->int:
     root=root if root is not None else _root()
     try: entries=archive_runs(root,older_than_days=args.older_than_days,execute=args.execute)
     except (ValueError,OSError) as exc: print(f'archive-runs: {exc}',file=sys.stderr); return EXIT_INVALID
-    planned=[e for e in entries if e['files']]
-    skipped=[e for e in entries if e['status']=='skipped']
-    summary={'executed':args.execute,'older_than_days':args.older_than_days,'state_root':str(root),'runs':entries,
-             'originals_retained':all(e.get('originals_retained',True) for e in planned),
-             'reclaimed_bytes':max(0,-sum(e.get('storage_delta_bytes',0) for e in planned)),
-             'storage_delta_bytes':sum(e.get('storage_delta_bytes',0) for e in planned),
-             'raw_bytes_removed':sum(e.get('raw_bytes_removed',0) for e in planned),
-             'eligible_runs':len(planned),'skipped_runs':len(skipped),
-             'eligible_raw_bytes':sum(e['raw_bytes'] for e in planned),
-             'eligible_estimated_compressed_bytes':sum(e['estimated_compressed_bytes'] for e in planned),
-             'archived_files':sum(1 for e in planned for f in e['files'] if f['status']=='archived'),
-             'archived_raw_bytes':sum(f['raw_bytes'] for e in planned for f in e['files'] if f['status']=='archived'),
-             'compressed_bytes':sum(e.get('compressed_bytes',0) for e in planned),
-             'not_archived_files':sum(1 for e in planned for f in e['files'] if f['status']!='archived')}
+    summary=summarize_archive_results(entries,executed=args.execute,older_than_days=args.older_than_days,state_root=root)
     failed=args.execute and summary['not_archived_files']>0
     if args.json: print(json.dumps(summary,indent=2,default=str)); return EXIT_INVALID if failed else EXIT_OK
     if not args.execute: print(f'DRY RUN — nothing written. Re-run with --execute to archive. (runs under {root/"runs"}, older than {args.older_than_days:g} days)')
