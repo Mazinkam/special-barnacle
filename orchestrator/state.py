@@ -1,7 +1,14 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Any
-from .runtime import EventStore, write_json, read_json, utc_now, writer_lock, iter_jsonl_from, tail_fingerprint
+# core.*, not runtime: this module is imported by record_batch, which store.facade.EventStore
+# imports; orchestrator.runtime re-exports EventStore, so importing runtime here would cycle
+# (see docs/architecture-review.md B2.2/B2.3). state.* build a StateLayout instead of an
+# EventStore for the same directory/stream side effects.
+from .core.fs import read_json, write_json, writer_lock
+from .core.env import utc_now
+from .core.jsonl import iter_jsonl_from, tail_fingerprint
+from .core.layout import StateLayout
 from .contract import STREAMS
 from .record_index import discard as discard_record_index
 
@@ -124,18 +131,18 @@ def rebuild(root: str|Path|None=None)->dict[str,Any]:
     (collapsing repeated record_ids) and the record-id index is discarded so the next writer rebuilds
     its membership from the streams instead of trusting a cache that may be wrong.
     """
-    root=EventStore(root).root
+    root=StateLayout(root).root
     with writer_lock(root):
         discard_record_index(root)
         return replay_ledger(root,full=True)
 
 def refresh_ledger(root: str|Path|None=None)->dict[str,Any]:
     """Incremental catch-up of the ledger from its durable event offset (serialized with all writers)."""
-    root=EventStore(root).root
+    root=StateLayout(root).root
     with writer_lock(root): return replay_ledger(root)
 
 def load_or_rebuild(root: str|Path|None=None):
-    root=EventStore(root).root; p=root/LEDGER_FILE
+    root=StateLayout(root).root; p=root/LEDGER_FILE
     obj=read_json(p,None)
     if not obj or obj.get('schema_version')!=3:
         return rebuild(root)

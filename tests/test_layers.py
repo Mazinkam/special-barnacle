@@ -26,8 +26,10 @@ FORBIDDEN_EDGES: dict[str, set[str]] = {
     'runtime': {'dashboard', 'app'},
     'state': {'dashboard', 'app'},
     'record_index': {'dashboard', 'app'},
-    'records': {'dashboard', 'app'},
+    'records': {'dashboard', 'app', 'store', 'engine', 'cli'},
+    'records.metering': {'dashboard', 'app', 'store', 'engine', 'cli'},
     'engine': {'dashboard', 'app'},
+    'store': {'dashboard', 'app', 'engine', 'cli'},
 }
 
 #: Only these module prefixes may import `orchestrator.app`; every other module must not.
@@ -133,6 +135,21 @@ class LayerTests(unittest.TestCase):
             imported_tops = {_top_level(name) for name in imported}
             self.assertNotIn('app', imported_tops,
                              f'{module}.py must not import orchestrator.app (imports: {sorted(imported)})')
+
+    def test_runtime_has_no_function_level_orchestrator_imports(self):
+        """B2.2/B2.3: `runtime.py` is a pure re-export shim now — every import in it is a
+        module-level `from .x import y`, never one hidden inside a function body to dodge a
+        cycle (that pattern is exactly what caused the original `runtime` <-> `record_batch`
+        loop this step removes).
+        """
+        path = ORCHESTRATOR_ROOT / 'runtime.py'
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        module_level_imports = {id(node) for node in tree.body
+                                 if isinstance(node, (ast.Import, ast.ImportFrom))}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and id(node) not in module_level_imports:
+                self.fail(f'runtime.py has a non-module-level import at line {node.lineno}: '
+                         f'{ast.dump(node)}')
 
 
 if __name__ == '__main__':

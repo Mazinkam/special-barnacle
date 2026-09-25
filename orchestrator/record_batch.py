@@ -28,8 +28,13 @@ from pathlib import Path
 from typing import Any
 
 from .record_index import RecordIndex
-from .runtime import (RECORD_INDEX_FILE, default_attribution, default_state_root, encode_jsonl,
-                      fsync_directory, fsync_directory_ancestry, meter, utc_now, write_json, writer_lock)
+# core.fs/core.env/core.jsonl and records.metering, not runtime: this module is imported by
+# store.facade.EventStore, which orchestrator.runtime re-exports; importing runtime here would
+# cycle (see docs/architecture-review.md B2.2/B2.3).
+from .core.fs import RECORD_INDEX_FILE, fsync_directory, fsync_directory_ancestry, write_json, writer_lock
+from .core.env import default_attribution, default_state_root, utc_now
+from .core.jsonl import encode_jsonl
+from .records.metering import meter
 from .state import REDUCER_KEY_FIELDS, invalid_key_field, ledger_is_current, replay_ledger
 from .contract import (
     MAX_BATCH_RECORDS,
