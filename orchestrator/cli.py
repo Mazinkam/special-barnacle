@@ -6,6 +6,7 @@ from .runtime import EventStore,QualityEvidence,default_state_root,read_json,utc
 from .state import rebuild,refresh_ledger,load_or_rebuild
 from .dashboard import generate_dashboard
 from .record_batch import write_batch,single_record,BatchValidationError,BatchAppendError,STREAMS,RETRY_SAME_IDS
+from .app.refresh import refresh_after_write
 from .history import load_stats
 from .scheduler import recommend_package,topology_for
 from .context import ContextRegistry
@@ -146,9 +147,10 @@ def _write(records)->tuple[int,dict]:
     outcome through this one function, so a rejected batch or an interrupted append is always a
     structured body with `persisted`/`retry` and never an uncaught traceback.
     """
-    try: result=write_batch(ROOT,records,config=cfg())
+    try: result=write_batch(ROOT,records)
     except BatchValidationError as exc: return EXIT_INVALID,_failure(STATUS_INVALID,str(exc))
     except BatchAppendError as exc: return EXIT_APPEND_FAILED,_failure(STATUS_APPEND_FAILED,str(exc),exc.persisted,RETRY_SAME_IDS)
+    result=refresh_after_write(ROOT,result,config=cfg())
     return (EXIT_OK if result['ok'] else EXIT_REFRESH_FAILED),{k:v for k,v in result.items() if k!='records'}
 
 def write_records(records)->int:

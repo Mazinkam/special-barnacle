@@ -109,10 +109,13 @@ def test_run_evidence_dedups_each_stream_but_not_idless_rows():
 
 @pytest.mark.parametrize('model,priced', [('claude-sonnet-4-5', True), ('unknown-model', False)])
 def test_old_ht_zero_estimate_is_repriced_or_unmetered(tmp_path, model, priced):
+    from orchestrator.app.refresh import refresh_after_write
     row = call()
     row.update(stream='metric', record_id='old-ht', model=model, input_tokens=1000,
                cost_usd=0, cost_source='estimated-from-reported-tokens')
-    assert write_batch(tmp_path, [row])['ok']
+    result = write_batch(tmp_path, [row])
+    assert result['ok']
+    assert refresh_after_write(tmp_path, result)['ok']
     evidence = page(tmp_path)['runs'][0]
     assert evidence['metered_calls'] == int(priced)
     assert (evidence['cost_known_usd'] or 0) > 0 if priced else evidence['cost_known_usd'] is None

@@ -15,7 +15,8 @@ an append to that stream needs a separator. The ledger catches up to the complet
 event prefix even on an unrelated or duplicate-only batch. `settle_streams` runs
 the same durability step without records, for a reader (session ingestion) that
 must not trust un-fsynced bytes an interrupted append left behind. Dashboard
-rendering remains outside the writer lock. Public CLI/result/record formats are unchanged.
+rendering lives entirely outside this module (see `app.refresh.refresh_after_write`); this
+writer's own refresh is only the ledger catch-up. Public CLI/result/record formats are unchanged.
 """
 from __future__ import annotations
 
@@ -26,7 +27,6 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .dashboard import generate_dashboard
 from .record_index import RecordIndex
 from .runtime import (RECORD_INDEX_FILE, default_attribution, default_state_root, encode_jsonl,
                       fsync_directory, fsync_directory_ancestry, meter, utc_now, write_json, writer_lock)
@@ -211,17 +211,20 @@ def settle_streams(root: str | Path | None, *, lock: bool = True) -> dict[str, A
     return {'ok': error is None, 'status': status, 'settled': touched, 'error': error}
 
 
-def write_batch(root: str | Path | None, records: Any, *, config: dict | None = None, refresh: bool = True,
+def write_batch(root: str | Path | None, records: Any, *, refresh: bool = True,
                 lock: bool = True) -> dict[str, Any]:
     """Durably append once per ID; report derived-state failure with same-ID retry guidance.
 
+    `refresh=True` (the default) catches the ledger up to the complete durable event prefix
+    before returning; it is the only refresh this function does. Publishing the dashboard is an
+    app-layer decision made afterwards, from this result, by `app.refresh.refresh_after_write` —
+    this module never imports the presentation layer, at module scope or otherwise.
+
     `lock=False` is for a caller that already holds `writer_lock(root)` and must keep its own
     check/append/checkpoint sequence under that one lock (session ingestion). `flock` is per open
-    file description, so re-acquiring here would deadlock. Such a caller refreshes afterwards,
-    outside its lock: the dashboard render never runs under the writer lock.
+    file description, so re-acquiring here would deadlock; the ledger catch-up above runs fine
+    under the caller's own lock instead.
     """
-    if not lock and refresh:
-        raise ValueError('write_batch(lock=False) requires refresh=False; refresh the ledger/dashboard after releasing the lock')
     validated = validate_batch(records)
     root = Path(root) if root is not None else default_state_root()
     root.mkdir(parents=True, exist_ok=True)  # the lock file lives inside; durability of the chain is settled under the lock
@@ -272,12 +275,6 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
                         ledger_updated = True
                 except Exception as exc:  # noqa: BLE001 - records are already durable
                     status = STATUS_REFRESH_FAILED; error = f'ledger refresh failed: {exc}'
-    if refresh and error is None:
-        try:
-            generate_dashboard(root, config=config)
-            dashboard_updated = True
-        except Exception as exc:  # noqa: BLE001 - records are already durable
-            status = STATUS_REFRESH_FAILED; error = f'dashboard refresh failed: {exc}'
     return {
         'ok': error is None, 'status': status, 'format_version': FORMAT_VERSION,
         'persisted': persisted, 'duplicates': duplicates, 'ledger_updated': ledger_updated,

@@ -389,8 +389,7 @@ class RemediationTask2BTests(TemporaryRootTestCase):
         events = self.root / 'events.jsonl'
         events.write_bytes((json.dumps({'record_id': 'start-\ud800', 'event': 'run_started', 'run_id': 'R1'}) + '\n').encode('ascii'))
         done = [{'stream': 'event', 'record_id': 'done', 'event': 'run_completed', 'run_id': 'R1'}]
-        with patch('orchestrator.record_batch.generate_dashboard'):  # dashboard rendering is outside this writer's contract
-            result = record_batch.write_batch(self.root, done)
+        result = record_batch.write_batch(self.root, done)
         self.assertTrue(result['ok'], result)
         self.assertTrue(result['ledger_updated'])
         ledger = read_json(self.root / 'ledger.json', {})

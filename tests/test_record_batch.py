@@ -228,8 +228,10 @@ class BatchCliTests(TemporaryRootTestCase):
 
     def test_dashboard_failure_is_reported_after_records_are_durable(self):
         from orchestrator import record_batch
-        with patch.object(record_batch, "generate_dashboard", side_effect=RuntimeError("render exploded")):
-            result = record_batch.write_batch(self.root, sample_batch())
+        from orchestrator.app import refresh as refresh_module
+        result = record_batch.write_batch(self.root, sample_batch())
+        with patch.object(refresh_module, "generate_dashboard", side_effect=RuntimeError("render exploded")):
+            result = refresh_module.refresh_after_write(self.root, result)
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], "refresh_failed")
         self.assertEqual(result["persisted"], {"event": 3, "metric": 1, "outcome": 1})
@@ -239,6 +241,7 @@ class BatchCliTests(TemporaryRootTestCase):
         self.assertEqual(stream_ids(self.root, "event"), ["e-1", "e-2", "e-3"])
         # The retry must not append duplicates and must complete the refresh.
         retry = record_batch.write_batch(self.root, sample_batch())
+        retry = refresh_module.refresh_after_write(self.root, retry)
         self.assertTrue(retry["ok"])
         self.assertEqual(retry["duplicates"], {"event": 3, "metric": 1, "outcome": 1})
         self.assertTrue(retry["dashboard_updated"])
@@ -249,9 +252,10 @@ class BatchCliTests(TemporaryRootTestCase):
             """
             import sys, json
             from unittest.mock import patch
-            from orchestrator import record_batch, cli
+            from orchestrator import cli
+            from orchestrator.app import refresh as refresh_module
             sys.argv = ["orchestrator", "batch"]
-            with patch.object(record_batch, "generate_dashboard", side_effect=RuntimeError("render exploded")):
+            with patch.object(refresh_module, "generate_dashboard", side_effect=RuntimeError("render exploded")):
                 cli.main()
             """
         )
@@ -741,6 +745,8 @@ class ReviewRegressionTests(TemporaryRootTestCase):
         self.assertFalse((self.root / record_batch.CHECKPOINT_FILE).exists())
 
         retry = record_batch.write_batch(self.root, sample_batch())
+        from orchestrator.app.refresh import refresh_after_write
+        retry = refresh_after_write(self.root, retry)
         self.assertTrue(retry["ok"], retry)
         self.assertEqual(retry["duplicates"], {"event": 3, "metric": 1, "outcome": 1})
         self.assertIsNone(retry["retry"])
