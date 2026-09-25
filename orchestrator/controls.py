@@ -1,3 +1,23 @@
+"""Feature-driven control decisions: public API.
+
+Every function here is a pure decision derived from a `features` config dict plus a small amount
+of call/task state; none of them mutate config or have side effects. This module is exercised
+directly by `tests/test_v3_features.py` and is safe to import from other modules that need one of
+these decisions without pulling in `engine`. B3 (`docs/architecture-review.md`) considered
+merging it elsewhere, but nothing else in the tree imports it, so it stays a standalone module
+rather than being folded into a layer it doesn't share a caller with; see the B3 task report for
+this note.
+
+Exports:
+- `stop_loss_action(*, features, actual_cost=0.0, expected_cost=None, retries=0,
+  elapsed_minutes=None) -> str` -- 'continue' or 'replan'.
+- `promotion_action(*, features, conceptual_failures=0, mechanical_failures=0) -> str`.
+- `independent_review_required(*, features, risk, sampled=False) -> bool`.
+- `verification_plan(*, features, risk) -> dict[str, bool]`.
+- `specialized_reviews(*, features, risk, tags=None) -> list[str]`.
+- `approval_for(*, features, action) -> str`.
+- `budget_action(*, features, spent, budget) -> str`.
+"""
 from __future__ import annotations
 from typing import Any
 
