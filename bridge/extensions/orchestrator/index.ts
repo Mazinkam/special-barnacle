@@ -144,6 +144,7 @@ import contract from "./contract.json";
 // `core/*` never imports this module and never reads `process.env`; every
 // value it needs (run tags, max-lead ceilings, ...) is a parameter.
 import { emptyOverrides, type ModelOverrides, parseArgs, usageText } from "./core/args.ts";
+import { loadBridgeConfig } from "./config.ts";
 import { clampComplexity, parseTriageResponse, TRIAGE_PROMPT, type TriageResult } from "./core/triage.ts";
 import { pickModel } from "./core/routing.ts";
 import {
@@ -189,27 +190,31 @@ export type { DispatchResult, DispatchTask };
 // Configuration
 // -----------------------------------------------------------------------------
 
-const SKILL_ROOT =
-	process.env.HUMAIN_ORCHESTRATOR_SKILL_ROOT ??
-	"~/.local/share/agent-skills/hierarchical-agent-orchestrator";
-const STATE_ROOT =
-	process.env[contract.state_root.env_vars.ts] ??
-	contract.state_root.default;
-const PYTHON = process.env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3";
-const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
-const expandedStateRoot = STATE_ROOT.replace(/^~/, homedir());
 /**
- * Extra env every Python spawn gets on top of `python-cli.ts`'s builder
- * (PYTHONPATH + CODING_AGENT_ORCHESTRATOR_HOME): CODING_AGENT_RUNTIME so
- * dispatched metrics land under `agent_runtime: "humain-terminal"`, and
- * CODING_AGENT_REPOSITORY so the skill can attribute a run to the repo it
- * touched. Read once at module load — see rule 4 in the architecture review
- * (no `process.env` reads outside a config module).
+ * Every `process.env` read and `~` expansion this extension makes, computed
+ * once at module load (B4.2). Everything below destructures its fields under
+ * the same names the pre-B4.2 module-level consts used, so the rest of this
+ * file — and every existing test — is unchanged.
  */
-const PYTHON_EXTRA_ENV = {
-	CODING_AGENT_RUNTIME: "humain-terminal",
-	CODING_AGENT_REPOSITORY: process.env.CODING_AGENT_REPOSITORY ?? process.cwd(),
-};
+const CONFIG = loadBridgeConfig(process.env, homedir());
+const {
+	skillRoot: SKILL_ROOT,
+	stateRoot: STATE_ROOT,
+	python: PYTHON,
+	expandedSkillRoot,
+	expandedStateRoot,
+	profilesPath: PROFILES_PATH,
+	legacyAdapterPath: LEGACY_ADAPTER_PATH,
+	pythonTimeoutMs: PYTHON_TIMEOUT_MS,
+	maxConcurrentDispatches: MAX_CONCURRENT_DISPATCHES,
+	maxLeads: MAX_LEADS,
+	dispatchTimeoutMs: DISPATCH_TIMEOUT_MS,
+	telemetryFlushMs: TELEMETRY_FLUSH_MS,
+	telemetryMaxBatch: TELEMETRY_MAX_BATCH,
+	reconEvidenceMaxChars: RECON_EVIDENCE_MAX_CHARS,
+	pythonExtraEnv: PYTHON_EXTRA_ENV,
+} = CONFIG;
+
 /**
  * Model configuration lives in one file: `orchestrator-profiles.json`
  * (named profiles of alias -> capability/tier bindings; see models.ts). The
@@ -225,12 +230,6 @@ const PATH_RE = new RegExp(contract.redaction_regex.ts, "g");
 export function redactPaths(text: string): string {
 	return text.replace(PATH_RE, "<path>");
 }
-const PROFILES_PATH =
-	process.env.HUMAIN_ORCHESTRATOR_PROFILES_FILE ??
-	join(homedir(), ".humain-terminal", "agent", "orchestrator-profiles.json");
-const LEGACY_ADAPTER_PATH =
-	process.env.HUMAIN_ORCHESTRATOR_ADAPTER_FILE ??
-	join(homedir(), ".humain-terminal", "agent", "orchestrator-adapter.json");
 
 /**
  * The profiles shipped with the skill (`bridge/orchestrator-profiles.json`).
@@ -247,7 +246,7 @@ function shippedProfilesPath(): string {
 
 /** Where per-run logs land: `<STATE_ROOT>/runs/<runId>/`. */
 function runsDir(): string {
-	return join(STATE_ROOT.replace(/^~/, homedir()), "runs");
+	return join(expandedStateRoot, "runs");
 }
 
 /** Manifest `python3 -m orchestrator.cli archive-runs --execute` leaves next to a run's `<name>.gz` files. */
@@ -282,14 +281,6 @@ export function describeRunArtifact(path: string): string {
 // `confirm()` always resolves false. Runs therefore auto-approve by default;
 // `--interactive` explicitly opts in to the confirmation gates.
 
-function positiveIntEnv(name: string, fallback: number): number {
-	const raw = Number(process.env[name]);
-	return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : fallback;
-}
-
-/** Wall clock for a single Python spawn (see python-cli.ts); a hung Python must not hang a run's terminal path. */
-const PYTHON_TIMEOUT_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_PYTHON_TIMEOUT_MS", 60_000);
-
 /**
  * The one Python spawner for this extension (C1 in the architecture review):
  * `loadDynamicAdapter`, `runModule`, `planRun`, the RecordQueue runner, the
@@ -317,36 +308,6 @@ function orchestratorPythonCli(pythonOverride?: string) {
 		extraEnv: PYTHON_EXTRA_ENV,
 	});
 }
-
-/** Hard ceiling on concurrent child processes, independent of what a plan asks for. */
-const MAX_CONCURRENT_DISPATCHES = positiveIntEnv("HUMAIN_ORCHESTRATOR_MAX_CONCURRENCY", 4);
-/** Hard ceiling on lead fan-out, so a malformed topology can't spawn unbounded leads. */
-const MAX_LEADS = positiveIntEnv("HUMAIN_ORCHESTRATOR_MAX_LEADS", 8);
-/** Per-dispatch wall clock for a LEAF dispatch that does its own work directly. */
-const DISPATCH_TIMEOUT_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS", 20 * 60 * 1000);
-
-/**
- * Telemetry batching. Records written within this window share one Python `batch`
- * process; a Python start-up costs ~250 ms, so a shorter window buys nothing. The
- * batch size stays well under Python's 500-record validation limit. Terminal writes
- * (run complete/fail/cancel/crash, session shutdown) flush immediately regardless.
- */
-const TELEMETRY_FLUSH_MS = positiveIntEnv("HUMAIN_ORCHESTRATOR_TELEMETRY_FLUSH_MS", 500);
-const TELEMETRY_MAX_BATCH = positiveIntEnv("HUMAIN_ORCHESTRATOR_TELEMETRY_BATCH", 100);
-
-
-/**
- * Bounds the aggregate parent-owned recon evidence packet handed to every
- * lead prompt (see `formatReconEvidence` in recon.ts). Derived from
- * method.json's `evidence_packet_max_tokens` — a token budget the policy
- * already declares — via a conservative ~4 chars/token estimate, rather than
- * inventing a new, undeclared character cap.
- */
-const CHARS_PER_TOKEN_ESTIMATE = 4;
-const RECON_EVIDENCE_MAX_CHARS = positiveIntEnv(
-	"HUMAIN_ORCHESTRATOR_RECON_EVIDENCE_MAX_CHARS",
-	METHOD.rules.pre_implementation_recon.evidence_packet_max_tokens * CHARS_PER_TOKEN_ESTIMATE,
-);
 
 // `dispatchTimeoutFor()` + LEAD_DISPATCH_TIMEOUT_MS lived here. Dropped in
 // favour of main's progress-aware lead timeouts (`cb9f51e`): a flat per-
