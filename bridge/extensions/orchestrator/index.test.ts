@@ -1134,7 +1134,7 @@ describe("RunSession terminal timing", () => {
 			expect(fn).toContain("...timing");
 		}
 		// Every terminal call inside the /orchestrate handler must pass the session timing.
-		const handler = source.slice(source.indexOf('pi.registerCommand("orchestrate"'), source.indexOf('pi.registerCommand("orchestrator-models"'));
+		const handler = source.slice(source.indexOf('pi.registerCommand("orchestrate"'), source.indexOf("registerOrchestrateCancelCommand("));
 		const calls = handler.match(/await (?:completeRun|failRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThanOrEqual(6);
 		for (const call of calls) expect(call).toContain("session.terminalTiming()");
@@ -1320,7 +1320,7 @@ describe("batched telemetry through the Python batch CLI", () => {
 		const fail = source.slice(source.indexOf("async function failRun("), source.indexOf("// Subagent dispatch"));
 		for (const fn of [complete, fail]) expect(fn).toContain("flush()");
 		// Every terminal call reports telemetry cumulatively since the run started, not just the final drain.
-		const handler = source.slice(source.indexOf('pi.registerCommand("orchestrate"'), source.indexOf('pi.registerCommand("orchestrator-models"'));
+		const handler = source.slice(source.indexOf('pi.registerCommand("orchestrate"'), source.indexOf("registerOrchestrateCancelCommand("));
 		const calls = handler.match(/await (?:completeRun|failRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThanOrEqual(6);
 		for (const call of calls) expect(call).toContain("session.telemetryBaseline");
