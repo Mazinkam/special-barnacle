@@ -82,6 +82,17 @@ afterAll(() => {
 	rmSync(testStateRoot, { recursive: true, force: true });
 });
 
+// B4.4: activeRunForTest()/setActiveRunForTest() were free functions reading/
+// writing the (now-deleted) ACTIVE_RUN global. `orchestrator.runRegistry` is
+// the module's one allowed piece of state now; these helpers give tests the
+// same two operations directly against it.
+function activeSession(): InstanceType<typeof orchestrator.RunSession> | null {
+	return orchestrator.runRegistry.active()?.session ?? null;
+}
+function forceActiveSession(session: InstanceType<typeof orchestrator.RunSession> | null): void {
+	orchestrator.runRegistry.setForTest(session ? { session, tags: {}, aliasTable: null } : null);
+}
+
 describe("session ingest hook wiring", () => {
 	test("both lifecycle hooks use the current session file and the supplied scheduler", async () => {
 		const handlers: Record<string, (...args: any[]) => unknown> = {};
@@ -549,7 +560,7 @@ describe("recon tool boundary", () => {
 		// depth 0, then the injected deps: `dispatchParallel` takes both since the
 		// progress-view nesting depth and the test seam landed independently.
 		await orchestrator.dispatchParallel(process.cwd(), "run", tasks,
-			{ scout: { model: "provider/recon-model", effort: "low" } }, {} as never, 0, {
+			{ scout: { model: "provider/recon-model", effort: "low" } }, {} as never, null, 0, {
 			recordEvent: async () => {},
 			runProcess: (opts) => orchestrator.runSubagentProcess({
 				...opts,
@@ -581,7 +592,7 @@ describe("recon tool boundary", () => {
 			complexity: 5, taskClass: "implementation", goal: "repair flow", runId: "run" });
 		const personas: string[] = [];
 		await orchestrator.dispatchParallel(process.cwd(), "run", tasks,
-			{ scout: { model: "provider/recon-model", effort: "low" } }, {} as never, 0, {
+			{ scout: { model: "provider/recon-model", effort: "low" } }, {} as never, null, 0, {
 			recordEvent: async () => {},
 			runProcess: (opts) => orchestrator.runSubagentProcess({
 				...opts,
@@ -3349,7 +3360,7 @@ describe("final triage and shutdown integration", () => {
 			}) as typeof childProcess.spawn);
 			try {
 				await handler("synthetic triage", { modelRegistry: registry(), ui: { notify: (n: string) => notices.push(n), setWidget() {}, setStatus() {} } } as never);
-				await orchestrator.activeRunForTest()?.runPromise;
+				await activeSession()?.runPromise;
 				const rows = readRows("metrics.jsonl").filter(row => row.run_id === runId && row.event === "model_call");
 				expect(rows).toHaveLength(1);
 				expect(rows[0].role).toBe("triage");
@@ -3579,16 +3590,16 @@ describe("final triage and shutdown integration", () => {
 		try {
 			await handler("gated synthetic run --complexity 4", ctx as never);
 			// The command returned already; the background run is still going.
-			const session = orchestrator.activeRunForTest();
+			const session = activeSession();
 			expect(session).not.toBeNull();
 			await started; // background reached the real (mocked) plan spawn
-			expect(orchestrator.activeRunForTest()).toBe(session);
+			expect(activeSession()).toBe(session);
 			await omsgHandler("check the staging config", ctx as never);
 			expect(notices.some(n => n.includes("Queued for next dispatch"))).toBe(true);
 			expect(session!.queuedDepth()).toBe(1);
 		} finally {
 			child?.kill();
-			await orchestrator.activeRunForTest()?.runPromise;
+			await activeSession()?.runPromise;
 			spawn.mockRestore();
 		}
 	}, 15_000);
@@ -3609,14 +3620,14 @@ describe("final triage and shutdown integration", () => {
 		const ctx = { ui: { notify: (m: string) => notices.push(m), setWidget() {}, setStatus() {} }, sessionManager: { getSessionFile: () => undefined } };
 		try {
 			await handler("first synthetic run --complexity 4", ctx as never);
-			const first = orchestrator.activeRunForTest();
+			const first = activeSession();
 			await started;
 			await handler("second synthetic run --complexity 4", ctx as never);
-			expect(orchestrator.activeRunForTest()).toBe(first);
+			expect(activeSession()).toBe(first);
 			expect(notices.some(n => n.includes("already running"))).toBe(true);
 		} finally {
 			child?.kill();
-			await orchestrator.activeRunForTest()?.runPromise;
+			await activeSession()?.runPromise;
 			spawn.mockRestore();
 		}
 	}, 15_000);
@@ -3647,7 +3658,7 @@ describe("final triage and shutdown integration", () => {
 			const p1 = handler("racer one --complexity 4", ctx as never);
 			const p2 = handler("racer two --complexity 4", ctx as never);
 			await Promise.all([p1, p2]);
-			active = orchestrator.activeRunForTest();
+			active = activeSession();
 			expect(active).not.toBeNull();
 			await started;
 			expect(notices.some(n => n.includes("already running"))).toBe(true);
@@ -3672,20 +3683,20 @@ describe("final triage and shutdown integration", () => {
 		const ctx = { ui: { notify() {}, setWidget() {}, setStatus() {} }, sessionManager: { getSessionFile: () => undefined } };
 		try {
 			await handler("stale finally synthetic run --complexity 4", ctx as never);
-			const sessionA = orchestrator.activeRunForTest()!;
+			const sessionA = activeSession()!;
 			expect(sessionA).not.toBeNull();
 			// The race guard above makes it impossible for a second run to take ACTIVE_RUN while
 			// sessionA still owns it, so simulate the state directly: a newer run has since become
 			// ACTIVE_RUN. sessionA's own finally must recognize it no longer owns the singleton and
 			// leave it alone rather than unconditionally nulling it out.
 			const sessionB = new orchestrator.RunSession!("newer-run-stale-finally-test", ctx as never, "a different goal");
-			orchestrator.setActiveRunForTest!(sessionB);
+			forceActiveSession(sessionB);
 			await sessionA.runPromise;
-			expect(orchestrator.activeRunForTest()).toBe(sessionB);
+			expect(activeSession()).toBe(sessionB);
 			sessionB.close();
 			await sessionB.sealDiagnostics();
 			sessionB.finish();
-			orchestrator.setActiveRunForTest!(null);
+			forceActiveSession(null);
 		} finally {
 			spawn.mockRestore();
 		}
@@ -3716,12 +3727,12 @@ describe("final triage and shutdown integration", () => {
 		};
 		try {
 			await handler("cancel-me synthetic run --complexity 4", ctx as never);
-			const session = orchestrator.activeRunForTest()!;
+			const session = activeSession()!;
 			await started;
 			await cancelHandler("", ctx as never);
 			child?.kill();
 			await session.runPromise;
-			expect(orchestrator.activeRunForTest()).toBeNull();
+			expect(activeSession()).toBeNull();
 			expect(widget).toBeUndefined();
 			expect(status).toBeUndefined();
 			const cancelled = sent.find((s) => s.message.details?.runId === session.runId);
@@ -3745,7 +3756,7 @@ describe("final triage and shutdown integration", () => {
 			await started2;
 			expect(notices.some(n => n.includes("already running"))).toBe(false);
 			child2?.kill();
-			await orchestrator.activeRunForTest()?.runPromise;
+			await activeSession()?.runPromise;
 		} finally {
 			spawn.mockRestore();
 		}
@@ -3863,7 +3874,7 @@ describe("final triage and shutdown integration", () => {
 		try {
 			await ready;
 			for (const fn of shutdown) await fn({}, ctx as never);
-			expect(orchestrator.activeRunForTest()).toBeNull();
+			expect(activeSession()).toBeNull();
 			expect(widget).toBeUndefined();
 			expect(status).toBeUndefined();
 			expect(session?.cancelReason).toBe("shutdown");
@@ -3912,7 +3923,7 @@ describe("final triage and shutdown integration", () => {
 			uiInvalidated = true;
 			for (const fn of shutdown) await fn({}, ctx as never);
 			await session?.runPromise;
-			expect(orchestrator.activeRunForTest()).toBeNull();
+			expect(activeSession()).toBeNull();
 			const runId = session!.runId;
 			expect(readRows("outcomes.jsonl").some(row => row.run_id === runId && row.task_id === "run-failed")).toBe(true);
 			expect(errors.some((args) => String(args[0] ?? "").includes("rejected unexpectedly"))).toBe(false);
@@ -4066,7 +4077,7 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 		const events: Array<[string, Record<string, unknown>]> = [];
 		const models: string[] = [];
 		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
-			{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, 0, {
+			{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, null, 0, {
 				recordEvent: (e, p) => { events.push([e, p]); },
 				aliasTable: table,
 				runProcess: async (opts) => {
@@ -4090,7 +4101,7 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 		let calls = 0;
 		const events: string[] = [];
 		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
-			{ security_review: { model: "openai-codex/gpt-5.3-codex-spark" } }, {} as never, 0, {
+			{ security_review: { model: "openai-codex/gpt-5.3-codex-spark" } }, {} as never, null, 0, {
 				recordEvent: (e) => { events.push(e); },
 				aliasTable: table,
 				runProcess: async () => { calls++; return proc({ exitCode: 1, stderr: "429 Too Many Requests" }); },
@@ -4103,7 +4114,7 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 	test("non-quota failure is not retried", async () => {
 		let calls = 0;
 		await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
-			{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, 0, {
+			{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, null, 0, {
 				recordEvent: () => {}, aliasTable: table,
 				runProcess: async () => { calls++; return proc({ exitCode: 1, stderr: "TypeError: boom" }); },
 			});
@@ -4226,7 +4237,7 @@ describe("review fixes (Phase A review)", () => {
 		]) {
 			let calls = 0;
 			await orchestrator.dispatchParallel(process.cwd(), "run", [{ capability: "security_review", task: "t", taskId: "run-sec" }],
-				{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, 0, {
+				{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, null, 0, {
 					recordEvent: () => {}, aliasTable: table,
 					runProcess: async () => { calls++; return { ...base, ...over }; },
 				});

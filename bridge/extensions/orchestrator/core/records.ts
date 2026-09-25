@@ -1,8 +1,8 @@
 /**
  * Metrics rows attributable to a single dispatch. Pure: takes the dispatch's
  * `CaptureOpts`/`DispatchResult`, plus the active run's tag set as an explicit
- * parameter (the caller — `index.ts` — passes its `CURRENT_RUN_TAGS` global's
- * current value; this module never reads a global itself).
+ * parameter (the caller — `index.ts` — passes its current `RunContext.tags`
+ * (B4.4, run/context.ts); this module never reads a global itself).
  */
 
 import type { SubagentSingleResult } from "@humain/terminal";

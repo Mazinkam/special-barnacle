@@ -167,7 +167,6 @@ import {
 	dispatchRecordsFor,
 	leadSelfImplemented,
 	methodEffortFor,
-	type RunTags,
 } from "./core/records.ts";
 import {
 	architectPrompt,
@@ -182,6 +181,11 @@ import {
 	QA_SCOPE_RULES,
 } from "./core/prompts.ts";
 import { verificationVerdictFor } from "./core/report.ts";
+
+// RunContext/RunRegistry replace the ACTIVE_RUN / CURRENT_RUN_TAGS /
+// CURRENT_ALIAS_TABLE globals (B4.4; run/context.ts never imports this module).
+import { RunRegistry, type RunContext } from "./run/context.ts";
+import { safeUi } from "./run/ui-sink.ts";
 
 // Re-export the symbols index.test.ts imports from this module by name
 // (`import * as orchestrator from "./index.ts"`); moving the implementation
@@ -390,7 +394,7 @@ export function appendTrimmedEventLog(eventsLog: string | undefined, event: unkn
 }
 
 // installDispatchReaper() moved to adapters/process-reaper.ts (B4.3); called
-// below (activation) with the real liveDispatchPids set and ACTIVE_RUN/
+// below (activation) with the real liveDispatchPids set and runRegistry.active()/
 // recordQueue as injected deps instead of module globals it reached into itself.
 
 const PERSONA_TMP_PREFIX = "orch-agent-";
@@ -452,15 +456,11 @@ export async function confirmStep(
 // keep every call site unchanged while wiring the real Python CLI / profiles
 // path / model registry in place of the adapter's injected parameters.
 
-/**
- * Cohort tags stamped on every model_call / route_executed row of the active
- * run so routing history can be grouped by profile, resolved adapter, and
- * lead size. One orchestration runs at a time (ACTIVE_RUN); reset per run.
- * Type moved to core/records.ts (B4.1); imported below.
- */
-let CURRENT_RUN_TAGS: RunTags = {};
-/** Alias table of the active run, for codex -> Bedrock quota fallback. */
-let CURRENT_ALIAS_TABLE: AliasTable | null = null;
+// Cohort tags (RunTags, core/records.ts, B4.1) and the alias table now live on
+// each run's RunContext (run/context.ts, B4.4) instead of the module-level
+// CURRENT_RUN_TAGS / CURRENT_ALIAS_TABLE globals this comment used to sit
+// above. Every dispatch-path function below takes a `run: RunContext<RunSession> | null`
+// parameter instead of reading them.
 
 // ModelOverrides + emptyOverrides moved to core/args.ts (pure; B4.1); imported below.
 
@@ -739,20 +739,7 @@ export interface OrchestratorStatus {
 	recentLog: string[];
 }
 
-/**
- * Swallow throws from `ctx.ui` access. `ctx.ui` can become unavailable after the session
- * that owns it has moved on (shutdown, a later session start racing the tail of this run's
- * cleanup) — that failure is not this run's problem: the run has already been logged and
- * recorded, so a UI notify/setWidget/setStatus call failing here must never crash the
- * terminal or cleanup path.
- */
-function safeUi(fn: () => void): void {
-	try {
-		fn();
-	} catch {
-		/* ctx.ui is unavailable; the run's outcome is already recorded */
-	}
-}
+// safeUi moved to run/ui-sink.ts (pure, no globals; B4.4); imported above.
 
 export class RunSession {
 	readonly runId: string;
@@ -1239,28 +1226,19 @@ export class RunSession {
 /** Sentinel agent name: spawn with HT's default system prompt, no persona file. */
 const NO_PERSONA = "__no_persona__";
 
-/** The run currently owning the UI. Only one /orchestrate may be live per session. */
-let ACTIVE_RUN: RunSession | null = null;
-
-/** Reads `ACTIVE_RUN` through a function boundary so TS control-flow narrowing (which assumes
- *  a module-level `let` can't change between two reads in the same function) doesn't hide a
- *  second, later check as unreachable — it deliberately can: another `/orchestrate` invocation
- *  may reassign `ACTIVE_RUN` during the `await` between the two checks. */
-function getActiveRun(): RunSession | null {
-	return ACTIVE_RUN;
-}
-
-/** Test seam: the module has no other way to observe the run-scoped singleton. */
-export function activeRunForTest(): RunSession | null {
-	return ACTIVE_RUN;
-}
-
-/** Test seam: lets a test simulate ACTIVE_RUN having been reassigned to a newer run out from
- *  under a stale one, to exercise the finally-block guard that must not clobber it. Not used
- *  by production code, which only ever assigns `ACTIVE_RUN` via the guarded paths above. */
-export function setActiveRunForTest(run: RunSession | null): void {
-	ACTIVE_RUN = run;
-}
+/**
+ * Owns "the one active run" for this extension: only one /orchestrate (or the
+ * model-check probe) may be live at a time. The one piece of module state this
+ * file keeps for run-scoped data (B4.4) — everywhere else in the dispatch path
+ * (dispatchParallel, runVerification, triageTask, dispatchHierarchical, the
+ * telemetry onError, ...) receives the RunContext it needs as an explicit
+ * parameter instead of reading this registry. Only wiring code with no context
+ * of its own to thread through — the orchestrator_status tool, the
+ * signal/shutdown hooks, /orchestrate-cancel, /omsg — calls `runRegistry.active()`
+ * directly. Exported so tests can drive claim()/release()/setForTest() directly
+ * instead of the old activeRunForTest()/setActiveRunForTest() free functions.
+ */
+export const runRegistry = new RunRegistry<RunSession>();
 
 /** Render an `OrchestratorStatus` snapshot as plain text for chat/tool output. */
 export function formatOrchestratorStatus(s: OrchestratorStatus): string {
@@ -1299,10 +1277,11 @@ export function registerOrchestratorStatusTool(pi: ExtensionAPI): void {
 		promptSnippet: "orchestrator_status: check progress of a live /orchestrate run without blocking on it",
 		parameters,
 		async execute(_toolCallId, params) {
-			if (!ACTIVE_RUN) {
+			const active = runRegistry.active();
+			if (!active) {
 				return { content: [{ type: "text", text: "No orchestrator run is active." }], details: undefined };
 			}
-			const snapshot = ACTIVE_RUN.statusSnapshot(params.logLines ?? 20);
+			const snapshot = active.session.statusSnapshot(params.logLines ?? 20);
 			return {
 				content: [{ type: "text", text: formatOrchestratorStatus(snapshot) }],
 				details: snapshot,
@@ -1492,7 +1471,14 @@ export async function runSubagentProcess(opts: {
 	depth?: number;
 	/** Test seam for deterministic progress/absolute timeout coverage. */
 	leadTimeouts?: { inactivityMs: number; maxMs: number };
-	/** Optional owning session; production callers use the active run. */
+	/**
+	 * Owning session, so this dispatch's progress/diagnostics land on the run's
+	 * board and log (B4.4: every production caller now passes its RunContext's
+	 * `session` explicitly — dispatchParallel's `runOn`, triageTask, and
+	 * checkModels's probe all do; this function itself never reads a module-level
+	 * "active run" global). Omitted entirely by tests that want the "no session"
+	 * behaviour (diagnostics go to a private temp file; see openStderrTarget).
+	 */
 	session?: RunSession;
 	/**
 	 * Test seam only: replaces the real child launcher. Defaults to node's
@@ -1513,7 +1499,7 @@ export async function runSubagentProcess(opts: {
 		input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
 		cost: 0, contextTokens: 0, turns: 0,
 	};
-	const session = opts.session ?? ACTIVE_RUN;
+	const session = opts.session;
 	session?.cancellation.throwIfCancelled();
 	const taskId = opts.taskId ?? `${opts.agentName}-${Date.now()}`;
 	const safeTaskId = taskId.replace(/[^a-zA-Z0-9._-]+/g, "_");
@@ -2168,6 +2154,9 @@ async function triageTask(
 	goal: string,
 	cwd: string,
 	ctx: ExtensionContext,
+	/** The claiming run's context, threaded explicitly (B4.4) so triage's dispatch
+	 *  and billing land on the right run instead of an implicit "active run" read. */
+	run: RunContext<RunSession> | null,
 	costSink: { usd: number },
 	adapter: Adapter,
 ): Promise<TriageResult | null> {
@@ -2191,6 +2180,7 @@ async function triageTask(
 			ctx,
 			taskId: "triage",
 			label: "triage",
+			session: run?.session,
 		});
 		costSink.usd += r?.costUsd ?? 0;
 		// Bill the dispatch before parsing: malformed/empty classifier output still used tokens.
@@ -2200,6 +2190,7 @@ async function triageTask(
 			{ taskId: "triage", capability: "triage", model: r.model ?? cheapest.model,
 				exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, usage: r.usage,
 				durationMs: r.durationMs, costUsd: r.costUsd, costReported: r.costReported, stopReason: r.stopReason, filesChanged: [] },
+			run,
 		);
 		if (r.exitCode !== 0) {
 			console.warn(`[orchestrator] triage exited ${r.exitCode}: ${summarizeStderr(r.stderr || r.rawStdout, 400) || "(no output)"}`);
@@ -2314,7 +2305,13 @@ const telemetry = createTelemetry({
 	flushDelayMs: TELEMETRY_FLUSH_MS,
 	onError: (message) => {
 		console.warn(`[orchestrator] ${message}`);
-		ACTIVE_RUN?.log(`telemetry: ${message}`);
+		// No RunContext to thread through here: `telemetry` is a module-level
+		// singleton created once at load, long before any run exists, and its
+		// onError can fire during any run or between runs. That is exactly the
+		// "no context naturally available" case the architecture review carves
+		// out for `runRegistry.active()` (B4.4) — same behaviour as the old
+		// `ACTIVE_RUN?.log(...)`: log into whichever run is current right now, if any.
+		runRegistry.active()?.session.log(`telemetry: ${message}`);
 	},
 });
 export const recordQueue = telemetry.queue;
@@ -2377,7 +2374,14 @@ export interface RunTiming {
  * the summary just because the final drain went through.
  */
 export async function completeRun(runId: string, summary: Record<string, unknown>, timing?: RunTiming, since?: QueueStats): Promise<FlushReport> {
-	const session = ACTIVE_RUN?.runId === runId ? ACTIVE_RUN : null;
+	// No RunContext parameter here either (see the telemetry onError comment
+	// above): every call site already holds its own `session`/`RunContext`
+	// directly and could pass it, but completeRun/failRun are also meant to be
+	// callable with just a runId. `runRegistry.active()` plus the runId check
+	// preserves the exact old `ACTIVE_RUN?.runId === runId ? ACTIVE_RUN : null`
+	// guard: a stale/older run's terminal call must never acknowledge a newer run.
+	const active = runRegistry.active();
+	const session = active?.session.runId === runId ? active.session : null;
 	recordEvent("run_completed", { run_id: runId, ...timing });
 	recordOutcome({ ...runCompletionOutcomeFor(runId, summary), ...timing });
 	const report = reportSince(await recordQueue.flush(), since);
@@ -2386,7 +2390,8 @@ export async function completeRun(runId: string, summary: Record<string, unknown
 }
 
 export async function failRun(runId: string, error: string, timing?: RunTiming, since?: QueueStats): Promise<FlushReport> {
-	const session = ACTIVE_RUN?.runId === runId ? ACTIVE_RUN : null;
+	const active = runRegistry.active();
+	const session = active?.session.runId === runId ? active.session : null;
 	recordEvent("run_failed", { run_id: runId, error, ...timing });
 	recordOutcome({
 		run_id: runId,
@@ -2472,11 +2477,15 @@ export async function dispatchParallel(
 	tasks: DispatchTask[],
 	adapter: Adapter,
 	ctx: ExtensionContext,
+	/** The dispatching run's context (session/tags/aliasTable), or null outside a
+	 *  run (e.g. a bare test call). Threaded explicitly (B4.4) instead of reading
+	 *  the module-level runRegistry singleton from inside the dispatch path. */
+	run: RunContext<RunSession> | null,
 	depth: number = 0,
 	deps: {
 		recordEvent: typeof recordEvent;
 		runProcess: typeof runSubagentProcess;
-		/** Alias table for the codex -> Bedrock quota fallback; defaults to the active run's. */
+		/** Alias table for the codex -> Bedrock quota fallback; defaults to `run`'s. */
 		aliasTable?: AliasTable | null;
 	} = { recordEvent, runProcess: runSubagentProcess },
 ): Promise<DispatchResult[]> {
@@ -2486,7 +2495,7 @@ export async function dispatchParallel(
 	// the batch sees the same messages; the next dispatchParallel call picks up
 	// anything that arrived during or after this one. Draining mid-batch would
 	// split messages across two prompts in non-obvious ways.
-	const session = ACTIVE_RUN;
+	const session = run?.session ?? null;
 	const recipient = tasks.length === 1
 		? `${tasks[0].capability}:${tasks[0].taskId.replace(`${runId}-`, "")}`
 		: `${tasks.length} ${tasks[0].capability} tasks`;
@@ -2559,30 +2568,40 @@ export async function dispatchParallel(
 				// everywhere it did before.
 				tools: input.tools,
 				ctx,
+				// Explicit (B4.4): this dispatch's progress/diagnostics belong to the
+				// run whose RunContext was passed in, not whatever the module-level
+				// registry currently holds.
+				session: session ?? undefined,
 			});
 			let r = await runOn(input.model, input._taskId, shortId);
 			// Codex first, Bedrock fallback: a quota/rate-limit failure on an
 			// openai-codex model is retried ONCE on the same model id under
 			// amazon-bedrock. Both attempts are billed (usage summed).
-			const table = deps.aliasTable === undefined ? CURRENT_ALIAS_TABLE : deps.aliasTable;
+			const table = deps.aliasTable === undefined ? (run?.aliasTable ?? null) : deps.aliasTable;
 			// Only a genuine provider rejection qualifies: not a timeout, a user
 			// cancel, or a spend-cap stop (those would re-run finished work), and
 			// only when stderr (not the model's own prose) names the quota.
+			// `session` above is `run?.session` captured once at this call's start;
+			// unlike the old `session ?? ACTIVE_RUN` fallback, there is no live global
+			// left to re-read here. That fallback only ever mattered if the module
+			// global changed after `session` was captured but before this line ran —
+			// impossible in practice, since only one run is ever active and this
+			// closure only runs inside that same run's own dispatch flow.
 			const eligible = r.exitCode !== 0 && r.outcome !== "timed_out" && r.outcome !== "cancelled" &&
-				r.stopReason !== "spend_cap" && !(session ?? ACTIVE_RUN)?.cancellation.isCancelled;
+				r.stopReason !== "spend_cap" && !session?.cancellation.isCancelled;
 			const twin = eligible && table && isQuotaError(r.stderr) ? bedrockFallbackFor(input.model, table) : null;
 			if (twin) {
 				deps.recordEvent("dispatch_finished", {
 					run_id: runId, task_id: input._taskId, capability: input._capability, model: r.model ?? input.model,
 					exit_code: r.exitCode, duration_ms: r.durationMs, cost_usd: r.costUsd, turns: r.usage.turns,
-					stop_reason: r.stopReason, log_dir: ACTIVE_RUN?.dir, superseded_by_fallback: true,
+					stop_reason: r.stopReason, log_dir: session?.dir, superseded_by_fallback: true,
 				});
 				deps.recordEvent("route_degraded", {
 					run_id: runId, task_id: input._taskId, capability: input._capability,
 					from_model: input.model, to_model: twin, reason: "provider_quota",
 					detail: summarizeStderr(r.stderr, 240),
 				});
-				ACTIVE_RUN?.log(`${input._taskId}: ${input.model} hit a provider quota; retrying once on ${twin}`);
+				session?.log(`${input._taskId}: ${input.model} hit a provider quota; retrying once on ${twin}`);
 				const first = r;
 				const second = await runOn(twin, input._taskId ? `${input._taskId}-fallback` : undefined, `${shortId}↻`);
 				r = {
@@ -2605,7 +2624,7 @@ export async function dispatchParallel(
 				nested_cost_usd: r.nestedCostUsd,
 				turns: r.usage.turns,
 				stop_reason: r.stopReason,
-				log_dir: ACTIVE_RUN?.dir,
+				log_dir: session?.dir,
 			});
 			return {
 				taskId: input._taskId ?? `unknown-${runId}`,
@@ -2707,14 +2726,17 @@ export function agentNameFor(capability: string): string {
 
 // CaptureOpts, dispatchRecordsFor, methodEffortFor, runTagFields, leadSelfImplemented
 // moved to core/records.ts (pure; B4.1). dispatchRecordsFor now takes the run's
-// tags as an explicit parameter instead of reading CURRENT_RUN_TAGS itself; this
-// call site still passes CURRENT_RUN_TAGS's current value, so behaviour is unchanged.
+// tags as an explicit parameter instead of reading a global itself; the caller
+// below passes `run?.tags` (B4.4: RunContext, not CURRENT_RUN_TAGS), so
+// behaviour is unchanged.
 
 async function captureDispatchCost(
 	opts: CaptureOpts,
 	result: DispatchResult,
+	/** The dispatching run's context, for its tag set; null outside a run. */
+	run: RunContext<RunSession> | null,
 ): Promise<void> {
-	for (const record of dispatchRecordsFor(opts, result, CURRENT_RUN_TAGS)) {
+	for (const record of dispatchRecordsFor(opts, result, run?.tags ?? {})) {
 		recordModelCall(record);
 	}
 }
@@ -2756,6 +2778,9 @@ async function runVerification(
 	filesChanged: string[],
 	adapter: Adapter,
 	ctx: ExtensionContext,
+	/** The run this QA pass belongs to; threaded through to dispatchParallel and
+	 *  captureDispatchCost instead of an implicit "active run" read (B4.4). */
+	run: RunContext<RunSession> | null,
 	captureOpts: CaptureOpts,
 ): Promise<VerificationResult> {
 	if (filesChanged.length === 0) {
@@ -2783,6 +2808,7 @@ async function runVerification(
 		[{ capability: "qa_agent", task: qaTask, taskId: `${runId}-qa` }],
 		adapter,
 		ctx,
+		run,
 	);
 
 	if (!qaResult) {
@@ -2795,7 +2821,7 @@ async function runVerification(
 
 	// The QA agent is a billable dispatch like any other. Recording only its
 	// outcome left its spend out of both metrics.jsonl and the run total.
-	await captureDispatchCost({ ...captureOpts, planId }, qaResult);
+	await captureDispatchCost({ ...captureOpts, planId }, qaResult, run);
 
 	const out = qaResult.stdout;
 	const failedChecks = parseFailedChecks(out);
@@ -2859,6 +2885,10 @@ async function dispatchHierarchical(
 	plan: PlanResponse,
 	adapter: Adapter,
 	ctx: ExtensionContext,
+	/** The run this dispatch belongs to; threaded through to dispatchParallel,
+	 *  captureDispatchCost and dispatchReconAndLeads's effects instead of an
+	 *  implicit "active run" read (B4.4). */
+	run: RunContext<RunSession> | null,
 	leadCapability = "lead",
 ): Promise<{
 	leadResults: DispatchResult[];
@@ -2880,7 +2910,7 @@ async function dispatchHierarchical(
 	let architectResult: DispatchResult | undefined;
 	const needsArchitect = depth >= 2 && complexityNeedsArchitect(plan.complexity);
 	if (needsArchitect) {
-		ACTIVE_RUN?.setPhase(
+		run?.session.setPhase(
 			`architect planning on ${shortName(adapter.architect?.model ?? "?")} (complexity ${plan.complexity} ≥ 5)`,
 		);
 		[architectResult] = await dispatchParallel(
@@ -2895,11 +2925,13 @@ async function dispatchHierarchical(
 			],
 			adapter,
 			ctx,
+			run,
 		);
 		await captureDispatchCost(
 			{ runId, planId, taskClass: plan.task_class, complexity: plan.complexity,
 			  risk: plan.risk, recommended: plan.route.recommended, mode: plan.route.mode },
 			architectResult,
+			run,
 		);
 		// The leads proceed without a plan rather than aborting the run, but the
 		// operator must be told the decomposition step was lost — it silently
@@ -2912,7 +2944,7 @@ async function dispatchHierarchical(
 				"warning",
 			);
 		} else if (architectResult) {
-			ACTIVE_RUN?.setPhase(
+			run?.session.setPhase(
 				`architect done in ${fmtElapsed(architectResult.durationMs)} ($${architectResult.costUsd.toFixed(4)}) — ${architectResult.stdout.split("\n").filter((l) => /^\s*\d+[.)]/.test(l)).length} tasks planned`,
 			);
 		}
@@ -2923,10 +2955,10 @@ async function dispatchHierarchical(
 		risk: plan.risk, recommended: plan.route.recommended, mode: plan.route.mode,
 	};
 	const results = await dispatchReconAndLeads({ runId, goal, plan, adapter, architectResult, leadCapability }, {
-		dispatch: (tasks) => dispatchParallel(cwd, runId, tasks, adapter, ctx),
-		capture: (result) => captureDispatchCost(captureOpts, result),
-		setPhase: (phase) => ACTIVE_RUN?.setPhase(phase),
-		throwIfCancelled: () => ACTIVE_RUN?.cancellation.throwIfCancelled(),
+		dispatch: (tasks) => dispatchParallel(cwd, runId, tasks, adapter, ctx, run),
+		capture: (result) => captureDispatchCost(captureOpts, result, run),
+		setPhase: (phase) => run?.session.setPhase(phase),
+		throwIfCancelled: () => run?.session.cancellation.throwIfCancelled(),
 	});
 	return { ...results, architectResult, escalationResults: [] };
 }
@@ -3132,8 +3164,9 @@ function goalExpectsInteraction(goal: string): boolean {
  * on reply text: personas rewrite replies into report formats.
  */
 async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Promise<boolean> {
-	if (ACTIVE_RUN) {
-		ctx.ui.notify(`An orchestration is already running (${ACTIVE_RUN.runId}); try again when it finishes.`, "warning");
+	const alreadyActive = runRegistry.active();
+	if (alreadyActive) {
+		ctx.ui.notify(`An orchestration is already running (${alreadyActive.session.runId}); try again when it finishes.`, "warning");
 		return false;
 	}
 	const byModel = new Map<string, string[]>();
@@ -3141,7 +3174,18 @@ async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Pr
 		byModel.set(b.model, [...(byModel.get(b.model) ?? []), cap]);
 	}
 	const session = new RunSession(`model-check-${Date.now()}`, ctx, "model check");
-	ACTIVE_RUN = session;
+	// No await ran between the guard above and here, so nothing else could have
+	// claimed the registry in between; claim() cannot fail. Kept as a real check
+	// (not a `!` assertion) for symmetry with the /orchestrate handler's own
+	// claim, and so this stays correct if that ever stops being true.
+	const claimed = runRegistry.claim(session);
+	if (!claimed) {
+		ctx.ui.notify(`An orchestration is already running (${runRegistry.active()!.session.runId}); try again when it finishes.`, "warning");
+		session.close();
+		await session.sealDiagnostics();
+		session.finish();
+		return false;
+	}
 	session.setPhase(`probing ${byModel.size} distinct model(s)`);
 	try {
 		const probes = await mapWithConcurrency([...byModel.entries()], MAX_CONCURRENT_DISPATCHES, async ([model, caps]) => {
@@ -3154,6 +3198,7 @@ async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Pr
 				ctx,
 				taskId: `probe-${shortName(model)}`,
 				label: shortName(model),
+				session,
 			});
 			const replied = (r.finalText || r.stdout).trim();
 			const expectedId = model.slice(model.indexOf("/") + 1);
@@ -3189,7 +3234,7 @@ async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Pr
 			session.close();
 			await session.sealDiagnostics(); // bounded drain; no terminal outcome means no seal
 		} finally {
-			ACTIVE_RUN = null;
+			runRegistry.release(claimed);
 			session.finish();
 		}
 	}
@@ -3336,7 +3381,10 @@ function installSessionIngest(pi: ExtensionAPI): void {
  */
 function installTelemetryDrain(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async () => {
-		const session = ACTIVE_RUN;
+		// Wiring code with no context of its own to thread through (B4.4): this
+		// hook fires whenever the session ends, regardless of which run (if any)
+		// is live, so `runRegistry.active()` is the natural read here.
+		const session = runRegistry.active()?.session ?? null;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		session?.cancel("shutdown");
 		try {
@@ -3382,7 +3430,7 @@ export default function (pi: ExtensionAPI) {
 	installDispatchReaper({
 		liveDispatchPids,
 		onSignal: () => {
-			ACTIVE_RUN?.cancel("signal");
+			runRegistry.active()?.session.cancel("signal");
 		},
 		// Best effort only. A signal handler cannot await, so this merely *starts* a drain of
 		// records still inside the coalescing window; whether the Python child gets to run
@@ -3416,9 +3464,10 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Unknown flag(s): ${parsed.unknownFlags.join(", ")}\n${USAGE}`, "error");
 				return;
 			}
-			if (ACTIVE_RUN) {
+			const alreadyActive = runRegistry.active();
+			if (alreadyActive) {
 				ctx.ui.notify(
-					`An orchestration is already running (${ACTIVE_RUN.runId}). Wait for it to finish; its log is ${ACTIVE_RUN.file("run.log")}.`,
+					`An orchestration is already running (${alreadyActive.session.runId}). Wait for it to finish; its log is ${alreadyActive.session.file("run.log")}.`,
 					"warning",
 				);
 				return;
@@ -3455,11 +3504,17 @@ export default function (pi: ExtensionAPI) {
 			const session = new RunSession(runId, ctx, parsed.goal);
 			// Re-check: the first guard above ran before the `await resolveAdapter` a few lines up,
 			// so a second /orchestrate invocation could have raced through that same window and
-			// already claimed ACTIVE_RUN by the time we get here. Losing this race must not let two
-			// sessions both believe they own ACTIVE_RUN, so re-check immediately before the write.
-			if (getActiveRun()) {
+			// already claimed the registry by the time we get here. Losing this race must not let two
+			// sessions both believe they own it, so `claim()` re-checks and sets atomically, right
+			// before the write, instead of trusting the guard above's now-stale result.
+			const claimed = runRegistry.claim(
+				session,
+				{ profile: resolved.profileName, policy_id: policyIdFor(resolved.profileName, adapter) },
+				resolved.table,
+			);
+			if (!claimed) {
 				ctx.ui.notify(
-					`An orchestration is already running (${ACTIVE_RUN!.runId}). Wait for it to finish; its log is ${ACTIVE_RUN!.file("run.log")}.`,
+					`An orchestration is already running (${runRegistry.active()!.session.runId}). Wait for it to finish; its log is ${runRegistry.active()!.session.file("run.log")}.`,
 					"warning",
 				);
 				session.close();
@@ -3467,10 +3522,7 @@ export default function (pi: ExtensionAPI) {
 				session.finish();
 				return;
 			}
-			ACTIVE_RUN = session;
-			CURRENT_RUN_TAGS = { profile: resolved.profileName, policy_id: policyIdFor(resolved.profileName, adapter) };
-			CURRENT_ALIAS_TABLE = resolved.table;
-			session.log(`policy: ${CURRENT_RUN_TAGS.policy_id}`);
+			session.log(`policy: ${claimed.tags.policy_id}`);
 			session.log(`models (profile "${resolved.profileName}"):\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
 			for (const n of resolved.notes) session.log(`note: ${n}`);
 
@@ -3498,7 +3550,7 @@ export default function (pi: ExtensionAPI) {
 
 				if (missingTriage) {
 					session.setPhase(`triage on ${shortName(adapter.implementation_fast?.model ?? "?")}`);
-					triageResult = await triageTask(runId, parsed.goal, cwd, ctx, triageCost, adapter);
+					triageResult = await triageTask(runId, parsed.goal, cwd, ctx, claimed, triageCost, adapter);
 					session.cancellation.throwIfCancelled();
 					if (triageResult) {
 						effectiveTaskClass = triageResult.task_class;
@@ -3566,7 +3618,7 @@ export default function (pi: ExtensionAPI) {
 					source: parsed.leadSize ? "flag" : triageResult ? "triage" : missingTriage ? "heuristic" : "flag",
 				});
 				const leadModel = adapter[leadDecision.capability]?.model ?? adapter.lead?.model ?? "unknown";
-				CURRENT_RUN_TAGS.lead_size = leadDecision.size;
+				claimed.tags.lead_size = leadDecision.size;
 				recordEvent("lead_sized", {
 					run_id: runId,
 					complexity: effectiveComplexity,
@@ -3650,7 +3702,6 @@ export default function (pi: ExtensionAPI) {
 				// `workerResults` carries the parent-owned recon dispatches; they must stay
 				// destructured here or the run stops billing them (plan Task 3).
 				const { leadResults, workerResults, architectResult, escalationResults, skippedLeads, leadTasks } = await dispatchHierarchical(
-
 					cwd,
 					runId,
 					plan.plan_id,
@@ -3658,6 +3709,7 @@ export default function (pi: ExtensionAPI) {
 					plan,
 					adapter,
 					ctx,
+					claimed,
 					leadDecision.capability,
 				);
 				session.cancellation.throwIfCancelled();
@@ -3754,6 +3806,7 @@ export default function (pi: ExtensionAPI) {
 						allFiles,
 						adapter,
 						ctx,
+						claimed,
 						captureOpts,
 					);
 					session.cancellation.throwIfCancelled();
@@ -3798,7 +3851,7 @@ export default function (pi: ExtensionAPI) {
 						);
 						const escalatedSize = leadSizeOf(t.capability);
 						if (escalatedSize) {
-							CURRENT_RUN_TAGS.lead_size = escalatedSize;
+							claimed.tags.lead_size = escalatedSize;
 							recordEvent("lead_sized", {
 								run_id: runId,
 								complexity: effectiveComplexity,
@@ -3821,6 +3874,7 @@ export default function (pi: ExtensionAPI) {
 								[t.capability]: { ...binding, model: escalatedModel },
 							},
 							ctx,
+							claimed,
 						);
 						// Capture settled usage before cancellation unwinds this round, just
 						// as the architect, lead and QA paths do.
@@ -3828,7 +3882,7 @@ export default function (pi: ExtensionAPI) {
 						// absent result wrote an all-"unknown" model_call for a dispatch
 						// that never happened.
 						if (retryResult) {
-							await captureDispatchCost(captureOpts, retryResult);
+							await captureDispatchCost(captureOpts, retryResult, claimed);
 							escalationResults.push(retryResult);
 						}
 						session.cancellation.throwIfCancelled();
@@ -4003,14 +4057,11 @@ export default function (pi: ExtensionAPI) {
 					safeUi(() => session.close());
 					await session.sealDiagnostics();
 				} finally {
-					// A newer race winner may already have replaced ACTIVE_RUN with its own session
-					// (see the re-check guard above); only clear the run-scoped singletons when they
-					// still belong to this run, so a stale run's finally never nulls out a newer one.
-					if (ACTIVE_RUN === session) {
-						ACTIVE_RUN = null;
-						CURRENT_RUN_TAGS = {};
-						CURRENT_ALIAS_TABLE = null;
-					}
+					// A newer race winner may already have replaced the registry's active
+					// context with its own (see the re-check guard above); release() only
+					// clears the registry when `claimed` — by identity — is still the
+					// current owner, so a stale run's finally never clobbers a newer one.
+					runRegistry.release(claimed);
 					session.finish();
 				}
 			}
@@ -4025,12 +4076,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("orchestrate-cancel", {
 		description: "Cancel the currently running /orchestrate run, if any.",
 		handler: async (_args, ctx) => {
-			if (!ACTIVE_RUN) {
+			const active = runRegistry.active();
+			if (!active) {
 				ctx.ui.notify("no active run", "info");
 				return;
 			}
-			const runId = ACTIVE_RUN.runId;
-			ACTIVE_RUN.cancel("user");
+			const runId = active.session.runId;
+			active.session.cancel("user");
 			ctx.ui.notify(`Cancelling orchestration ${runId}…`, "info");
 		},
 	});
@@ -4271,7 +4323,8 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /omsg <message>  (queues one message for the next dispatch)", "warning");
 				return;
 			}
-			if (!ACTIVE_RUN) {
+			const active = runRegistry.active();
+			if (!active) {
 				ctx.ui.notify(
 					"No orchestration is running. Start one with /orchestrate <goal> first — " +
 						"messages are only delivered to a live run.",
@@ -4282,7 +4335,7 @@ export default function (pi: ExtensionAPI) {
 			// Literal "\n" in the input becomes a real newline so multi-line
 			// instructions paste cleanly from shell history.
 			const normalized = text.replace(/\\n/g, "\n");
-			const depth = ACTIVE_RUN.enqueueMessage(normalized);
+			const depth = active.session.enqueueMessage(normalized);
 			const preview = normalized.length > 80 ? `${normalized.slice(0, 77)}…` : normalized;
 			ctx.ui.notify(
 				`Queued for next dispatch (depth=${depth}): “${preview}”`,

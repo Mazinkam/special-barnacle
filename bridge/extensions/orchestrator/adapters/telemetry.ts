@@ -4,7 +4,7 @@
  * `onError` callback are both taken as parameters: this module never spawns
  * Python itself and never reaches into the active run / UI to report a
  * failure — index.ts wires both to the real things (`runModule(...)` and
- * `ACTIVE_RUN?.log(...)`).
+ * `runRegistry.active()?.session.log(...)`, B4.4).
  */
 
 import { type BatchRunner, type FlushReport, RecordQueue } from "../record-queue.ts";
