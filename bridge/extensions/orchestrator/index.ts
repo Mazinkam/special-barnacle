@@ -119,6 +119,7 @@ import {
 } from "./dispatch-progress.ts";
 import { RunCancellation } from "./cancellation.ts";
 import { buildChildArgs, buildChildEnv, personaCanMutateFor } from "./dispatch/child-args.ts";
+import { resolvePersona } from "./dispatch/persona.ts";
 import { applyObservation, applyWarnings, createProgressView, fmtElapsed, formatNestedWorkerRows, formatProgressLine, formatWarningLine, spinnerFrame } from "./run-ui.ts";
 import type { DispatchProgressView } from "./run-ui.ts";
 import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
@@ -1517,37 +1518,24 @@ export async function runSubagentProcess(opts: {
 
 	// Resolve the orchestrator agent persona the same way the subagent tool
 	// does: read the agent markdown from the runtime's agents/ directories and
-	// pass its body via --append-system-prompt. There is NO `--agent` CLI flag;
-	// passing one makes HT exit 1 with "Unknown option: --agent" before it ever
-	// contacts a provider, which is what silently zeroed out every dispatch.
-	let persona: { tools?: string[] } | undefined;
-	let promptDir: string | undefined;
-	let promptPath: string | undefined;
-	if (opts.agentName === NO_PERSONA) {
-		/* probes run on the default system prompt on purpose */
-	} else try {
-		const discovered = discoverAgents(opts.cwd, "both");
-		const agent = discovered.agents.find((a) => a.name === opts.agentName);
-		if (agent) {
-			persona = { tools: agent.tools };
-			if (agent.systemPrompt.trim()) {
-				promptDir = mkdtempSync(join(tmpdir(), PERSONA_TMP_PREFIX));
-				promptPath = join(promptDir, `${opts.agentName}.md`);
-				writeFileSync(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
-			}
-		} else {
-			console.warn(`[orchestrator] agent persona not found: ${opts.agentName} (using default persona)`);
-		}
-	} catch (err) {
-		console.warn(`[orchestrator] agent persona load failed: ${(err as Error).message}`);
-	}
+	// pass its body via --append-system-prompt (dispatch/persona.ts). There is NO
+	// `--agent` CLI flag; passing one makes HT exit 1 with "Unknown option:
+	// --agent" before it ever contacts a provider, which is what silently
+	// zeroed out every dispatch.
+	const personaResolution = resolvePersona({
+		cwd: opts.cwd,
+		agentName: opts.agentName,
+		noPersonaSentinel: NO_PERSONA,
+		discoverAgents,
+		tmpPrefix: PERSONA_TMP_PREFIX,
+	});
 
-	const tools = opts.tools && opts.tools.length > 0 ? opts.tools : persona?.tools;
+	const tools = opts.tools && opts.tools.length > 0 ? opts.tools : personaResolution.tools;
 	const personaCanMutate = personaCanMutateFor(tools);
 	const args = buildChildArgs({
 		model: opts.model,
 		effort: opts.effort,
-		promptPath,
+		promptPath: personaResolution.promptPath,
 		tools,
 		task: renderTaskWithContext(opts.task, undefined),
 	});
@@ -1595,13 +1583,7 @@ export async function runSubagentProcess(opts: {
 		const assistantTexts: string[] = [];
 
 		const cleanupPrompt = () => {
-			if (!promptDir) return;
-			try {
-				rmSync(promptDir, { recursive: true, force: true });
-			} catch {
-				/* best-effort temp cleanup */
-			}
-			promptDir = undefined;
+			personaResolution.cleanup();
 		};
 
 		const recordInterruption = (reason: InterruptionReport["reason"]): string => {
