@@ -68,6 +68,9 @@ FORBIDDEN_EDGES: dict[str, set[str]] = {
     # `presentation`/`app`/`cli`/`engine` in the B2 layer order too.
     'analytics': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
     'analytics.verification': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    # B3: `store.documents` (the locked `JsonDocument` `ContextRegistry`/`VerificationCache` now
+    # share) sits in the `store` layer, below all of them too.
+    'store.documents': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
 }
 
 #: Only these module prefixes may import `orchestrator.app`; every other module must not.
