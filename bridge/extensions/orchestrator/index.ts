@@ -1183,12 +1183,21 @@ export function registerOrchestratorStatusTool(pi: ExtensionAPI): void {
  * singleton) and `env` (`config.ts`'s `liveEnv`) as defaults for
  * dispatch/child-process.ts's optional `opts.recordEvent`/`opts.env` seams,
  * so dispatch/* itself never has to import index.ts.
+ *
+ * `session` also falls back to `runRegistry.active()?.session` when the
+ * caller omits it (matching the pre-B4.4 `opts.session ?? ACTIVE_RUN`
+ * behaviour): every in-tree production caller now threads its own
+ * `RunContext.session` explicitly, but this exported wrapper is also a
+ * public extension API — an external caller (or a test) that dispatches
+ * without a session should still land on whatever run is active, not lose
+ * its progress board/diagnostics/cancellation silently.
  */
 export function runSubagentProcess(opts: Parameters<typeof runSubagentProcessCore>[0]): ReturnType<typeof runSubagentProcessCore> {
 	return runSubagentProcessCore({
 		...opts,
 		recordEvent: opts.recordEvent ?? recordEvent,
 		env: opts.env ?? liveEnv,
+		session: opts.session ?? runRegistry.active()?.session ?? undefined,
 	});
 }
 

@@ -1596,6 +1596,40 @@ describe("runSubagentProcess process/event handling", () => {
 		}
 	});
 
+	test("exported runSubagentProcess falls back to the active run when opts.session is omitted (B4.4)", async () => {
+		const session = createSession("active-run-fallback");
+		forceActiveSession(session);
+		const child = Object.assign(new EventEmitter(), {
+			stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true,
+		});
+		try {
+			const pending = orchestrator.runSubagentProcess!({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "active-run-fallback",
+				// No `session` here — must fall back to `runRegistry.active()?.session`
+				// (matching the pre-B4.4 `opts.session ?? ACTIVE_RUN` behaviour), not just
+				// silently dispatch with no session at all.
+				leadTimeouts: { inactivityMs: 100, maxMs: 1000 },
+				spawnChild: () => child as never,
+			});
+			// The active run's own cancellation must be honoured: only wired up if
+			// this dispatch actually landed on `session` internally.
+			session.cancel();
+			const result = await pending;
+			expect(result.outcome).toBe("cancelled");
+			expect(result.exitCode).toBe(137);
+			expect(session.cancelledDispatches()).toEqual(["__no_persona__"]);
+			// And its diagnostics/progress line landed on the active run's own log,
+			// not a private per-call temp file (the "no session" fallback path).
+			const runLog = readFileSync(session.file("run.log"), "utf8");
+			expect(runLog.match(/\ntaskId: active-run-fallback\n/g) ?? []).toHaveLength(1);
+		} finally {
+			child.emit("close", 137);
+			forceActiveSession(null);
+			session.close();
+		}
+	});
+
 	test("spend cap enforce stops a dispatch once, on the first message that crosses it", async () => {
 		const { SpendCapTracker } = await import("./spend-cap.ts");
 		const session = createSession("spend-cap-enforce");
