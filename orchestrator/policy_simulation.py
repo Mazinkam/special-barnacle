@@ -5,10 +5,11 @@ from typing import Any
 
 from .history import bucket_complexity
 from .scheduler import recommend_package
+from .vocab import DEFAULT_MIN_SAMPLES
 
 
 def simulate_policy(*, stats: list[dict[str, Any]], quality_floor: float, cost_aggressiveness: float,
-                    min_samples: int = 12) -> dict[str, Any]:
+                    min_samples: int = DEFAULT_MIN_SAMPLES) -> dict[str, Any]:
     """Approximate counterfactual using historical cohort summaries.
 
     This is intentionally labeled an estimate: it re-selects among routes that were actually observed
@@ -53,7 +54,7 @@ def simulate_policy(*, stats: list[dict[str, Any]], quality_floor: float, cost_a
     }
 
 
-def compare_policies(*, stats: list[dict[str, Any]], current: dict[str, float], candidate: dict[str, float], min_samples: int=12) -> dict[str, Any]:
+def compare_policies(*, stats: list[dict[str, Any]], current: dict[str, float], candidate: dict[str, float], min_samples: int=DEFAULT_MIN_SAMPLES) -> dict[str, Any]:
     a=simulate_policy(stats=stats,quality_floor=current['quality_floor'],cost_aggressiveness=current['cost_aggressiveness'],min_samples=min_samples)
     b=simulate_policy(stats=stats,quality_floor=candidate['quality_floor'],cost_aggressiveness=candidate['cost_aggressiveness'],min_samples=min_samples)
     ac=a['estimated_avg_verified_cost_usd']; bc=b['estimated_avg_verified_cost_usd']

@@ -41,6 +41,7 @@ from .runtime import (default_state_root, exclusive_file_lock, iter_jsonl, read_
                       write_json, write_text_atomic)
 from .run_evidence import evidence_coverage, summarize_runs
 from .verification import flaky_stats
+from .contract import INGEST_STATUS_FILE, STREAMS
 
 # Display tails only; every aggregate still covers the complete deduplicated history.
 RECENT_EVENTS = 500
@@ -397,7 +398,7 @@ def build_data(root: Path, config: dict | None = None):
     invalidations = 0
     run_events = []
     recent_events = deque(maxlen=RECENT_EVENTS)
-    for event in unique_records(iter_jsonl(root / 'events.jsonl')):
+    for event in unique_records(iter_jsonl(root / STREAMS['event'])):
         event_count += 1
         recent_events.append(event)
         last_event_ts = max(last_event_ts, str(event.get('ts', '')))
@@ -406,8 +407,8 @@ def build_data(root: Path, config: dict | None = None):
         invalidations += kind == 'decision_invalidated'
         if event.get('run_id') is not None or kind == 'decision_invalidated':
             run_events.append(event)
-    outcomes = list(unique_records(iter_jsonl(root / 'outcomes.jsonl')))
-    ingest_status = build_ingest_status(read_json(root / 'ingest_status.json', {}),
+    outcomes = list(unique_records(iter_jsonl(root / STREAMS['outcome'])))
+    ingest_status = build_ingest_status(read_json(root / INGEST_STATUS_FILE, {}),
                                         now=datetime.now(timezone.utc))
     metric_count = 0
     last_metric_ts = ''
@@ -421,7 +422,7 @@ def build_data(root: Path, config: dict | None = None):
 
     def metric_rows():
         nonlocal metric_count, last_metric_ts
-        for row in unique_records(iter_jsonl(root / 'metrics.jsonl')):
+        for row in unique_records(iter_jsonl(root / STREAMS['metric'])):
             metric_count += 1
             recent_metrics.append(row)
             last_metric_ts = max(last_metric_ts, str(row.get('ts', '')))
@@ -747,7 +748,7 @@ $('#runs').innerHTML='<thead><tr><th>Run</th><th>Status</th><th>Elapsed (wall)</
 def stream_version(root):
     """Cheap invalidation receipt; sync-health-only writes must invalidate the page too."""
     version={'format_version':1}
-    for name in ('events.jsonl','metrics.jsonl','outcomes.jsonl','ingest_status.json'):
+    for name in (STREAMS['event'], STREAMS['metric'], STREAMS['outcome'], INGEST_STATUS_FILE):
         try:
             s=(Path(root)/name).stat()
             version[name]=[s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns]

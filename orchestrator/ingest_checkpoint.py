@@ -65,17 +65,16 @@ from pathlib import Path
 from typing import Any, BinaryIO, Iterable, Optional
 
 from .runtime import TAIL_FINGERPRINT_BYTES, iter_jsonl_from, open_binary, read_json, stable_hash, tail_fingerprint, write_json
+from .contract import STREAMS
+from .vocab import CALL, SESSION, INGEST_TOKEN_FIELDS
 
 FORMAT_VERSION = 3  # 3: full prefix hash and authoritative aggregate call coverage; older caches cost a full read
 CHECKPOINT_DIR = 'ingest-checkpoints'
 INGEST_SOURCE = 'session_ingest'
 PROMOTION_EVENT = 'session_ingest_promotion'
 PROMOTION_VERSION = 1
-CALL = 'call'
-SESSION = 'session'
 GRANULARITIES = (CALL, SESSION)
-TOKEN_FIELDS = ('input_tokens', 'cached_input_tokens', 'cache_write_tokens', 'output_tokens',
-                'reasoning_output_tokens', 'total_tokens')
+TOKEN_FIELDS = INGEST_TOKEN_FIELDS
 COUNT_FIELDS = TOKEN_FIELDS + ('calls',)
 MAX_CHECKPOINT_BYTES = 64 * 1024 * 1024  # a per-source file far beyond this is not a checkpoint
 MAX_TAIL_BYTES = 16 * 1024 * 1024  # an unterminated metrics tail beyond this is a fragment, not a row
@@ -344,7 +343,7 @@ class IngestLedger:
     """
 
     def __init__(self, root: str | Path):
-        self.path = Path(root) / 'metrics.jsonl'
+        self.path = Path(root) / STREAMS['metric']
         self.sessions: dict[tuple[str, str], dict[str, Any]] = {}
         self.sources: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
         self.full = False
@@ -550,7 +549,7 @@ class IngestLedger:
                                  'nothing was written.')
             bindings[before] = {'to_session_id': after, 'source_identity': identity}
 
-        path = self.path.with_name('events.jsonl')
+        path = self.path.with_name(STREAMS['event'])
         end = 0
         for row, end in iter_jsonl_from(path):
             apply(row)

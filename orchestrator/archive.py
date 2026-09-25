@@ -37,10 +37,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from .runtime import (RECORD_INDEX_FILE, WRITER_LOCK_FILE, exclusive_file_lock, fsync_directory,
-                      iter_jsonl, utc_now)
-from .record_index import DATABASE_FILE
-from .state import LEDGER_FILE
+from .runtime import (exclusive_file_lock, fsync_directory, iter_jsonl, utc_now)
+from .contract import NEVER_ARCHIVE_FILES, STREAMS
+from .vocab import TERMINAL_TASK_IDS
 
 FORMAT_VERSION = 1
 OWNER_FILE = '.diagnostics-owner.json'
@@ -51,10 +50,8 @@ MANIFEST_FILE = 'archive.manifest.json'
 ARCHIVE_LOCK_FILE = 'archive.lock'
 ARCHIVE_SUFFIX = '.gz'
 DEFAULT_OLDER_THAN_DAYS = 30
-TERMINAL_TASK_IDS = frozenset({'run-complete', 'run-failed'})
 #: Authoritative streams and their integrity/recovery metadata: never archived, wherever they appear.
-NEVER_ARCHIVE = frozenset({'events.jsonl', 'metrics.jsonl', 'outcomes.jsonl', 'discoveries.jsonl', LEDGER_FILE, WRITER_LOCK_FILE,
-                           RECORD_INDEX_FILE, DATABASE_FILE, 'ingest_status.json', MANIFEST_FILE, ARCHIVE_LOCK_FILE})
+NEVER_ARCHIVE = NEVER_ARCHIVE_FILES
 #: Kept readable in place even when the rest of the run is archived (the HT progress board links to it).
 KEEP_READABLE = frozenset({'run.log'})
 RESTORE_COMMAND = 'python3 -m orchestrator.cli restore-run {run_id}'
@@ -78,7 +75,7 @@ def parse_ts(value: Any) -> Optional[datetime]:
 def terminal_outcomes(root: Path) -> dict[str, dict[str, Any]]:
     """Latest durable terminal outcome per run id, streamed from `outcomes.jsonl` (missing file -> {})."""
     latest: dict[str, dict[str, Any]] = {}
-    for row in iter_jsonl(Path(root) / 'outcomes.jsonl'):
+    for row in iter_jsonl(Path(root) / STREAMS['outcome']):
         run_id = row.get('run_id'); task_id = row.get('task_id')
         if not isinstance(run_id, str) or task_id not in TERMINAL_TASK_IDS: continue
         latest[run_id] = {'task_id': task_id, 'ts': row.get('ts'), 'outcome': row.get('outcome'), 'finished_at': row.get('finished_at')}
@@ -364,7 +361,7 @@ def plan_run(run_dir: Path, terminal: Optional[dict[str, Any]], *, older_than_da
     seal = load_seal(run_dir)
     if terminal is None:
         return _skip(run_id, run_dir, 'no_terminal_outcome',
-                     f'no durable run-complete/run-failed outcome for {run_id} in outcomes.jsonl; the run may still be active or its status is unknown')
+                     f"no durable run-complete/run-failed outcome for {run_id} in {STREAMS['outcome']}; the run may still be active or its status is unknown")
     if seal is None and any((run_dir / name).exists() for name in (OWNER_FILE, SEAL_FILE)):
         return _skip(run_id, run_dir, 'writers_unsealed',
                      'managed diagnostic ownership is incomplete: producers may still be draining; no snapshots or raw removal',

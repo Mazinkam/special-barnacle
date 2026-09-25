@@ -44,11 +44,12 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from .contract import STREAMS
 from .runtime import RECORD_INDEX_FILE, read_json, tail_fingerprint
 
 DATABASE_FILE = 'records.index.sqlite3'
 INDEX_VERSION = 2  # 2: BLOB keys (surrogatepass); receipts of version 1 (TEXT keys) are discarded
-STREAMS = {'event': 'events.jsonl', 'metric': 'metrics.jsonl', 'outcome': 'outcomes.jsonl'}
+# STREAMS is re-exported from contract.py (its canonical home); it used to be defined here.
 
 
 def encode_key(record_id: str) -> bytes:

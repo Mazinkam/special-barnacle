@@ -50,6 +50,7 @@ import json
 
 from . import records
 from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, has_reported_tokens, is_call_row, is_session_ingest, row_cost, unique_records
+from .vocab import parse_iso_ts as _parse_ts
 
 ACTUAL = 'actual'
 COUNTERFACTUAL = 'counterfactual'
@@ -57,12 +58,6 @@ TERMINAL_OUTCOME_TASKS = {'run-complete': 'completed', 'run-failed': 'failed'}
 TERMINAL_EVENTS = {'run_completed': 'completed', 'run_failed': 'failed'}
 IMPLEMENTATION_ROLES = {'worker', 'implementer', 'complex_implementer', 'implementation_fast', 'implementation_strong'}
 BAD_OUTCOME_KEYS = ('reopened', 'regression', 'rollback', 'human_correction', 'incident', 'major_rewrite')
-
-
-def _parse_ts(value: Any) -> datetime | None:
-    if not value: return None
-    try: return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
-    except Exception: return None
 
 
 def _int_or_none(value: Any) -> int | None:

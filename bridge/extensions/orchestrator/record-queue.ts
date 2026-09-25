@@ -41,9 +41,11 @@
  * The queue is pure (the runner is injected) so it can be tested without Python.
  */
 
+import contract from "./contract.json";
+
 export type Stream = "event" | "metric" | "outcome";
 
-export const STREAMS: readonly Stream[] = ["event", "metric", "outcome"];
+export const STREAMS: readonly Stream[] = Object.keys(contract.streams) as Stream[];
 
 /** A record as sent to `batch`: the stream, its stable id, and the payload. */
 export interface QueuedRecord {
@@ -127,7 +129,7 @@ export interface QueueStats {
 }
 
 /** Python's `MAX_BATCH_RECORDS`; a larger batch is rejected before anything is written. */
-export const PYTHON_MAX_BATCH_RECORDS = 500;
+export const PYTHON_MAX_BATCH_RECORDS = contract.batch.max_records;
 const DEFAULT_MAX_BATCH = 100;
 const DEFAULT_FLUSH_DELAY_MS = 500;
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -135,10 +137,10 @@ const RETRY_BACKOFF_MS = 250;
 /** Failed records retained for inspection; beyond this only the count grows. */
 const MAX_RETAINED_FAILURES = 500;
 
-const EXIT_OK = 0;
-const EXIT_INVALID = 1;
+const EXIT_OK = contract.batch.exit_codes.ok;
+const EXIT_INVALID = contract.batch.exit_codes.invalid;
 /** Body statuses that mean "rows durable, derived views not refreshed" (exit 3). */
-const DURABLE_STATUSES = new Set(["refresh_failed", "checkpoint_failed"]);
+const DURABLE_STATUSES = new Set([contract.batch.statuses.refresh_failed, contract.batch.statuses.checkpoint_failed]);
 
 function emptyReport(): FlushReport {
 	return { ok: true, batches: 0, acknowledged: 0, failed: 0, derivedStale: 0 };

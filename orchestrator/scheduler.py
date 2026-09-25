@@ -4,6 +4,7 @@ from typing import Any
 from .history import bucket_complexity
 from .method import effort_levels
 from .records import is_no_data
+from .vocab import SCHEDULER_MIN_SAMPLES
 
 EFFORTS=effort_levels()
 
@@ -60,7 +61,7 @@ def package_history(stats:list[dict], *, task_class:str, complexity:float, risk:
     return max(matches,key=lambda s:(measured(s.get('verified_tasks')) or 0,measured(s.get('samples')) or 0),default=None)
 
 
-def recommend_package(*,task_class:str,complexity:float,risk:str,quality_floor:float,cost_aggressiveness:float,stats:list[dict],min_samples:int=8)->dict[str,Any]:
+def recommend_package(*,task_class:str,complexity:float,risk:str,quality_floor:float,cost_aggressiveness:float,stats:list[dict],min_samples:int=SCHEDULER_MIN_SAMPLES)->dict[str,Any]:
     cb=bucket_complexity(complexity)
     candidates=[]
     for p in DEFAULT_PACKAGES:

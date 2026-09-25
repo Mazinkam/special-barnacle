@@ -37,7 +37,9 @@ from .records import (
     verification_state,
 )
 
-TOKEN_KEYS = ('input_tokens', 'output_tokens', 'cached_input_tokens', 'cache_write_tokens')
+from .vocab import ECONOMICS_TOKEN_KEYS
+
+TOKEN_KEYS = ECONOMICS_TOKEN_KEYS
 
 REPORTED = 'reported'
 ESTIMATED = 'estimated'

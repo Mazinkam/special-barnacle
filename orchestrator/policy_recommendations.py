@@ -1,10 +1,11 @@
 from __future__ import annotations
 from typing import Any
 from .policy_simulation import simulate_policy
+from .vocab import DEFAULT_MIN_SAMPLES
 
 
 def recommend_policy(*, stats:list[dict[str,Any]], current_quality_floor:float, current_cost_aggressiveness:float,
-                     min_samples:int=12)->dict[str,Any]:
+                     min_samples:int=DEFAULT_MIN_SAMPLES)->dict[str,Any]:
     """Search a small, conservative policy grid and return an estimated recommendation.
 
     This function never mutates config. It is suitable for the `policy_recommendations` feature;

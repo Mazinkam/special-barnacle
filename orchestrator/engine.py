@@ -12,6 +12,7 @@ from .features import FeaturePolicy, feature_inventory
 from .policy_simulation import compare_policies
 from .policy_recommendations import recommend_policy as build_policy_recommendation
 from .dashboard import generate_dashboard
+from .vocab import DEFAULT_MIN_SAMPLES
 
 
 class OrchestrationEngine:
@@ -58,7 +59,7 @@ class OrchestrationEngine:
         decay = features.get('historical_learning',{}).get('decay_half_life_days') if features.get('historical_learning',{}).get('decay_old_results',False) else None
         stats = load_stats(self.state_root, history_cfg.get("complexity_bucket_width", 2), decay)
 
-        min_samples=int(features.get('historical_learning',{}).get('minimum_samples',history_cfg.get('min_samples_for_empirical_route',12)))
+        min_samples=int(features.get('historical_learning',{}).get('minimum_samples',history_cfg.get('min_samples_for_empirical_route',DEFAULT_MIN_SAMPLES)))
         route = adaptive_route(
             run_id=run_id, task_class=task_class, complexity=complexity, risk=risk,
             quality_floor=qf, cost_aggressiveness=ca, stats=stats, features=features,
@@ -154,7 +155,7 @@ class OrchestrationEngine:
             stats=stats,
             current={'quality_floor':p.quality_floor,'cost_aggressiveness':p.cost_aggressiveness},
             candidate={'quality_floor':candidate_quality_floor,'cost_aggressiveness':candidate_cost_aggressiveness},
-            min_samples=self.config.get('history',{}).get('min_samples_for_empirical_route',12)
+            min_samples=self.config.get('history',{}).get('min_samples_for_empirical_route',DEFAULT_MIN_SAMPLES)
         )
 
 
@@ -167,7 +168,7 @@ class OrchestrationEngine:
         p=self.policy()
         return build_policy_recommendation(
             stats=stats,current_quality_floor=p.quality_floor,current_cost_aggressiveness=p.cost_aggressiveness,
-            min_samples=self.config.get('history',{}).get('min_samples_for_empirical_route',12)
+            min_samples=self.config.get('history',{}).get('min_samples_for_empirical_route',DEFAULT_MIN_SAMPLES)
         )
 
     def complete_run(self, run_id: str, **payload: Any) -> None:

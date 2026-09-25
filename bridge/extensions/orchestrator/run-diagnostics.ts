@@ -9,17 +9,16 @@ import {
 	mkdirSync, openSync, readSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import contract from "./contract.json";
 
 export const OWNER_FILE = ".diagnostics-owner.json";
 export const SEAL_FILE = ".diagnostics-sealed.json";
 const PROTOCOL = "ht-run-diagnostics-v1";
 const SEAL_DRAIN_TIMEOUT_MS = 2000;
 const owners = new Map<string, RunDiagnostics>();
-const protectedNames = new Set([
-	"events.jsonl", "metrics.jsonl", "outcomes.jsonl", "discoveries.jsonl", "ledger.json",
-	"ledger.lock", "records.checkpoint.json", "records.index.sqlite3", "ingest_status.json",
-	"archive.manifest.json", "archive.lock",
-]);
+// Mirrors orchestrator/contract.json's never_archive_files (the authoritative streams and their
+// integrity/recovery metadata), which archive.py's NEVER_ARCHIVE also derives from.
+const protectedNames = new Set<string>(contract.never_archive_files);
 
 function syncDirectory(dir: string): void {
 	const fd = openSync(dir, constants.O_RDONLY | constants.O_NOFOLLOW);

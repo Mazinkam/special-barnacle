@@ -27,17 +27,23 @@ from pathlib import Path
 from typing import Any
 
 from .dashboard import generate_dashboard
-from .record_index import RecordIndex, STREAMS
+from .record_index import RecordIndex
 from .runtime import (RECORD_INDEX_FILE, default_attribution, default_state_root, encode_jsonl,
                       fsync_directory, fsync_directory_ancestry, meter, utc_now, write_json, writer_lock)
 from .state import REDUCER_KEY_FIELDS, invalid_key_field, ledger_is_current, replay_ledger
+from .contract import (
+    MAX_BATCH_RECORDS,
+    MAX_RECORD_ID_LENGTH,
+    RETRY_SAME_IDS,
+    STATUS_CHECKPOINT_FAILED,
+    STATUS_OK,
+    STATUS_REFRESH_FAILED,
+    STREAMS,
+)
 
 FORMAT_VERSION = 1
 CHECKPOINT_FILE = RECORD_INDEX_FILE
-MAX_BATCH_RECORDS = 500
-MAX_RECORD_ID_LENGTH = 200
 RESERVED_KEYS = {'stream'}
-RETRY_SAME_IDS = 'same_ids'
 
 
 class BatchValidationError(ValueError):
@@ -187,7 +193,7 @@ def settle_streams(root: str | Path | None, *, lock: bool = True) -> dict[str, A
     """
     root = Path(root) if root is not None else default_state_root()
     root.mkdir(parents=True, exist_ok=True)
-    status = 'ok'; error: str | None = None; touched: list[str] = []
+    status = STATUS_OK; error: str | None = None; touched: list[str] = []
     with writer_lock(root) if lock else contextlib.nullcontext():
         try:
             fsync_directory_ancestry(root)
@@ -200,7 +206,7 @@ def settle_streams(root: str | Path | None, *, lock: bool = True) -> dict[str, A
                 try:
                     _write_checkpoint(root, index)
                 except (OSError, sqlite3.Error) as exc:
-                    status = 'checkpoint_failed'
+                    status = STATUS_CHECKPOINT_FAILED
                     error = f'checkpoint write failed after the streams were made durable: {exc}; the next write rebuilds the index'
     return {'ok': error is None, 'status': status, 'settled': touched, 'error': error}
 
@@ -221,7 +227,7 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
     root.mkdir(parents=True, exist_ok=True)  # the lock file lives inside; durability of the chain is settled under the lock
     persisted = _counts(); duplicates = _counts(); statuses: list[dict[str, Any]] = []
     built: list[dict[str, Any]] = []
-    ledger_updated = False; dashboard_updated = False; error: str | None = None; status = 'ok'
+    ledger_updated = False; dashboard_updated = False; error: str | None = None; status = STATUS_OK
     with writer_lock(root) if lock else contextlib.nullcontext():
         try:
             # Existence is not durability: whoever created these directories (this call, a concurrent
@@ -256,7 +262,7 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
                         index.add(stream, record_id)
                 _write_checkpoint(root, index)
             except (OSError, sqlite3.Error) as exc:
-                status = 'checkpoint_failed'
+                status = STATUS_CHECKPOINT_FAILED
                 error = (f'checkpoint write failed after the records were durably appended: {exc}; '
                          f'retry with the same record ids to rebuild the index and refresh the ledger')
             if refresh and error is None:
@@ -265,13 +271,13 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
                         replay_ledger(root)
                         ledger_updated = True
                 except Exception as exc:  # noqa: BLE001 - records are already durable
-                    status = 'refresh_failed'; error = f'ledger refresh failed: {exc}'
+                    status = STATUS_REFRESH_FAILED; error = f'ledger refresh failed: {exc}'
     if refresh and error is None:
         try:
             generate_dashboard(root, config=config)
             dashboard_updated = True
         except Exception as exc:  # noqa: BLE001 - records are already durable
-            status = 'refresh_failed'; error = f'dashboard refresh failed: {exc}'
+            status = STATUS_REFRESH_FAILED; error = f'dashboard refresh failed: {exc}'
     return {
         'ok': error is None, 'status': status, 'format_version': FORMAT_VERSION,
         'persisted': persisted, 'duplicates': duplicates, 'ledger_updated': ledger_updated,

@@ -6,6 +6,7 @@ import hashlib
 
 from .history import bucket_complexity
 from .scheduler import DEFAULT_PACKAGES, EFFORTS, recommend_package, topology_for, package_history, measured
+from .vocab import DEFAULT_MIN_SAMPLES, HIGH_RISK
 
 
 def _unit_interval(seed: str) -> float:
@@ -18,7 +19,7 @@ def deterministic_coin(seed: str, probability: float) -> bool:
 
 
 def default_package_for(complexity: float, risk: str, features: dict[str, Any], default_efforts: dict[str, str]) -> dict[str, Any]:
-    strong = risk in {'high','critical'} or float(complexity) >= 8
+    strong = risk in HIGH_RISK or float(complexity) >= 8
     capability = 'implementation_strong' if strong else 'implementation_fast'
     effort = default_efforts.get(capability, 'standard')
     effort_cfg=features.get('effort_adaptation', {})
@@ -39,7 +40,7 @@ def default_package_for(complexity: float, risk: str, features: dict[str, Any], 
         'effort': effort,
         'context_budget_tokens': context_budget,
         'verification_depth': verification,
-        'reviewer_independence': 'independent' if risk in {'high','critical'} else 'normal',
+        'reviewer_independence': 'independent' if risk in HIGH_RISK else 'normal',
     }
 
 
@@ -76,7 +77,7 @@ def route_evidence(stats: list[dict[str, Any]], *, task_class: str, complexity: 
     return {key: int(measured(hist.get(key)) or 0) for key in ('verified_tasks', 'run_samples', 'call_samples')}
 
 
-def configured_min_samples(features: dict[str, Any], default: int = 12) -> int:
+def configured_min_samples(features: dict[str, Any], default: int = DEFAULT_MIN_SAMPLES) -> int:
     return int(features.get('historical_learning', {}).get('minimum_samples', default))
 
 
@@ -135,7 +136,7 @@ def recommend_topology(*, task_class: str, complexity: float, risk: str, couplin
 
 def adaptive_route(*, run_id: str, task_class: str, complexity: float, risk: str, quality_floor: float,
                    cost_aggressiveness: float, stats: list[dict[str, Any]], features: dict[str, Any],
-                   default_efforts: dict[str, str], min_samples: int = 12) -> dict[str, Any]:
+                   default_efforts: dict[str, str], min_samples: int = DEFAULT_MIN_SAMPLES) -> dict[str, Any]:
     default = default_package_for(complexity, risk, features, default_efforts)
     mode = features.get('adaptive_routing', {}).get('mode', 'off')
     if not features.get('adaptive_system', {}).get('enabled', True):
@@ -167,7 +168,7 @@ def adaptive_route(*, run_id: str, task_class: str, complexity: float, risk: str
     exploration = features.get('exploration', {})
     explored = False
     exploration_candidate = None
-    if mode == 'enforce' and exploration.get('enabled', False) and (risk not in {'high','critical'} or not exploration.get('exclude_high_risk_tasks', True)):
+    if mode == 'enforce' and exploration.get('enabled', False) and (risk not in HIGH_RISK or not exploration.get('exclude_high_risk_tasks', True)):
         rate=float(exploration.get('rate',0))
         if deterministic_coin(f'explore:{run_id}:{task_class}:{complexity}:{risk}', rate):
             feasible=[c for c in empirical['candidates'] if c.get('feasible')]

@@ -138,6 +138,7 @@ import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.t
 // time, so a planned recon task still needs no conversion step.
 import { formatReconEvidence, planReconTasks } from "./recon.ts";
 import { createPythonCli } from "./python-cli.ts";
+import contract from "./contract.json";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -147,8 +148,8 @@ const SKILL_ROOT =
 	process.env.HUMAIN_ORCHESTRATOR_SKILL_ROOT ??
 	"~/.local/share/agent-skills/hierarchical-agent-orchestrator";
 const STATE_ROOT =
-	process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT ??
-	"~/.local/state/coding-agent-orchestrator";
+	process.env[contract.state_root.env_vars.ts] ??
+	contract.state_root.default;
 const PYTHON = process.env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3";
 const expandedSkillRoot = SKILL_ROOT.replace(/^~/, homedir());
 const expandedStateRoot = STATE_ROOT.replace(/^~/, homedir());
@@ -172,8 +173,10 @@ const PYTHON_EXTRA_ENV = {
  */
 // Match absolute paths under common user homes so the bounded Status Contract
 // `error` field never leaks filesystem locations. Mirrors the redaction the
-// Python CLI applies when writing `ingest_status.json`.
-const PATH_RE = /(\/Users\/[^\s|]+|\/home\/[^\s|]+|~\/[^\s|]+)/g;
+// Python CLI applies when writing `ingest_status.json`. Deliberately not the same
+// regex as the Python side (`orchestrator/contract.json`'s `redaction_regex._todo`
+// explains why); this side reads its own key from the shared contract.
+const PATH_RE = new RegExp(contract.redaction_regex.ts, "g");
 function redactPaths(text: string): string {
 	return text.replace(PATH_RE, "<path>");
 }
@@ -4335,7 +4338,7 @@ const MODELS_USAGE = [
  */
 export function recordHookFailure(stateRoot: string, detail: string): void {
 	const root = stateRoot.replace(/^~/, homedir());
-	const statusPath = join(root, "ingest_status.json");
+	const statusPath = join(root, contract.ingest_status_file);
 	const temporaryPath = `${statusPath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
 	try {
 		let previous: Record<string, unknown> = {};

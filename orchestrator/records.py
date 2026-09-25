@@ -27,10 +27,10 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, NamedTuple
 
+from .vocab import CALL, SESSION
+
 # --- granularity -----------------------------------------------------------------------------
 
-CALL = 'call'
-SESSION = 'session'
 EVENT = 'event'
 GRANULARITIES = (CALL, SESSION, EVENT)
 

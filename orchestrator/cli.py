@@ -1,6 +1,5 @@
 from __future__ import annotations
 import argparse,json,os,sys
-import re as _re_path
 from pathlib import Path
 from typing import Any, Callable
 from .runtime import EventStore,QualityEvidence,default_state_root,read_json,utc_now,write_json
@@ -15,8 +14,18 @@ from .engine import OrchestrationEngine
 from .ingest import discover_logs, ingest_paths
 from .dynamic_adapter import resolve_adapter
 from .archive import archive_runs, restore_run, DEFAULT_OLDER_THAN_DAYS, RESTORE_COMMAND
+from .contract import (
+    EXIT_APPEND_FAILED as CONTRACT_EXIT_APPEND_FAILED,
+    EXIT_INVALID as CONTRACT_EXIT_INVALID,
+    EXIT_OK as CONTRACT_EXIT_OK,
+    EXIT_REFRESH_FAILED as CONTRACT_EXIT_REFRESH_FAILED,
+    INGEST_STATUS_FILE,
+    PATH_REDACTION_RE,
+    STATUS_APPEND_FAILED,
+    STATUS_INVALID,
+)
 
-_PATH_RE = _re_path.compile(r"(/Users/[^ \t\n|]+|/home/[^ \t\n|]+|~/[^ \t\n|]+)")
+_PATH_RE = PATH_REDACTION_RE
 def _redact_paths(text):
     return _PATH_RE.sub("<path>", text)
 
@@ -101,15 +110,15 @@ def process_ingest(paths: list[Path], *, state_root: Path, runtime: str | None,
                           summarize_files=len(paths) <= 25)
     result['files_scanned'] = len(paths)
     if not dry_run:
-        previous = read_json(root / 'ingest_status.json', {})
+        previous = read_json(root / INGEST_STATUS_FILE, {})
         if not isinstance(previous, dict):
             previous = {}
         status = make_ingest_status(previous, result)
-        write_json(root / 'ingest_status.json', status)
+        write_json(root / INGEST_STATUS_FILE, status)
         try:
             refresh(root)
         except Exception as error:
-            write_json(root / 'ingest_status.json',
+            write_json(root / INGEST_STATUS_FILE,
                        make_ingest_status(previous, result, materialization_error=error))
             raise
     return result
@@ -117,7 +126,7 @@ def process_ingest(paths: list[Path], *, state_root: Path, runtime: str | None,
 # Exit codes for the durable-write commands (`batch`, `event`, `metric`, `outcome`). The JSON body on
 # stdout always carries `persisted`/`duplicates`/`retry`; `retry == 'same_ids'` (exit 2 or 3) means the
 # durable records are fine and resubmitting the same ids finishes the work without appending twice.
-EXIT_OK=0; EXIT_INVALID=1; EXIT_APPEND_FAILED=2; EXIT_REFRESH_FAILED=3
+EXIT_OK=CONTRACT_EXIT_OK; EXIT_INVALID=CONTRACT_EXIT_INVALID; EXIT_APPEND_FAILED=CONTRACT_EXIT_APPEND_FAILED; EXIT_REFRESH_FAILED=CONTRACT_EXIT_REFRESH_FAILED
 
 def _parse_json(text:str,what:str):
     try: return json.loads(text)
@@ -138,8 +147,8 @@ def _write(records)->tuple[int,dict]:
     structured body with `persisted`/`retry` and never an uncaught traceback.
     """
     try: result=write_batch(ROOT,records,config=cfg())
-    except BatchValidationError as exc: return EXIT_INVALID,_failure('invalid',str(exc))
-    except BatchAppendError as exc: return EXIT_APPEND_FAILED,_failure('append_failed',str(exc),exc.persisted,RETRY_SAME_IDS)
+    except BatchValidationError as exc: return EXIT_INVALID,_failure(STATUS_INVALID,str(exc))
+    except BatchAppendError as exc: return EXIT_APPEND_FAILED,_failure(STATUS_APPEND_FAILED,str(exc),exc.persisted,RETRY_SAME_IDS)
     return (EXIT_OK if result['ok'] else EXIT_REFRESH_FAILED),{k:v for k,v in result.items() if k!='records'}
 
 def write_records(records)->int:
@@ -149,7 +158,7 @@ def write_records(records)->int:
 def _single(stream:str,payload_text:str,event:str|None=None)->int:
     """One-record form of `write_records`: the command names the stream (and event); the payload cannot override them."""
     try: record=single_record(stream,_parse_json(payload_text,'payload'),event=event)
-    except BatchValidationError as exc: print(json.dumps(_failure('invalid',str(exc)))); return EXIT_INVALID
+    except BatchValidationError as exc: print(json.dumps(_failure(STATUS_INVALID,str(exc)))); return EXIT_INVALID
     return write_records([record])
 
 def _add_policy_override_flags(subparser):
@@ -262,7 +271,7 @@ def main():
     if args.cmd=='outcome': raise SystemExit(_single('outcome',args.payload))
     if args.cmd=='batch':
         try: records=_batch_payload(args.payload)
-        except BatchValidationError as exc: print(json.dumps(_failure('invalid',str(exc)))); raise SystemExit(EXIT_INVALID)
+        except BatchValidationError as exc: print(json.dumps(_failure(STATUS_INVALID,str(exc)))); raise SystemExit(EXIT_INVALID)
         raise SystemExit(write_records(records))
     if args.cmd=='route':
         overrides={}

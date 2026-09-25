@@ -6,6 +6,8 @@ from typing import Any, Iterable, Iterator, Optional
 from contextlib import contextmanager
 import fcntl, hashlib, json, logging, os, secrets, sys
 
+from .contract import DEFAULT_STATE_ROOT, STATE_ROOT_ENV_VAR, STREAMS
+
 _LOGGER = logging.getLogger('orchestrator')
 if not _LOGGER.handlers:
     # Independent of the caller's logging config: a warning about a corrupt config file must
@@ -21,7 +23,7 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def default_state_root() -> Path:
-    return Path(os.environ.get('CODING_AGENT_ORCHESTRATOR_HOME', Path.home()/'.local'/'state'/'coding-agent-orchestrator')).expanduser()
+    return Path(os.environ.get(STATE_ROOT_ENV_VAR, DEFAULT_STATE_ROOT)).expanduser()
 
 def default_attribution() -> dict[str, str]:
     return {
@@ -273,7 +275,7 @@ def meter(payload: dict[str,Any]) -> dict[str,Any]:
 class EventStore:
     def __init__(self, root: str|Path|None=None):
         self.root=Path(root) if root is not None else default_state_root(); self.root.mkdir(parents=True,exist_ok=True)  # write_batch syncs the ancestry before any acknowledgement
-        self.events=self.root/'events.jsonl'; self.metrics=self.root/'metrics.jsonl'; self.discoveries=self.root/'discoveries.jsonl'; self.outcomes=self.root/'outcomes.jsonl'
+        self.events=self.root/STREAMS['event']; self.metrics=self.root/STREAMS['metric']; self.discoveries=self.root/'discoveries.jsonl'; self.outcomes=self.root/STREAMS['outcome']
         for p in [self.events,self.metrics,self.discoveries,self.outcomes]:
             if not p.exists(): p.touch(exist_ok=True)
     def _write(self,stream:str,payload:dict[str,Any],*,event:str|None=None):
