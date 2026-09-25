@@ -96,7 +96,15 @@ export async function dispatchParallel(
 	depth: number,
 	deps: {
 		recordEvent: (event: string, payload: Record<string, unknown>) => void;
-		runProcess: typeof runSubagentProcess;
+		/**
+		 * `env` stays optional here even though dispatch/child-process.ts's own
+		 * `runSubagentProcess` requires it (B4.5 hardening): the real binding is
+		 * always index.ts's re-exported wrapper, which supplies `config.ts`'s
+		 * `liveEnv` default; this module never has to build one itself.
+		 */
+		runProcess: (
+			opts: Omit<Parameters<typeof runSubagentProcess>[0], "env"> & { env?: () => NodeJS.ProcessEnv },
+		) => ReturnType<typeof runSubagentProcess>;
 		/** Alias table for the codex -> Bedrock quota fallback; defaults to `run`'s. */
 		aliasTable?: AliasTable | null;
 		/** Bounded concurrency ceiling; the real caller passes its configured value. */

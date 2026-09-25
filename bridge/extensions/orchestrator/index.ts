@@ -1192,7 +1192,9 @@ export function registerOrchestratorStatusTool(pi: ExtensionAPI): void {
  * without a session should still land on whatever run is active, not lose
  * its progress board/diagnostics/cancellation silently.
  */
-export function runSubagentProcess(opts: Parameters<typeof runSubagentProcessCore>[0]): ReturnType<typeof runSubagentProcessCore> {
+export function runSubagentProcess(
+	opts: Omit<Parameters<typeof runSubagentProcessCore>[0], "env"> & { env?: () => NodeJS.ProcessEnv },
+): ReturnType<typeof runSubagentProcessCore> {
 	return runSubagentProcessCore({
 		...opts,
 		recordEvent: opts.recordEvent ?? recordEvent,

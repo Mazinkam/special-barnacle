@@ -413,15 +413,19 @@ export async function runSubagentProcess(opts: {
 	 * overrides from, called fresh at each of the three points below (B4.4 review
 	 * fix) so a caller that mutates `process.env` between dispatches (index.test.ts
 	 * does) is still observed, exactly as when this module read `process.env`
-	 * directly. Optional so dispatch/* never has to import `process.env`/config.ts
-	 * itself; defaults to an empty env. index.ts's re-exported `runSubagentProcess`
-	 * supplies `config.ts`'s `liveEnv` when the caller omits it.
+	 * directly. Required (B4.5 hardening): an omitted getter used to default to
+	 * `() => ({})`, which spawned the child with an EMPTY environment (no PATH,
+	 * no HOME, no provider credentials) whenever a caller forgot it — silent and
+	 * far worse than a type error. dispatch/* itself still never imports
+	 * `process.env`/config.ts: index.ts's re-exported `runSubagentProcess` keeps
+	 * `env` optional for ITS callers and always supplies `config.ts`'s `liveEnv`
+	 * here.
 	 */
-	env?: () => NodeJS.ProcessEnv;
+	env: () => NodeJS.ProcessEnv;
 }): Promise<SubagentProcessResult> {
 	const session = opts.session;
 	const recordEvent = opts.recordEvent ?? (() => {});
-	const envGetter = opts.env ?? (() => ({}));
+	const envGetter = opts.env;
 	session?.cancellation.throwIfCancelled();
 	const taskId = opts.taskId ?? `${opts.agentName}-${Date.now()}`;
 	const safeTaskId = taskId.replace(/[^a-zA-Z0-9._-]+/g, "_");
