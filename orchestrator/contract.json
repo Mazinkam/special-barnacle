@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "description": "Values shared verbatim between the Python engine (orchestrator/contract.py) and the HT bridge (bridge/extensions/orchestrator/*.ts, via the symlinked copy of this file). This is the on-disk layout and CLI wire contract: stream file names, protected file names, the durable-write CLI's exit codes and body statuses, batch/id limits, the path-redaction regexes and the state-root environment variables/default. It does NOT hold orchestration method vocabulary (capabilities, tiers, effort, roles) — that lives in method.json. Editing this file edits the on-disk contract for both runtimes at once; keep both sides' behaviour identical except where a field is explicitly documented as intentionally different (see redaction_regex).",
+
+  "streams": {
+    "event": "events.jsonl",
+    "metric": "metrics.jsonl",
+    "outcome": "outcomes.jsonl"
+  },
+
+  "ingest_status_file": "ingest_status.json",
+
+  "never_archive_files": [
+    "events.jsonl",
+    "metrics.jsonl",
+    "outcomes.jsonl",
+    "discoveries.jsonl",
+    "ledger.json",
+    "ledger.lock",
+    "records.checkpoint.json",
+    "records.index.sqlite3",
+    "ingest_status.json",
+    "archive.manifest.json",
+    "archive.lock"
+  ],
+
+  "batch": {
+    "max_records": 500,
+    "max_record_id_length": 200,
+    "exit_codes": {
+      "ok": 0,
+      "invalid": 1,
+      "append_failed": 2,
+      "refresh_failed": 3
+    },
+    "statuses": {
+      "ok": "ok",
+      "invalid": "invalid",
+      "append_failed": "append_failed",
+      "refresh_failed": "refresh_failed",
+      "checkpoint_failed": "checkpoint_failed"
+    },
+    "retry_same_ids": "same_ids"
+  },
+
+  "redaction_regex": {
+    "python": "(/Users/[^ \\t\\n|]+|/home/[^ \\t\\n|]+|~/[^ \\t\\n|]+)",
+    "ts": "(/Users/[^\\s|]+|/home/[^\\s|]+|~/[^\\s|]+)",
+    "_todo": "these already differ in behaviour (python's character class excludes only space/tab/newline/pipe; ts's excludes any whitespace plus pipe) and are stored separately on purpose. DO NOT harmonize them here — that is a deliberate follow-up decision, not part of this refactor. Each side must keep importing exactly its own key."
+  },
+
+  "state_root": {
+    "env_vars": {
+      "python": "CODING_AGENT_ORCHESTRATOR_HOME",
+      "ts": "HUMAIN_ORCHESTRATOR_STATE_ROOT"
+    },
+    "default": "~/.local/state/coding-agent-orchestrator"
+  }
+}
