@@ -2,8 +2,9 @@
 
 Status: approved in brainstorming (2026-09-25); spec awaiting review.
 Scope: the `/orchestrate` bridge (`bridge/extensions/orchestrator/`), `method.json`, and the profile schema.
-Sequencing: implement **after** part B4 of `docs/architecture-review.md` lands (the bridge split). Only the
-pure `core/` modules in §6 may be built earlier, since they don't touch `index.ts`.
+Sequencing: implemented now, as flat modules in `bridge/extensions/orchestrator/` on branch `feat/model-failover`
+(plan: `docs/superpowers/plans/2026-09-25-model-failover.md`, whose "Deviations from the spec" section wins
+where it differs from this document). Part B4 later moves these files into its `core/`/`dispatch/`/`run/` layout.
 
 ## 1. Problem
 
