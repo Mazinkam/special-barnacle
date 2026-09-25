@@ -16,4 +16,4 @@ include = ["orchestrator*"]
 # wheel. The `bridge/` TypeScript sources and `install.sh` live outside the
 # package (repo-root siblings) and are installed from a git checkout via
 # install.sh, not from the wheel -- do not list them here.
-orchestrator = ["*.json"]
+orchestrator = ["*.json", "presentation/*.html"]

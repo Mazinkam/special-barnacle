@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..contract import RETRY_SAME_IDS, STATUS_REFRESH_FAILED
-from ..dashboard import generate_dashboard
+from ..presentation.publish import generate_dashboard
 
 
 def refresh_after_write(root: str | Path, result: dict[str, Any], *, config: dict | None = None) -> dict[str, Any]:

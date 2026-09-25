@@ -30,6 +30,9 @@ FORBIDDEN_EDGES: dict[str, set[str]] = {
     'records.metering': {'dashboard', 'app', 'store', 'engine', 'cli'},
     'engine': {'dashboard', 'app'},
     'store': {'dashboard', 'app', 'engine', 'cli'},
+    'presentation.dashboard_data': {'app', 'engine', 'cli'},
+    'presentation.dashboard_html': {'app', 'engine', 'cli'},
+    'presentation.publish': {'app', 'engine', 'cli'},
 }
 
 #: Only these module prefixes may import `orchestrator.app`; every other module must not.

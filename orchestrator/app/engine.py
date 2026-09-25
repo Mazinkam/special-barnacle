@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..dashboard import generate_dashboard
+from ..presentation.publish import generate_dashboard
 from ..engine import OrchestrationEngine
 
 

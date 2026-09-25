@@ -721,7 +721,7 @@ class IngestStatusTests(unittest.TestCase):
             output = Path(directory, 'dashboard.html')
             original = b'previous usable dashboard'
             output.write_bytes(original)
-            with patch('orchestrator.dashboard.os.replace', side_effect=OSError('forced replace failure')):
+            with patch('orchestrator.core.fs.os.replace', side_effect=OSError('forced replace failure')):
                 with self.assertRaisesRegex(OSError, 'forced replace failure'):
                     generate_dashboard(directory, config={})
             self.assertEqual(output.read_bytes(), original)

@@ -28,12 +28,15 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 #: Data files every currently-shipped module reads at import/run time via
 #: `Path(__file__).with_name(...)` (method.py, cli.py, dashboard.py, engine.py,
 #: pricing.py, contract.py), plus feature_schema.json (the only other non-.py file in the
-#: package). If a new data file is added under `orchestrator/`, add it here too.
+#: package) and presentation/dashboard_template.html (read lazily by
+#: `orchestrator.presentation.dashboard_html`, B3). If a new data file is added under
+#: `orchestrator/`, add it here too.
 REQUIRED_DATA_FILES = (
     "orchestrator/method.json",
     "orchestrator/config.json",
     "orchestrator/feature_schema.json",
     "orchestrator/contract.json",
+    "orchestrator/presentation/dashboard_template.html",
 )
 
 
