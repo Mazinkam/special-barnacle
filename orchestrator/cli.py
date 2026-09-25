@@ -11,7 +11,7 @@ from .history import load_stats
 from .scheduler import recommend_package,topology_for
 from .context import ContextRegistry
 from .features import FeaturePolicy, feature_inventory
-from .engine import OrchestrationEngine
+from .app.engine import build_engine
 from .ingest import discover_logs, ingest_paths
 from .dynamic_adapter import resolve_adapter
 from .archive import archive_runs, restore_run, DEFAULT_OLDER_THAN_DAYS, RESTORE_COMMAND
@@ -253,7 +253,7 @@ def main():
     # only ensured for commands that write or read them; the engine is built where a command needs it.
     # The archive commands never touch the streams at all, so they do not create them either.
     if not (args.cmd=='ingest' and args.dry_run) and args.cmd not in ('archive-runs','restore-run'): EventStore(ROOT)
-    def eng(): return OrchestrationEngine(ROOT, on_change=lambda: generate_dashboard(ROOT, config=C))
+    def eng(): return build_engine(ROOT)
     if args.cmd=='init':
         # One coordinated write: durable append -> incremental ledger -> atomic dashboard, instead of
         # an append followed by a full history replay that also discards the record-id cache. A

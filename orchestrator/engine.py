@@ -19,6 +19,12 @@ class OrchestrationEngine:
 
     The engine remains harness/model agnostic: it chooses abstract topology, capability,
     effort, context, and verification policy. The harness resolves those through an adapter.
+
+    The engine never imports the presentation layer (`dashboard.py`); `on_change` defaults to
+    `None` (a no-op), so a plain `OrchestrationEngine(...)` durably appends state changes but
+    regenerates no dashboard. Callers that want the dashboard kept in sync should construct
+    their engine through `orchestrator.app.engine.build_engine`, the wired entry point that
+    injects an `on_change` rendering the dashboard from this engine's own `config`.
     """
 
     def __init__(self, state_root: str | Path | None = None, config_path: str | Path | None = None,

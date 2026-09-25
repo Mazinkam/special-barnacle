@@ -225,6 +225,8 @@ def write_batch(root: str | Path | None, records: Any, *, refresh: bool = True,
     file description, so re-acquiring here would deadlock; the ledger catch-up above runs fine
     under the caller's own lock instead.
     """
+    if not lock and refresh:
+        raise ValueError('write_batch(lock=False) requires refresh=False; refresh the ledger/dashboard after releasing the lock')
     validated = validate_batch(records)
     root = Path(root) if root is not None else default_state_root()
     root.mkdir(parents=True, exist_ok=True)  # the lock file lives inside; durability of the chain is settled under the lock

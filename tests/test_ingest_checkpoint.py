@@ -1895,13 +1895,8 @@ class WriterInterfaceTests(CheckpointTestCase):
         with writer_lock(self.root):
             result = write_batch(self.root, [{'stream': 'metric', 'record_id': 'x-1', 'event': 'model_call'}], refresh=False, lock=False)
         self.assertEqual(result['persisted']['metric'], 1)
-        # `lock=False` no longer forbids `refresh=True`: the ledger catch-up (write_batch's only
-        # refresh now that dashboard publication moved to app.refresh) runs fine under a lock the
-        # caller already holds.
-        with writer_lock(self.root):
-            refreshed = write_batch(self.root, [{'stream': 'metric', 'record_id': 'x-2'}], refresh=True, lock=False)
-        self.assertEqual(refreshed['persisted']['metric'], 1)
-        self.assertTrue(refreshed['ledger_updated'])
+        with self.assertRaises(ValueError):
+            write_batch(self.root, [{'stream': 'metric', 'record_id': 'x-2'}], refresh=True, lock=False)
 
     def test_ingest_cli_reports_conflicts_on_stderr_and_exits_nonzero_when_nothing_could_be_ingested(self):
         log = ht_session(self.dir / 'session.jsonl', 3)

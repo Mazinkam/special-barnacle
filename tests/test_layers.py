@@ -3,8 +3,10 @@
 Parses every module under `orchestrator/` with `ast` (module-level AND function-level imports;
 `ast.walk` finds `Import`/`ImportFrom` nodes anywhere in the tree, not just at module scope) and
 builds a module -> {orchestrator modules it imports} graph. `FORBIDDEN_EDGES` is a data-driven map
-of "this module must not import that module" so more edges can be added as later B2 steps land,
-without touching the walking/resolution logic below.
+of "this module must not import that module, directly or transitively" so more edges can be added
+as later B2 steps land, without touching the walking/resolution logic below. The forbidden-edge
+check follows the graph transitively (BFS over each module's direct imports), so a violation
+reached only through an intermediate module — not just a direct `import` line — is caught too.
 
 This is a coarse, single-file stand-in for the fuller layer map/`import-linter` config B2 promises
 ("A fuller layer map comes later"); it only pins down the edges this step's refactor depends on.
@@ -102,13 +104,26 @@ class LayerTests(unittest.TestCase):
         self.assertIn('app.refresh', self.graph)
         self.assertIn('cli', self.graph)
 
+    def _transitive_closure(self, module: str) -> set[str]:
+        """Every dotted module reachable from `module` by following direct imports (BFS)."""
+        seen: set[str] = set()
+        queue = [module]
+        while queue:
+            current = queue.pop()
+            for imported in self.graph.get(current, set()):
+                if imported not in seen:
+                    seen.add(imported)
+                    queue.append(imported)
+        return seen
+
     def test_forbidden_edges_are_absent(self):
         for module, forbidden in FORBIDDEN_EDGES.items():
-            imported = self.graph[module]
-            imported_tops = {_top_level(name) for name in imported}
+            reachable = self._transitive_closure(module)
+            reachable_tops = {_top_level(name) for name in reachable}
             for target in forbidden:
-                self.assertNotIn(target, imported_tops,
-                                 f'{module}.py must not import {target} (imports: {sorted(imported)})')
+                self.assertNotIn(target, reachable_tops,
+                                 f'{module}.py must not import {target}, directly or transitively '
+                                 f'(reachable: {sorted(reachable)})')
 
     def test_only_app_and_cli_import_the_app_package(self):
         for module, imported in self.graph.items():
