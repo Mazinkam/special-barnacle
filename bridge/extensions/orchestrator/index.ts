@@ -48,7 +48,6 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash } from "node:crypto";
 // TypeBox 1.x: `Type` is a namespace (`Type.Object`, `Type.Array`, ...);
 // the validation function moved to a separate `typebox/value` module.
 import { Type } from "typebox";
@@ -66,18 +65,13 @@ import {
 	ALL_CAPABILITIES,
 	type AliasTable,
 	type AvailableModel,
-	type Binding,
 	buildAliasTable,
 	DEFAULT_PROVIDER_PREFERENCE,
-	emptyProfilesFile,
 	formatAdapterTable,
 	isThinkingLevel,
 	isTier,
-	type Layer,
 	listShortcuts,
-	mergeLayers,
 	METHOD,
-	parseProfilesFile,
 	PROFILE_NAME_RE,
 	type ProfileSpec,
 	type ProfilesFile,
@@ -92,7 +86,6 @@ import {
 	tierOf,
 	tierOfModel,
 	TIERS,
-	tiersToBindings,
 	type LeadSize,
 	userLayerWarnings,
 } from "./models.ts";
@@ -139,6 +132,18 @@ import { formatReconEvidence, planReconTasks } from "./recon.ts";
 import { createPythonCli } from "./adapters/python-cli.ts";
 import { killProcessTree, installDispatchReaper, reapOrphanedPersonaDirs } from "./adapters/process-reaper.ts";
 import { createTelemetry } from "./adapters/telemetry.ts";
+import {
+	type Adapter,
+	FALLBACK_ADAPTER,
+	type FullResolution,
+	loadDynamicAdapter as loadDynamicAdapterAdapter,
+	policyIdFor,
+	resolveAdapter as resolveAdapterAdapter,
+} from "./adapters/adapter-resolver.ts";
+import {
+	loadProfiles as loadProfilesAdapter,
+	writeProfilesFile as writeProfilesFileAdapter,
+} from "./adapters/profiles-store.ts";
 import {
 	changedFilesSinceRunStart,
 	diffDirtySnapshots,
@@ -195,6 +200,7 @@ export {
 	leadSelfImplemented,
 	methodEffortFor,
 	parseArgs,
+	policyIdFor,
 	QA_SCOPE_RULES,
 };
 export type { DispatchResult, DispatchTask };
@@ -439,34 +445,12 @@ export async function confirmStep(
 	return ctx.ui.confirm(title, message);
 }
 
-/**
- * Last-resort bindings, used only when neither a profile nor the dynamic
- * resolver yields a model for a capability. Mirrors the shipped `premium`
- * profile (bridge/orchestrator-profiles.json).
- */
-const FALLBACK_ADAPTER: Record<string, { model: string; effort?: string }> = {
-	scout:                { model: "amazon-bedrock/global.openai.gpt-6-luna" },
-	worker:               { model: "amazon-bedrock/global.openai.gpt-6-luna" },
-	implementation_fast:  { model: "amazon-bedrock/global.openai.gpt-6-luna" },
-	analysis_mid:         { model: "amazon-bedrock/global.anthropic.claude-sonnet-5" },
-	technical_lead:       { model: "amazon-bedrock/global.anthropic.claude-sonnet-5" },
-	lead_small:           { model: "amazon-bedrock/global.anthropic.claude-sonnet-5" },
-	implementation_strong:{ model: "amazon-bedrock/global.anthropic.claude-sonnet-5" },
-	qa_agent:             { model: "amazon-bedrock/global.anthropic.claude-sonnet-5" },
-	technical_review:     { model: "amazon-bedrock/global.openai.gpt-6-sol" },
-	integration_review:   { model: "amazon-bedrock/global.openai.gpt-6-sol" },
-	migration_review:     { model: "amazon-bedrock/global.openai.gpt-6-sol" },
-	performance_review:   { model: "amazon-bedrock/global.openai.gpt-6-sol" },
-	api_contract_review:  { model: "amazon-bedrock/global.openai.gpt-6-sol" },
-	lead:                 { model: "amazon-bedrock/global.anthropic.claude-opus-5-5" },
-	architect:            { model: "amazon-bedrock/global.anthropic.claude-opus-5-5" },
-	analysis_strong:      { model: "amazon-bedrock/global.anthropic.claude-opus-5-5" },
-	security_review:      { model: "amazon-bedrock/global.anthropic.claude-opus-5-5" },
-	lead_large:           { model: "amazon-bedrock/global.anthropic.claude-fable-5-1" },
-};
-
-
-type Adapter = Record<string, Binding>;
+// FALLBACK_ADAPTER, policyIdFor, loadDynamicAdapter, resolveAdapter (+ Adapter/
+// FullResolution types) moved to adapters/adapter-resolver.ts (B4.3);
+// FALLBACK_ADAPTER is now derived from bridge/orchestrator-profiles.json
+// instead of hand-copied (see that module's doc comment). The wrappers below
+// keep every call site unchanged while wiring the real Python CLI / profiles
+// path / model registry in place of the adapter's injected parameters.
 
 /**
  * Cohort tags stamped on every model_call / route_executed row of the active
@@ -478,57 +462,20 @@ let CURRENT_RUN_TAGS: RunTags = {};
 /** Alias table of the active run, for codex -> Bedrock quota fallback. */
 let CURRENT_ALIAS_TABLE: AliasTable | null = null;
 
-/** `<profile>-<sha256(canonical adapter)[:8]>`: stable for identical bindings. */
-export function policyIdFor(profileName: string, adapter: Record<string, Binding>): string {
-	const canon = Object.keys(adapter)
-		.sort()
-		.map((c) => `${c}=${adapter[c]?.model ?? ""}@${adapter[c]?.effort ?? ""}`)
-		.join(";");
-	return `${profileName}-${createHash("sha256").update(canon).digest("hex").slice(0, 8)}`;
-}
-
 // ModelOverrides + emptyOverrides moved to core/args.ts (pure; B4.1); imported below.
 
 async function loadDynamicAdapter(): Promise<{ adapter: Adapter; warning?: string }> {
-	try {
-		const result = await orchestratorPythonCli().run("orchestrator.cli", ["resolve-adapter", "--explain"]);
-		if (result.code !== 0) {
-			return {
-				adapter: {},
-				warning: `resolve-adapter failed (exit ${result.code ?? "n/a"}): ${(result.error ?? result.stderr).trim().slice(0, 300)}`,
-			};
-		}
-		const resolved = JSON.parse(result.stdout.trim()) as Record<string, any>;
-		const out: Adapter = {};
-		for (const [cap, info] of Object.entries(resolved)) {
-			if (!info || typeof info !== "object" || cap.startsWith("_")) continue;
-			if (!info.provider || !info.model) continue;
-			out[cap] = { model: `${info.provider}/${info.model}` };
-		}
-		return { adapter: out, warning: Object.keys(out).length === 0 ? "resolve-adapter returned no bindings" : undefined };
-	} catch (err) {
-		return { adapter: {}, warning: `resolve-adapter error: ${(err as Error).message}` };
-	}
+	return loadDynamicAdapterAdapter(orchestratorPythonCli());
 }
 
 // -----------------------------------------------------------------------------
 // Profiles file I/O
 // -----------------------------------------------------------------------------
 
-interface LoadedProfiles {
-	file: ProfilesFile;
-	/** true when the file exists on disk (vs. synthesized defaults). */
-	present: boolean;
-	problems: string[];
-	notes: string[];
-}
+type LoadedProfiles = ReturnType<typeof loadProfiles>;
 
 function writeProfilesFile(file: ProfilesFile): void {
-	// Atomic: a crash mid-write must not leave a truncated config behind.
-	mkdirSync(dirname(PROFILES_PATH), { recursive: true });
-	const tmp = `${PROFILES_PATH}.${process.pid}.tmp`;
-	writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
-	renameSync(tmp, PROFILES_PATH);
+	writeProfilesFileAdapter(PROFILES_PATH, file);
 }
 
 /**
@@ -536,34 +483,12 @@ function writeProfilesFile(file: ProfilesFile): void {
  * does, migrate it into profile "default" once and write the new file, so the
  * user's existing bindings keep working under the new scheme.
  */
-function loadProfiles(): LoadedProfiles {
-	const notes: string[] = [];
-	if (existsSync(PROFILES_PATH)) {
-		try {
-			const { file, problems } = parseProfilesFile(JSON.parse(readFileSync(PROFILES_PATH, "utf-8")));
-			if (existsSync(LEGACY_ADAPTER_PATH)) {
-				notes.push(`${LEGACY_ADAPTER_PATH} is ignored now that ${PROFILES_PATH} exists; delete it to silence this note.`);
-			}
-			return { file, present: true, problems, notes };
-		} catch (err) {
-			return {
-				file: emptyProfilesFile(),
-				present: true,
-				problems: [`${PROFILES_PATH} could not be parsed: ${(err as Error).message}`],
-				notes,
-			};
-		}
-	}
-	// No profiles file: run on the dynamic resolver + fallback bindings and say
-	// how to get the shipped profiles. Loading never writes: install.sh copies
-	// bridge/orchestrator-profiles.json (active "premium"), backing up any file
-	// it replaces. The legacy adapter is no longer migrated into a "default"
-	// profile; that profile was retired.
-	notes.push(`${PROFILES_PATH} not found; using dynamic/fallback bindings. Run install.sh to install the shipped profiles (${shippedProfilesPath()}).`);
-	if (existsSync(LEGACY_ADAPTER_PATH)) {
-		notes.push(`${LEGACY_ADAPTER_PATH} is ignored; the shipped profiles replace it.`);
-	}
-	return { file: emptyProfilesFile(), present: false, problems: [], notes };
+function loadProfiles() {
+	return loadProfilesAdapter({
+		profilesPath: PROFILES_PATH,
+		legacyAdapterPath: LEGACY_ADAPTER_PATH,
+		shippedProfilesPath,
+	});
 }
 
 function availableModels(ctx: ExtensionContext): AvailableModel[] {
@@ -572,13 +497,6 @@ function availableModels(ctx: ExtensionContext): AvailableModel[] {
 	} catch {
 		return [];
 	}
-}
-
-interface FullResolution extends ResolvedAdapter {
-	profileName: string;
-	profiles: LoadedProfiles;
-	table: AliasTable;
-	preference: string[];
 }
 
 /**
@@ -591,41 +509,15 @@ async function resolveAdapter(
 	ctx: ExtensionContext,
 	overrides: ModelOverrides = emptyOverrides(),
 ): Promise<FullResolution> {
-	const profiles = loadProfiles();
-	const table = buildAliasTable(availableModels(ctx));
-	const preference = profiles.file.provider_preference ?? DEFAULT_PROVIDER_PREFERENCE;
-	const profileName = overrides.profile ?? profiles.file.active_profile;
-	const profile = profiles.file.profiles[profileName];
-	const warnings: string[] = [...profiles.problems];
-	if (!profile) {
-		warnings.push(
-			`(profile:${profileName}) profile "${profileName}" is not defined in ${PROFILES_PATH} (have: ${Object.keys(profiles.file.profiles).join(", ") || "none"})`,
-		);
-	}
-	const dynamic = await loadDynamicAdapter();
-	if (dynamic.warning) warnings.push(dynamic.warning);
-
-	const layers: Layer[] = [
-		{ source: "flag", bindings: { ...tiersToBindings(overrides.tiers), ...overrides.capabilities } },
+	return resolveAdapterAdapter(
 		{
-			source: `profile:${profileName}`,
-			bindings: Object.fromEntries(Object.entries(profile?.capabilities ?? {}).map(([c, m]) => [c, { model: m }])),
+			profilesPath: PROFILES_PATH,
+			loadProfiles,
+			availableModels: () => availableModels(ctx),
+			dynamicCli: orchestratorPythonCli(),
 		},
-		{ source: `profile:${profileName}`, bindings: tiersToBindings(profile?.tiers) },
-		{ source: "dynamic", bindings: dynamic.adapter },
-		{ source: "fallback", bindings: FALLBACK_ADAPTER },
-	];
-	const merged = mergeLayers(layers, table, preference, profile?.effort ?? {}, overrides.effort);
-	// Fallback/dynamic specs are canonical already but may name models the user
-	// has not configured; those show up as non-user warnings and are informational.
-	return {
-		...merged,
-		warnings: [...warnings, ...merged.warnings],
-		profileName,
-		profiles,
-		table,
-		preference,
-	};
+		overrides,
+	);
 }
 
 // -----------------------------------------------------------------------------
