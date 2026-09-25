@@ -4235,5 +4235,47 @@ describe("effort telemetry vocabulary", () => {
 			expect(METHOD.effort_levels).toContain(orchestrator.methodEffortFor(t));
 		}
 	});
+
+	test("method.json effort_aliases matches the formerly hard-coded switch in index.ts", () => {
+		// Snapshot of the literal switch that used to live in index.ts before it moved
+		// into method.json's effort_aliases (B1 step 5). "medium" and any unlisted
+		// thinking level fell through to the `default: return "standard"` branch.
+		expect(METHOD.effort_aliases).toEqual({
+			off: "minimal",
+			minimal: "minimal",
+			low: "low",
+			medium: "standard",
+			high: "high",
+			xhigh: "maximum",
+			max: "maximum",
+		});
+	});
+});
+
+describe("capability persona overrides", () => {
+	test("method.json capability_personas matches the formerly hard-coded CAPABILITY_AGENT_ALIASES in index.ts", () => {
+		// Snapshot of the static overrides that used to live in index.ts before they
+		// moved into method.json's capability_personas (B1 step 5). The lead-size
+		// overrides (lead_small/lead/lead_large -> orchestrator-lead) are excluded
+		// here because they were already derived from rules.lead_sizing.sizes.
+		expect(METHOD.capability_personas).toEqual({
+			analysis_mid: "orch-technical-lead",
+			analysis_strong: "orch-architect",
+			integration_review: "orch-technical-review",
+			migration_review: "orch-technical-review",
+			performance_review: "orch-technical-review",
+			api_contract_review: "orch-technical-review",
+		});
+	});
+
+	test("agentNameFor still resolves every previously-aliased capability", () => {
+		expect(orchestrator.agentNameFor("analysis_mid")).toBe("orch-technical-lead");
+		expect(orchestrator.agentNameFor("analysis_strong")).toBe("orch-architect");
+		expect(orchestrator.agentNameFor("integration_review")).toBe("orch-technical-review");
+		expect(orchestrator.agentNameFor("migration_review")).toBe("orch-technical-review");
+		expect(orchestrator.agentNameFor("performance_review")).toBe("orch-technical-review");
+		expect(orchestrator.agentNameFor("api_contract_review")).toBe("orch-technical-review");
+		expect(orchestrator.agentNameFor("implementation_strong")).toBe("orch-implementation-strong");
+	});
 });
 

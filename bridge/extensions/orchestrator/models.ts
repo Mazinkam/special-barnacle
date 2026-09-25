@@ -35,6 +35,10 @@ interface MethodFile {
 	tiers: Tier[];
 	capabilities: Record<string, { tier: Tier; default_effort: string }>;
 	effort_levels: string[];
+	/** Capability -> persona overrides for capabilities whose persona file is not simply `orch-<capability>`. */
+	capability_personas: Record<string, string>;
+	/** HT thinking level -> method.json effort vocabulary (minimal|low|standard|high|maximum). */
+	effort_aliases: Record<string, string>;
 	roles: Record<string, string>;
 	rules: {
 		review_after_fix: {

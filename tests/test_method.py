@@ -139,6 +139,31 @@ class TestMethod(unittest.TestCase):
             for prefix in preset.values():
                 self.assertNotIn("haiku", prefix)
 
+    def test_capability_personas_map_to_declared_capabilities(self):
+        m = method.load_method()
+        for cap, persona in m["capability_personas"].items():
+            self.assertIn(cap, m["capabilities"], cap)
+            self.assertIsInstance(persona, str)
+        self.assertEqual(method.capability_personas(), m["capability_personas"])
+
+    def test_effort_aliases_resolve_to_declared_effort_levels(self):
+        m = method.load_method()
+        for thinking, effort in m["effort_aliases"].items():
+            self.assertIn(effort, m["effort_levels"], thinking)
+        self.assertEqual(method.effort_aliases(), m["effort_aliases"])
+
+    def test_bad_capability_persona_raises(self):
+        data = json.loads(method.METHOD_PATH.read_text())
+        data["capability_personas"]["nope"] = "orch-nope"
+        with self.assertRaisesRegex(ValueError, "capability_personas"):
+            method._validate(data)
+
+    def test_bad_effort_alias_raises(self):
+        data = json.loads(method.METHOD_PATH.read_text())
+        data["effort_aliases"]["off"] = "bogus"
+        with self.assertRaisesRegex(ValueError, "effort_aliases"):
+            method._validate(data)
+
 
 if __name__ == "__main__":
     unittest.main()

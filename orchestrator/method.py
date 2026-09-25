@@ -41,6 +41,12 @@ def _validate(m: dict[str, Any]) -> None:
     for role, cap in m["roles"].items():
         if cap not in m["capabilities"]:
             raise ValueError(f"method.json: role {role!r} maps to undeclared capability {cap!r}")
+    for cap in m.get("capability_personas", {}):
+        if cap not in m["capabilities"]:
+            raise ValueError(f"method.json: capability_personas key {cap!r} is not a declared capability")
+    for thinking, effort in m.get("effort_aliases", {}).items():
+        if effort not in efforts:
+            raise ValueError(f"method.json: effort_aliases[{thinking!r}] has unknown effort {effort!r}")
     for risk, spec in m["rules"]["review_after_fix"]["escalation_by_risk"].items():
         if spec["tier_min"] not in tiers:
             raise ValueError(f"method.json: review_after_fix[{risk}] has unknown tier {spec['tier_min']!r}")
@@ -112,6 +118,19 @@ def default_efforts() -> dict[str, str]:
 
 def roles() -> dict[str, str]:
     return dict(load_method()["roles"])
+
+
+def capability_personas() -> dict[str, str]:
+    """Capability -> persona overrides for capabilities whose persona file is not
+    simply `orch-<capability>`. Mirrors bridge/extensions/orchestrator/index.ts'
+    agentNameFor."""
+    return dict(load_method().get("capability_personas", {}))
+
+
+def effort_aliases() -> dict[str, str]:
+    """HT thinking level -> method.json effort vocabulary. Mirrors
+    bridge/extensions/orchestrator/index.ts' methodEffortFor."""
+    return dict(load_method().get("effort_aliases", {}))
 
 
 def rule(name: str) -> dict[str, Any]:

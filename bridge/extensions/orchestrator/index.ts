@@ -3026,12 +3026,7 @@ const CAPABILITY_AGENT_ALIASES: Record<string, string> = {
 	// Every lead size (lead_small / lead / lead_large) runs the same
 	// orchestrator-lead persona: no write/edit tools, delegation rule, STATUS line.
 	...Object.fromEntries(Object.values(METHOD.rules.lead_sizing.sizes).map((cap) => [cap, "orchestrator-lead"])),
-	analysis_mid: "orch-technical-lead",
-	analysis_strong: "orch-architect",
-	integration_review: "orch-technical-review",
-	migration_review: "orch-technical-review",
-	performance_review: "orch-technical-review",
-	api_contract_review: "orch-technical-review",
+	...METHOD.capability_personas,
 };
 
 export function agentNameFor(capability: string): string {
@@ -3516,13 +3511,8 @@ export function dispatchRecordsFor(
 
 /** HT thinking level -> method.json effort vocabulary (minimal|low|standard|high|maximum). */
 export function methodEffortFor(thinking: string | undefined): string {
-	switch (thinking) {
-		case "off": case "minimal": return "minimal";
-		case "low": return "low";
-		case "high": return "high";
-		case "xhigh": case "max": return "maximum";
-		default: return "standard"; // unset or "medium"
-	}
+	if (thinking === undefined) return "standard"; // unset defaults to standard
+	return METHOD.effort_aliases[thinking] ?? "standard";
 }
 
 function sumUsage(a: SubagentUsageStats, b: SubagentUsageStats): SubagentUsageStats {
