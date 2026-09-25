@@ -16,6 +16,13 @@ needs no entry in `contract.NEVER_ARCHIVE_FILES`.
 
 This is B3's one intended behaviour change (adding locking); everything else in this refactor is
 required to be behaviour-preserving.
+
+One consequence of that locking: `ContextRegistry`/`VerificationCache` mutating methods (`put`,
+`invalidate`, `invalidate_dependents`) re-read the document under the lock and apply their change
+to that fresh on-disk state, then assign the written result to `.data` — they do **not** start
+from (or merge) whatever a caller may have written into `.data` directly. Callers who edit `.data`
+in place must call `save()` (or the equivalent `._doc.update(lambda _data: self.data)`) to persist
+that edit; see the docstrings on `ContextRegistry` and `VerificationCache` for details.
 """
 from __future__ import annotations
 

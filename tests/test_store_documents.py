@@ -71,6 +71,45 @@ class JsonDocumentConcurrencyTests(unittest.TestCase):
                 for j in range(per_thread):
                     self.assertIn(f'artifact-{i}-{j}', data['artifacts'])
 
+            # The shared instance's public `.data` (and anything derived from it, like
+            # `packet()`) must also reflect every write, not just what's on disk: each `put`
+            # assigns `self.data` under the instance lock in the same order it wrote to disk, so
+            # the last assignment can never be an earlier snapshot than the last disk write.
+            self.assertEqual(len(registry.data['artifacts']), threads_n * per_thread)
+            all_ids = [f'artifact-{i}-{j}' for i in range(threads_n) for j in range(per_thread)]
+            packet = registry.packet(all_ids, budget_tokens=10**9)
+            self.assertEqual(set(packet['artifact_ids']), set(all_ids))
+            self.assertEqual(packet['missing_or_stale'], [])
+
+    def test_concurrent_context_registry_puts_from_separate_instances_are_all_visible(self):
+        """Separate `ContextRegistry` instances (simulating separate processes) writing to the
+        same path concurrently must not lose writes: a *fresh* instance opened afterward sees
+        every artifact written by every instance."""
+        with tempfile.TemporaryDirectory() as d:
+            threads_n, per_thread = 6, 15
+            errors: list[BaseException] = []
+
+            def worker(i):
+                try:
+                    registry = ContextRegistry(d)
+                    for j in range(per_thread):
+                        registry.put(f'artifact-{i}-{j}', f'content-{i}-{j}', source='test')
+                except BaseException as exc:  # noqa: BLE001 - surface any worker failure
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(threads_n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [])
+            fresh = ContextRegistry(d)
+            self.assertEqual(len(fresh.data['artifacts']), threads_n * per_thread)
+            for i in range(threads_n):
+                for j in range(per_thread):
+                    self.assertIn(f'artifact-{i}-{j}', fresh.data['artifacts'])
+
     def test_concurrent_verification_cache_puts_do_not_lose_writes(self):
         with tempfile.TemporaryDirectory() as d:
             cache = VerificationCache(d)
@@ -93,6 +132,77 @@ class JsonDocumentConcurrencyTests(unittest.TestCase):
             self.assertEqual(errors, [])
             data = cache._doc.read()
             self.assertEqual(len(data['entries']), threads_n * per_thread)
+
+            # As with `ContextRegistry`, the shared instance's `.data` (and `get()`, which reads
+            # from it) must reflect every write once all threads have joined.
+            self.assertEqual(len(cache.data['entries']), threads_n * per_thread)
+            for i in range(threads_n):
+                for j in range(per_thread):
+                    entry = cache.get(command=f'cmd-{i}-{j}', revision='rev', environment_fingerprint='env')
+                    self.assertIsNotNone(entry)
+                    self.assertEqual(entry['result'], 'pass')
+
+    def test_concurrent_verification_cache_puts_from_separate_instances_are_all_visible(self):
+        """Same cross-instance guarantee as `ContextRegistry`: a fresh `VerificationCache` opened
+        after several separate instances wrote concurrently sees every entry."""
+        with tempfile.TemporaryDirectory() as d:
+            threads_n, per_thread = 6, 15
+            errors: list[BaseException] = []
+
+            def worker(i):
+                try:
+                    cache = VerificationCache(d)
+                    for j in range(per_thread):
+                        cache.put(command=f'cmd-{i}-{j}', revision='rev', environment_fingerprint='env', result='pass')
+                except BaseException as exc:  # noqa: BLE001 - surface any worker failure
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(threads_n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [])
+            fresh = VerificationCache(d)
+            self.assertEqual(len(fresh.data['entries']), threads_n * per_thread)
+            for i in range(threads_n):
+                for j in range(per_thread):
+                    entry = fresh.get(command=f'cmd-{i}-{j}', revision='rev', environment_fingerprint='env')
+                    self.assertIsNotNone(entry)
+
+
+class DirectDataEditIsNotMergedTests(unittest.TestCase):
+    """Documents the one deliberate semantic change described in `store.documents`'s and
+    `ContextRegistry`/`VerificationCache`'s docstrings: mutating methods re-read fresh disk state
+    under the lock rather than merging whatever a caller wrote into `.data` directly. Direct edits
+    to `.data` must be persisted with `save()` (or, for `VerificationCache`, the equivalent
+    `._doc.update(lambda _data: self.data)`).
+    """
+
+    def test_context_registry_direct_data_edit_requires_save_to_persist(self):
+        with tempfile.TemporaryDirectory() as d:
+            registry = ContextRegistry(d)
+            registry.put('A', 'x', source='test')
+
+            registry.data['artifacts']['A']['status'] = 'reviewed'
+            # Not saved yet: a fresh instance still sees the old status.
+            self.assertEqual(ContextRegistry(d).data['artifacts']['A']['status'], 'observed')
+
+            registry.save()
+            self.assertEqual(ContextRegistry(d).data['artifacts']['A']['status'], 'reviewed')
+
+    def test_context_registry_direct_data_edit_is_not_merged_by_put(self):
+        with tempfile.TemporaryDirectory() as d:
+            registry = ContextRegistry(d)
+            registry.put('A', 'x', source='test')
+
+            registry.data['artifacts']['A']['status'] = 'reviewed'
+            # `put` re-reads disk under the lock rather than merging the direct edit above, so
+            # the direct edit is silently dropped from `.data` once another mutating call happens.
+            registry.put('B', 'y', source='test')
+
+            self.assertEqual(registry.data['artifacts']['A']['status'], 'observed')
 
 
 class JsonDocumentNoOpUpdateTests(unittest.TestCase):
