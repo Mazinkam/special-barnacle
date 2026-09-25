@@ -1,0 +1,1153 @@
+{
+  "adaptive": [
+    {
+      "adaptive_mode": "recommend",
+      "agent_runtime": "humain-terminal",
+      "capability_class": "architect",
+      "cost_aggressiveness": 0.7,
+      "event": "adaptive_route_decision",
+      "explored": false,
+      "history_sufficient": true,
+      "policy_id": "p1",
+      "route_action": "recommended_only",
+      "ts": "2026-09-24T10:00:02+00:00"
+    }
+  ],
+  "by_role": {
+    "architect": {
+      "call_rows": 0,
+      "cost": 0.0,
+      "covered_calls": 0,
+      "rows": 1,
+      "session_rows": 0,
+      "tokens": 0
+    },
+    "implementation_fast": {
+      "call_rows": 1,
+      "cost": 0.8,
+      "covered_calls": 1,
+      "rows": 1,
+      "session_rows": 0,
+      "tokens": 9700
+    },
+    "lead": {
+      "call_rows": 2,
+      "cost": 5.1430299999999995,
+      "covered_calls": 30,
+      "rows": 3,
+      "session_rows": 1,
+      "tokens": 5742314
+    },
+    "lead_large": {
+      "call_rows": 1,
+      "cost": 6.0,
+      "covered_calls": 1,
+      "rows": 1,
+      "session_rows": 0,
+      "tokens": 21500
+    },
+    "unknown": {
+      "call_rows": 0,
+      "cost": 0.0,
+      "covered_calls": 0,
+      "rows": 1,
+      "session_rows": 0,
+      "tokens": 0
+    }
+  },
+  "by_runtime": {
+    "claude-code": {
+      "call_rows": 1,
+      "cost": 6.0,
+      "covered_calls": 1,
+      "estimated_cost": 0.0,
+      "metered_calls": 1,
+      "reported_cost": 6.0,
+      "rows": 1,
+      "session_rows": 0,
+      "unmetered_calls": 0
+    },
+    "humain-terminal": {
+      "call_rows": 3,
+      "cost": 5.94303,
+      "covered_calls": 31,
+      "estimated_cost": 4.74303,
+      "metered_calls": 3,
+      "reported_cost": 1.2,
+      "rows": 5,
+      "session_rows": 1,
+      "unmetered_calls": 0
+    },
+    "unknown": {
+      "call_rows": 0,
+      "cost": 0.0,
+      "covered_calls": 0,
+      "estimated_cost": 0.0,
+      "metered_calls": 0,
+      "reported_cost": 0.0,
+      "rows": 1,
+      "session_rows": 0,
+      "unmetered_calls": 0
+    }
+  },
+  "event_count": 5,
+  "events": [
+    {
+      "elapsed_ms": 62000,
+      "elapsed_source": "reported",
+      "event": "run_completed",
+      "run_id": "r1",
+      "ts": "2026-09-24T10:10:00+00:00"
+    },
+    {
+      "elapsed_ms": 45000,
+      "elapsed_source": "reported",
+      "event": "run_failed",
+      "run_id": "r2",
+      "ts": "2026-09-25T08:05:00+00:00"
+    },
+    {
+      "event": "decision_invalidated",
+      "run_id": "r1",
+      "ts": "2026-09-24T10:07:00+00:00"
+    },
+    {
+      "event": "merge_conflict",
+      "run_id": "r1",
+      "ts": "2026-09-24T10:08:00+00:00"
+    },
+    {
+      "event": "context_packet_miss",
+      "run_id": "r2",
+      "ts": "2026-09-25T08:01:00+00:00"
+    }
+  ],
+  "features": [
+    {
+      "config": {
+        "allow_context_budget_changes": true,
+        "allow_effort_switching": true,
+        "allow_model_switching": true,
+        "allow_topology_changes": true,
+        "allow_verification_changes": true,
+        "mode": "recommend"
+      },
+      "feature": "adaptive_routing",
+      "state": "recommend"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "adaptive_system",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": false
+      },
+      "feature": "auto_deploy",
+      "state": "off"
+    },
+    {
+      "config": {
+        "enabled": false
+      },
+      "feature": "auto_merge",
+      "state": "off"
+    },
+    {
+      "config": {
+        "enabled": false
+      },
+      "feature": "auto_policy_promotion",
+      "state": "off"
+    },
+    {
+      "config": {
+        "enabled": false
+      },
+      "feature": "auto_policy_tuning",
+      "state": "off"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "branch_cancellation",
+      "state": "on"
+    },
+    {
+      "config": {
+        "mode": "warn"
+      },
+      "feature": "budget_enforcement",
+      "state": "warn"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "compute_cost",
+      "state": "on"
+    },
+    {
+      "config": {
+        "adaptive_budget": true,
+        "deduplicate_context": true,
+        "enabled": true,
+        "lazy_load_context": true
+      },
+      "feature": "context_optimization",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "cost_optimization",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "level": "concise"
+      },
+      "feature": "decision_explanations",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "windows_days": [
+          7,
+          30,
+          90
+        ]
+      },
+      "feature": "delayed_outcomes",
+      "state": "on"
+    },
+    {
+      "config": {
+        "auto_add": "ask",
+        "auto_upgrade": "ask"
+      },
+      "feature": "dependencies",
+      "state": "configured"
+    },
+    {
+      "config": {
+        "mode": "deny"
+      },
+      "feature": "destructive_operations",
+      "state": "deny"
+    },
+    {
+      "config": {
+        "formatter": "on",
+        "full_test_suite": "adaptive",
+        "integration_tests": "adaptive",
+        "lint": "on",
+        "typecheck": "on",
+        "unit_tests": "on"
+      },
+      "feature": "deterministic_verification",
+      "state": "configured"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "max_depth": 4
+      },
+      "feature": "dynamic_depth",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "max_workers": 8,
+        "min_workers": 1,
+        "use_backpressure": true
+      },
+      "feature": "dynamic_parallelism",
+      "state": "on"
+    },
+    {
+      "config": {
+        "allow_decrease": true,
+        "allow_increase": true,
+        "enabled": true,
+        "max_effort": "high"
+      },
+      "feature": "effort_adaptation",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "exclude_high_risk_tasks": true,
+        "max_extra_cost_percent": 10.0,
+        "rate": 0.02
+      },
+      "feature": "exploration",
+      "state": "on"
+    },
+    {
+      "config": {
+        "auto_ignore_known_flakes": false,
+        "auto_retry_known_flakes": true,
+        "enabled": true
+      },
+      "feature": "flaky_test_detection",
+      "state": "on"
+    },
+    {
+      "config": {
+        "decay_half_life_days": 60,
+        "decay_old_results": true,
+        "enabled": true,
+        "minimum_samples": 12,
+        "use_cross_repo_history": false
+      },
+      "feature": "historical_learning",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": false,
+        "hourly_rate_usd": 100.0
+      },
+      "feature": "human_cost",
+      "state": "off"
+    },
+    {
+      "config": {
+        "mode": "risk_based"
+      },
+      "feature": "independent_review",
+      "state": "risk_based"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "track_complexity_delta": true,
+        "track_duplication": true,
+        "track_rewrite_rate": true
+      },
+      "feature": "maintainability",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "model_demotion",
+      "state": "on"
+    },
+    {
+      "config": {
+        "after_conceptual_failures": 1,
+        "after_mechanical_failures": 2,
+        "enabled": true
+      },
+      "feature": "model_promotion",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "reuse_across_runs": true
+      },
+      "feature": "persistent_leads",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "percentage": 5.0
+      },
+      "feature": "policy_canary",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "policy_recommendations",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "policy_simulation",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": false,
+        "ingest_error_rates": true,
+        "ingest_incidents": true,
+        "ingest_rollbacks": true
+      },
+      "feature": "production_feedback",
+      "state": "off"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "replanning",
+      "state": "on"
+    },
+    {
+      "config": {
+        "auto_invalidate": true,
+        "enabled": true,
+        "reuse": true
+      },
+      "feature": "repo_map",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": false
+      },
+      "feature": "reproducible_routing",
+      "state": "off"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "risk_adjustment",
+      "state": "on"
+    },
+    {
+      "config": {
+        "adaptive_depth": true,
+        "enabled": true
+      },
+      "feature": "semantic_review",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "sample_rate": 0.03
+      },
+      "feature": "shadow_review",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "estimate_only": true,
+        "execute_alternative": false,
+        "sampling_rate": 0.05
+      },
+      "feature": "shadow_routing",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "shared_discoveries",
+      "state": "on"
+    },
+    {
+      "config": {
+        "api_contract": "adaptive",
+        "migration": "adaptive",
+        "performance": "adaptive",
+        "security": "adaptive"
+      },
+      "feature": "specialized_reviews",
+      "state": "configured"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "max_cost_multiplier": 3.0,
+        "max_retry_count": 3,
+        "max_wall_time_minutes": null
+      },
+      "feature": "stop_loss",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "minimum_complexity": 8.0
+      },
+      "feature": "subleads",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "task_fusion",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true
+      },
+      "feature": "task_splitting",
+      "state": "on"
+    },
+    {
+      "config": {
+        "enabled": true,
+        "require_exact_revision": true
+      },
+      "feature": "verification_cache",
+      "state": "on"
+    }
+  ],
+  "flaky": [],
+  "generated_at": "2026-10-01T12:00:00+00:00",
+  "ingest_status": {
+    "emitted": 140,
+    "error": null,
+    "failure_count": 0,
+    "last_attempt_at": "2026-10-01T11:50:00+00:00",
+    "last_success_at": "2026-10-01T11:50:00+00:00",
+    "stale_after_seconds": 1800,
+    "status": "ok"
+  },
+  "instrumentation": {
+    "avg_quality_evidence": {
+      "field": "quality_evidence_score",
+      "instrumented": true,
+      "label": null,
+      "note": "engine.Engine.verify_task only \u2014 never emitted by a live run",
+      "samples": 1
+    },
+    "conflicts": {
+      "field": "merge_conflict",
+      "instrumented": false,
+      "label": "not instrumented",
+      "note": "read by dashboard.build_data and economics.WASTE_EVENTS; no emitter anywhere in this repo",
+      "samples": 1
+    },
+    "context_miss_rate": {
+      "field": "context_packet",
+      "instrumented": false,
+      "label": "not instrumented",
+      "note": "read by dashboard.build_data as the miss-rate denominator; no emitter",
+      "samples": 0
+    },
+    "fanout_rework": {
+      "field": "decision_invalidated",
+      "instrumented": false,
+      "label": "not instrumented",
+      "note": "read by economics.fanout_rework; state.py only reduces it, nothing emits it",
+      "samples": 1
+    },
+    "quality": {
+      "field": "quality_evidence_score",
+      "instrumented": true,
+      "label": null,
+      "note": "engine.Engine.verify_task only \u2014 never emitted by a live run",
+      "samples": 1
+    },
+    "retry_rate": {
+      "field": "retry",
+      "instrumented": true,
+      "label": null,
+      "note": "agent-authored metric rows via cli.py `metric` (12 live rows)",
+      "samples": 1
+    },
+    "review_wait_p90_s": {
+      "field": "review_wait_ms",
+      "instrumented": false,
+      "label": "not instrumented",
+      "note": "read by dashboard.build_data; no emitter \u2014 the dispatch queue never records the wait",
+      "samples": 0
+    },
+    "shadow_false_pass_rate": {
+      "field": "shadow_review",
+      "instrumented": false,
+      "label": "not instrumented",
+      "note": "read by dashboard.build_data; runtime.py models shadow review in simulation only",
+      "samples": 0
+    },
+    "shadow_over_reject_rate": {
+      "field": "shadow_review",
+      "instrumented": false,
+      "label": "not instrumented",
+      "note": "read by dashboard.build_data; runtime.py models shadow review in simulation only",
+      "samples": 0
+    }
+  },
+  "interactive_sessions": {
+    "aggregate_rows": 1,
+    "by_runtime": {
+      "codex": {
+        "calls": 140,
+        "cost": 12.5,
+        "rows": 1
+      }
+    },
+    "calls": 140,
+    "cost": 12.5,
+    "rows": 1,
+    "sessions": 1,
+    "tokens": 1020000
+  },
+  "last_event_ts": "2026-09-25T08:05:00+00:00",
+  "last_metric_ts": "2026-09-25T08:00:00+00:00",
+  "lead_sizes": [
+    {
+      "calls": 1,
+      "cost": 1.2,
+      "cost_per_run": 1.2,
+      "lead_size": "small",
+      "runs": 1,
+      "self_implemented": 0,
+      "verification_unknown": 0,
+      "verified_fail": 0,
+      "verified_pass": 1
+    },
+    {
+      "calls": 1,
+      "cost": 6.0,
+      "cost_per_run": 6.0,
+      "lead_size": "large",
+      "runs": 1,
+      "self_implemented": 1,
+      "verification_unknown": 0,
+      "verified_fail": 1,
+      "verified_pass": 0
+    }
+  ],
+  "metric_count": 8,
+  "metrics": [
+    {
+      "agent_runtime": "humain-terminal",
+      "capability_class": "lead",
+      "cost_source": "reported",
+      "cost_usd": 1.2,
+      "event": "model_call",
+      "granularity": "call",
+      "input_tokens": 4000,
+      "lead_size": "small",
+      "model": "gpt-6-astra",
+      "output_tokens": 300,
+      "policy_id": "p1",
+      "result": "pass",
+      "role": "lead",
+      "run_id": "r1",
+      "task_id": "t1",
+      "ts": "2026-09-24T10:00:00+00:00"
+    },
+    {
+      "agent_runtime": "humain-terminal",
+      "cost_aggressiveness": 0.5,
+      "cost_rate_model": "gpt-6-astra",
+      "cost_source": "estimated-from-reported-tokens",
+      "cost_usd": 0.8,
+      "event": "model_call",
+      "granularity": "call",
+      "input_tokens": 9000,
+      "model": "gpt-6-astra",
+      "output_tokens": 700,
+      "policy_id": "p1",
+      "quality_evidence_score": 0.6,
+      "result": "fail",
+      "retry": 1,
+      "role": "implementation_fast",
+      "run_id": "r1",
+      "task_id": "t2",
+      "ts": "2026-09-24T10:05:00+00:00"
+    },
+    {
+      "event": "task_verified",
+      "result": "verified",
+      "run_id": "r1",
+      "task_id": "t1",
+      "ts": "2026-09-24T10:06:00+00:00"
+    },
+    {
+      "agent_runtime": "humain-terminal",
+      "cost_rate_model": "claude-opus-5",
+      "cost_source": "estimated-from-reported-tokens",
+      "cost_usd": 3.94303,
+      "covers_calls": 29,
+      "event": "model_call",
+      "granularity": "session",
+      "input_tokens": 5704180,
+      "model": "claude-opus-5",
+      "output_tokens": 33834,
+      "role": "lead",
+      "run_id": "r1",
+      "ts": "2026-09-24T09:44:06+00:00"
+    },
+    {
+      "agent_runtime": "claude-code",
+      "capability_class": "lead",
+      "cost_source": "reported",
+      "cost_usd": 6.0,
+      "event": "model_call",
+      "granularity": "call",
+      "input_tokens": 20000,
+      "lead_self_implemented": true,
+      "lead_size": "large",
+      "model": "sonnet",
+      "output_tokens": 1500,
+      "policy_id": "p2",
+      "role": "lead_large",
+      "run_id": "r2",
+      "task_id": "r2-lead-0",
+      "ts": "2026-09-25T08:00:00+00:00"
+    },
+    {
+      "agent_runtime": "humain-terminal",
+      "capability_class": "lead",
+      "event": "route_executed",
+      "executed_cost_usd": 1.2,
+      "executed_passes": true,
+      "run_id": "r1",
+      "task_id": "t1",
+      "ts": "2026-09-24T10:00:01+00:00"
+    },
+    {
+      "adaptive_mode": "recommend",
+      "agent_runtime": "humain-terminal",
+      "capability_class": "architect",
+      "cost_aggressiveness": 0.7,
+      "event": "adaptive_route_decision",
+      "explored": false,
+      "history_sufficient": true,
+      "policy_id": "p1",
+      "route_action": "recommended_only",
+      "ts": "2026-09-24T10:00:02+00:00"
+    },
+    {
+      "agent_runtime": "codex",
+      "cost_rate_model": "gpt-6-astra",
+      "cost_source": "estimated-from-reported-tokens",
+      "cost_usd": 12.5,
+      "covers_calls": 140,
+      "event": "model_call",
+      "granularity": "session",
+      "input_tokens": 1000000,
+      "output_tokens": 20000,
+      "role": "interactive_session",
+      "session_id": "sess-a",
+      "source": "session_ingest",
+      "ts": "2026-09-24T11:00:00+00:00"
+    }
+  ],
+  "outcomes": [
+    {
+      "age_days": 7,
+      "bad_outcome": false,
+      "mature_30d": false,
+      "mature_7d": true,
+      "mature_90d": false,
+      "task_id": "r1-qa"
+    },
+    {
+      "age_days": 6,
+      "bad_outcome": false,
+      "mature_30d": false,
+      "mature_7d": false,
+      "mature_90d": false,
+      "task_id": "r2-qa"
+    },
+    {
+      "age_days": 7,
+      "bad_outcome": false,
+      "mature_30d": false,
+      "mature_7d": true,
+      "mature_90d": false,
+      "task_id": "run-complete"
+    },
+    {
+      "age_days": 6,
+      "bad_outcome": false,
+      "mature_30d": false,
+      "mature_7d": false,
+      "mature_90d": false,
+      "task_id": "run-failed"
+    },
+    {
+      "age_days": 61,
+      "bad_outcome": true,
+      "mature_30d": true,
+      "mature_7d": true,
+      "mature_90d": false,
+      "task_id": "t2"
+    }
+  ],
+  "policies": [
+    {
+      "call_rows": 2,
+      "cost": 2.0,
+      "cost_aggressiveness": 0.6,
+      "dispatch_pass": 0,
+      "policy_id": "p1",
+      "quality": 0.6,
+      "rows": 3,
+      "verified": 1,
+      "verified_cost": 2.0
+    },
+    {
+      "call_rows": 1,
+      "cost": 3.94303,
+      "cost_aggressiveness": null,
+      "dispatch_pass": 0,
+      "policy_id": "unknown",
+      "quality": null,
+      "rows": 3,
+      "verified": 1,
+      "verified_cost": 3.94303
+    },
+    {
+      "call_rows": 1,
+      "cost": 6.0,
+      "cost_aggressiveness": null,
+      "dispatch_pass": 0,
+      "policy_id": "p2",
+      "quality": null,
+      "rows": 1,
+      "verified": 0,
+      "verified_cost": null
+    }
+  ],
+  "routes": [
+    {
+      "avg_call_cost_usd": null,
+      "avg_quality_evidence": null,
+      "call_samples": 0,
+      "capability": "architect",
+      "complexity_bucket": "5-6",
+      "delayed_failure_rate": null,
+      "effective_samples": 1.0,
+      "effort": "standard",
+      "pass_rate": 0.0,
+      "priced_call_samples": 0,
+      "retry_rate": null,
+      "risk": "medium",
+      "run_samples": 0,
+      "samples": 1,
+      "task_class": "unknown",
+      "task_samples": 0,
+      "topology_depth": null,
+      "topology_leads": null,
+      "topology_shape": null,
+      "topology_workers": null,
+      "total_cost_usd": null,
+      "unmetered_call_samples": 0,
+      "verification_depth": "targeted",
+      "verification_samples": 0,
+      "verified_cost_usd": null,
+      "verified_runs": 0,
+      "verified_tasks": 0
+    },
+    {
+      "avg_call_cost_usd": 0.8,
+      "avg_quality_evidence": 0.6,
+      "call_samples": 1,
+      "capability": "implementation_fast",
+      "complexity_bucket": "5-6",
+      "delayed_failure_rate": null,
+      "effective_samples": 1.0,
+      "effort": "standard",
+      "pass_rate": 0.0,
+      "priced_call_samples": 1,
+      "retry_rate": 1.0,
+      "risk": "medium",
+      "run_samples": 1,
+      "samples": 1,
+      "task_class": "unknown",
+      "task_samples": 1,
+      "topology_depth": null,
+      "topology_leads": null,
+      "topology_shape": null,
+      "topology_workers": null,
+      "total_cost_usd": 0.8,
+      "unmetered_call_samples": 0,
+      "verification_depth": "targeted",
+      "verification_samples": 0,
+      "verified_cost_usd": null,
+      "verified_runs": 0,
+      "verified_tasks": 0
+    },
+    {
+      "avg_call_cost_usd": 3.7143433333333333,
+      "avg_quality_evidence": null,
+      "call_samples": 3,
+      "capability": "lead",
+      "complexity_bucket": "5-6",
+      "delayed_failure_rate": null,
+      "effective_samples": 4.0,
+      "effort": "standard",
+      "pass_rate": 0.5,
+      "priced_call_samples": 3,
+      "retry_rate": null,
+      "risk": "medium",
+      "run_samples": 2,
+      "samples": 4,
+      "task_class": "unknown",
+      "task_samples": 2,
+      "topology_depth": null,
+      "topology_leads": null,
+      "topology_shape": null,
+      "topology_workers": null,
+      "total_cost_usd": 11.14303,
+      "unmetered_call_samples": 0,
+      "verification_depth": "targeted",
+      "verification_samples": 1,
+      "verified_cost_usd": 11.14303,
+      "verified_runs": 1,
+      "verified_tasks": 1
+    }
+  ],
+  "run_evidence": {
+    "call_rows": 4,
+    "cost_known_usd": 11.94303,
+    "cost_provenance": "actual",
+    "duration_coverage": 1.0,
+    "elapsed_ms_total_known": 107000,
+    "priced_run_coverage": 1.0,
+    "runs": 2,
+    "runs_completed": 1,
+    "runs_failed": 1,
+    "runs_fully_priced": 2,
+    "runs_incomplete": 0,
+    "runs_with_elapsed": 2,
+    "runs_with_verification": 2,
+    "unmetered_calls": 0,
+    "verification_coverage": 1.0
+  },
+  "runs": [
+    {
+      "cache_write_tokens": 0,
+      "cached_input_tokens": 0,
+      "call_rows": 3,
+      "cost_complete": true,
+      "cost_coverage": 1.0,
+      "cost_estimated_usd": 4.74303,
+      "cost_known_usd": 5.94303,
+      "cost_provenance": "actual",
+      "cost_reported_usd": 1.2,
+      "counterfactual": null,
+      "decision_rows": 0,
+      "delayed_bad_outcome": false,
+      "dispatch_duration_ms_total": null,
+      "duration_missing_calls": 3,
+      "elapsed_ms": 62000,
+      "elapsed_source": "reported",
+      "excluded_session_ingest_rows": 0,
+      "finished_at": null,
+      "implementation_cost_usd": 0.8,
+      "input_tokens": 5717180,
+      "metered_calls": 3,
+      "other_metric_rows": 1,
+      "output_tokens": 34834,
+      "overhead_by_role": {
+        "lead": 5.1430299999999995
+      },
+      "overhead_cost_usd": 5.1430299999999995,
+      "overhead_ratio": 0.8653885307662925,
+      "retries": 1,
+      "rework_events": 1,
+      "roles": [
+        "implementation_fast",
+        "lead"
+      ],
+      "run_id": "r1",
+      "started_at": null,
+      "status": "completed",
+      "tasks": 2,
+      "tokens_known_calls": 3,
+      "tokens_missing_calls": 0,
+      "unmetered_calls": 0,
+      "verification": "passed",
+      "verification_rows": 1,
+      "verified_tasks": 1
+    },
+    {
+      "cache_write_tokens": 0,
+      "cached_input_tokens": 0,
+      "call_rows": 1,
+      "cost_complete": true,
+      "cost_coverage": 1.0,
+      "cost_estimated_usd": 0,
+      "cost_known_usd": 6.0,
+      "cost_provenance": "actual",
+      "cost_reported_usd": 6.0,
+      "counterfactual": null,
+      "decision_rows": 0,
+      "delayed_bad_outcome": false,
+      "dispatch_duration_ms_total": null,
+      "duration_missing_calls": 1,
+      "elapsed_ms": 45000,
+      "elapsed_source": "reported",
+      "excluded_session_ingest_rows": 0,
+      "finished_at": null,
+      "implementation_cost_usd": 0.0,
+      "input_tokens": 20000,
+      "metered_calls": 1,
+      "other_metric_rows": 0,
+      "output_tokens": 1500,
+      "overhead_by_role": {
+        "lead_large": 6.0
+      },
+      "overhead_cost_usd": 6.0,
+      "overhead_ratio": 1.0,
+      "retries": 0,
+      "rework_events": 0,
+      "roles": [
+        "lead_large"
+      ],
+      "run_id": "r2",
+      "started_at": null,
+      "status": "failed",
+      "tasks": 1,
+      "tokens_known_calls": 1,
+      "tokens_missing_calls": 0,
+      "unmetered_calls": 0,
+      "verification": "failed",
+      "verification_rows": 0,
+      "verified_tasks": 0
+    }
+  ],
+  "summary": {
+    "adaptive_action_counts": {
+      "empirical_enforced": 0,
+      "fallback_insufficient_history": 0,
+      "recommended_only": 1,
+      "static_default": 0
+    },
+    "adaptive_actions": {
+      "recommended_only": 1
+    },
+    "adaptive_decisions": 1,
+    "call_rows": 4,
+    "conflicts": 1,
+    "context_miss_rate": null,
+    "coordination_cost": 11.14303,
+    "coordination_rate": 0.933015323582039,
+    "cost_coverage": 1.0,
+    "cost_provenance": "actual",
+    "covered_calls": 32,
+    "dispatch_pass_cost": null,
+    "dispatch_pass_tasks": 0,
+    "duration_coverage": 1.0,
+    "estimated_cost": 4.74303,
+    "executed_spend": {
+      "by_runtime": {
+        "humain-terminal": 1.2
+      },
+      "cost": 1.2,
+      "counted_in_total_cost": false,
+      "mirrors_model_call_cost": false,
+      "model_call_cost_same_runtimes": 5.94303,
+      "rows": 1
+    },
+    "exploration_rate_observed": 0.0,
+    "fanout_rework": 0.0,
+    "history_sufficient_rate": 1.0,
+    "max_call_cost": 6.0,
+    "mean_call_cost": 2.6666666666666665,
+    "orchestration_overhead": {
+      "coordination_cost": 11.14303,
+      "coordination_rate": 0.933015323582039,
+      "total_cost": 11.94303,
+      "verification_cost": 0.0,
+      "verification_rate": 0.0
+    },
+    "p50_cost": 1.2,
+    "p90_cost": 5.04,
+    "p99_cost": 5.904,
+    "per_call_cost": 8.0,
+    "per_call_samples": 3,
+    "priced_run_coverage": 1.0,
+    "rate_provenance": {
+      "dominant_cost": 13.3,
+      "dominant_model": "gpt-6-astra",
+      "dominant_rows": 2,
+      "estimated_cost": 17.24303,
+      "models": [
+        {
+          "cost": 13.3,
+          "model": "gpt-6-astra",
+          "rows": 2,
+          "source": null,
+          "verified_on": null
+        },
+        {
+          "cost": 3.94303,
+          "model": "claude-opus-5",
+          "rows": 1,
+          "source": null,
+          "verified_on": null
+        }
+      ],
+      "rate_rows": 3,
+      "scope": "all metric rows (orchestrated + ingested)",
+      "unverified_rate_cost": 17.24303,
+      "verified_rate_rows": 0
+    },
+    "reported_cost": 7.2,
+    "review_wait_p90_s": null,
+    "runs": 2,
+    "runs_fully_priced": 2,
+    "runs_with_elapsed": 2,
+    "session_cost": 3.94303,
+    "session_rows": 1,
+    "shadow_false_pass_rate": null,
+    "shadow_over_reject_rate": null,
+    "shadow_reviews": 0,
+    "stable_30d_failure_rate": 1.0,
+    "tail_ratio": null,
+    "tail_ratio_min_samples": 20,
+    "total_cost": 11.94303,
+    "unmetered_calls": 0,
+    "verification_cost": 0.0,
+    "verification_coverage": 1.0,
+    "verification_rate": 0.0,
+    "verified_cost": 5.971515,
+    "verified_tasks": 2,
+    "waste_cost": 0.8,
+    "waste_rate": 0.06698467641796094
+  },
+  "trends": [
+    {
+      "adaptive": 1,
+      "call_rows": 3,
+      "cost": 5.94303,
+      "cost_aggressiveness": 0.6,
+      "day": "2026-09-24",
+      "dispatch_pass": 0,
+      "quality": 0.6,
+      "retries": 1,
+      "rows": 6,
+      "verified": 1,
+      "verified_cost": 5.94303
+    },
+    {
+      "adaptive": 0,
+      "call_rows": 1,
+      "cost": 6.0,
+      "cost_aggressiveness": null,
+      "day": "2026-09-25",
+      "dispatch_pass": 0,
+      "quality": null,
+      "retries": 0,
+      "rows": 1,
+      "verified": 0,
+      "verified_cost": null
+    }
+  ],
+  "waste": {
+    "retry": 0.8
+  }
+}
