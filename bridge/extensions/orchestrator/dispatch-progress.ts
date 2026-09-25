@@ -57,7 +57,7 @@ function configuredTimeout(
 /** Resolve dispatch budgets at dispatch time so callers can supply current environment values. */
 export function resolveDispatchTimeoutPolicy(
 	capability: string | undefined,
-	env: EnvLike = process.env,
+	env: EnvLike,
 ): DispatchTimeoutPolicy {
 	const notes: string[] = [];
 	if (!capability || !ORCHESTRATING_CAPABILITIES.has(capability)) {
@@ -526,7 +526,7 @@ export interface LeadTimeoutConfig {
  * `{ inactivityMs, maxMs }`. Delegates to `resolveDispatchTimeoutPolicy` so
  * there is exactly one source of truth for defaults, legacy compat, and clamping.
  */
-export function resolveLeadTimeoutConfig(env: EnvLike = process.env): LeadTimeoutConfig {
+export function resolveLeadTimeoutConfig(env: EnvLike): LeadTimeoutConfig {
 	const policy = resolveDispatchTimeoutPolicy("lead", env);
 	return { inactivityMs: policy.inactivityMs, maxMs: policy.absoluteMs, notes: policy.notes };
 }

@@ -407,9 +407,21 @@ export async function runSubagentProcess(opts: {
 	 * `runSubagentProcess` supplies the real one when the caller omits it.
 	 */
 	recordEvent?: (event: string, payload: Record<string, unknown>) => void;
+	/**
+	 * The child's base env (before `buildChildEnv`'s dispatch overrides) and the
+	 * source `resolveDispatchTimeoutPolicy` reads its `HUMAIN_ORCHESTRATOR_*_TIMEOUT_MS`
+	 * overrides from, called fresh at each of the three points below (B4.4 review
+	 * fix) so a caller that mutates `process.env` between dispatches (index.test.ts
+	 * does) is still observed, exactly as when this module read `process.env`
+	 * directly. Optional so dispatch/* never has to import `process.env`/config.ts
+	 * itself; defaults to an empty env. index.ts's re-exported `runSubagentProcess`
+	 * supplies `config.ts`'s `liveEnv` when the caller omits it.
+	 */
+	env?: () => NodeJS.ProcessEnv;
 }): Promise<SubagentProcessResult> {
 	const session = opts.session;
 	const recordEvent = opts.recordEvent ?? (() => {});
+	const envGetter = opts.env ?? (() => ({}));
 	session?.cancellation.throwIfCancelled();
 	const taskId = opts.taskId ?? `${opts.agentName}-${Date.now()}`;
 	const safeTaskId = taskId.replace(/[^a-zA-Z0-9._-]+/g, "_");
@@ -451,7 +463,7 @@ export async function runSubagentProcess(opts: {
 	const startedAt = Date.now();
 	return new Promise<SubagentProcessResult>((resolve) => {
 		const invocation = orchCliInvocation(args);
-		const env: NodeJS.ProcessEnv = buildChildEnv(process.env, { cwd: opts.cwd });
+		const env: NodeJS.ProcessEnv = buildChildEnv(envGetter(), { cwd: opts.cwd });
 		let buffer = "";
 		// Raw child events can recursively include full worker histories. Retain
 		// only diagnostics, never the unbounded stream.
@@ -498,7 +510,7 @@ export async function runSubagentProcess(opts: {
 			// The tracker is created only after a successful spawn; a cancellation
 			// racing a synchronous spawn failure still needs an honest note.
 			if (!progressTracker) {
-				progressTracker = new DispatchProgressTracker(resolveDispatchTimeoutPolicy(opts.capability, process.env), dispatchStartedAt);
+				progressTracker = new DispatchProgressTracker(resolveDispatchTimeoutPolicy(opts.capability, envGetter()), dispatchStartedAt);
 			}
 			interruption = buildInterruptionReport({
 				taskId,
@@ -747,7 +759,7 @@ export async function runSubagentProcess(opts: {
 		// `leadTimeouts` is a test seam that only applies to orchestrating capabilities.
 		const timeoutOverride = ORCHESTRATING_CAPABILITIES.has(opts.capability ?? "") ? opts.leadTimeouts : undefined;
 		const policy: DispatchTimeoutPolicy = applyLeadTimeoutOverride(
-			resolveDispatchTimeoutPolicy(opts.capability, process.env),
+			resolveDispatchTimeoutPolicy(opts.capability, envGetter()),
 			timeoutOverride,
 		);
 		isLead = policy.mode === "lead";

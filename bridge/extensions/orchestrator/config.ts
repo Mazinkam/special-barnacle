@@ -56,6 +56,20 @@ export function expandHome(path: string, home: string): string {
 	return path.replace(/^~/, home);
 }
 
+/**
+ * Live, un-snapshotted `process.env` passthrough (B4.4 review fix). Every
+ * other module — including `dispatch/*` and `index.ts`'s own
+ * `orchestratorPythonCli()` and per-dispatch timeout-policy lookups — takes
+ * env as an injected parameter/getter instead of naming `process.env`
+ * itself; this is the one place that still does, so a child process's
+ * inherited env and a dispatch's timeout policy both see the CURRENT
+ * `process.env` at the moment they're read (not a value captured earlier),
+ * matching the pre-B4.4 behaviour exactly.
+ */
+export function liveEnv(): NodeJS.ProcessEnv {
+	return process.env;
+}
+
 function positiveIntEnv(env: BridgeEnv, name: string, fallback: number): number {
 	const raw = Number(env[name]);
 	return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : fallback;

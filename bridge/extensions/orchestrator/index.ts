@@ -149,7 +149,7 @@ import contract from "./contract.json";
 // `core/*` never imports this module and never reads `process.env`; every
 // value it needs (run tags, max-lead ceilings, ...) is a parameter.
 import { emptyOverrides, type ModelOverrides, parseArgs, usageText } from "./core/args.ts";
-import { loadBridgeConfig } from "./config.ts";
+import { loadBridgeConfig, liveEnv } from "./config.ts";
 import { clampComplexity, parseTriageResponse, TRIAGE_PROMPT, type TriageResult } from "./core/triage.ts";
 import { pickModel } from "./core/routing.ts";
 import {
@@ -209,7 +209,7 @@ export type { DispatchResult, DispatchTask };
  * the same names the pre-B4.2 module-level consts used, so the rest of this
  * file — and every existing test — is unchanged.
  */
-const CONFIG = loadBridgeConfig(process.env, homedir());
+const CONFIG = loadBridgeConfig(liveEnv(), homedir());
 const {
 	skillRoot: SKILL_ROOT,
 	stateRoot: STATE_ROOT,
@@ -317,7 +317,7 @@ function orchestratorPythonCli(pythonOverride?: string) {
 		stateRoot: expandedStateRoot,
 		spawn,
 		defaultTimeoutMs: PYTHON_TIMEOUT_MS,
-		baseEnv: process.env,
+		baseEnv: liveEnv(),
 		extraEnv: PYTHON_EXTRA_ENV,
 	});
 }
@@ -1180,11 +1180,16 @@ export function registerOrchestratorStatusTool(pi: ExtensionAPI): void {
  * production call site (`orchestrator.runSubagentProcess`, `dispatchParallel`,
  * `triageTask`, the model-check probe, ...) is unchanged. This wrapper is the
  * one place that supplies the real `recordEvent` (index.ts's telemetry
- * singleton) as the default for dispatch/child-process.ts's optional
- * `opts.recordEvent` seam, so dispatch/* itself never has to import index.ts.
+ * singleton) and `env` (`config.ts`'s `liveEnv`) as defaults for
+ * dispatch/child-process.ts's optional `opts.recordEvent`/`opts.env` seams,
+ * so dispatch/* itself never has to import index.ts.
  */
 export function runSubagentProcess(opts: Parameters<typeof runSubagentProcessCore>[0]): ReturnType<typeof runSubagentProcessCore> {
-	return runSubagentProcessCore({ ...opts, recordEvent: opts.recordEvent ?? recordEvent });
+	return runSubagentProcessCore({
+		...opts,
+		recordEvent: opts.recordEvent ?? recordEvent,
+		env: opts.env ?? liveEnv,
+	});
 }
 
 
