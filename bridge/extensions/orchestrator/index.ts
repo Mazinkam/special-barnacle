@@ -102,6 +102,7 @@ import {
 	liveDispatchPids,
 	guardChildStreamHandler,
 	appendTrimmedEventLog,
+	type DispatchSession,
 } from "./dispatch/child-process.ts";
 export { guardChildStreamHandler, appendTrimmedEventLog };
 import {
@@ -150,7 +151,7 @@ import contract from "./contract.json";
 // value it needs (run tags, max-lead ceilings, ...) is a parameter.
 import { emptyOverrides, type ModelOverrides, parseArgs, usageText } from "./core/args.ts";
 import { loadBridgeConfig, liveEnv } from "./config.ts";
-import { clampComplexity, parseTriageResponse, TRIAGE_PROMPT, type TriageResult } from "./core/triage.ts";
+import { clampComplexity, type TriageResult } from "./core/triage.ts";
 import { pickModel } from "./core/routing.ts";
 import {
 	type CaptureOpts,
@@ -181,6 +182,7 @@ import {
 	type RunSessionDeps,
 	type RunTiming,
 } from "./run/session.ts";
+import { triageTask as triageTaskCore } from "./pipeline/triage-step.ts";
 import type { OrchestratorStatus, WorktreeInfo } from "./run/board.ts";
 import { formatOrchestratorStatus } from "./run/board.ts";
 export type { OrchestratorStatus, RunTiming, WorktreeInfo };
@@ -609,69 +611,27 @@ export function runSubagentProcess(
 
 
 /**
- * Classify the goal with the cheapest capability.
- *
- * `costSink` accumulates what triage spent. Triage is logged as run overhead under
- * the same run identifier even when classification fails.
+ * Classify the goal with the cheapest capability (pipeline/triage-step.ts,
+ * B4.6). Re-exported under its original name so every existing call site
+ * and test (`orchestrator.triageTask` is not itself part of the public
+ * surface, but the /orchestrate handler below is) is unchanged. This
+ * wrapper is the one place that supplies the real `runSubagentProcess`/
+ * `captureDispatchCost` as `TriageDeps`, so pipeline/* never has to import
+ * index.ts.
  */
-async function triageTask(
+function triageTask(
 	runId: string,
 	goal: string,
 	cwd: string,
 	ctx: ExtensionContext,
-	/** The claiming run's context, threaded explicitly (B4.4) so triage's dispatch
-	 *  and billing land on the right run instead of an implicit "active run" read. */
 	run: RunContext<RunSession> | null,
 	costSink: { usd: number },
 	adapter: Adapter,
 ): Promise<TriageResult | null> {
-	const cheapest =
-		adapter["implementation_fast"] ??
-		adapter["worker"] ??
-		adapter["scout"] ??
-		Object.values(adapter)[0];
-	if (!cheapest || !cheapest.model) {
-		console.warn("[orchestrator] triage skipped: adapter has no dispatchable model");
-		return null;
-	}
-
-	const prompt = TRIAGE_PROMPT + "\n" + goal + "\n\nJSON:\n";
-	try {
-		const r = await runSubagentProcess({
-			cwd,
-			agentName: "orch-implementation-fast",
-			task: prompt,
-			model: cheapest.model,
-			ctx,
-			taskId: "triage",
-			label: "triage",
-			session: run?.session,
-		});
-		costSink.usd += r?.costUsd ?? 0;
-		// Bill the dispatch before parsing: malformed/empty classifier output still used tokens.
-		await captureDispatchCost(
-			{ runId, planId: "triage", taskClass: "triage", complexity: 5, risk: "medium",
-				recommended: { capability: "implementation_fast", effort: "low", verification_depth: "none" }, mode: "triage" },
-			{ taskId: "triage", capability: "triage", model: r.model ?? cheapest.model,
-				exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, usage: r.usage,
-				durationMs: r.durationMs, costUsd: r.costUsd, costReported: r.costReported, stopReason: r.stopReason, filesChanged: [] },
-			run,
-		);
-		if (r.exitCode !== 0) {
-			console.warn(`[orchestrator] triage exited ${r.exitCode}: ${summarizeStderr(r.stderr || r.rawStdout, 400) || "(no output)"}`);
-			return null;
-		}
-		// The child's final assistant message is the JSON verdict.
-		const text = r.finalText || r.stdout;
-		if (!text.trim()) {
-			console.warn("[orchestrator] triage produced no assistant text");
-			return null;
-		}
-		return parseTriageResponse(text);
-	} catch (err) {
-		console.warn(`[orchestrator] triage failed: ${(err as Error).message}`);
-		return null;
-	}
+	return triageTaskCore(runId, goal, cwd, ctx, run, costSink, adapter, {
+		runProcess: runSubagentProcess,
+		captureDispatchCost,
+	});
 }
 
 function slugGoal(goal: string): string {
@@ -988,8 +948,11 @@ export function dispatchParallel(
 async function captureDispatchCost(
 	opts: CaptureOpts,
 	result: DispatchResult,
-	/** The dispatching run's context, for its tag set; null outside a run. */
-	run: RunContext<RunSession> | null,
+	/** The dispatching run's context, for its tag set; null outside a run. Typed
+	 * structurally over `DispatchSession` (not the concrete `RunSession`) so
+	 * this can be handed to pipeline/* modules as a `TriageDeps`/hierarchy dep
+	 * without them needing to know `RunSession`'s full shape. */
+	run: RunContext<DispatchSession> | null,
 ): Promise<void> {
 	for (const record of dispatchRecordsFor(opts, result, run?.tags ?? {})) {
 		recordModelCall(record);
