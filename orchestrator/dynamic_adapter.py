@@ -38,7 +38,21 @@ from .method import adapter_tier_targets
 # Capability -> cost tier (cheapest|mid|expensive). Derived from the canonical
 # method file (orchestrator/method.json) so the Python resolver and the HT
 # bridge (models.ts) can never disagree on which tier a capability sits at.
-CAPABILITY_TIER_TARGET = adapter_tier_targets()
+#
+# Resolved lazily on first access (`_capability_tier_target()`, or the module attribute via
+# `__getattr__` below) so `import orchestrator.dynamic_adapter` alone performs no file read.
+_CAPABILITY_TIER_TARGET: dict[str, str] | None = None
+
+def _capability_tier_target() -> dict[str, str]:
+    global _CAPABILITY_TIER_TARGET
+    if _CAPABILITY_TIER_TARGET is None:
+        _CAPABILITY_TIER_TARGET = adapter_tier_targets()
+    return _CAPABILITY_TIER_TARGET
+
+def __getattr__(name: str):
+    if name == 'CAPABILITY_TIER_TARGET':
+        return _capability_tier_target()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Cost-tier thresholds (USD per million output tokens). Models below fall in
 # the cheapest bucket, above into expensive, the rest into mid. Calibrated to
@@ -355,7 +369,7 @@ def resolve_adapter(model_family: str | None = None) -> dict[str, dict[str, Any]
     chosen: dict[str, dict[str, Any]] = {}
     explanations: dict[str, list[str]] = {}
 
-    for cap, target_tier in CAPABILITY_TIER_TARGET.items():
+    for cap, target_tier in _capability_tier_target().items():
         m: dict[str, Any] | None = None
         effective_tier = target_tier
         notes: list[str] = []

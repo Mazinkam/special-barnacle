@@ -50,16 +50,26 @@ def _bound_error(text: str, limit: int = INGEST_ERROR_LIMIT, tail: int = _INGEST
     tail = min(tail, (limit - len(joiner)) // 2)
     return text[:limit - tail - len(joiner)] + joiner + text[-tail:]
 
-ROOT=default_state_root()
+#: Override for the state root, set only by tests via `mock.patch.object(cli, 'ROOT', ...)`.
+#: `None` (the default at import time) means "resolve from the environment lazily"; see `_root()`.
+#: Importing this module must never read `CODING_AGENT_ORCHESTRATOR_HOME`/`HOME` or touch the
+#: filesystem, so nothing here calls `default_state_root()` at module scope.
+ROOT: Path | None = None
+
+def _root() -> Path:
+    """The effective state root: the `ROOT` override if a test set one, else resolved from the
+    environment right now (once per call, never cached at import time)."""
+    return ROOT if ROOT is not None else default_state_root()
+
 def cfg(): return read_json(Path(__file__).with_name('config.json'),{})
-def refresh(state_root: Path = ROOT) -> Path:
+def refresh(state_root: Path | None = None) -> Path:
     """Catch the ledger up from its durable checkpoint and republish the dashboard; return its path.
 
     Not a recovery: records reach the streams through the coordinated writer (deduplicated by
     record id), so an incremental replay is exact and the record-id cache stays trusted. A full
     `rebuild` (replay from byte 0, cache discarded) remains the explicit `rebuild` command.
     """
-    root = Path(state_root)
+    root = Path(state_root) if state_root is not None else _root()
     refresh_ledger(root)
     return generate_dashboard(root, config=cfg())
 
@@ -147,10 +157,10 @@ def _write(records)->tuple[int,dict]:
     outcome through this one function, so a rejected batch or an interrupted append is always a
     structured body with `persisted`/`retry` and never an uncaught traceback.
     """
-    try: result=write_batch(ROOT,records)
+    try: result=write_batch(_root(),records)
     except BatchValidationError as exc: return EXIT_INVALID,_failure(STATUS_INVALID,str(exc))
     except BatchAppendError as exc: return EXIT_APPEND_FAILED,_failure(STATUS_APPEND_FAILED,str(exc),exc.persisted,RETRY_SAME_IDS)
-    result=refresh_after_write(ROOT,result,config=cfg())
+    result=refresh_after_write(_root(),result,config=cfg())
     return (EXIT_OK if result['ok'] else EXIT_REFRESH_FAILED),{k:v for k,v in result.items() if k!='records'}
 
 def write_records(records)->int:
@@ -252,8 +262,8 @@ def main():
     # A dry run must leave the state root untouched (not even created), so the root and its streams are
     # only ensured for commands that write or read them; the engine is built where a command needs it.
     # The archive commands never touch the streams at all, so they do not create them either.
-    if not (args.cmd=='ingest' and args.dry_run) and args.cmd not in ('archive-runs','restore-run'): EventStore(ROOT)
-    def eng(): return build_engine(ROOT)
+    if not (args.cmd=='ingest' and args.dry_run) and args.cmd not in ('archive-runs','restore-run'): EventStore(_root())
+    def eng(): return build_engine(_root())
     if args.cmd=='init':
         # One coordinated write: durable append -> incremental ledger -> atomic dashboard, instead of
         # an append followed by a full history replay that also discards the record-id cache. A
@@ -262,9 +272,9 @@ def main():
         code,body=_write([single_record('event',{'schema_version':3},event='orchestrator_initialized')])
         if code!=EXIT_OK: print(json.dumps(body)); raise SystemExit(code)
         print('Initialized V3 state'); return
-    if args.cmd=='status': print(json.dumps(load_or_rebuild(ROOT),indent=2)); return
-    if args.cmd=='dashboard': print(generate_dashboard(ROOT,config=C)); return
-    if args.cmd=='rebuild': print(json.dumps(rebuild(ROOT),indent=2)); generate_dashboard(ROOT,config=C); return
+    if args.cmd=='status': print(json.dumps(load_or_rebuild(_root()),indent=2)); return
+    if args.cmd=='dashboard': print(generate_dashboard(_root(),config=C)); return
+    if args.cmd=='rebuild': print(json.dumps(rebuild(_root()),indent=2)); generate_dashboard(_root(),config=C); return
     if args.cmd=='features':
         f=FeaturePolicy(C.get('features',{})).resolve(); print(json.dumps(feature_inventory(f),indent=2)); return
     if args.cmd=='recommend-policy': print(json.dumps(eng().recommend_policy(),indent=2)); return
@@ -313,7 +323,7 @@ def main():
             done[0]+=1
             runtime_label=str(summary.get('runtime') or '?')
             print(f"[{done[0]}/{len(paths)}] {runtime_label:16} +{summary.get('emitted',0):<5} dup={summary.get('duplicates',0):<4} ${summary.get('estimated_cost_usd',0.0):.4f}  {Path(summary['file']).name}",file=sys.stderr,flush=True)
-        result=process_ingest(paths, state_root=ROOT, runtime=args.runtime,
+        result=process_ingest(paths, state_root=_root(), runtime=args.runtime,
                               repository=args.repository, dry_run=args.dry_run,
                               granularity=args.granularity,
                               on_file=progress if not args.quiet else None)
@@ -330,19 +340,19 @@ def main():
         return
     if args.cmd=='quality':
         ev=QualityEvidence(**json.loads(args.payload)); print(json.dumps({'hard_gate_pass':ev.hard_gate_pass(),'quality_evidence_score':ev.evidence_score()},indent=2)); return
-    if args.cmd=='context-put': print(json.dumps(ContextRegistry(ROOT).put(args.id,args.content,source=args.source,status=args.status,repo_revision=args.revision),indent=2)); return
-    if args.cmd=='context-packet': print(json.dumps(ContextRegistry(ROOT).packet([x.strip() for x in args.ids.split(',') if x.strip()],args.budget),indent=2)); return
+    if args.cmd=='context-put': print(json.dumps(ContextRegistry(_root()).put(args.id,args.content,source=args.source,status=args.status,repo_revision=args.revision),indent=2)); return
+    if args.cmd=='context-packet': print(json.dumps(ContextRegistry(_root()).packet([x.strip() for x in args.ids.split(',') if x.strip()],args.budget),indent=2)); return
     if args.cmd=='archive-runs': raise SystemExit(_archive_runs_command(args))
     if args.cmd=='restore-run': raise SystemExit(_restore_run_command(args))
 
 def _fmt_bytes(n:int)->str: return f'{n:,}'
 
 def _archive_runs_command(args)->int:
-    try: entries=archive_runs(ROOT,older_than_days=args.older_than_days,execute=args.execute)
+    try: entries=archive_runs(_root(),older_than_days=args.older_than_days,execute=args.execute)
     except (ValueError,OSError) as exc: print(f'archive-runs: {exc}',file=sys.stderr); return EXIT_INVALID
     planned=[e for e in entries if e['files']]
     skipped=[e for e in entries if e['status']=='skipped']
-    summary={'executed':args.execute,'older_than_days':args.older_than_days,'state_root':str(ROOT),'runs':entries,
+    summary={'executed':args.execute,'older_than_days':args.older_than_days,'state_root':str(_root()),'runs':entries,
              'originals_retained':all(e.get('originals_retained',True) for e in planned),
              'reclaimed_bytes':max(0,-sum(e.get('storage_delta_bytes',0) for e in planned)),
              'storage_delta_bytes':sum(e.get('storage_delta_bytes',0) for e in planned),
@@ -356,7 +366,7 @@ def _archive_runs_command(args)->int:
              'not_archived_files':sum(1 for e in planned for f in e['files'] if f['status']!='archived')}
     failed=args.execute and summary['not_archived_files']>0
     if args.json: print(json.dumps(summary,indent=2,default=str)); return EXIT_INVALID if failed else EXIT_OK
-    if not args.execute: print(f'DRY RUN — nothing written. Re-run with --execute to archive. (runs under {ROOT/"runs"}, older than {args.older_than_days:g} days)')
+    if not args.execute: print(f'DRY RUN — nothing written. Re-run with --execute to archive. (runs under {_root()/"runs"}, older than {args.older_than_days:g} days)')
     for e in entries:
         if e['status']=='skipped' and not e['files']: print(f"skipped  {e['run_id']}  {e['reason']}: {e['detail']}"); continue
         size=f"{_fmt_bytes(e['raw_bytes'])} raw bytes -> "+(f"{_fmt_bytes(e['compressed_bytes'])} compressed" if args.execute else f"~{_fmt_bytes(e['estimated_compressed_bytes'])} estimated compressed")
@@ -374,7 +384,7 @@ def _archive_runs_command(args)->int:
     return EXIT_INVALID if failed else EXIT_OK
 
 def _restore_run_command(args)->int:
-    try: result=restore_run(ROOT,args.run_id,execute=not args.dry_run)
+    try: result=restore_run(_root(),args.run_id,execute=not args.dry_run)
     except (ValueError,OSError) as exc: print(f'restore-run: {exc}',file=sys.stderr); return EXIT_INVALID
     if args.json: print(json.dumps(result,indent=2,default=str)); return EXIT_OK if not result['errors'] else EXIT_INVALID
     print(result['message'])

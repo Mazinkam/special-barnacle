@@ -5,7 +5,8 @@ from typing import Any
 import hashlib
 
 from .history import bucket_complexity
-from .scheduler import DEFAULT_PACKAGES, EFFORTS, recommend_package, topology_for, package_history, measured
+from . import scheduler
+from .scheduler import DEFAULT_PACKAGES, recommend_package, topology_for, package_history, measured
 from .vocab import DEFAULT_MIN_SAMPLES, HIGH_RISK
 
 
@@ -29,7 +30,8 @@ def default_package_for(complexity: float, risk: str, features: dict[str, Any], 
         elif float(complexity) <= 3 and risk == 'low':
             effort = 'low'
         max_effort=effort_cfg.get('max_effort','maximum')
-        if max_effort in EFFORTS and effort in EFFORTS and EFFORTS.index(effort) > EFFORTS.index(max_effort):
+        efforts = scheduler.efforts()
+        if max_effort in efforts and effort in efforts and efforts.index(effort) > efforts.index(max_effort):
             effort=max_effort
     verification = 'full' if risk == 'critical' else ('broad' if risk == 'high' or float(complexity) >= 7 else 'targeted')
     context_budget = 26000 if capability == 'implementation_strong' else 18000
@@ -52,12 +54,13 @@ def _apply_switch_guards(empirical: dict[str, Any], default: dict[str, Any], fea
     effort_cfg=features.get('effort_adaptation', {})
     if not routing.get('allow_effort_switching', True) or not effort_cfg.get('enabled', True):
         out['effort'] = default['effort']
-    elif out.get('effort') in EFFORTS and default.get('effort') in EFFORTS:
-        oi=EFFORTS.index(out['effort']); di=EFFORTS.index(default['effort'])
+    elif out.get('effort') in scheduler.efforts() and default.get('effort') in scheduler.efforts():
+        efforts = scheduler.efforts()
+        oi=efforts.index(out['effort']); di=efforts.index(default['effort'])
         if oi > di and not effort_cfg.get('allow_increase',True): out['effort']=default['effort']
         if oi < di and not effort_cfg.get('allow_decrease',True): out['effort']=default['effort']
         mx=effort_cfg.get('max_effort','maximum')
-        if mx in EFFORTS and out.get('effort') in EFFORTS and EFFORTS.index(out['effort']) > EFFORTS.index(mx): out['effort']=mx
+        if mx in efforts and out.get('effort') in efforts and efforts.index(out['effort']) > efforts.index(mx): out['effort']=mx
     if not routing.get('allow_context_budget_changes', True) or not features.get('context_optimization', {}).get('enabled', True):
         out['context_budget_tokens'] = default['context_budget_tokens']
     if not routing.get('allow_verification_changes', True):

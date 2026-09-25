@@ -6,7 +6,22 @@ from .method import effort_levels
 from .records import is_no_data
 from .vocab import SCHEDULER_MIN_SAMPLES
 
-EFFORTS=effort_levels()
+#: `EFFORTS` used to be computed at import time (`effort_levels()` reads `method.json`). Kept as a
+#: module attribute (some tests do `from orchestrator.scheduler import EFFORTS`), but resolved lazily
+#: on first access via `efforts()`/module `__getattr__` so `import orchestrator.scheduler` alone
+#: performs no file read.
+_EFFORTS: list[str] | None = None
+
+def efforts() -> list[str]:
+    global _EFFORTS
+    if _EFFORTS is None:
+        _EFFORTS = effort_levels()
+    return _EFFORTS
+
+def __getattr__(name: str):
+    if name == 'EFFORTS':
+        return efforts()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def measured(value:Any)->Any:
@@ -73,9 +88,9 @@ def recommend_package(*,task_class:str,complexity:float,risk:str,quality_floor:f
         quality=(measured(hist.get('avg_quality_evidence')) if hist else None)
         delayed=(measured(hist.get('delayed_failure_rate')) if hist else None)
         # conservative priors; stronger packages get higher assurance prior, cheap packages lower cost prior
-        if cost is None: cost={'implementation_fast':.05,'implementation_strong':.12}[p.capability]*(1+EFFORTS.index(p.effort)*.18)
+        if cost is None: cost={'implementation_fast':.05,'implementation_strong':.12}[p.capability]*(1+efforts().index(p.effort)*.18)
         prior_q=.945 if p.capability=='implementation_fast' else .975
-        prior_q += max(0,EFFORTS.index(p.effort)-1)*.006
+        prior_q += max(0,efforts().index(p.effort)-1)*.006
         if quality is None: quality=prior_q
         if delayed is not None: quality=max(0.0,quality-delayed*.20)
         small_penalty=max(0,min_samples-samples)/min_samples*.025
