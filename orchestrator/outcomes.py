@@ -1,4 +1,5 @@
 from __future__ import annotations
+import functools
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -6,7 +7,11 @@ from collections import defaultdict
 from typing import Iterable
 from .runtime import default_state_root, iter_jsonl
 from .contract import STREAMS
-from .vocab import parse_iso_ts as _dt
+from .vocab import parse_iso_ts
+
+#: `outcomes.py`'s historical `_dt`: no falsy guard, no `str()` coercion — see
+#: `vocab.parse_iso_ts`'s docstring for exactly how this differs from run_evidence's.
+_dt = functools.partial(parse_iso_ts, coerce_str=False)
 
 #: Keys that make an outcome "bad". `major_rewrite` and `incident` are historical additions from
 #: two different call sites (outcome_summary and history.build_route_stats respectively); both are

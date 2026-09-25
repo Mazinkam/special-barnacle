@@ -13,7 +13,11 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator import contract, record_batch, record_index, cli, runtime
+from datetime import datetime, timezone
+
+from orchestrator import archive, contract, record_batch, record_index, cli, runtime
+from orchestrator.outcomes import _dt as outcomes_dt
+from orchestrator.run_evidence import _parse_ts as run_evidence_parse_ts
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_JSON = REPO_ROOT / 'orchestrator' / 'contract.json'
@@ -90,3 +94,99 @@ def test_default_state_root_uses_contract_env_var_and_default(monkeypatch: pytes
     assert runtime.default_state_root() == Path(contract.DEFAULT_STATE_ROOT).expanduser()
     monkeypatch.setenv(contract.STATE_ROOT_ENV_VAR, '/tmp/some-other-root')
     assert runtime.default_state_root() == Path('/tmp/some-other-root')
+
+
+# --- parse_iso_ts: exact per-caller semantics (B1 review) ------------------------------
+#
+# Reference oracles: the *original* bodies of `outcomes._dt` and `run_evidence._parse_ts`
+# before they were unified into `vocab.parse_iso_ts`, copied here verbatim (see
+# `git show 1a1e439:orchestrator/outcomes.py` and `git show 1a1e439:orchestrator/run_evidence.py`).
+# `vocab.parse_iso_ts(value, coerce_str=False)` must equal `_old_outcomes_dt` on every input,
+# and the default `vocab.parse_iso_ts(value)` (coerce_str=True) must equal `_old_run_evidence_parse_ts`.
+
+
+def _old_outcomes_dt(s):
+    try:
+        return datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
+def _old_run_evidence_parse_ts(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+
+_PARSE_TS_SAMPLES = [
+    None,
+    '',
+    'not-a-date',
+    '2024-01-01T00:00:00Z',
+    '2024-01-01T00:00:00',
+    '2024-01-01T00:00:00+02:00',
+    20240101,
+    3.14,
+    datetime(2024, 1, 1, 12, 0, 0),
+    datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+    0,
+    False,
+]
+
+
+@pytest.mark.parametrize('value', _PARSE_TS_SAMPLES)
+def test_parse_iso_ts_matches_old_outcomes_dt(value) -> None:
+    assert outcomes_dt(value) == _old_outcomes_dt(value)
+
+
+@pytest.mark.parametrize('value', _PARSE_TS_SAMPLES)
+def test_parse_iso_ts_matches_old_run_evidence_parse_ts(value) -> None:
+    assert run_evidence_parse_ts(value) == _old_run_evidence_parse_ts(value)
+
+
+def test_parse_iso_ts_callers_disagree_on_datetime_input_on_purpose() -> None:
+    # This is the exact case the B1 review flagged: the two old functions are NOT
+    # behaviourally identical on non-str input, so each caller must keep its own behaviour.
+    dt = datetime(2024, 1, 1, 12, 0, 0)
+    assert outcomes_dt(dt) is None
+    assert run_evidence_parse_ts(dt) == dt
+
+
+# --- B1 review: consumer-level parity, not just the JSON --------------------------------
+
+
+def test_archive_never_archive_matches_contract() -> None:
+    assert archive.NEVER_ARCHIVE == contract.NEVER_ARCHIVE_FILES
+
+
+def test_record_batch_limits_exit_and_status_constants_match_contract() -> None:
+    assert record_batch.MAX_BATCH_RECORDS == contract.MAX_BATCH_RECORDS
+    assert record_batch.MAX_RECORD_ID_LENGTH == contract.MAX_RECORD_ID_LENGTH
+    assert record_batch.RETRY_SAME_IDS == contract.RETRY_SAME_IDS
+
+
+def test_cli_redaction_constant_matches_contract() -> None:
+    assert cli._PATH_RE is contract.PATH_REDACTION_RE
+    assert cli._PATH_RE.pattern == contract.PATH_REDACTION_RE.pattern
+
+
+def test_runtime_state_root_env_var_matches_contract() -> None:
+    """`runtime.default_state_root` must read the contract's env var name, not a re-typed copy."""
+    import inspect
+    source = inspect.getsource(runtime.default_state_root)
+    assert 'STATE_ROOT_ENV_VAR' in source
+    assert contract.STATE_ROOT_ENV_VAR == 'CODING_AGENT_ORCHESTRATOR_HOME'
+
+
+def test_install_sh_default_state_root_matches_contract() -> None:
+    """`install.sh` hard-codes the default state root as a shell fallback (see the comment
+    above the literal in install.sh, next to `orchestrator/contract.json`'s `state_root.default`).
+    The contract default is `~/...`; install.sh spells the same path as `$HOME/...`, so compare
+    the path suffix rather than the literal string.
+    """
+    install_sh = (REPO_ROOT / 'install.sh').read_text(encoding='utf-8')
+    suffix = contract.DEFAULT_STATE_ROOT.removeprefix('~/')
+    assert suffix and suffix in install_sh

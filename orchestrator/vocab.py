@@ -12,8 +12,16 @@ Two rules this module follows on purpose:
   4-tuple vs. a 6-tuple, a set of ids vs. a dict of id -> status, 12 vs. 8),
   they keep separate names here rather than being merged into one — merging
   those would be a behaviour change, which this refactor (B1) does not make.
-* `parse_iso_ts` unifies only the two copies (`outcomes.py`, `run_evidence.py`)
-  that are behaviourally identical, including on invalid/falsy/None input.
+* `parse_iso_ts` unifies the two copies (`outcomes._dt`, `run_evidence._parse_ts`)
+  behind one function, but they are NOT behaviourally identical on every input:
+  `outcomes._dt(s)` called `s.replace('Z', '+00:00')` directly (no `str()`, no
+  falsy guard), so a non-string value (an int, a float, a `datetime`) raised
+  inside the `try` and was caught, returning `None`. `run_evidence._parse_ts(value)`
+  guarded falsy input first and then called `str(value).replace(...)`, so a
+  `datetime` value (whose `str()` is itself a valid, single-separator ISO-ish
+  string) actually parsed successfully instead of returning `None`. `parse_iso_ts`
+  below takes a `coerce_str` flag to reproduce each caller's exact behaviour
+  instead of picking one and quietly changing the other's semantics.
   `archive.parse_ts` (which normalizes naive timestamps to UTC) and
   `dashboard.py`'s inner `parse_timestamp`/`history.py`'s inline weight-decay
   parse (both of which also normalize tz, with different exception handling)
@@ -53,21 +61,38 @@ TERMINAL_TASK_IDS: frozenset[str] = frozenset({'run-complete', 'run-failed'})
 # --- ISO timestamp parsing -------------------------------------------------------
 
 
-def parse_iso_ts(value: Any) -> Optional[datetime]:
+def parse_iso_ts(value: Any, *, coerce_str: bool = True) -> Optional[datetime]:
     """Parse an ISO-8601 timestamp (`Z` suffix accepted), or return None.
 
-    Matches the previously-duplicated `outcomes._dt` and `run_evidence._parse_ts`:
-    falsy input (None, '', 0, ...) and any parse failure both return None; a
-    successful parse is returned exactly as `datetime.fromisoformat` produces it
-    (naive stays naive, aware stays aware — no timezone normalization). Do not
-    change this to normalize tz; callers that need UTC-normalized timestamps use
+    Reproduces the two previously-duplicated functions exactly, selected by `coerce_str`:
+
+    * `coerce_str=True` (the default) matches `run_evidence._parse_ts`: falsy input
+      (None, '', 0, ...) short-circuits to None, then the value is coerced with `str()`
+      before `.replace('Z', '+00:00')` and `datetime.fromisoformat`. Because of the
+      `str()` coercion, a `datetime` value can parse successfully here (its `str()` is
+      itself an ISO-ish string).
+    * `coerce_str=False` matches `outcomes._dt`: no falsy guard and no `str()` coercion —
+      `.replace('Z', '+00:00')` is called on `value` itself, inside the same `try`, so a
+      non-string value (None, an int, a float, a `datetime`) raises `AttributeError` (or
+      `TypeError`) and is caught, always returning None.
+
+    In both modes, a successful parse is returned exactly as `datetime.fromisoformat`
+    produces it (naive stays naive, aware stays aware — no timezone normalization). Do
+    not change this to normalize tz; callers that need UTC-normalized timestamps use
     `archive.parse_ts` or their own local copy instead, on purpose (see module
-    docstring).
+    docstring). Do not change the default or add a single unconditional behaviour here:
+    the two modes are intentionally different (see module docstring) and each caller
+    below is pinned to its own historical mode via `functools.partial`.
     """
-    if not value:
-        return None
+    if coerce_str:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        except Exception:
+            return None
     try:
-        return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
     except Exception:
         return None
 

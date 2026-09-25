@@ -14,6 +14,7 @@ import {
 	userLayerWarnings,
 	METHOD,
 	TIERS,
+	TIER_LITERALS,
 	isTier,
 	tierOf,
 	type AvailableModel,
@@ -243,6 +244,15 @@ describe("tiers", () => {
 		expect(TIERS[0]).toBe("frontier");
 		expect(isTier("frontier")).toBe(true);
 		expect(isTier("ultra")).toBe(false);
+	});
+	test("the Tier literal union matches method.json's tiers list, in both directions", () => {
+		// TIER_LITERALS is the hand-written source of truth the `Tier` type is checked
+		// against at compile time (see the comment above `Tier` in models.ts). This test
+		// is the runtime half of that guarantee: it must equal METHOD.tiers as a set.
+		expect([...TIER_LITERALS].sort()).toEqual([...METHOD.tiers].sort());
+		expect(TIER_LITERALS.length as number).toBe(METHOD.tiers.length);
+		expect(TIERS.length).toBe(METHOD.tiers.length);
+		expect([...TIERS].sort()).toEqual([...METHOD.tiers].sort());
 	});
 	test("lead sizes sit on mid/premium/frontier", () => {
 		expect(tierOf("lead_small")).toBe("mid");

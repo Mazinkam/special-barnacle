@@ -13,6 +13,7 @@ import { METHOD, TIER_CAPABILITIES, buildAliasTable } from "./models.ts";
 import type { DispatchResult, DispatchTask } from "./index.ts";
 import { RunCancellation } from "./cancellation.ts";
 import { MAX_CHILD_STDERR_DISK_BYTES } from "./dispatch-outcome.ts";
+import contract from "./contract.json";
 
 mock.module("@humain/terminal", () => ({
 	BorderedLoader: class {
@@ -313,6 +314,15 @@ describe("session ingest hook wiring", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	test("redactPaths (index.ts) matches contract.json's ts redaction_regex on a sample", () => {
+		// The B1 review asked for a consumer-level parity check, not just the JSON: this
+		// exercises the actual exported function, not a re-typed copy of the pattern.
+		const contractRe = new RegExp(contract.redaction_regex.ts, "g");
+		const sample = "failed: /Users/alice/proj/file.ts and /home/bob/other.py and ~/relative/thing";
+		expect(orchestrator.redactPaths(sample)).toBe(sample.replace(contractRe, "<path>"));
+		expect(orchestrator.redactPaths(sample)).toBe("failed: <path> and <path> and <path>");
 	});
 
 	test("runModule forwards STATE_ROOT as CODING_AGENT_ORCHESTRATOR_HOME", async () => {

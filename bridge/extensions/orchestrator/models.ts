@@ -14,9 +14,26 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 // the two runtimes. Edit the root file, never this one.
 import method from "./method.json";
 
+/**
+ * `Tier` is a hand-written literal union, not derived via `(typeof METHOD.tiers)[number]`:
+ * `method.json` is imported as plain JSON, so TS widens its `tiers` array to `string[]` at the
+ * import boundary — there is no way to recover a literal union from a JSON module import. The
+ * `MethodFile` interface above already asserts (via the `as unknown as MethodFile` cast) that
+ * `METHOD.tiers` is `Tier[]`, but that cast is unchecked; `TIER_LITERALS` and the exhaustiveness
+ * check just below make the *type* checked at compile time — if method.json ever gains or drops
+ * a tier without `Tier` (and `TIER_LITERALS`) being updated to match, `tsc` fails on the
+ * `AssertTierExhaustive` line, and the bun test below fails on the runtime value.
+ */
 export type Tier = "cheap" | "mid" | "premium" | "frontier";
-/** Display order, most expensive first. `METHOD.tiers` is the ascending cost order. */
-export const TIERS: Tier[] = ["frontier", "premium", "mid", "cheap"];
+
+/** The `Tier` union's members, spelled out once for the compile-time and runtime checks below. */
+export const TIER_LITERALS = ["cheap", "mid", "premium", "frontier"] as const satisfies readonly Tier[];
+// `satisfies readonly Tier[]` above checks TIER_LITERALS ⊆ Tier (every listed literal is a valid
+// Tier). This checks the other direction, Tier ⊆ TIER_LITERALS (every Tier member is listed):
+// if `Tier` ever grows a member missing from TIER_LITERALS, this line fails to compile.
+type AssertTierExhaustive = Tier extends (typeof TIER_LITERALS)[number] ? true : ["Tier has a member missing from TIER_LITERALS", Tier];
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _assertTierExhaustive: AssertTierExhaustive = true;
 
 export type LeadSize = "small" | "standard" | "large";
 export type SpendCapMode = "off" | "warn" | "enforce";
@@ -69,6 +86,9 @@ interface MethodFile {
 }
 
 export const METHOD = method as unknown as MethodFile;
+
+/** Display order, most expensive first, derived from METHOD.tiers (the ascending cost order). */
+export const TIERS: Tier[] = [...(METHOD.tiers as readonly Tier[])].reverse();
 
 /** Which cost tier each abstract capability sits at. Derived from method.json. */
 export const TIER_CAPABILITIES: Record<Tier, string[]> = { cheap: [], mid: [], premium: [], frontier: [] };
@@ -127,7 +147,7 @@ export function tierOfModel(model: string, adapter: Record<string, { model: stri
 }
 
 export function isTier(s: string): s is Tier {
-	return s === "cheap" || s === "mid" || s === "premium" || s === "frontier";
+	return (METHOD.tiers as readonly string[]).includes(s);
 }
 
 export function isThinkingLevel(s: string): s is ThinkingLevel {

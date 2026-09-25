@@ -17,8 +17,9 @@ const PROTOCOL = "ht-run-diagnostics-v1";
 const SEAL_DRAIN_TIMEOUT_MS = 2000;
 const owners = new Map<string, RunDiagnostics>();
 // Mirrors orchestrator/contract.json's never_archive_files (the authoritative streams and their
-// integrity/recovery metadata), which archive.py's NEVER_ARCHIVE also derives from.
-const protectedNames = new Set<string>(contract.never_archive_files);
+// integrity/recovery metadata), which archive.py's NEVER_ARCHIVE also derives from. Exported so
+// the contract parity test can assert equality without duplicating the list.
+export const protectedNames = new Set<string>(contract.never_archive_files);
 
 function syncDirectory(dir: string): void {
 	const fd = openSync(dir, constants.O_RDONLY | constants.O_NOFOLLOW);

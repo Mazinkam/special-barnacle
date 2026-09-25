@@ -177,7 +177,7 @@ const PYTHON_EXTRA_ENV = {
 // regex as the Python side (`orchestrator/contract.json`'s `redaction_regex._todo`
 // explains why); this side reads its own key from the shared contract.
 const PATH_RE = new RegExp(contract.redaction_regex.ts, "g");
-function redactPaths(text: string): string {
+export function redactPaths(text: string): string {
 	return text.replace(PATH_RE, "<path>");
 }
 const PROFILES_PATH =

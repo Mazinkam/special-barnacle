@@ -26,6 +26,11 @@ AGENTS_DST="$TARGET_DIR/agents"
 PROFILES_SRC="$BRIDGE_DIR/orchestrator-profiles.json"
 PROFILES_DST="$TARGET_DIR/orchestrator-profiles.json"
 
+# Default state root: kept in sync with `orchestrator/contract.json`'s `state_root.default`
+# (`~/.local/state/coding-agent-orchestrator`) by a parity test
+# (`tests/test_contract.py::test_install_sh_default_state_root_matches_contract`), not by a
+# shared import (this is a shell script). Behaviour intentionally unchanged by B1: update both
+# places by hand if the default ever moves.
 STATE_ROOT="${HUMAIN_ORCHESTRATOR_STATE_ROOT:-$HOME/.local/state/coding-agent-orchestrator}"
 PYTHON_BIN="${HUMAIN_ORCHESTRATOR_PYTHON:-$(command -v python3 || echo python3)}"
 LAUNCHD_LABEL="com.humain.orchestrator-ingest"

@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 from .runtime import EventStore, write_json, read_json, utc_now, writer_lock, iter_jsonl_from, tail_fingerprint
+from .contract import STREAMS
 from .record_index import discard as discard_record_index
 
 LEDGER_FILE='ledger.json'
@@ -84,7 +85,7 @@ def _replay_into(state:dict[str,Any], events:Path, offset:int, replayed:int, see
     return offset,replayed
 
 def _publish(root:Path, state:dict[str,Any], offset:int, replayed:int)->dict[str,Any]:
-    state['checkpoint']=_checkpoint(root/'events.jsonl',offset,replayed)
+    state['checkpoint']=_checkpoint(root/STREAMS['event'],offset,replayed)
     write_json(root/LEDGER_FILE,state); return state
 
 def replay_ledger(root: str|Path, *, full:bool=False)->dict[str,Any]:
@@ -95,7 +96,7 @@ def replay_ledger(root: str|Path, *, full:bool=False)->dict[str,Any]:
     `full=True`) the whole stream is replayed. Full replay also collapses repeated `record_id`s,
     which is how duplicates that bypassed append-time deduplication are recovered.
     """
-    root=Path(root); events=root/'events.jsonl'
+    root=Path(root); events=root/STREAMS['event']
     if not full:
         ledger=read_json(root/LEDGER_FILE,None); ck=_resumable_checkpoint(ledger,events)
         if ck is not None:
@@ -113,7 +114,7 @@ def ledger_is_current(root: str|Path, events_offset:int)->bool:
     verifying the offset still lands on a line boundary of the current file. A missing, legacy or
     stale ledger, or one whose prefix was repaired/extended by another writer, is not current.
     """
-    root=Path(root); ck=_resumable_checkpoint(read_json(root/LEDGER_FILE,None),root/'events.jsonl')
+    root=Path(root); ck=_resumable_checkpoint(read_json(root/LEDGER_FILE,None),root/STREAMS['event'])
     return ck is not None and ck['events_offset']==events_offset
 
 def rebuild(root: str|Path|None=None)->dict[str,Any]:

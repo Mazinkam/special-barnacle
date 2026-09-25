@@ -137,8 +137,10 @@ const RETRY_BACKOFF_MS = 250;
 /** Failed records retained for inspection; beyond this only the count grows. */
 const MAX_RETAINED_FAILURES = 500;
 
-const EXIT_OK = contract.batch.exit_codes.ok;
-const EXIT_INVALID = contract.batch.exit_codes.invalid;
+export const EXIT_OK = contract.batch.exit_codes.ok;
+export const EXIT_INVALID = contract.batch.exit_codes.invalid;
+/** Body status the CLI prints for exit `EXIT_INVALID` when nothing was written. */
+export const STATUS_INVALID: string = contract.batch.statuses.invalid;
 /** Body statuses that mean "rows durable, derived views not refreshed" (exit 3). */
 const DURABLE_STATUSES = new Set([contract.batch.statuses.refresh_failed, contract.batch.statuses.checkpoint_failed]);
 
@@ -314,7 +316,7 @@ export class RecordQueue {
 			// Only a structured verdict from the CLI is a validation failure. A bare exit 1 with
 			// no body means the interpreter never reached the CLI (import error, OOM, SIGPIPE):
 			// transient, so it is replayed whole below instead of fanning out one spawn per record.
-			if (result.exitCode === EXIT_INVALID && body?.status === "invalid") {
+			if (result.exitCode === EXIT_INVALID && body?.status === STATUS_INVALID) {
 				// Nothing was written. Isolate the bad record so the rest of the batch still lands.
 				if (batch.length > 1) {
 					for (const record of batch) await this.sendWithRetry([record]);

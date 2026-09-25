@@ -4,7 +4,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import contract from "./contract.json";
-import { PYTHON_MAX_BATCH_RECORDS, STREAMS } from "./record-queue.ts";
+import { EXIT_INVALID, EXIT_OK, PYTHON_MAX_BATCH_RECORDS, STATUS_INVALID, STREAMS } from "./record-queue.ts";
+import { protectedNames } from "./run-diagnostics.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -68,5 +69,17 @@ describe("contract.json parity", () => {
 
 	test("max_record_id_length matches the documented Python limit", () => {
 		expect(contract.batch.max_record_id_length).toBe(200);
+	});
+
+	test("record-queue's exported exit codes and invalid status match the contract", () => {
+		// Consumer-level parity, not just the JSON: exercise record-queue's actual exported
+		// constants (the ones the retry/replay logic branches on), not a re-typed copy.
+		expect(EXIT_OK).toBe(contract.batch.exit_codes.ok);
+		expect(EXIT_INVALID).toBe(contract.batch.exit_codes.invalid);
+		expect(STATUS_INVALID).toBe(contract.batch.statuses.invalid);
+	});
+
+	test("run-diagnostics' protected file set equals contract.never_archive_files", () => {
+		expect([...protectedNames].sort()).toEqual([...contract.never_archive_files].sort());
 	});
 });

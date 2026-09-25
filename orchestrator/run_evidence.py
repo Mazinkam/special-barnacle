@@ -50,6 +50,8 @@ import json
 
 from . import records
 from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, has_reported_tokens, is_call_row, is_session_ingest, row_cost, unique_records
+#: `run_evidence.py`'s historical `_parse_ts`: falsy guard, then `str()` coercion —
+#: `vocab.parse_iso_ts`'s default (`coerce_str=True`) reproduces this exactly.
 from .vocab import parse_iso_ts as _parse_ts
 
 ACTUAL = 'actual'
