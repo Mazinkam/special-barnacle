@@ -48,9 +48,6 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-// TypeBox 1.x: `Type` is a namespace (`Type.Object`, `Type.Array`, ...);
-// the validation function moved to a separate `typebox/value` module.
-import { Type } from "typebox";
 
 import {
 	type ExtensionAPI,
@@ -123,7 +120,7 @@ import { type FlushReport, type QueueStats } from "./record-queue.ts";
 // time, so a planned recon task still needs no conversion step.
 import { formatReconEvidence, planReconTasks } from "./recon.ts";
 import { createPythonCli } from "./adapters/python-cli.ts";
-import { installDispatchReaper, reapOrphanedPersonaDirs } from "./adapters/process-reaper.ts";
+import { reapOrphanedPersonaDirs } from "./adapters/process-reaper.ts";
 import { createTelemetry } from "./adapters/telemetry.ts";
 import {
 	type Adapter,
@@ -144,7 +141,6 @@ import {
 	gitHead,
 	looksLikeFilePath,
 } from "./adapters/git-changes.ts";
-import contract from "./contract.json";
 
 // Pure logic split out of this file per docs/architecture-review.md B4.1.
 // `core/*` never imports this module and never reads `process.env`; every
@@ -194,6 +190,15 @@ import {
 	runVerification as runVerificationCore,
 	type VerificationResult,
 } from "./pipeline/verify-loop.ts";
+import { registerOrchestratorStatusTool } from "./tools/status.ts";
+import {
+	installSessionIngest,
+	recordHookFailure,
+	redactPaths,
+	registerSessionIngestHooks,
+} from "./hooks/ingest.ts";
+import { installShutdownHooks } from "./hooks/shutdown.ts";
+export { recordHookFailure, redactPaths, registerSessionIngestHooks };
 export { qaVerificationOutcomeFor };
 export type { VerificationResult };
 export { collectBilledResults, summarizeReconWorkers };
@@ -259,15 +264,8 @@ const {
  * older `orchestrator-adapter.json` is migrated into profile "default" on first
  * load and then ignored.
  */
-// Match absolute paths under common user homes so the bounded Status Contract
-// `error` field never leaks filesystem locations. Mirrors the redaction the
-// Python CLI applies when writing `ingest_status.json`. Deliberately not the same
-// regex as the Python side (`orchestrator/contract.json`'s `redaction_regex._todo`
-// explains why); this side reads its own key from the shared contract.
-const PATH_RE = new RegExp(contract.redaction_regex.ts, "g");
-export function redactPaths(text: string): string {
-	return text.replace(PATH_RE, "<path>");
-}
+// redactPaths moved to hooks/ingest.ts (B4.6; its only caller, recordHookFailure,
+// moved with it); imported below.
 
 /**
  * The profiles shipped with the skill (`bridge/orchestrator-profiles.json`).
@@ -563,32 +561,7 @@ export const runRegistry = new RunRegistry<RunSession>();
 
 // formatOrchestratorStatus moved to run/board.ts (pure; B4.6); imported above.
 
-export function registerOrchestratorStatusTool(pi: ExtensionAPI): void {
-	const parameters = Type.Object({
-		logLines: Type.Optional(Type.Number({ description: "Number of trailing run.log lines to include (clamped to 1..200; default 20)." })),
-	});
-	pi.registerTool({
-		name: "orchestrator_status",
-		label: "Orchestrator Status",
-		description:
-			"Read-only status of the current /orchestrate run, if any: phase, elapsed time, total cost, " +
-			"per-dispatch progress (model, status, turns, last tool call, cost), and recent run.log lines. " +
-			"Does not affect the run.",
-		promptSnippet: "orchestrator_status: check progress of a live /orchestrate run without blocking on it",
-		parameters,
-		async execute(_toolCallId, params) {
-			const active = runRegistry.active();
-			if (!active) {
-				return { content: [{ type: "text", text: "No orchestrator run is active." }], details: undefined };
-			}
-			const snapshot = active.session.statusSnapshot(params.logLines ?? 20);
-			return {
-				content: [{ type: "text", text: formatOrchestratorStatus(snapshot) }],
-				details: snapshot,
-			};
-		},
-	});
-}
+// registerOrchestratorStatusTool moved to tools/status.ts (B4.6); imported below.
 
 // ChildSpawner / StderrTarget / reserveFallbackName / openStderrTarget moved
 // to dispatch/child-process.ts (B4.5 step 5), runSubagentProcess's only
@@ -1134,142 +1107,11 @@ const MODELS_USAGE = [
 // Automatic session-usage ingestion (hooks)
 // -----------------------------------------------------------------------------
 
-/**
- * Ingest this session's usage into the ledger after every settled turn and on
- * shutdown. Runs `orchestrator.cli ingest <sessionFile> --granularity session`,
- * whose rows are deltas against what is already recorded, so it is safe to run
- * as often as we like and alongside the launchd sweep (install.sh).
- */
-export function recordHookFailure(stateRoot: string, detail: string): void {
-	const root = stateRoot.replace(/^~/, homedir());
-	const statusPath = join(root, contract.ingest_status_file);
-	const temporaryPath = `${statusPath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
-	try {
-		let previous: Record<string, unknown> = {};
-		try {
-			const parsed: unknown = JSON.parse(readFileSync(statusPath, "utf-8"));
-			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-				previous = parsed as Record<string, unknown>;
-			}
-		} catch {
-			// A missing or malformed prior status must not prevent reporting failure.
-		}
-		const safeDetail = redactPaths(String(detail))
-			.replace(/[\u0000-\u001f\u007f]+/g, " ")
-			.trim()
-			.slice(0, 240);
-		const emptyExitDetail = /exit \d+:\s*(.*)$/.exec(safeDetail);
-		const previousError = typeof previous.error === "string"
-			? redactPaths(previous.error)
-					.replace(/[\u0000-\u001f\u007f]+/g, " ")
-					.trim()
-					.slice(0, 240)
-			: "";
-		const error = emptyExitDetail && !emptyExitDetail[1].trim()
-			? previousError || safeDetail || "session ingest failed"
-			: safeDetail || previousError || "session ingest failed";
-		const failureCount = previous.failure_count;
-		const status = {
-			...previous,
-			version: 1,
-			last_attempt_at: new Date().toISOString(),
-			last_success_at: previous.last_success_at ?? null,
-			status: "error",
-			files_scanned: typeof previous.files_scanned === "number" ? previous.files_scanned : 1,
-			emitted: typeof previous.emitted === "number" ? previous.emitted : 0,
-			failure_count: typeof failureCount === "number" && Number.isFinite(failureCount) ? failureCount + 1 : 1,
-			error,
-			sweep_interval_seconds:
-				typeof previous.sweep_interval_seconds === "number" ? previous.sweep_interval_seconds : 900,
-		};
-		mkdirSync(root, { recursive: true });
-		writeFileSync(temporaryPath, `${JSON.stringify(status, null, 2)}\n`, { mode: 0o600 });
-		renameSync(temporaryPath, statusPath);
-	} catch {
-		// Status reporting is best-effort and must never interrupt a terminal session.
-	} finally {
-		try {
-			rmSync(temporaryPath, { force: true });
-		} catch {
-			// Ignore temporary-file cleanup failures.
-		}
-	}
-}
+// redactPaths, recordHookFailure, registerSessionIngestHooks and
+// installSessionIngest moved to hooks/ingest.ts (B4.6); imported below.
 
-/** Register the settled fast path and an awaited, bounded shutdown flush. */
-export function registerSessionIngestHooks(
-	host: Pick<ExtensionAPI, "on">,
-	scheduler: Pick<SessionIngestScheduler, "schedule" | "flush">,
-	onError: (message: string) => void = () => {},
-): void {
-	host.on("agent_settled", async (_event, ctx) => {
-		scheduler.schedule(ctx.sessionManager.getSessionFile());
-	});
-	host.on("session_shutdown", async (_event, ctx) => {
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		try {
-			const done = await Promise.race([
-				scheduler.flush(ctx.sessionManager.getSessionFile()).then(() => true),
-				new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 2000); }),
-			]);
-			if (!done) onError("shutdown ingestion timed out; retry the session import to refresh durable usage");
-		} finally { if (timer !== undefined) clearTimeout(timer); }
-	});
-}
-
-function installSessionIngest(pi: ExtensionAPI): void {
-	const stateRoot = STATE_ROOT.replace(/^~/, homedir());
-	const logPath = join(stateRoot, "ingest-hook.log");
-	const logError = (message: string) => {
-		try {
-			mkdirSync(dirname(logPath), { recursive: true });
-			appendFileSync(logPath, `${new Date().toISOString()} ${message}\n`);
-		} catch {
-			// Telemetry must never break the session.
-		}
-	};
-	const onError = (message: string) => {
-		logError(message);
-		recordHookFailure(stateRoot, message);
-	};
-	const scheduler = new SessionIngestScheduler({
-		onError,
-		run: async (sessionFile) => {
-			const res = await runModule("orchestrator.cli", ingestArgs(sessionFile));
-			if (res.exitCode === 0) return { ok: true };
-			return { ok: false, detail: `exit ${res.exitCode}: ${res.stderr.trim().split("\n").slice(-3).join(" | ")}` };
-		},
-	});
-	registerSessionIngestHooks(pi, scheduler, onError);
-}
-
-/**
- * Drain batched telemetry when the session ends, so records still inside the
- * coalescing window (a run that was cancelled by quitting, a plan that was just
- * confirmed) are durable before HT exits. Idempotent: flushing an empty queue is a no-op.
- */
-function installTelemetryDrain(pi: ExtensionAPI): void {
-	pi.on("session_shutdown", async () => {
-		// Wiring code with no context of its own to thread through (B4.4): this
-		// hook fires whenever the session ends, regardless of which run (if any)
-		// is live, so `runRegistry.active()` is the natural read here.
-		const session = runRegistry.active()?.session ?? null;
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		session?.cancel("shutdown");
-		try {
-			const drained = await Promise.race([
-				(async () => { await (session?.runPromise ?? session?.finished); await recordQueue.flush(); return true; })(),
-				new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 2000); }),
-			]);
-			if (!drained) {
-				// Do not pretend the terminal cost is complete or archive-safe on expiry.
-				session?.close();
-				if (session) void session.sealDiagnostics(Promise.resolve(false));
-				console.warn("[orchestrator] shutdown drain timed out; late telemetry is unacknowledged, diagnostics remain UNSEALED");
-			}
-		} finally { if (timer !== undefined) clearTimeout(timer); }
-	});
-}
+// installTelemetryDrain moved to hooks/shutdown.ts (B4.6), alongside the
+// signal-driven dispatch reaper; imported below as installShutdownHooks.
 
 /**
  * Post a run's terminal outcome to the chat as a custom message, so the user sees it
@@ -1296,23 +1138,13 @@ function postRunMessage(
 
 export default function (pi: ExtensionAPI) {
 	reapOrphanedPersonaDirs({ tmpRoot: tmpdir(), prefix: PERSONA_TMP_PREFIX, ttlMs: PERSONA_TMP_TTL_MS });
-	installDispatchReaper({
+	installShutdownHooks(pi, {
 		liveDispatchPids,
-		onSignal: () => {
-			runRegistry.active()?.session.cancel("signal");
-		},
-		// Best effort only. A signal handler cannot await, so this merely *starts* a drain of
-		// records still inside the coalescing window; whether the Python child gets to run
-		// before HT exits depends on HT's own shutdown sequencing. Anything it does not
-		// reach is lost with the process. The guaranteed drains are the awaited ones: the
-		// run's terminal path (complete/fail/cancel/crash) and the `session_shutdown` hook.
-		flush: () => {
-			void recordQueue.flush();
-		},
+		activeSession: () => runRegistry.active()?.session ?? null,
+		flush: () => recordQueue.flush(),
 	});
-	installTelemetryDrain(pi);
-	installSessionIngest(pi);
-	registerOrchestratorStatusTool(pi);
+	installSessionIngest(pi, STATE_ROOT, runModule);
+	registerOrchestratorStatusTool(pi, runRegistry);
 
 	pi.registerCommand("orchestrate", {
 		description:
