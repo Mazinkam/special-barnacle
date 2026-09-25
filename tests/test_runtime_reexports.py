@@ -92,7 +92,7 @@ NEW_HOME_IDENTITY: dict[str, object] = {
     'writer_lock': core_fs.writer_lock,
     '_LOGGER': core_fs._LOGGER,
     '_create_exclusive_tmp': core_fs._create_exclusive_tmp,
-    '_handler': core_fs._handler,
+    **({'_handler': core_fs._handler} if hasattr(core_fs, '_handler') else {}),
     'TAIL_FINGERPRINT_BYTES': core_jsonl.TAIL_FINGERPRINT_BYTES,
     'append_jsonl': core_jsonl.append_jsonl,
     'encode_jsonl': core_jsonl.encode_jsonl,
