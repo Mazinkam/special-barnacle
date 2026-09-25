@@ -108,6 +108,16 @@ def _resolve_relative(dotted_name: str, is_package: bool, level: int, module: st
     return prefix
 
 
+def _known_orchestrator_modules() -> set[str]:
+    """Every dotted module name that actually exists under `orchestrator/` (packages and plain
+    modules), used to tell submodule imports (`from . import records_cmds`, `from .pkg import
+    sub`) apart from name imports (`from .pkg import some_function`)."""
+    return {_dotted_name(path) for path in ORCHESTRATOR_ROOT.rglob('*.py')}
+
+
+_KNOWN_ORCHESTRATOR_MODULES = _known_orchestrator_modules()
+
+
 def imported_modules(path: Path) -> set[str]:
     """Every `orchestrator.<x>` module `path` imports, at any nesting depth."""
     dotted_name = _dotted_name(path)
@@ -124,9 +134,16 @@ def imported_modules(path: Path) -> set[str]:
                     found.add(name[len('orchestrator.'):])
         elif isinstance(node, ast.ImportFrom):
             if node.level:  # relative import: `from . import x`, `from .x import y`, `from ..x import y`
-                target = _resolve_relative(dotted_name, is_package, node.level, node.module)
-                if target:
-                    found.add(target)
+                base = _resolve_relative(dotted_name, is_package, node.level, node.module)
+                for alias in node.names:
+                    # `from . import records_cmds` / `from .. import x` / `from .pkg import sub`:
+                    # if `<base>.<alias.name>` is itself a real module under `orchestrator/`, the
+                    # import reaches into that submodule specifically, not just `base` as a whole.
+                    candidate = f'{base}.{alias.name}' if base else alias.name
+                    if candidate in _KNOWN_ORCHESTRATOR_MODULES:
+                        found.add(candidate)
+                    elif base:
+                        found.add(base)
             elif node.module == 'orchestrator':
                 for alias in node.names:
                     found.add(alias.name)
@@ -205,6 +222,41 @@ class LayerTests(unittest.TestCase):
             if isinstance(node, (ast.Import, ast.ImportFrom)) and id(node) not in module_level_imports:
                 self.fail(f'runtime.py has a non-module-level import at line {node.lineno}: '
                          f'{ast.dump(node)}')
+
+
+class ImportedModulesSubmoduleResolutionTests(unittest.TestCase):
+    """`from . import x` / `from .. import x` / `from .pkg import x` must resolve to the specific
+    submodule `x` when it is one, not just to the enclosing package (regression for B3 review)."""
+
+    def test_from_dot_import_submodule_resolves_to_the_submodule(self):
+        # orchestrator/archive/__init__.py has `from . import codec as _codec` etc.
+        imports = imported_modules(ORCHESTRATOR_ROOT / 'archive' / '__init__.py')
+        for submodule in ('archive.codec', 'archive.execute', 'archive.manifest', 'archive.plan',
+                          'archive.restore', 'archive.seal'):
+            self.assertIn(submodule, imports)
+
+    def test_from_dot_import_submodule_resolves_at_top_level_too(self):
+        # orchestrator/economics.py has `from . import method`; economics.py isn't a package, so
+        # the enclosing "package" is the top-level orchestrator package itself (empty prefix).
+        imports = imported_modules(ORCHESTRATOR_ROOT / 'economics.py')
+        self.assertIn('method', imports)
+
+    def test_from_dot_dot_import_submodule_resolves_to_the_submodule(self):
+        # orchestrator/presentation/dashboard_data.py has `from .. import records`.
+        imports = imported_modules(ORCHESTRATOR_ROOT / 'presentation' / 'dashboard_data.py')
+        self.assertIn('records', imports)
+
+    def test_from_dot_pkg_import_submodule_resolves_to_the_submodule(self):
+        # orchestrator/ingest/service.py has `from . import checkpoint as ckpt`.
+        imports = imported_modules(ORCHESTRATOR_ROOT / 'ingest' / 'service.py')
+        self.assertIn('ingest.checkpoint', imports)
+
+    def test_from_dot_import_name_that_is_not_a_submodule_resolves_to_the_package(self):
+        # orchestrator/controls.py has `from .vocab import HIGH_RISK`; `HIGH_RISK` is a name in
+        # `vocab.py`, not a submodule of it, so the edge is to `vocab` itself.
+        imports = imported_modules(ORCHESTRATOR_ROOT / 'controls.py')
+        self.assertIn('vocab', imports)
+        self.assertNotIn('vocab.HIGH_RISK', imports)
 
 
 if __name__ == '__main__':
