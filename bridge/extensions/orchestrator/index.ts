@@ -198,6 +198,9 @@ import {
 	registerSessionIngestHooks,
 } from "./hooks/ingest.ts";
 import { installShutdownHooks } from "./hooks/shutdown.ts";
+import { registerOrchestrateCancelCommand } from "./commands/cancel.ts";
+import { registerOmsgCommand } from "./commands/omsg.ts";
+import { registerOrchestratorRoiCommand } from "./commands/roi.ts";
 export { recordHookFailure, redactPaths, registerSessionIngestHooks };
 export { qaVerificationOutcomeFor };
 export type { VerificationResult };
@@ -1785,19 +1788,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("orchestrate-cancel", {
-		description: "Cancel the currently running /orchestrate run, if any.",
-		handler: async (_args, ctx) => {
-			const active = runRegistry.active();
-			if (!active) {
-				ctx.ui.notify("no active run", "info");
-				return;
-			}
-			const runId = active.session.runId;
-			active.session.cancel("user");
-			ctx.ui.notify(`Cancelling orchestration ${runId}…`, "info");
-		},
-	});
+	registerOrchestrateCancelCommand(pi, runRegistry);
 
 	pi.registerCommand("orchestrator-models", {
 		description:
@@ -2007,53 +1998,12 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("orchestrator-roi", {
-		description: "Print the skill vs flat-baseline ROI report.",
-		handler: async (_args, ctx) => {
-			const result = await orchestratorPythonCli().run(join(expandedSkillRoot, "scripts/skill_vs_baseline.py"), [], {
-				cwd: expandedSkillRoot,
-			});
-			if (result.code !== 0) {
-				ctx.ui.notify(`ROI report failed: ${result.error ?? result.stderr}`, "error");
-				return;
-			}
-			ctx.ui.notify(result.stdout.split("\n").slice(0, 20).join("\n"), "info");
-		},
-	});
+	registerOrchestratorRoiCommand(pi, { cli: orchestratorPythonCli, skillRoot: expandedSkillRoot });
 
 	// Message inbound while a run is live — queued in RunSession and folded
 	// into the prompt of the next dispatched task. Cannot be injected into a
 	// running Pi subprocess (humain-terminal --mode json --no-session has no
 	// stdin channel), so delivery is at the next dispatch boundary.
-	pi.registerCommand("omsg", {
-		description:
-			"Send a message to the running orchestration (queued, delivered to the next dispatched task). " +
-			"Usage: /omsg <text> — the lead will see and respond to it. Use '\\n' for newlines if needed.",
-		handler: async (args, ctx) => {
-			const text = args.trim();
-			if (!text) {
-				ctx.ui.notify("Usage: /omsg <message>  (queues one message for the next dispatch)", "warning");
-				return;
-			}
-			const active = runRegistry.active();
-			if (!active) {
-				ctx.ui.notify(
-					"No orchestration is running. Start one with /orchestrate <goal> first — " +
-						"messages are only delivered to a live run.",
-					"warning",
-				);
-				return;
-			}
-			// Literal "\n" in the input becomes a real newline so multi-line
-			// instructions paste cleanly from shell history.
-			const normalized = text.replace(/\\n/g, "\n");
-			const depth = active.session.enqueueMessage(normalized);
-			const preview = normalized.length > 80 ? `${normalized.slice(0, 77)}…` : normalized;
-			ctx.ui.notify(
-				`Queued for next dispatch (depth=${depth}): “${preview}”`,
-				"info",
-			);
-		},
-	});
+	registerOmsgCommand(pi, runRegistry);
 }
 
