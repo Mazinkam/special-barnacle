@@ -199,7 +199,7 @@ def build_parser():
             'Legacy uncoordinated runs are snapshot-only (zero reclaimed bytes); managed unsealed runs are skipped.\n'
             'Retries validate/adopt matching orphan gzip files without overwrite. Prior manifest generations and unknown\n'
             'archives/temporary files are preserved for recovery. Storage reports include manifest overhead.\n\n'
-            'Never archived: active runs and runs without a durable run-complete/run-failed outcome in outcomes.jsonl,\n'
+            'Never archived: active runs and runs without a durable run-complete/run-failed/run-cancelled outcome in outcomes.jsonl,\n'
             'runs completed or modified inside the window, run.log (the progress-board timeline stays readable), and the\n'
             'authoritative streams events.jsonl / metrics.jsonl / outcomes.jsonl with their ledger/checkpoint/index metadata.\n'
             'Nothing is deleted by default and no retention timer exists; confirmed sealed raw files are replaced by\n'

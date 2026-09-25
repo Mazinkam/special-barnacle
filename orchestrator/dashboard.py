@@ -32,7 +32,8 @@ from typing import Any, Iterable
 from . import records
 from .economics import (ESTIMATED, REPORTED, UNMETERED, cost_attribution, cost_class,
                         cost_distribution, fanout_rework, is_call_row, is_session_ingest,
-                        orchestration_overhead, quantile, row_cost, unique_records, waste_cost)
+                        nested_reconciliation, orchestration_overhead, quantile, row_cost,
+                        unique_records, waste_cost)
 from .features import feature_inventory
 from .history import build_route_stats
 from .outcomes import outcome_summary
@@ -169,6 +170,36 @@ def _mirrors(cost: float, paired: float) -> bool:
     return abs(cost - paired) <= EXECUTED_MIRROR_TOLERANCE * max(cost, paired)
 
 
+#: When `cost_rate_source` was introduced (commit d57b327). A row recorded strictly before this
+#: instant could not possibly carry the field yet, so its absence is explained by age; a row
+#: recorded on or after it that still lacks the field is NOT explained by age (Phase 1 review
+#: finding T7 — the dashboard previously labelled every sourceless row "predates provenance
+#: tracking" regardless of when it was actually recorded).
+PROVENANCE_INTRODUCED_AT = datetime(2026, 9, 23, 18, 42, 5, tzinfo=timezone.utc)
+
+
+def _parse_row_ts(value: Any) -> datetime | None:
+    """A row's own `ts`, parsed defensively as an AWARE instant — `None` for anything absent,
+    malformed, or offset-naive (Phase 1 review B4).
+
+    An offset-naive ISO timestamp (no `Z`/`+HH:MM` suffix) is never guessed to be UTC: comparing it
+    against the aware `PROVENANCE_INTRODUCED_AT` would raise `TypeError` ("can't compare
+    offset-naive and offset-aware datetimes") and crash the whole dashboard build over ONE row.
+    Treating a naive `ts` as unknown — the same honesty rule this function already applies to an
+    absent or malformed one — means such a row reads as `source unknown`, never as
+    `predates provenance tracking` (a claim this function has no aware instant to justify).
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
 def _executed_spend(orchestrated: list[dict]) -> dict[str, Any]:
     """`route_executed.executed_cost_usd` — real spend that reads as `$0` to every cost field.
 
@@ -209,9 +240,17 @@ def _rate_provenance(metrics: Iterable[dict]) -> dict[str, Any]:
 
     Scope is *all* metric rows, orchestrated and ingested: the ingested side is where the dominant
     rate does most of its work, and splitting it out would hide the exposure.
+
+    `source_predates_provenance` (Phase 1 review finding T7) is `True` for a sourceless group ONLY
+    when every one of its rows carries a parseable `ts` strictly before `PROVENANCE_INTRODUCED_AT`
+    (commit d57b327) — the field genuinely could not have existed yet. A sourceless group with any
+    row timestamped on/after that commit, or with an unparseable/missing `ts`, gets `False`: the
+    renderer must not assume "predates provenance tracking" as a default explanation for every
+    absence, only for the rows that can actually be shown to predate it (the label was previously
+    applied to ANY group lacking `cost_rate_source`, whatever its age).
     """
     by_model: defaultdict[str, dict[str, Any]] = defaultdict(
-        lambda: {'rows': 0, 'cost': 0.0, 'source': None, 'verified_on': None})
+        lambda: {'rows': 0, 'cost': 0.0, 'source': None, 'verified_on': None, '_max_ts': None, '_ts_unknown': False})
     verified_rows = 0
     for row in metrics:
         if cost_class(row) != ESTIMATED:
@@ -226,8 +265,17 @@ def _rate_provenance(metrics: Iterable[dict]) -> dict[str, Any]:
         if verified_on:
             entry['verified_on'] = str(verified_on)
             verified_rows += 1
-    models = sorted(({'model': name, **entry} for name, entry in by_model.items()),
-                    key=lambda m: -m['cost'])
+        ts = _parse_row_ts(row.get('ts'))
+        if ts is None:
+            entry['_ts_unknown'] = True
+        elif entry['_max_ts'] is None or ts > entry['_max_ts']:
+            entry['_max_ts'] = ts
+    models = sorted(
+        ({'model': name, 'rows': e['rows'], 'cost': e['cost'], 'source': e['source'], 'verified_on': e['verified_on'],
+          'source_predates_provenance': (not e['source']) and (not e['_ts_unknown']) and e['_max_ts'] is not None
+          and e['_max_ts'] < PROVENANCE_INTRODUCED_AT}
+         for name, e in by_model.items()),
+        key=lambda m: -m['cost'])
     dominant = models[0] if models else None
     return {
         'scope': 'all metric rows (orchestrated + ingested)',
@@ -496,6 +544,16 @@ def build_data(root: Path, config: dict | None = None):
 
     rate_provenance = _rate_provenance(metric_rows())
     interactive_sessions['sessions'] = len(session_ids) if session_ids else NO_DATA
+    # One residual `model_call` row per `dispatch_finished` whose `nested_cost_usd` aggregate has
+    # no matching per-task detail rows (see `economics.nested_reconciliation`). Injected exactly
+    # once, here, before ANY reducer below reads `orchestrated` — `verified_cost`, `by_role`,
+    # `by_runtime`, `cost_attribution`, `orchestration_overhead`/`coordination_rate` and
+    # `run_evidence.summarize_runs` (called later with this same list) all pick it up for free,
+    # and none of them re-derives it, so the aggregate is booked exactly once. `ambiguous` cases
+    # (Phase 1 review T3: the claimed detail-row count is durable but the dollars still don't
+    # reconcile) are never added to any total — they are only counted, in `summary`, below.
+    nested = nested_reconciliation(run_events, orchestrated)
+    orchestrated.extend(nested['rows'])
     total = sum(row_cost(r) for r in orchestrated)
     waste = waste_cost(orchestrated)
     attribution = cost_attribution(orchestrated)
@@ -615,6 +673,19 @@ def build_data(root: Path, config: dict | None = None):
         'duration_coverage': run_cov['duration_coverage'],
         'verification_coverage': run_cov['verification_coverage'],
         'cost_provenance': run_cov['cost_provenance'],
+        # Factual verification evidence coverage (Phase 1 item 5): share of runs whose QA gate
+        # row carries a tested revision / structured check commands / a review verdict / an
+        # explicit unavailable-checks list, out of ALL runs, not just runs that were verified.
+        # `check_commands_coverage` is expected to read 0% until the QA output format itself
+        # gains a structured command field — a known, explained gap, not a bug.
+        'runs_with_verification_evidence': run_cov['runs_with_verification_evidence'],
+        'runs_with_tested_revision': run_cov['runs_with_tested_revision'],
+        'runs_with_check_commands': run_cov['runs_with_check_commands'],
+        'runs_with_review_verdict': run_cov['runs_with_review_verdict'],
+        'runs_with_unavailable_checks_listed': run_cov['runs_with_unavailable_checks_listed'],
+        'tested_revision_coverage': run_cov['tested_revision_coverage'],
+        'check_commands_coverage': run_cov['check_commands_coverage'],
+        'review_verdict_coverage': run_cov['review_verdict_coverage'],
         # Attested verifications only — a dispatch `result: 'pass'` is a process exit code, not a
         # gate outcome, and counting it here reported 174 verified tasks for 18 real ones.
         # `dispatch_pass_tasks` carries that weaker signal under its own name so both are visible and
@@ -643,6 +714,11 @@ def build_data(root: Path, config: dict | None = None):
         'fanout_rework': fanout_rework(run_events),
         # The bridge emits this event whenever a cap is crossed, so absence is a measured 0.
         'spend_cap_breaches': spend_caps['breaches'],
+        # Phase 1 review T3: `dispatch_finished` events whose `nested_cost_usd` aggregate is not
+        # explained by durable detail rows AND whose own `nested_rows_emitted` claim is already
+        # fully satisfied by what IS durable — an unexplained mismatch, never guessed into a
+        # residual. A real 0 when reconciliation found nothing to flag; never silently dropped.
+        'nested_reconciliation_ambiguous': nested['ambiguous_count'],
         'context_miss_rate': records.ratio(context_misses, context_packets),
         # A genuine 0 stays 0; with no producer for merge-conflict events at all, the absence is
         # reported as absence and the renderer labels it `not instrumented`.
@@ -721,6 +797,9 @@ def build_data(root: Path, config: dict | None = None):
             'run_evidence': run_cov, 'runs': runs[-RECENT_RUNS:],
             'lead_sizes': _lead_sizes(orchestrated, runs),
             'spend_caps': spend_caps,
+            # Phase 1 review T3: dispatch-level nested-cost mismatches reconciliation could not
+            # explain from durable evidence — never added to any total, kept visible here instead.
+            'nested_reconciliation_ambiguous': nested['ambiguous'],
             # flaky_stats only matches rows with event=='verification_result'; session-ingest rows
             # are event=='model_call' and never contribute, but we pass `orchestrated` for
             # consistency with the rest of this function's inputs.
@@ -769,7 +848,7 @@ const S=D.summary;const X=S.executed_spend||{};const RP=S.rate_provenance||{};
 // orchestrated spend, including coordination, review, waste, and tasks that were neither verified
 // nor passed); they differ only in denominator. Labels below say "total spend per", not "cost of",
 // so neither reads as an isolated unit-economics figure, and the explainer card repeats the fact.
-const cards=[['Total spend (incl. session aggregates)',m$('total_cost',S.total_cost)],['Provider-reported spend',m$('reported_cost',S.reported_cost)],['Estimated spend (orchestrated rows only, unverified rates)',m$('estimated_cost',S.estimated_cost)],['Unverified-rate exposure — ALL rows incl. ingested (see <a href="#rate-provenance">rate provenance</a> below)','<span class="warn">'+m$('rate_provenance',RP.unverified_rate_cost)+'</span>'],['Unmetered call rows',n$('unmetered_calls',S.unmetered_calls)+' of '+n$('call_rows',S.call_rows)],['Covered calls (rows × covers_calls; legacy session rows count as 1)',n$('covered_calls',S.covered_calls)],['Cost coverage',p$('cost_coverage',S.cost_coverage)],['Fully priced runs',n$('runs_fully_priced',S.runs_fully_priced)+' of '+n$('runs',S.runs)],['Runs with elapsed time',n$('runs_with_elapsed',S.runs_with_elapsed)+' of '+n$('runs',S.runs)],['Verified tasks (attested verdict)',n$('verified_tasks',S.verified_tasks)],['Total spend per attested-verified task (not an isolated unit cost)',m$('verified_cost',S.verified_cost)],['Dispatch passes (exit 0 — NOT gate-verified)',n$('dispatch_pass_tasks',S.dispatch_pass_tasks)],['Total spend per dispatch pass (not an isolated unit cost)',m$('dispatch_pass_cost',S.dispatch_pass_cost)],['Waste rate',p$('waste_rate',S.waste_rate)],['Coordination overhead',p$('coordination_rate',S.coordination_rate)],['Verification spend',p$('verification_rate',S.verification_rate)],['Bridge-executed spend',m$('executed_spend',X.cost)],['30d delayed failure',p$('stable_30d_failure_rate',S.stable_30d_failure_rate)],['p99/p50 tail ratio (per-call rows)',fmt('tail_ratio',S.tail_ratio,times)],['Adaptive decisions',n$('adaptive_decisions',S.adaptive_decisions)]];
+const cards=[['Total spend (incl. session aggregates)',m$('total_cost',S.total_cost)],['Provider-reported spend',m$('reported_cost',S.reported_cost)],['Estimated spend (orchestrated rows only, unverified rates)',m$('estimated_cost',S.estimated_cost)],['Unverified-rate exposure — ALL rows incl. ingested (see <a href="#rate-provenance">rate provenance</a> below)','<span class="warn">'+m$('rate_provenance',RP.unverified_rate_cost)+'</span>'],['Unmetered call rows',n$('unmetered_calls',S.unmetered_calls)+' of '+n$('call_rows',S.call_rows)],['Covered calls (rows × covers_calls; legacy session rows count as 1)',n$('covered_calls',S.covered_calls)],['Cost coverage',p$('cost_coverage',S.cost_coverage)],['Fully priced runs',n$('runs_fully_priced',S.runs_fully_priced)+' of '+n$('runs',S.runs)],['Runs with elapsed time',n$('runs_with_elapsed',S.runs_with_elapsed)+' of '+n$('runs',S.runs)],['Runs with a tested revision on record',n$('runs_with_tested_revision',S.runs_with_tested_revision)+' of '+n$('runs',S.runs)+' ('+p$('tested_revision_coverage',S.tested_revision_coverage)+')'],['Runs with a structured check-commands record',n$('runs_with_check_commands',S.runs_with_check_commands)+' of '+n$('runs',S.runs)+' ('+p$('check_commands_coverage',S.check_commands_coverage)+') — QA output has no structured command field yet'],['Runs with a review verdict on record',n$('runs_with_review_verdict',S.runs_with_review_verdict)+' of '+n$('runs',S.runs)+' ('+p$('review_verdict_coverage',S.review_verdict_coverage)+')'],['Verified tasks (attested verdict)',n$('verified_tasks',S.verified_tasks)],['Total spend per attested-verified task (not an isolated unit cost)',m$('verified_cost',S.verified_cost)],['Dispatch passes (exit 0 — NOT gate-verified)',n$('dispatch_pass_tasks',S.dispatch_pass_tasks)],['Total spend per dispatch pass (not an isolated unit cost)',m$('dispatch_pass_cost',S.dispatch_pass_cost)],['Waste rate',p$('waste_rate',S.waste_rate)],['Coordination overhead',p$('coordination_rate',S.coordination_rate)],['Verification spend',p$('verification_rate',S.verification_rate)],['Bridge-executed spend',m$('executed_spend',X.cost)],['30d delayed failure',p$('stable_30d_failure_rate',S.stable_30d_failure_rate)],['p99/p50 tail ratio (per-call rows)',fmt('tail_ratio',S.tail_ratio,times)],['Adaptive decisions',n$('adaptive_decisions',S.adaptive_decisions)]];
 $('#cards').innerHTML=cards.map(x=>`<div class="card"><div class="k">${x[0]}</div><div class="v">${x[1]}</div></div>`).join('')+`<div class="card" style="grid-column:1/-1"><div class="k">What “verified” counts here</div><div class="small"><b>Verified tasks</b> counts only tasks with an <b>attested verdict</b> — an emitted <code>task_verified</code>/<code>task_failed</code> event, or a verdict field in <code>outcomes.jsonl</code>. <b>Dispatch passes</b> counts tasks whose only evidence is <code>result: 'pass'</code> on a <code>model_call</code> row, which means <em>the dispatched subprocess exited 0</em> — not that the work cleared its quality gates. The two are disjoint (a task with both counts once, as attested) and are never pooled: pooling them reported ${nz(S.verified_tasks)}+${nz(S.dispatch_pass_tasks)} tasks as “verified”. A dispatch pass is real evidence, but it is weaker evidence, so cost-per-verified-task is ${m$('verified_cost',S.verified_cost)} and is reported as unknown rather than falling back to cost-per-dispatch-pass when nothing is attested. <b>Both “total spend per…” figures divide the exact same numerator</b> — ${m$('total_cost',S.total_cost)} of total orchestrated spend, which includes coordination, review, waste, and work on tasks that were neither verified nor passed — by two different denominators (${nz(S.verified_tasks)} attested-verified tasks vs. ${nz(S.dispatch_pass_tasks)} dispatch passes). Neither is a per-task unit cost for the verified or passed work itself; both are spend-efficiency ratios over the whole workload.</div></div>`;
 $('#statsNote').innerHTML=`Per-call statistics (p50/p90/p99, mean, max, tail ratio) use ${nz(S.per_call_samples)} cost-bearing per-call rows totalling ${m$('per_call_cost',S.per_call_cost)}; ${nz(S.session_rows)} whole-session aggregate rows holding ${m$('session_cost',S.session_cost)} are excluded from them but included in total spend. A tail ratio needs at least ${nz(S.tail_ratio_min_samples)} per-call samples and a non-zero p50, otherwise it is reported as unknown. Median call ${m$('p50_cost',S.p50_cost)} · p90 ${m$('p90_cost',S.p90_cost)} · p99 ${m$('p99_cost',S.p99_cost)} · max ${m$('max_call_cost',S.max_call_cost)}. Bridge dispatches also record ${m$('executed_spend',X.cost)} of <code>executed_cost_usd</code> across ${nz(X.rows)} <code>route_executed</code> rows${X.mirrors_model_call_cost?' — matching, to within 1%, the <code>model_call</code> spend of the same runtimes ('+m$('executed_spend',X.model_call_cost_same_runtimes)+'), i.e. two rows per dispatch':' (the <code>model_call</code> spend of the same runtimes is '+m$('executed_spend',X.model_call_cost_same_runtimes)+')'}; it is not added into total spend (different field), and those rows contribute no per-call cost sample.`;
 // `S.covered_calls` (`attribution['covered_calls']`) equals `S.call_rows` for this stream because
@@ -777,7 +856,7 @@ $('#statsNote').innerHTML=`Per-call statistics (p50/p90/p99, mean, max, tail rat
 // undercount, not a measured 1 — which is why the card above states that caveat instead of a bare number.
 const ah=[['History sufficient',p$('history_sufficient_rate',S.history_sufficient_rate)],['Observed exploration',p$('exploration_rate_observed',S.exploration_rate_observed)],['Recommend only',n$('adaptive_decisions',(S.adaptive_action_counts||{}).recommended_only)],['Empirical enforced',n$('adaptive_decisions',(S.adaptive_action_counts||{}).empirical_enforced)],['Static/fallback',S.adaptive_decisions?nz(n0((S.adaptive_action_counts||{}).static_default)+n0((S.adaptive_action_counts||{}).fallback_insufficient_history)):'—']];$('#adaptiveHealth').innerHTML=ah.map(x=>`<div class="risk"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
 const risks=[['Fan-out rework multiplier',fmt('fanout_rework',S.fanout_rework,mult)],['Context packet miss rate',p$('context_miss_rate',S.context_miss_rate)],['Merge/conflict events',n$('conflicts',S.conflicts)],['Shadow false-pass rate',p$('shadow_false_pass_rate',S.shadow_false_pass_rate)],['Shadow over-rejection',p$('shadow_over_reject_rate',S.shadow_over_reject_rate)],['Review wait p90',fmt('review_wait_p90_s',S.review_wait_p90_s,secs)],['p99 per-call cost',m$('p99_cost',S.p99_cost)],['Spend-cap breaches',S.spend_cap_breaches?'<span class="warn">'+nz(S.spend_cap_breaches)+'</span>':'0']];$('#risk').innerHTML=risks.map(x=>`<div class="risk"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
-$('#rates').innerHTML=`<div class="small">Estimated spend is arithmetic over rate-table entries in <code>config.json</code>; none is provider-confirmed unless a row carries <code>cost_rate_verified_on</code>. Scope: ${esc(RP.scope||'')}. Dominant rate model <b>${esc(RP.dominant_model??'—')}</b> on ${n$('rate_provenance',RP.dominant_rows)} priced rows (${m$('rate_provenance',RP.dominant_cost)} of ${m$('rate_provenance',RP.estimated_cost)} estimated). Rows with a verified rate: ${nz(RP.verified_rate_rows)} of ${nz(RP.rate_rows)}; ${m$('rate_provenance',RP.unverified_rate_cost)} rests on unverified rates.</div><div class="scroll"><table><thead><tr><th>Rate model</th><th>Priced rows</th><th>Estimated cost</th><th>Rate source</th><th>Verified on</th></tr></thead><tbody>`+(RP.models||[]).map(r=>`<tr><td><code>${esc(r.model)}</code></td><td>${nz(r.rows)}</td><td>${m$('rate_provenance',r.cost)}</td><td>${r.source?esc(r.source):'<span class="pill off">unstated</span>'}</td><td>${r.verified_on?esc(r.verified_on):'<span class="pill warn">unverified</span>'}</td></tr>`).join('')+'</tbody></table></div>';
+$('#rates').innerHTML=`<div class="small">Estimated spend is arithmetic over rate-table entries in <code>config.json</code>; none is provider-confirmed unless a row carries <code>cost_rate_verified_on</code>. Scope: ${esc(RP.scope||'')}. Dominant rate model <b>${esc(RP.dominant_model??'—')}</b> on ${n$('rate_provenance',RP.dominant_rows)} priced rows (${m$('rate_provenance',RP.dominant_cost)} of ${m$('rate_provenance',RP.estimated_cost)} estimated). Rows with a verified rate: ${nz(RP.verified_rate_rows)} of ${nz(RP.rate_rows)}; ${m$('rate_provenance',RP.unverified_rate_cost)} rests on unverified rates. Rows recorded before <code>cost_rate_source</code> existed (commit d57b327, 2026-09-23) are never repriced against today's <code>config.json</code> — they are labelled by when they were recorded, not guessed at.</div><div class="scroll"><table><thead><tr><th>Rate model</th><th>Priced rows</th><th>Estimated cost</th><th>Rate source</th><th>Verified on</th></tr></thead><tbody>`+(RP.models||[]).map(r=>`<tr><td><code>${esc(r.model)}</code></td><td>${nz(r.rows)}</td><td>${m$('rate_provenance',r.cost)}</td><td>${r.source?esc(r.source):(r.source_predates_provenance?'<span class="pill off" title="No row in this group carries cost_rate_source, and every row is timestamped before commit d57b327 (2026-09-23T18:42:05Z) introduced the field">predates provenance tracking</span>':'<span class="pill warn" title="No row in this group carries cost_rate_source, but at least one row is timestamped on/after cost_rate_source existed (or has no usable timestamp) — the omission is not explained by age">source unknown</span>')}</td><td>${r.verified_on?esc(r.verified_on):'<span class="pill warn">unverified</span>'}</td></tr>`).join('')+'</tbody></table></div>';
 $('#features').innerHTML='<thead><tr><th>Feature</th><th>State</th><th>Configuration</th></tr></thead><tbody>'+D.features.map(f=>`<tr><td>${esc(f.feature)}</td><td><span class="pill ${f.state==='off'?'off':(f.state==='recommend'||f.state==='observe'?'warn':'on')}">${esc(f.state)}</span></td><td><code>${esc(JSON.stringify(f.config))}</code></td></tr>`).join('')+'</tbody>';
 $('#adaptive').innerHTML='<thead><tr><th>Time</th><th>Task</th><th>Risk</th><th>Mode</th><th>Action</th><th>Selected</th><th>Effort</th><th>Verify</th><th>Rows (decayed)</th><th>Verified tasks</th><th>Explore</th><th>Canary</th></tr></thead><tbody>'+D.adaptive.slice().reverse().map(r=>`<tr><td>${esc(r.ts||'')}</td><td>${esc(r.task_class||'')}</td><td>${esc(r.risk||'')}</td><td>${esc(r.adaptive_mode||'')}</td><td>${esc(r.route_action||'')}</td><td>${esc(r.selected_capability||'')}</td><td>${esc(r.selected_effort||'')}</td><td>${esc(r.selected_verification_depth||'')}</td><td>${n$('historical_samples',r.historical_samples)}</td><td>${n$('verified_task_samples',r.verified_task_samples)}</td><td>${r.explored?'yes':'no'}</td><td>${r.canary?'yes':'no'}</td></tr>`).join('')+'</tbody>';
 $('#policies').innerHTML='<thead><tr><th>Policy</th><th>Cost aggr.</th><th>Cost</th><th>Rows (per-call)</th><th>Verified (attested)</th><th>Cost/attested</th><th>Dispatch pass (exit 0)</th><th>Quality evidence</th></tr></thead><tbody>'+D.policies.map(p=>`<tr><td><code>${esc(p.policy_id)}</code></td><td>${p$('cost_aggressiveness',p.cost_aggressiveness)}</td><td>${m$('cost',p.cost)}</td><td>${nz(p.rows)} (${nz(p.call_rows)})</td><td>${nz(p.verified)}</td><td>${m$('verified_cost',p.verified_cost)}</td><td>${nz(p.dispatch_pass)}</td><td>${p$('quality',p.quality)}</td></tr>`).join('')+'</tbody>';

@@ -376,6 +376,36 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(cov['call_rows'],4)
         self.assertEqual(cov['cost_provenance'],'actual')
 
+    def test_evidence_coverage_reports_factual_verification_evidence_coverage(self):
+        """Phase 1 item 5: coverage is by run, counts a run without a QA gate as 'not observed'
+        (never as failing/zero), and never requires or implies a `quality_evidence_score`.
+        """
+        metrics=[call('r1','r1-a',cost_usd=.1,cost_source='reported'), call('r2','r2-a',cost_usd=.1,cost_source='reported')]
+        outcomes=[{
+            'run_id':'r1','task_id':'r1-qa','outcome':'verified','verification_scope':'run','quality':.95,
+            'checks':[{'id':'typecheck','result':'pass'},{'id':'environment','result':'unavailable'}],
+            'checks_unavailable':['environment'],
+            'check_commands':None,
+            'tested_revision':'abc123','tested_revision_dirty':False,
+            'review_verdicts':[{'role':'qa_agent','verdict':'pass'}],
+            'artifacts':[],'outcome_finality':'immediate',
+        }]
+        # r2 has no QA gate row at all — its verification_evidence must read as absent, not failed.
+        runs=summarize_runs(metrics,[],outcomes)
+        by=by_run(runs)
+        self.assertIsNotNone(by['r1']['verification_evidence'])
+        self.assertIsNone(by['r2']['verification_evidence'])
+        cov=evidence_coverage(runs)
+        self.assertEqual(cov['runs_with_verification_evidence'],1)
+        self.assertEqual(cov['runs_with_tested_revision'],1)
+        self.assertEqual(cov['runs_with_review_verdict'],1)
+        self.assertEqual(cov['runs_with_unavailable_checks_listed'],1)
+        # QA output has no structured command field yet — this stays 0, honestly, not fabricated.
+        self.assertEqual(cov['runs_with_check_commands'],0)
+        self.assertAlmostEqual(cov['tested_revision_coverage'],.5)
+        self.assertAlmostEqual(cov['review_verdict_coverage'],.5)
+        self.assertEqual(cov['check_commands_coverage'],0.0)
+
 
 if __name__=='__main__': unittest.main()
 
@@ -416,3 +446,125 @@ class SpendCapTests(unittest.TestCase):
         e = cap_event('r1', 't')
         runs = by_run(summarize_runs([], [e, dict(e)], []))
         self.assertEqual(len(runs['r1']['spend_cap_hits']), 1)
+
+
+class CancelledStatusTests(unittest.TestCase):
+    def test_run_cancelled_event_is_a_distinct_terminal_status(self):
+        events=[{'event':'run_cancelled','run_id':'rc1','reason':'orchestrate_cancel',
+                 'started_at':'2026-09-23T10:00:00Z','finished_at':'2026-09-23T10:00:05Z','elapsed_ms':5000,'elapsed_source':'monotonic'}]
+        r=by_run(summarize_runs([],events,[]))['rc1']
+        self.assertEqual(r['status'],'cancelled')
+        self.assertEqual(r['elapsed_ms'],5000)
+
+    def test_run_cancelled_outcome_task_id_is_a_distinct_terminal_status(self):
+        outcomes=[{'run_id':'rc2','task_id':'run-cancelled','outcome':'cancelled','note':'signal','elapsed_ms':10}]
+        r=by_run(summarize_runs([],[],outcomes))['rc2']
+        self.assertEqual(r['status'],'cancelled')
+
+    def test_cancelled_outcome_is_run_scoped_never_counted_as_a_task_verdict(self):
+        # A run-cancelled outcome row must join like run-complete/run-failed: it decides the run
+        # verdict once and is never mistaken for a task-level verification row.
+        outcomes=[{'run_id':'rc3','task_id':'run-cancelled','outcome':'cancelled','note':'signal'}]
+        r=by_run(summarize_runs([],[],outcomes))['rc3']
+        self.assertEqual(r['verification_rows'],0)
+        self.assertEqual(r['verified_tasks'],0)
+
+    def test_evidence_coverage_counts_cancelled_separately_from_failed_and_incomplete(self):
+        events=[{'event':'run_completed','run_id':'a'},{'event':'run_failed','run_id':'b'},
+                {'event':'run_cancelled','run_id':'c','reason':'signal'}]
+        runs=summarize_runs([call('a','a-t1',cost_usd=.01,cost_source='reported'),
+                              call('b','b-t1',cost_usd=.01,cost_source='reported'),
+                              call('c','c-t1',cost_usd=.01,cost_source='reported'),
+                              call('d','d-t1',cost_usd=.01,cost_source='reported')],events,[])
+        cov=evidence_coverage(runs)
+        self.assertEqual(cov['runs_completed'],1)
+        self.assertEqual(cov['runs_failed'],1)
+        self.assertEqual(cov['runs_cancelled'],1)
+        self.assertEqual(cov['runs_incomplete'],1)  # run 'd' has no terminal event and no ownership evidence
+        self.assertEqual(cov['runs_interrupted'],0)
+
+
+def _ownership(pid, hostname='host-a', session_id='/s.jsonl'):
+    return {'run_id':'r','event':'run_started','pid':pid,'hostname':hostname,
+            'process_started_at_ms':1000,'session_id':session_id,'started_at':'2026-09-23T10:00:00Z'}
+
+
+class RestartReconciliationTests(unittest.TestCase):
+    """Phase 1 item 4: a non-terminal run is only reclassified 'interrupted' when durable
+    ownership evidence proves the owning process is gone. Never from age alone, and never for
+    a run that has no ownership evidence at all (historical runs predating this tracking)."""
+
+    def test_dead_pid_same_host_is_interrupted(self):
+        events=[_ownership(pid=4242)]
+        r=by_run(summarize_runs([],events,[],liveness_check=lambda o: False))['r']
+        self.assertEqual(r['status'],'interrupted')
+
+    def test_alive_pid_stays_incomplete_never_reclassified(self):
+        events=[_ownership(pid=4242)]
+        r=by_run(summarize_runs([],events,[],liveness_check=lambda o: True))['r']
+        self.assertEqual(r['status'],'incomplete')
+
+    def test_unknown_liveness_stays_incomplete(self):
+        events=[_ownership(pid=4242)]
+        r=by_run(summarize_runs([],events,[],liveness_check=lambda o: None))['r']
+        self.assertEqual(r['status'],'incomplete')
+
+    def test_pid_alive_but_process_start_identity_differs_stays_incomplete(self):
+        # Simulates pid reuse: the pid the run recorded is technically alive right now, but it is
+        # a DIFFERENT process (a caller with a more precise liveness check would detect this via
+        # process_started_at_ms and report it as gone; the identity mismatch alone must never be
+        # enough on its own to claim 'interrupted' without the check saying so explicitly).
+        events=[_ownership(pid=4242)]
+        def mismatched_identity_check(ownership):
+            # A precise checker could compare ownership['process_started_at_ms'] against the
+            # live process's actual start time; here it finds a mismatch and refuses to claim
+            # the process is confirmed gone (only an explicit False does that).
+            return None
+        r=by_run(summarize_runs([],events,[],liveness_check=mismatched_identity_check))['r']
+        self.assertEqual(r['status'],'incomplete')
+
+    def test_different_host_is_unknown_never_reclassified(self):
+        events=[_ownership(pid=4242,hostname='some-other-host')]
+        from orchestrator.run_evidence import default_liveness_check
+        r=by_run(summarize_runs([],events,[]))['r']  # default_liveness_check: different host -> None
+        self.assertEqual(r['status'],'incomplete')
+
+    def test_old_run_with_no_ownership_evidence_stays_incomplete_never_reclassified_by_age(self):
+        # No run_started at all for this run_id (a historical run predating ownership tracking):
+        # even though this outcome is very old, it must stay 'incomplete', never 'interrupted'.
+        outcomes=[{'run_id':'old1','task_id':'r1','outcome':'verified','note':'{}',
+                   'ts':'2000-01-01T00:00:00Z'}]
+        r=by_run(summarize_runs([],[],outcomes,liveness_check=lambda o: False))['old1']
+        self.assertEqual(r['status'],'incomplete')
+
+    def test_default_liveness_check_confirms_a_definitely_dead_pid_on_this_host(self):
+        from orchestrator.run_evidence import default_liveness_check
+        import socket
+        # pid 2**31-1 is never a real pid; ESRCH is the only possible outcome for it locally.
+        ownership=_ownership(pid=2**31-1, hostname=socket.gethostname())
+        self.assertFalse(default_liveness_check(ownership))
+
+    def test_default_liveness_check_never_raises_on_malformed_pid(self):
+        from orchestrator.run_evidence import default_liveness_check
+        import socket
+        for bad_pid in (None, 'not-a-pid', -1, 0, True):
+            ownership=_ownership(pid=bad_pid, hostname=socket.gethostname())
+            self.assertIsNone(default_liveness_check(ownership))
+
+    def test_default_liveness_check_never_raises_on_an_oversized_pid(self):
+        # Phase 1 review finding S6: `os.kill` raises `OverflowError` on CPython for a pid outside
+        # the platform's signed-int range, BEFORE it ever reaches the kernel. A pid this large
+        # cannot possibly name a real process; it must read as unknown, never crash the classifier.
+        from orchestrator.run_evidence import _local_process_alive, default_liveness_check
+        import socket
+        self.assertIsNone(_local_process_alive(2 ** 100))
+        ownership=_ownership(pid=2 ** 100, hostname=socket.gethostname())
+        self.assertIsNone(default_liveness_check(ownership))
+        # A run whose recorded pid is this implausible stays 'incomplete', never crashes the run.
+        r=by_run(summarize_runs([],[_ownership(pid=2 ** 100, hostname=socket.gethostname())],[]))['r']
+        self.assertEqual(r['status'],'incomplete')
+
+    def test_classify_liveness_returns_none_without_any_ownership_evidence(self):
+        from orchestrator.run_evidence import classify_liveness
+        self.assertIsNone(classify_liveness(None))
+        self.assertIsNone(classify_liveness({}))

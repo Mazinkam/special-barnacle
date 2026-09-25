@@ -19,6 +19,7 @@ derived but semantically false:
 """
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from functools import lru_cache
 from typing import Any
@@ -52,6 +53,7 @@ __all__ = [
     'cost_distribution', 'is_unsuccessful_attempt', 'waste_cost', 'coordination_roles',
     'verification_roles', 'orchestration_overhead', 'fanout_rework', 'topology_regret',
     'has_reported_tokens', 'unique_records', 'verification_passed',
+    'nested_residual_rows', 'nested_reconciliation',
 ]
 
 
@@ -127,6 +129,235 @@ def unique_records(rows):
             if rid in seen: continue
             seen.add(rid)
         yield row
+
+
+def _is_nested_detail_row(row: dict) -> bool:
+    """A per-task nested-subagent `model_call` row (bridge `nestedModelCallRowsFor`)."""
+    nested = row.get('nested')
+    return nested is True or str(nested).strip().lower() == 'true'
+
+
+#: Tolerance for "the aggregate and its detail rows agree": provider rounding, not a real gap.
+_NESTED_COST_EPSILON_ABS = 0.005
+_NESTED_COST_EPSILON_REL = 0.005
+
+
+def _nested_cost_epsilon(aggregate: float) -> float:
+    return max(_NESTED_COST_EPSILON_ABS, _NESTED_COST_EPSILON_REL * aggregate)
+
+
+def _valid_dispatch_attempt(value: Any) -> int | None:
+    """`value` as a validated `dispatch_attempt`: a finite, integral number in `[0, 16]`, or
+    `None` for anything else — Infinity/NaN, a non-integral float (`1.5`), a string, a bool, or an
+    out-of-range value (Phase 1 review F4). Malformed data must read as "cannot be trusted as a
+    distinct identity", never crash `int(...)` (a bare `int(float('inf'))` raises `OverflowError`,
+    which the old, unvalidated cast here did not catch) and never masquerade as attempt 0 or as
+    provably distinct from another malformed value. Mirrors
+    `scripts/backfill_nested_costs.py`'s `_valid_dispatch_attempt` exactly — keep both updated
+    together. 16 is generously above any real fallback depth (attempt is 0 or 1 today); the cap
+    exists only so a corrupted or hostile value is never trusted as a distinct attempt.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        value = int(value)
+    if not (0 <= value <= 16):
+        return None
+    return value
+
+
+def _dispatch_attempt(row: dict) -> int:
+    """The codex -> Bedrock quota-fallback attempt identity a `dispatch_finished` event or nested
+    detail row belongs to (0 = the original attempt, 1 = the retry) — see the `dispatchAttempt`
+    comment in `bridge/extensions/orchestrator/index.ts`'s `dispatchParallel`. Absent/malformed
+    reads as 0: every dispatch that never hit the fallback path (the overwhelming majority) has no
+    reason to carry the field at all, and that is exactly the same thing as being attempt 0. Used
+    only to KEY detail rows/events once a group has already been proven separable (or has only one
+    member) — see `_explicit_dispatch_attempt`/`_separable_dispatch_group` for the case where an
+    absent field must NOT be defaulted.
+    """
+    value = _valid_dispatch_attempt(row.get('dispatch_attempt'))
+    return value if value is not None else 0
+
+
+def _explicit_dispatch_attempt(row: dict) -> int | None:
+    """The row's own EXPLICIT, validated `dispatch_attempt` — `None` when the field is absent OR
+    malformed. Unlike `_dispatch_attempt` (which defaults absent/malformed to 0), this is used
+    only to decide whether multiple `dispatch_finished` events sharing a `(run_id, task_id)` can be
+    PROVABLY told apart into independent attempts (Phase 1 review F1/F4): an absent field must
+    never be assumed to mean 0 for THIS purpose, because that is exactly the shape the historical
+    quota-fallback cumulative-sum bug's second event has.
+    """
+    if 'dispatch_attempt' not in row:
+        return None
+    return _valid_dispatch_attempt(row.get('dispatch_attempt'))
+
+
+def _separable_dispatch_group(group: list[dict]) -> bool:
+    """Whether a `(run_id, task_id)` group of `dispatch_finished` events can be told apart into
+    provably-independent attempts — mirrors `scripts/backfill_nested_costs.py`'s
+    `_separate_attempts` exactly (Phase 1 review F1): a single event is always separable (its
+    attempt identity, present or defaulted, cannot collide with anything else in the group);
+    MORE than two is never provable (the fallback design this codebase has never produces more,
+    so more than two is itself a signal something is wrong, not evidence of more valid attempts);
+    exactly two is provable only when EVERY event carries an explicit, validated
+    `dispatch_attempt` and those values are pairwise distinct — the same shape a pre-fix quota-
+    fallback cumulative-sum bug (the second event summing both attempts, `dispatch_attempt`
+    absent on one or both) cannot be told apart from otherwise.
+    """
+    if len(group) <= 1:
+        return True
+    if len(group) > 2:
+        return False
+    attempts = [_explicit_dispatch_attempt(event) for event in group]
+    if any(attempt is None for attempt in attempts):
+        return False
+    return len(set(attempts)) == len(attempts)
+
+
+def nested_reconciliation(events: list[dict], calls: list[dict]) -> dict[str, Any]:
+    """Reconcile each `dispatch_finished` event's `nested_cost_usd` AGGREGATE against the durable
+    per-task detail rows actually present for its `(run_id, task_id, dispatch_attempt)`, and
+    return `{'rows': [...], 'ambiguous': [...], 'ambiguous_count': N}`.
+
+    Phase 1 items 2/3 (see `docs/superpowers/audits/2026-09-25-phase1-audit.md`, confirmed defect
+    1, and the Phase 1 review's T1/T2/T3 findings): a dispatch's nested subagent spend used to be
+    invisible to `verified_cost`, `cost_attribution`, `orchestration_overhead` and
+    `dashboard.by_role`/`by_runtime` — none of them read `nested_cost_usd`, and no per-call row
+    existed for it at all. The bridge (`bridge/extensions/orchestrator/index.ts`,
+    `nestedModelCallRowsFor`) now emits a `model_call` row per nested task, tagged `nested: true`
+    with `parent_task_id` set to the dispatch's own `task_id` and `dispatch_attempt` set to the
+    fallback-attempt identity, and stamps `nested_rows_emitted` on the matching `dispatch_finished`
+    event so this function never has to guess how many detail rows THIS attempt should have.
+
+    `(run_id, task_id, dispatch_attempt)` — never just `(run_id, task_id)` — is the reconciliation
+    key: a codex -> Bedrock quota fallback can write TWO `dispatch_finished` events for the same
+    `task_id` (the superseded original attempt and the final retry), each carrying only ITS OWN
+    attempt's nested cost (T1). Keying on `(run_id, task_id)` alone would let the second event's
+    reconciliation silently absorb the first attempt's detail rows (or vice versa); the attempt tag
+    keeps the two independent, exactly as the bridge's own `record_id`s keep their rows independent
+    (T2).
+
+    The rule, per event, is intentionally conservative — the emitter's `nested_rows_emitted` is a
+    CLAIM, never proof by itself:
+
+    1. Sum the known cost of every durable detail row matching this event's key. If that sum
+       already covers the aggregate (within a small epsilon — provider rounding, not a real gap),
+       nothing is missing: no residual, no ambiguity.
+    2. Otherwise there is a real gap (aggregate minus detail sum). Book it as an explicit,
+       clearly-labelled residual for exactly that shortfall — never the full aggregate when detail
+       rows partially cover it — ONLY when there is affirmative evidence some rows are missing:
+       either the event never claimed any row count at all (a legacy event from before
+       `nested_rows_emitted` existed — nothing durable could possibly explain ANY of it), or the
+       event's claimed count exceeds how many matching rows are actually durable (a proven partial
+       write: the emitter claims N rows should exist and fewer than N do).
+    3. Any other gap — the claimed row count IS fully satisfied by durable rows, yet the dollars
+       still don't add up — is an unexplained mismatch. Nothing is booked (booking here would be a
+       guess, not evidence), but it is reported back as `ambiguous` so it stays visible instead of
+       silently vanishing.
+
+    A residual row is tagged `role='unknown_nested'` (never a guessed real role — an aggregate
+    carries no per-task attribution) and `cost_source='reported'`: the aggregate is a sum of the
+    bridge's own provider-reported `usage.cost` observations
+    (`bridge/extensions/orchestrator/nested-cost.ts`), so it is real reported spend, just not fully
+    itemized per call. Callers must call this exactly once per rows population (e.g.
+    `orchestrator/dashboard.py:build_data`) and feed the *combined* `rows` list into every other
+    reducer, so a residual is never independently re-derived — and therefore never double-counted —
+    by a second call site; re-running this against a list that already contains its own prior
+    output is safe (the residual row is itself a `nested=true` detail row for its own key, so its
+    own gap reads as zero the second time).
+
+    Phase 1 review F1 (dynamic mirror of `scripts/backfill_nested_costs.py`'s own ambiguity rule):
+    BEFORE any of the above runs per-event, every `dispatch_finished` event is grouped by
+    `(run_id, task_id)`. A group with more than one event is only ever split into independent,
+    reconcilable `(run_id, task_id, dispatch_attempt)` units when `_separable_dispatch_group`
+    proves every event in it carries an explicit, pairwise-distinct `dispatch_attempt` — the exact
+    same test the backfill script applies to historical data. A group that fails this test is the
+    live-data mirror of the historical cumulative-sum bug (T1): the second event's `nested_cost_usd`
+    may be a running SUM of both attempts, not its own, and there is no way to tell that apart from
+    two provably-independent attempts using only the event stream. NOTHING in such a group is ever
+    booked as a residual — booking against an unprovable identity risks charging one attempt's
+    detail rows against the other attempt's aggregate — and the group is reported once as a single
+    `ambiguous` entry naming its event count and the total aggregate dollars at stake
+    (`'events'`, `'aggregate_usd'`), distinct in shape from the per-attempt dollar-mismatch
+    ambiguous entries below.
+    """
+    detail_by_key: dict[tuple, list[dict]] = defaultdict(list)
+    for row in calls:
+        if _is_nested_detail_row(row):
+            detail_by_key[(row.get('run_id'), row.get('parent_task_id'), _dispatch_attempt(row))].append(row)
+
+    dispatch_groups: dict[tuple, list[dict]] = defaultdict(list)
+    for event in events:
+        if event.get('event') == 'dispatch_finished':
+            dispatch_groups[(event.get('run_id'), event.get('task_id'))].append(event)
+
+    residuals: list[dict] = []
+    ambiguous: list[dict[str, Any]] = []
+    for (run_id, task_id), group in dispatch_groups.items():
+        if not _separable_dispatch_group(group):
+            amount = sum(row_cost({'cost_usd': event.get('nested_cost_usd')}) for event in group)
+            ambiguous.append({
+                'run_id': run_id, 'task_id': task_id, 'events': len(group), 'aggregate_usd': amount,
+                'reason': (f'{len(group)} dispatch_finished events share (run_id, task_id) without a '
+                          'provable, pairwise-distinct dispatch_attempt on every one of them — the same '
+                          'shape a pre-fix quota-fallback cumulative-sum bug produces (the second event '
+                          'summing both attempts); nothing booked for any of them.'),
+            })
+            continue
+
+        for event in group:
+            aggregate = row_cost({'cost_usd': event.get('nested_cost_usd')})
+            if aggregate <= 0:
+                continue
+            attempt = _dispatch_attempt(event)
+            detail_rows = detail_by_key.get((run_id, task_id, attempt), [])
+            detail_sum = sum(row_cost(r) for r in detail_rows)
+            gap = aggregate - detail_sum
+            if gap <= _nested_cost_epsilon(aggregate):
+                continue  # fully explained by durable detail rows (or they exceed the aggregate)
+
+            emitted = event.get('nested_rows_emitted')
+            claimed = emitted is not None
+            try:
+                emitted_n = int(emitted) if claimed else 0
+            except (TypeError, ValueError):
+                claimed, emitted_n = False, 0
+            durable_n = len(detail_rows)
+
+            if (not claimed) or emitted_n > durable_n:
+                residuals.append({
+                    'event': 'model_call',
+                    'run_id': run_id,
+                    'task_id': f'{task_id}:nested-residual' if task_id is not None else None,
+                    'parent_task_id': task_id,
+                    'dispatch_attempt': attempt,
+                    'role': 'unknown_nested',
+                    'capability_class': 'unknown_nested',
+                    'agent_runtime': event.get('agent_runtime') or 'humain-terminal',
+                    'cost_usd': gap,
+                    'cost_source': 'reported',
+                    'nested': True,
+                    'nested_residual': True,
+                    'ts': event.get('ts'),
+                    'record_id': f'nested-residual:{run_id}:{task_id}:{attempt}',
+                })
+            else:
+                ambiguous.append({
+                    'run_id': run_id, 'task_id': task_id, 'dispatch_attempt': attempt,
+                    'aggregate_usd': aggregate, 'detail_usd': detail_sum, 'gap_usd': gap,
+                    'nested_rows_emitted': emitted_n, 'durable_rows_found': durable_n,
+                })
+    return {'rows': residuals, 'ambiguous': ambiguous, 'ambiguous_count': len(ambiguous)}
+
+
+def nested_residual_rows(events: list[dict], calls: list[dict]) -> list[dict]:
+    """The residual `model_call` rows from `nested_reconciliation`, for callers that only need the
+    rows to inject (not the ambiguous-mismatch report). See `nested_reconciliation` for the rule.
+    """
+    return nested_reconciliation(events, calls)['rows']
 
 
 def is_session_ingest(row: dict) -> bool:

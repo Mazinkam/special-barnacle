@@ -1106,13 +1106,14 @@ describe("RunSession terminal timing", () => {
 	test("run terminal outcomes carry the timing fields", () => {
 		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 		const complete = source.slice(source.indexOf("async function completeRun("), source.indexOf("async function failRun("));
-		const fail = source.slice(source.indexOf("async function failRun("), source.indexOf("// Subagent dispatch"));
-		for (const fn of [complete, fail]) {
+		const fail = source.slice(source.indexOf("async function failRun("), source.indexOf("async function cancelRun("));
+		const cancel = source.slice(source.indexOf("async function cancelRun("), source.indexOf("// Subagent dispatch"));
+		for (const fn of [complete, fail, cancel]) {
 			expect(fn).toContain("...timing");
 		}
 		// Every terminal call inside the /orchestrate handler must pass the session timing.
 		const handler = source.slice(source.indexOf('pi.registerCommand("orchestrate"'), source.indexOf('pi.registerCommand("orchestrator-models"'));
-		const calls = handler.match(/await (?:completeRun|failRun)\([^;]*?\);/gs) ?? [];
+		const calls = handler.match(/await (?:completeRun|failRun|cancelRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThanOrEqual(6);
 		for (const call of calls) expect(call).toContain("session.terminalTiming()");
 	});
@@ -1135,6 +1136,30 @@ describe("batched telemetry through the Python batch CLI", () => {
 		expect(result).not.toBeInstanceOf(Promise);
 		expect(orchestrator.recordQueue!.stats.batches).toBe(before);
 		expect(orchestrator.recordQueue!.pending).toBeGreaterThanOrEqual(1);
+	});
+
+	test("recordRunStarted records durable ownership evidence (pid/hostname/process-start identity/session id)", async () => {
+		const runId = `ht-started-${Date.now()}`;
+		orchestrator.recordRunStarted!(runId, "/sessions/some-session.jsonl");
+		await orchestrator.recordQueue!.flush();
+		const events = readFileSync(join(pythonStateRoot, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+		const started = events.find((e) => e.run_id === runId && e.event === "run_started");
+		// The session_id is reduced to its basename (review note, Phase A review): the full absolute
+		// path is never needed downstream (`run_evidence.classify_liveness` reads only pid/hostname)
+		// and would otherwise leak the OS username / home-directory layout into a durable, shared log.
+		expect(started).toMatchObject({ session_id: "some-session.jsonl", pid: process.pid, hostname: require("node:os").hostname() });
+		expect(typeof started?.process_started_at_ms).toBe("number");
+		expect(Number.isFinite(started?.process_started_at_ms)).toBe(true);
+		expect(typeof started?.started_at).toBe("string");
+	});
+
+	test("recordRunStarted accepts a null session id when the runtime has none", async () => {
+		const runId = `ht-started-nosession-${Date.now()}`;
+		orchestrator.recordRunStarted!(runId, null);
+		await orchestrator.recordQueue!.flush();
+		const events = readFileSync(join(pythonStateRoot, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+		const started = events.find((e) => e.run_id === runId && e.event === "run_started");
+		expect(started).toMatchObject({ session_id: null });
 	});
 
 	test("one dispatch boundary plus run completion is one Python spawn, and the terminal outcome is durable when completeRun resolves", async () => {
@@ -1175,6 +1200,73 @@ describe("batched telemetry through the Python batch CLI", () => {
 		expect(rows("events.jsonl").some((r) => r.run_id === runId)).toBe(true);
 		expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("failed");
 		expect(orchestrator.recordQueue!.pending).toBe(0);
+	}, 30_000);
+
+	test("cancelRun writes a distinct run_cancelled event and run-cancelled outcome, never run-failed", async () => {
+		const runId = `ht-cancelrun-${Date.now()}`;
+		orchestrator.recordEvent!("dispatch_started", { run_id: runId, task_id: `${runId}-lead-0` });
+		const report = await orchestrator.cancelRun!(runId, "orchestrate_cancel", timing());
+		expect(report.ok).toBe(true);
+		const outcome = rows("outcomes.jsonl").find((r) => r.run_id === runId && r.task_id === "run-cancelled");
+		expect(outcome).toMatchObject({ outcome: "cancelled", note: "orchestrate_cancel", elapsed_source: "monotonic" });
+		expect(rows("outcomes.jsonl").some((r) => r.run_id === runId && r.task_id === "run-failed")).toBe(false);
+		const events = rows("events.jsonl").filter((r) => r.run_id === runId).map((r) => r.event);
+		expect(events).toEqual(["dispatch_started", "run_cancelled"]);
+		const cancelEvent = rows("events.jsonl").find((r) => r.run_id === runId && r.event === "run_cancelled");
+		expect(cancelEvent).toMatchObject({ reason: "orchestrate_cancel", elapsed_source: "monotonic" });
+		expect(typeof cancelEvent?.started_at).toBe("string");
+		expect(typeof cancelEvent?.finished_at).toBe("string");
+		expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("cancelled");
+	}, 30_000);
+
+	test("cancelReasonLabel maps every cancellation source to its documented label", () => {
+		expect(orchestrator.cancelReasonLabel!("user")).toBe("orchestrate_cancel");
+		expect(orchestrator.cancelReasonLabel!("shutdown")).toBe("session_shutdown");
+		expect(orchestrator.cancelReasonLabel!("signal")).toBe("signal");
+		expect(orchestrator.cancelReasonLabel!(undefined)).toBe("unknown");
+	});
+
+	test("exactly one terminal event/outcome is ever written per run_id, even if two terminal paths race", async () => {
+		const runId = `ht-single-terminal-${Date.now()}`;
+		orchestrator.recordEvent!("dispatch_started", { run_id: runId, task_id: `${runId}-lead-0` });
+		const first = await orchestrator.cancelRun!(runId, "signal", timing());
+		expect(first.ok).toBe(true);
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+		try {
+			// A second terminal path (e.g. a crash unwind racing an already-recorded cancel)
+			// must not add a second run_failed/run_cancelled event or outcome row for the same run.
+			const second = await orchestrator.failRun!(runId, "crashed: too late", timing());
+			expect(second.ok).toBe(true);
+		} finally {
+			console.warn = originalWarn;
+		}
+		expect(warnings.some((w) => w.includes(runId) && w.includes("already has a terminal event"))).toBe(true);
+		const terminalEvents = rows("events.jsonl").filter((r) => r.run_id === runId && (r.event === "run_cancelled" || r.event === "run_failed" || r.event === "run_completed"));
+		expect(terminalEvents).toHaveLength(1);
+		expect(terminalEvents[0].event).toBe("run_cancelled");
+		const terminalOutcomes = rows("outcomes.jsonl").filter((r) => r.run_id === runId && ["run-cancelled", "run-failed", "run-complete"].includes(String(r.task_id)));
+		expect(terminalOutcomes).toHaveLength(1);
+		expect(terminalOutcomes[0].task_id).toBe("run-cancelled");
+	}, 30_000);
+
+	test("completeRun/failRun/cancelRun each carry elapsed_ms, started_at and finished_at when timing is supplied, and omit them (never zero) when it is not", async () => {
+		const runId = `ht-elapsed-${Date.now()}`;
+		const withTiming = await orchestrator.cancelRun!(runId, "signal", timing());
+		expect(withTiming.ok).toBe(true);
+		const outcome = rows("outcomes.jsonl").find((r) => r.run_id === runId);
+		expect(outcome?.elapsed_ms).toBe(1);
+		expect(typeof outcome?.started_at).toBe("string");
+		expect(typeof outcome?.finished_at).toBe("string");
+
+		const runId2 = `ht-elapsed-unknown-${Date.now()}`;
+		const withoutTiming = await orchestrator.cancelRun!(runId2, "signal");
+		expect(withoutTiming.ok).toBe(true);
+		const outcome2 = rows("outcomes.jsonl").find((r) => r.run_id === runId2);
+		// No session/timing to derive elapsed from: the field must be absent, never a fabricated 0.
+		expect(outcome2?.elapsed_ms).toBeUndefined();
+		expect("elapsed_ms" in (outcome2 ?? {})).toBe(false);
 	}, 30_000);
 
 	test("session shutdown drains records still inside the coalescing window", async () => {
@@ -1294,11 +1386,12 @@ describe("batched telemetry through the Python batch CLI", () => {
 	test("every terminal path in the /orchestrate handler awaits the drained terminal write", () => {
 		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 		const complete = source.slice(source.indexOf("async function completeRun("), source.indexOf("async function failRun("));
-		const fail = source.slice(source.indexOf("async function failRun("), source.indexOf("// Subagent dispatch"));
-		for (const fn of [complete, fail]) expect(fn).toContain("flush()");
+		const fail = source.slice(source.indexOf("async function failRun("), source.indexOf("async function cancelRun("));
+		const cancel = source.slice(source.indexOf("async function cancelRun("), source.indexOf("// Subagent dispatch"));
+		for (const fn of [complete, fail, cancel]) expect(fn).toContain("flush()");
 		// Every terminal call reports telemetry cumulatively since the run started, not just the final drain.
 		const handler = source.slice(source.indexOf('pi.registerCommand("orchestrate"'), source.indexOf('pi.registerCommand("orchestrator-models"'));
-		const calls = handler.match(/await (?:completeRun|failRun)\([^;]*?\);/gs) ?? [];
+		const calls = handler.match(/await (?:completeRun|failRun|cancelRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThanOrEqual(6);
 		for (const call of calls) expect(call).toContain("session.telemetryBaseline");
 		// Non-terminal records must not block dispatch: no awaited single-record spawns remain.
@@ -2632,6 +2725,72 @@ describe("verification outcome records", () => {
 		});
 	});
 
+	test("qaVerificationOutcomeFor records factual evidence additively, without a manufactured score", () => {
+		const outcome = orchestrator.qaVerificationOutcomeFor("run-9", true, 0.95, "ok", {
+			checks: [{ id: "typecheck", result: "pass" }, { id: "environment", result: "unavailable" }],
+			tested_revision: "abc123",
+			tested_revision_dirty: false,
+			review_verdicts: [{ role: "qa_agent", verdict: "pass" }],
+			artifacts: [],
+		});
+		expect(outcome).toMatchObject({
+			checks: [{ id: "typecheck", result: "pass" }, { id: "environment", result: "unavailable" }],
+			checks_unavailable: ["environment"],
+			check_commands: null,
+			tested_revision: "abc123",
+			tested_revision_dirty: false,
+			review_verdicts: [{ role: "qa_agent", verdict: "pass" }],
+			artifacts: [],
+			outcome_finality: "immediate",
+			evidence_status: "verified",
+		});
+		expect(outcome).not.toHaveProperty("quality_evidence_score");
+	});
+
+	test("Phase 1 review T8: an exit-0 gate whose checks are all skipped/unavailable still passes, but its evidence is marked unverified", () => {
+		// Gate control flow is deliberately UNCHANGED: `passed=true` (the caller's own
+		// `qaResult.exitCode === 0 && failedChecks.length === 0` computation) still produces
+		// `outcome: "verified"` here — only `evidence_status` differs from a real pass.
+		const allSkipped = orchestrator.qaVerificationOutcomeFor("run-11", true, 0.95, "ok", {
+			checks: [{ id: "typecheck", result: "skipped" }, { id: "lint", result: "unavailable" }],
+		});
+		expect(allSkipped).toMatchObject({ outcome: "verified", evidence_status: "unverified_checks_unavailable" });
+
+		// No checks parsed at all is the same gap: nothing proves the exit code reflects real checks.
+		const noChecks = orchestrator.qaVerificationOutcomeFor("run-12", true, 0.95, "ok");
+		expect(noChecks).toMatchObject({ outcome: "verified", evidence_status: "unverified_checks_unavailable" });
+
+		// One real pass/fail among a mix of skipped/unavailable checks IS factual evidence.
+		const mixed = orchestrator.qaVerificationOutcomeFor("run-13", true, 0.95, "ok", {
+			checks: [{ id: "typecheck", result: "pass" }, { id: "lint", result: "skipped" }],
+		});
+		expect(mixed).toMatchObject({ outcome: "verified", evidence_status: "verified" });
+	});
+
+	test("evidenceStatusFor: verified only when at least one check actually ran to pass/fail", () => {
+		expect(orchestrator.evidenceStatusFor([])).toBe("unverified_checks_unavailable");
+		expect(orchestrator.evidenceStatusFor([{ id: "a", result: "skipped" }])).toBe("unverified_checks_unavailable");
+		expect(orchestrator.evidenceStatusFor([{ id: "a", result: "unavailable" }, { id: "b", result: "skipped" }]))
+			.toBe("unverified_checks_unavailable");
+		expect(orchestrator.evidenceStatusFor([{ id: "a", result: "fail" }])).toBe("verified");
+		expect(orchestrator.evidenceStatusFor([{ id: "a", result: "pass" }])).toBe("verified");
+	});
+
+	test("qaVerificationOutcomeFor defaults evidence fields to explicit absence, never a guess", () => {
+		const outcome = orchestrator.qaVerificationOutcomeFor("run-10", false, 0.0, "fail");
+		expect(outcome).toMatchObject({
+			checks: [],
+			checks_unavailable: [],
+			check_commands: null,
+			tested_revision: null,
+			tested_revision_dirty: null,
+			review_verdicts: [],
+			artifacts: [],
+			outcome_finality: "immediate",
+		});
+		expect(typeof outcome.check_commands_unavailable_reason).toBe("string");
+	});
+
 	test("failed verification does not write a run-complete verified outcome", () => {
 		expect(orchestrator.runCompletionOutcomeFor).toBeFunction();
 		expect(orchestrator.runCompletionOutcomeFor!("run-1", {
@@ -2801,6 +2960,74 @@ describe("dispatch records (T6)", () => {
 		for (const event of ["task_verified", "task_failed"]) {
 			expect(source).not.toContain(`event: passed ? "${event}"`);
 			expect(source).not.toContain(`event: "${event}"`);
+		}
+	});
+});
+
+describe("factual verification evidence helpers", () => {
+	test("parseCheckResults reports pass/fail/skip/unavailable per check, not just failures", () => {
+		const out = [
+			"| Check | Result |",
+			"| --- | --- |",
+			"| typecheck | PASS |",
+			"| unit-tests | FAIL |",
+			"| lint | SKIPPED |",
+		].join("\n");
+		expect(orchestrator.parseCheckResults(out)).toEqual([
+			{ id: "typecheck", result: "pass" },
+			{ id: "unit-tests", result: "fail" },
+			{ id: "lint", result: "skipped" },
+		]);
+	});
+
+	test("parseCheckResults normalizes a failed `environment` check to unavailable", () => {
+		// QA_SCOPE_RULES tells the QA agent to report a broken environment as FAIL under the
+		// check name `environment` — that means the check never ran, not that code failed it.
+		const out = "| environment | FAIL: python3 not found |";
+		expect(orchestrator.parseCheckResults(out)).toEqual([{ id: "environment", result: "unavailable" }]);
+	});
+
+	test("parseCheckResults also reads bullet-point check reports", () => {
+		const out = "- typecheck: PASS\n- lint: unavailable (no linter configured)";
+		expect(orchestrator.parseCheckResults(out)).toEqual([
+			{ id: "typecheck", result: "pass" },
+			{ id: "lint", result: "unavailable" },
+		]);
+	});
+
+	test("parseCheckResults returns nothing for freeform text with no recognized status", () => {
+		expect(orchestrator.parseCheckResults("Looks good overall, no issues found.")).toEqual([]);
+	});
+
+	test("testedRevisionFor reports the HEAD sha and dirty state for a git worktree", () => {
+		const dir = mkdtempSync(join(tmpdir(), "orch-tested-revision-"));
+		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		try {
+			git("init", "-q");
+			git("config", "user.email", "t@example.com");
+			git("config", "user.name", "t");
+			git("config", "commit.gpgsign", "false");
+			writeFileSync(join(dir, "a.ts"), "export const a = 1;\n");
+			git("add", "a.ts");
+			git("commit", "-q", "-m", "init");
+			const head = git("rev-parse", "HEAD").toString().trim();
+			expect(orchestrator.testedRevisionFor(dir)).toEqual({ revision: head, dirty: false });
+			writeFileSync(join(dir, "a.ts"), "export const a = 2;\n");
+			expect(orchestrator.testedRevisionFor(dir)).toEqual({ revision: head, dirty: true });
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("testedRevisionFor reports an explicit unavailable reason outside a git repository", () => {
+		const dir = mkdtempSync(join(tmpdir(), "orch-tested-revision-no-git-"));
+		try {
+			const result = orchestrator.testedRevisionFor(dir);
+			expect(result.revision).toBeNull();
+			expect(result.dirty).toBeNull();
+			expect(typeof result.unavailable_reason).toBe("string");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 });
@@ -3397,8 +3624,8 @@ describe("final triage and shutdown integration", () => {
 			const calls = readRows("metrics.jsonl").filter(row => row.run_id === runId && row.event === "model_call");
 			expect(calls).toHaveLength(1);
 			expect(calls[0].cost_usd).toBe(.03);
-			expect(readRows("outcomes.jsonl").filter(row => row.run_id === runId && row.task_id === "run-failed")).toHaveLength(1);
-			expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("failed");
+			expect(readRows("outcomes.jsonl").filter(row => row.run_id === runId && row.task_id === "run-cancelled")).toHaveLength(1);
+			expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("cancelled");
 			expect(notices.some(message => message.includes("UNSEALED"))).toBe(true);
 			expect(existsSync(sessions[0].file(".diagnostics-sealed.json"))).toBe(false);
 			await handler("next synthetic run --complexity 4", ctx as never);
@@ -3504,8 +3731,8 @@ describe("final triage and shutdown integration", () => {
 			expect(calls.find(row => row.task_id === retryId)?.cost_usd).toBe(.3);
 			expect(calls).toHaveLength(3);
 			expect(readRows("events.jsonl").find(row => row.task_id === retryId && row.event === "dispatch_started")?.retry_of).toBe(`${runId}-lead-0`);
-			expect(readRows("outcomes.jsonl").filter(row => row.run_id === runId && row.task_id === "run-failed")).toHaveLength(1);
-			expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("failed");
+			expect(readRows("outcomes.jsonl").filter(row => row.run_id === runId && row.task_id === "run-cancelled")).toHaveLength(1);
+			expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("cancelled");
 			const data = JSON.parse(readFileSync(join(pythonStateRoot, "dashboard.html"), "utf8").split("const D=")[1].split(";const $=")[0]);
 			expect(data.runs.find((row: any) => row.run_id === runId).cost_known_usd).toBeCloseTo(.32);
 		} finally {
@@ -3536,9 +3763,9 @@ describe("final triage and shutdown integration", () => {
 		try {
 			await ready;
 			for (const fn of shutdown) await fn({}, ctx as never);
-			expect(readRows("outcomes.jsonl").some(row => row.run_id === runId && row.task_id === "run-failed")).toBe(true);
+			expect(readRows("outcomes.jsonl").some(row => row.run_id === runId && row.task_id === "run-cancelled")).toBe(true);
 			expect(readRows("metrics.jsonl").find(row => row.run_id === runId && row.event === "model_call")?.cost_usd).toBe(.1);
-			expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("failed");
+			expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("cancelled");
 		} finally {
 			// Also cleans up the pre-fix reproduction, whose shutdown hook did not cancel.
 			activeSession?.cancel();
@@ -3826,7 +4053,7 @@ describe("final triage and shutdown integration", () => {
 		}
 	}, 30_000);
 
-	test("session shutdown cancels the live run, records it failed, and clears ACTIVE_RUN/widget/status", async () => {
+	test("session shutdown cancels the live run, records it cancelled, and clears ACTIVE_RUN/widget/status", async () => {
 		const { handler, shutdown, sent } = activate();
 		let childReady!: () => void;
 		const ready = new Promise<void>(resolve => { childReady = resolve; });
@@ -3856,7 +4083,10 @@ describe("final triage and shutdown integration", () => {
 			expect(status).toBeUndefined();
 			expect(session?.cancelReason).toBe("shutdown");
 			const runId = session!.runId;
-			expect(readRows("outcomes.jsonl").some(row => row.run_id === runId && row.task_id === "run-failed")).toBe(true);
+			const outcome = readRows("outcomes.jsonl").find(row => row.run_id === runId && row.task_id === "run-cancelled");
+			expect(outcome).toMatchObject({ outcome: "cancelled", note: "session_shutdown" });
+			expect(readRows("events.jsonl").some(row => row.run_id === runId && row.event === "run_cancelled")).toBe(true);
+			expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("cancelled");
 			// A shutdown-initiated cancel has no live session to post into; the chat must stay silent for this run.
 			expect(sent.some((s) => s.message.details?.runId === runId)).toBe(false);
 		} finally {
@@ -3866,7 +4096,7 @@ describe("final triage and shutdown integration", () => {
 		}
 	}, 30_000);
 
-	test("a ctx whose ui getter throws after shutdown still ends with ACTIVE_RUN null and a recorded failed outcome", async () => {
+	test("a ctx whose ui getter throws after shutdown still ends with ACTIVE_RUN null and a recorded cancelled outcome", async () => {
 		const { handler, shutdown } = activate();
 		let childReady!: () => void;
 		const ready = new Promise<void>(resolve => { childReady = resolve; });
@@ -3902,7 +4132,7 @@ describe("final triage and shutdown integration", () => {
 			await session?.runPromise;
 			expect(orchestrator.activeRunForTest()).toBeNull();
 			const runId = session!.runId;
-			expect(readRows("outcomes.jsonl").some(row => row.run_id === runId && row.task_id === "run-failed")).toBe(true);
+			expect(readRows("outcomes.jsonl").some(row => row.run_id === runId && row.task_id === "run-cancelled")).toBe(true);
 			expect(errors.some((args) => String(args[0] ?? "").includes("rejected unexpectedly"))).toBe(false);
 		} finally {
 			uiInvalidated = false;
@@ -4088,6 +4318,54 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 		expect(events).not.toContain("route_degraded");
 	});
 
+	test("Phase 1 review T1/T2: each fallback attempt's dispatch_finished carries only its own nested cost, and detail rows never collide across attempts", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const calls: Record<string, unknown>[] = [];
+		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
+			{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, 0, {
+				recordEvent: (e, p) => { events.push([e, p]); },
+				recordModelCall: (m) => { calls.push(m); },
+				aliasTable: table,
+				runProcess: async (opts) => opts.model === "openai-codex/gpt-6-astra"
+					? proc({
+						exitCode: 1, stderr: "usage limit reached for this account", costUsd: 1, costReported: true,
+						nestedCostUsd: 2, nestedCalls: [{
+							key: "tc1:impl-0:0", toolCallId: "tc1", taskId: "impl-0",
+							agent: "orch-implementation-strong", model: "provider/impl-model",
+							usage: { cost: 2 }, costReported: true, exitCode: 0,
+						}],
+					})
+					: proc({
+						model: "amazon-bedrock/global.openai.gpt-6-astra", costUsd: 3, costReported: true,
+						nestedCostUsd: 5, nestedCalls: [{
+							// SAME (toolCallId, taskId, attempt) as the first attempt's nested call — a
+							// separate child process can legitimately reuse tool-call ids, so the two
+							// must not collide (Phase 1 review finding T2).
+							key: "tc1:impl-0:0", toolCallId: "tc1", taskId: "impl-0",
+							agent: "orch-implementation-strong", model: "provider/impl-model",
+							usage: { cost: 5 }, costReported: true, exitCode: 0,
+						}],
+					}),
+			});
+		const finished = events.filter(([e]) => e === "dispatch_finished");
+		expect(finished).toHaveLength(2);
+		const [superseded, final] = finished;
+		expect(superseded[1]).toMatchObject({
+			dispatch_attempt: 0, nested_cost_usd: 2, nested_rows_emitted: 1, superseded_by_fallback: true,
+		});
+		expect(final[1]).toMatchObject({ dispatch_attempt: 1, nested_cost_usd: 5, nested_rows_emitted: 1 });
+		expect(final[1].superseded_by_fallback).toBeUndefined();
+		// The RETURNED DispatchResult still reports the dispatch's TRUE total across both billed
+		// attempts (2 + 5 = 7) — only the per-event telemetry is split per attempt.
+		expect(result.nestedCostUsd).toBe(7);
+		// Two detail rows, one per attempt, never deduplicated into one despite the identical
+		// (toolCallId, taskId, nested-attempt) key.
+		expect(calls).toHaveLength(2);
+		expect(new Set(calls.map((c) => c.record_id)).size).toBe(2);
+		expect(calls.map((c) => c.dispatch_attempt).sort()).toEqual([0, 1]);
+		expect(calls.map((c) => c.cost_usd).sort()).toEqual([2, 5]);
+	});
+
 	test("non-quota failure is not retried", async () => {
 		let calls = 0;
 		await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
@@ -4096,6 +4374,123 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 				runProcess: async () => { calls++; return proc({ exitCode: 1, stderr: "TypeError: boom" }); },
 			});
 		expect(calls).toBe(1);
+	});
+});
+
+describe("nested subagent cost rows (Phase 1 item 2)", () => {
+	const nestedProc = (over: Partial<Awaited<ReturnType<typeof orchestrator.runSubagentProcess>>>) => ({
+		exitCode: 0, stdout: "ok", finalText: "ok", rawStdout: "", personaCanMutate: false, stderr: "",
+		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.01, contextTokens: 0, turns: 1 },
+		costUsd: 0.01, costReported: true, durationMs: 5, outcome: "completed" as const, processExitCode: 0, ...over,
+	});
+	const leadTask: DispatchTask[] = [{ capability: "lead", task: "lead work", taskId: "run-lead" }];
+
+	test("one row per nested call, tagged nested/nesting_depth, and nested_rows_emitted matches", async () => {
+		const calls: Record<string, unknown>[] = [];
+		const events: Array<[string, Record<string, unknown>]> = [];
+		await orchestrator.dispatchParallel(process.cwd(), "run", leadTask,
+			{ lead: { model: "provider/lead-model" } }, {} as never, 0, {
+				recordEvent: (e, p) => { events.push([e, p]); },
+				recordModelCall: (m) => { calls.push(m); },
+				runProcess: async () => nestedProc({
+					nestedCostUsd: 4.19,
+					nestedCalls: [{
+						key: "tc1:impl-0:0", toolCallId: "tc1", taskId: "impl-0",
+						agent: "orch-implementation-strong", model: "provider/impl-model",
+						usage: { input: 10, output: 20, cost: 4.19, turns: 1 },
+						costReported: true, exitCode: 0,
+					}],
+				}),
+			});
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toMatchObject({
+			event: "model_call", run_id: "run", parent_task_id: "run-lead",
+			role: "implementation_strong", capability_class: "implementation_strong",
+			provider: "provider", model: "provider/impl-model",
+			cost_usd: 4.19, cost_source: "reported", nested: true, nesting_depth: 1,
+		});
+		const finished = events.filter(([e]) => e === "dispatch_finished");
+		expect(finished).toHaveLength(1);
+		expect(finished[0][1]).toMatchObject({ nested_cost_usd: 4.19, nested_rows_emitted: 1 });
+	});
+
+	test("unknown agent name maps to role 'unknown', never guessed", async () => {
+		const calls: Record<string, unknown>[] = [];
+		await orchestrator.dispatchParallel(process.cwd(), "run", leadTask,
+			{ lead: { model: "provider/lead-model" } }, {} as never, 0, {
+				recordEvent: () => {},
+				recordModelCall: (m) => { calls.push(m); },
+				runProcess: async () => nestedProc({
+					nestedCalls: [{
+						key: "tc1:t-0:0", toolCallId: "tc1", taskId: "t-0",
+						agent: "totally-custom-agent", model: "provider/m",
+						usage: { cost: 1 }, costReported: true, exitCode: 0,
+					}],
+				}),
+			});
+		expect(calls[0]).toMatchObject({ role: "unknown", capability_class: "unknown" });
+	});
+
+	test("unknown cost stays absent (never coerced to 0)", async () => {
+		const calls: Record<string, unknown>[] = [];
+		await orchestrator.dispatchParallel(process.cwd(), "run", leadTask,
+			{ lead: { model: "provider/lead-model" } }, {} as never, 0, {
+				recordEvent: () => {},
+				recordModelCall: (m) => { calls.push(m); },
+				runProcess: async () => nestedProc({
+					nestedCalls: [{
+						key: "tc1:t-0:0", toolCallId: "tc1", taskId: "t-0",
+						agent: "orch-scout", model: "provider/m",
+						usage: {}, costReported: false, exitCode: 0,
+					}],
+				}),
+			});
+		expect(calls).toHaveLength(1);
+		expect("cost_usd" in calls[0]).toBe(false);
+		expect("cost_source" in calls[0]).toBe(false);
+	});
+
+	test("retries: distinct attempts on the same taskId each get their own row", async () => {
+		const calls: Record<string, unknown>[] = [];
+		await orchestrator.dispatchParallel(process.cwd(), "run", leadTask,
+			{ lead: { model: "provider/lead-model" } }, {} as never, 0, {
+				recordEvent: () => {},
+				recordModelCall: (m) => { calls.push(m); },
+				runProcess: async () => nestedProc({
+					nestedCalls: [
+						{ key: "tc1:t-0:0", toolCallId: "tc1", taskId: "t-0", attempt: 0,
+						  agent: "orch-implementation-fast", model: "provider/m", usage: { cost: 0.5 }, costReported: true, exitCode: 1 },
+						{ key: "tc1:t-0:1", toolCallId: "tc1", taskId: "t-0", attempt: 1,
+						  agent: "orch-implementation-fast", model: "provider/m", usage: { cost: 0.7 }, costReported: true, exitCode: 0 },
+					],
+				}),
+			});
+		expect(calls).toHaveLength(2);
+		expect(new Set(calls.map((c) => c.record_id)).size).toBe(2);
+		expect(calls.map((c) => c.cost_usd).sort()).toEqual([0.5, 0.7]);
+	});
+
+	test("emits nothing when the dispatch had no nested subagent calls", async () => {
+		const calls: Record<string, unknown>[] = [];
+		const events: Array<[string, Record<string, unknown>]> = [];
+		await orchestrator.dispatchParallel(process.cwd(), "run", leadTask,
+			{ lead: { model: "provider/lead-model" } }, {} as never, 0, {
+				recordEvent: (e, p) => { events.push([e, p]); },
+				recordModelCall: (m) => { calls.push(m); },
+				runProcess: async () => nestedProc({}),
+			});
+		expect(calls).toHaveLength(0);
+		const finished = events.filter(([e]) => e === "dispatch_finished");
+		expect(finished[0][1]).toMatchObject({ nested_rows_emitted: 0 });
+	});
+
+	test("roleForAgentName: known aliases, orch-<capability>, and unknown fallback", () => {
+		expect(orchestrator.roleForAgentName("orch-scout")).toBe("scout");
+		expect(orchestrator.roleForAgentName("orch-implementation-strong")).toBe("implementation_strong");
+		expect(orchestrator.roleForAgentName("orch-technical-review")).toBe("api_contract_review");
+		expect(orchestrator.roleForAgentName("orchestrator-lead")).toBe("lead_large");
+		expect(orchestrator.roleForAgentName(undefined)).toBe("unknown");
+		expect(orchestrator.roleForAgentName("something-else")).toBe("unknown");
 	});
 });
 

@@ -34,6 +34,12 @@ Rules that keep the numbers honest:
   and `elapsed_source` is whatever the writer declared (`'reported'` when it declared none).
 - Interactive-session ingestion is excluded even when it carries a `run_id`, and never
   establishes a run on its own.
+- A run's status is `completed`/`failed`/`cancelled` when a terminal event/outcome names it so,
+  else `incomplete` — UNLESS `classify_liveness` can prove, from the `run_started` ownership
+  evidence (pid/hostname/process-start identity), that the owning process is confirmed gone, in
+  which case it is `interrupted`. This is read-time only (`summarize_runs` never rewrites
+  `events.jsonl`) and never derived from age alone: a run with no ownership evidence, or whose
+  evidence names a live or unverifiable process, stays `incomplete` no matter how old it is.
 - Overhead is every metered call outside `IMPLEMENTATION_ROLES` (lead, architect, review,
   QA, triage...). This is broader than `economics.orchestration_overhead`, which counts a
   fixed set of coordination roles; the dashboard labels the two differently.
@@ -45,17 +51,19 @@ Rules that keep the numbers honest:
 """
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, Optional
 import json
 import math
+import os
+import socket
 
 from . import records
 from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, has_reported_tokens, is_call_row, is_session_ingest, row_cost, unique_records
 
 ACTUAL = 'actual'
 COUNTERFACTUAL = 'counterfactual'
-TERMINAL_OUTCOME_TASKS = {'run-complete': 'completed', 'run-failed': 'failed'}
-TERMINAL_EVENTS = {'run_completed': 'completed', 'run_failed': 'failed'}
+TERMINAL_OUTCOME_TASKS = {'run-complete': 'completed', 'run-failed': 'failed', 'run-cancelled': 'cancelled'}
+TERMINAL_EVENTS = {'run_completed': 'completed', 'run_failed': 'failed', 'run_cancelled': 'cancelled'}
 IMPLEMENTATION_ROLES = {'worker', 'implementer', 'complex_implementer', 'implementation_fast', 'implementation_strong'}
 BAD_OUTCOME_KEYS = ('reopened', 'regression', 'rollback', 'human_correction', 'incident', 'major_rewrite')
 
@@ -135,6 +143,22 @@ def _is_run_scoped(row: dict) -> bool:
     return row.get('verification_scope') == 'run' or tid in TERMINAL_OUTCOME_TASKS or tid.endswith('-qa')
 
 
+def _checks_factually_verified(checks: list) -> bool:
+    """At least one parsed QA check actually ran to a `pass`/`fail` verdict — not merely `skipped`
+    or `unavailable` (Phase 1 review finding T8).
+
+    Independently re-derived here from the `checks` list itself, never trusted from a bridge-
+    supplied `evidence_status` string alone (the same "a producer's claim is not proof" rule T3
+    applies to `nested_rows_emitted`): an empty list, or a list where every entry is
+    `skipped`/`unavailable`, proves nothing was actually executed — a QA dispatch that exits 0
+    without running (or fully skipping/erroring on) every check it named is not a factually
+    verified gate, whatever the exit code says. This changes NO gate control flow — `passed`,
+    `outcome`, and the run verdict computed from them are untouched — it only changes what
+    `evidence_coverage` reports as actually-verified evidence versus merely-claimed evidence.
+    """
+    return any(isinstance(c, dict) and c.get('result') in ('pass', 'fail') for c in checks)
+
+
 def _attempt_order(row: dict):
     """Sort key for a task's attested attempts: by instant, with ties — and undated rows — failing.
 
@@ -162,6 +186,74 @@ def _elapsed(terminal: dict[str, Any] | None) -> tuple[int | None, str]:
     start, finish = _parse_ts(terminal.get('started_at')), _parse_ts(terminal.get('finished_at'))
     if start and finish: return max(0, int((finish - start).total_seconds() * 1000)), 'timestamps'
     return None, 'unknown'
+
+
+LivenessResult = Optional[bool]  # True = alive (or presumed alive), False = confirmed gone, None = unknown
+LivenessCheck = Callable[[dict[str, Any]], LivenessResult]
+INTERRUPTED = 'interrupted'
+
+
+#: `os.kill` raises `OverflowError` (CPython) for a pid outside the platform's signed-int range
+#: before it ever reaches the kernel; a pid outside this bound cannot possibly name a real process,
+#: so it is treated exactly like any other malformed pid — unknown, never a crash (Phase 1 review
+#: finding S6).
+_MAX_PLAUSIBLE_PID = 2 ** 31 - 1
+
+
+def _local_process_alive(pid: Any) -> LivenessResult:
+    """Best-effort, dependency-free liveness probe for a pid on THIS host. Never raises: any
+    error we cannot interpret (permission denied on the syscall itself, a non-integer pid, a pid
+    outside the platform's plausible range, ...) reports `None` (unknown), never `False`. Only a
+    definitive `ProcessLookupError` (ESRCH) is read as "confirmed gone" — `os.kill(pid, 0)` sends
+    no signal, it only asks the kernel whether the pid exists and this process may signal it.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or pid > _MAX_PLAUSIBLE_PID:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # pid exists (owned by someone else); presume alive rather than guess dead
+    except (OSError, OverflowError, ValueError):
+        # `OverflowError`/`ValueError` should be unreachable given the range check above, but a
+        # future platform-specific `os.kill` behaviour change must still degrade to "unknown"
+        # rather than propagate out of a read-time classifier (Phase 1 review finding S6).
+        return None
+    return True
+
+
+def default_liveness_check(ownership: dict[str, Any]) -> LivenessResult:
+    """Default `LivenessCheck`: only ever confirms a run's owning process is gone when the
+    ownership evidence names THIS host (a pid is meaningless on a different machine) and the
+    local `os.kill` probe comes back ESRCH. A pid that IS alive on this host is presumed to
+    still be the same process — this default has no independent way to confirm the recorded
+    `process_started_at_ms` against the live process's actual start time without an extra
+    dependency (psutil) or a platform-specific `/proc` read, so a same-pid-different-process
+    (pid reuse) case is intentionally left `None`/alive here rather than guessed at; callers
+    that can supply a more precise check should inject one instead of relying on this default.
+    """
+    pid = ownership.get('pid')
+    host = ownership.get('hostname')
+    if not host or not isinstance(host, str) or host != socket.gethostname(): return None
+    return _local_process_alive(pid)
+
+
+def classify_liveness(ownership: dict[str, Any] | None, *, liveness_check: LivenessCheck = default_liveness_check) -> str | None:
+    """Restart reconciliation for a run that has no terminal event.
+
+    Returns `'interrupted'` only when `liveness_check` returns durable evidence (`False`) that
+    the run's recorded owning process is confirmed gone; returns `None` (caller keeps the
+    existing status, i.e. `'incomplete'`) for every other case — no ownership evidence at all,
+    evidence naming a different host, or a pid that is still alive (or whose liveness is
+    merely unknown). This is a read-time classification only: it never rewrites `events.jsonl`,
+    and a run is never reclassified by age alone, which is the bug this replaces (`104/193`
+    runs all read as the same undifferentiated `'incomplete'` regardless of whether the owning
+    process was still running).
+    """
+    if not ownership: return None
+    if liveness_check(ownership) is False: return INTERRUPTED
+    return None
 
 
 def _note_json(note: Any) -> dict:
@@ -201,7 +293,7 @@ def _counterfactual(calls: list[dict], baseline_model: str, pricing: dict[str, A
 
 
 def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict], *, baseline_model: str | None = None,
-                   pricing: dict[str, Any] | None = None) -> list[dict]:
+                   pricing: dict[str, Any] | None = None, liveness_check: LivenessCheck = default_liveness_check) -> list[dict]:
     """One evidence row per run_id joined across metrics, events, and outcomes."""
     calls: dict[str, list[dict]] = defaultdict(list)
     verifications: dict[str, list[dict]] = defaultdict(list)
@@ -256,6 +348,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
     summary_note: dict[str, dict] = {}
     delayed_bad: dict[str, bool] = defaultdict(bool)
     outcome_tasks: dict[str, set[str]] = defaultdict(set)
+    verification_evidence: dict[str, dict[str, Any]] = {}
     for o in unique_records(outcomes):
         rid = o.get('run_id')
         if rid is None: continue
@@ -270,6 +363,28 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
         if tid.endswith('-qa') or o.get('verification') is not None:
             passed = o.get('verification') if o.get('verification') is not None else o.get('outcome') == 'verified'
             verification[rid] = 'passed' if passed else 'failed'
+        # Factual verification evidence (Phase 1 item 5): the bridge's run-level QA gate row
+        # (`${run}-qa`, `verification_scope: 'run'`) is the one place `checks`/`tested_revision`/
+        # `review_verdicts` are recorded today. Captured once per run from that row; never derived
+        # or guessed from anything else.
+        if _is_run_scoped(o) and tid.endswith('-qa'):
+            checks = o.get('checks') if isinstance(o.get('checks'), list) else []
+            verification_evidence[rid] = {
+                'checks': checks,
+                'checks_unavailable': o.get('checks_unavailable') if isinstance(o.get('checks_unavailable'), list) else [],
+                'check_commands': o.get('check_commands'),
+                'tested_revision': o.get('tested_revision'),
+                'tested_revision_dirty': o.get('tested_revision_dirty'),
+                'review_verdicts': o.get('review_verdicts') if isinstance(o.get('review_verdicts'), list) else [],
+                'artifacts': o.get('artifacts') if isinstance(o.get('artifacts'), list) else [],
+                'outcome_finality': o.get('outcome_finality'),
+                # Phase 1 review finding T8: the bridge's own claim (`bridge/extensions/orchestrator/
+                # index.ts`'s `qaVerificationOutcomeFor`), read defensively — and, below,
+                # independently re-checked against the `checks` list itself rather than trusted
+                # alone. Gate control flow (`outcome`/`verification`) is unchanged either way.
+                'evidence_status': o.get('evidence_status') if isinstance(o.get('evidence_status'), str) else None,
+                'checks_factually_verified': _checks_factually_verified(checks),
+            }
         # An ordinary task outcome is an attested verdict for `(run_id, task_id)`: join it into the same
         # attempt timeline as the metrics-side `task_verified` rows. Run-scoped gate rows were counted
         # above as the run verdict and must not reappear as a task. This adds a verdict, never a call.
@@ -307,8 +422,14 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
         if verdict is None and verified_tasks: verdict = 'passed'
         term = terminal.get(rid)
         elapsed_ms, elapsed_source = _elapsed(term)
+        raw_status = status.get(rid, 'incomplete')
+        # Restart reconciliation: a run with no terminal event is reclassified 'interrupted'
+        # only when the run_started ownership evidence proves the owning process is gone —
+        # never merely because the run is old, and never for a run that has no ownership
+        # evidence at all (historical runs predating this tracking stay 'incomplete').
+        run_status = raw_status if raw_status != 'incomplete' else (classify_liveness(started_events.get(rid), liveness_check=liveness_check) or raw_status)
         result.append({
-            'run_id': rid, 'cost_provenance': ACTUAL, 'status': status.get(rid, 'incomplete'),
+            'run_id': rid, 'cost_provenance': ACTUAL, 'status': run_status,
             'started_at': (term or {}).get('started_at') or started_events.get(rid, {}).get('started_at'),
             'finished_at': (term or {}).get('finished_at'), 'elapsed_ms': elapsed_ms, 'elapsed_source': elapsed_source,
             'call_rows': len(rows), 'metered_calls': len(metered), 'unmetered_calls': len(rows) - len(metered),
@@ -329,6 +450,9 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
             'spend_cap_hit': bool(cap_hits[rid]), 'spend_cap_hits': cap_hits[rid],
             'delayed_bad_outcome': delayed_bad[rid] if (outcome_tasks[rid] or delayed_bad[rid]) else None,
             'counterfactual': _counterfactual(rows, baseline_model, pricing) if baseline_model else None,
+            # Factual verification evidence (Phase 1 item 5), or None when this run's QA gate
+            # (if it ran at all) predates this field set. Never backfilled/guessed.
+            'verification_evidence': verification_evidence.get(rid),
         })
     return result
 
@@ -339,10 +463,30 @@ def evidence_coverage(runs: list[dict]) -> dict[str, Any]:
     fully_priced = sum(1 for r in runs if r.get('cost_complete'))
     with_elapsed = sum(1 for r in runs if r.get('elapsed_ms') is not None)
     with_verification = sum(1 for r in runs if r.get('verification') in {'passed', 'failed'})
+    # Factual verification evidence coverage (Phase 1 item 5). `evidence` is None for a run whose
+    # QA gate (if any ran) predates these fields, or that had no run-scoped QA gate row at all —
+    # both read as "not observed", never as zero/failed. This never changes what makes a run
+    # verified; it only reports how much of the evidence behind that verdict is on record.
+    evidenced = [r.get('verification_evidence') for r in runs if r.get('verification_evidence')]
+    with_tested_revision = sum(1 for e in evidenced if e.get('tested_revision'))
+    with_check_commands = sum(1 for e in evidenced if e.get('check_commands'))
+    with_review_verdict = sum(1 for e in evidenced if e.get('review_verdicts'))
+    with_unavailable_checks = sum(1 for e in evidenced if e.get('checks_unavailable'))
+    # Phase 1 review finding T8: an exit-0 QA dispatch whose checks are ALL `skipped`/`unavailable`
+    # (or that reported no checks at all) is not factually verified evidence, however the gate
+    # verdict reads — that verdict is untouched by this count, which exists only so this gap in
+    # what a `passed` verdict actually proves is visible instead of silently reading as "verified".
+    with_factually_verified_checks = sum(1 for e in evidenced if e.get('checks_factually_verified'))
     return {
         'cost_provenance': ACTUAL, 'runs': n,
         'runs_completed': sum(1 for r in runs if r.get('status') == 'completed'),
         'runs_failed': sum(1 for r in runs if r.get('status') == 'failed'),
+        'runs_cancelled': sum(1 for r in runs if r.get('status') == 'cancelled'),
+        # Restart-reconciled: no terminal event, but ownership evidence proved the owning
+        # process is gone. Disjoint from `runs_incomplete` below (never both).
+        'runs_interrupted': sum(1 for r in runs if r.get('status') == INTERRUPTED),
+        # Still genuinely unknown: no terminal event, and either no ownership evidence or the
+        # owning process could not be shown to be gone. Never inferred from age alone.
         'runs_incomplete': sum(1 for r in runs if r.get('status') == 'incomplete'),
         'runs_fully_priced': fully_priced, 'runs_with_elapsed': with_elapsed, 'runs_with_verification': with_verification,
         'priced_run_coverage': (fully_priced / n) if n else None, 'duration_coverage': (with_elapsed / n) if n else None,
@@ -350,4 +494,14 @@ def evidence_coverage(runs: list[dict]) -> dict[str, Any]:
         'call_rows': sum(int(r.get('call_rows') or 0) for r in runs), 'unmetered_calls': sum(int(r.get('unmetered_calls') or 0) for r in runs),
         'cost_known_usd': sum(float(r.get('cost_known_usd') or 0) for r in runs),
         'elapsed_ms_total_known': sum(int(r['elapsed_ms']) for r in runs if r.get('elapsed_ms') is not None) if with_elapsed else None,
+        'runs_with_verification_evidence': len(evidenced),
+        'runs_with_tested_revision': with_tested_revision,
+        'runs_with_check_commands': with_check_commands,
+        'runs_with_review_verdict': with_review_verdict,
+        'runs_with_unavailable_checks_listed': with_unavailable_checks,
+        'runs_with_factually_verified_checks': with_factually_verified_checks,
+        'factually_verified_checks_coverage': (with_factually_verified_checks / n) if n else None,
+        'tested_revision_coverage': (with_tested_revision / n) if n else None,
+        'check_commands_coverage': (with_check_commands / n) if n else None,
+        'review_verdict_coverage': (with_review_verdict / n) if n else None,
     }

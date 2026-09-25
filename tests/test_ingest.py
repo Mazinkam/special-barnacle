@@ -131,6 +131,34 @@ class IngestTests(unittest.TestCase):
             self.assertEqual(rows[0]['source'], 'session_ingest')
             self.assertEqual(rows[0]['ts'], '2026-09-21T10:00:05.000Z')
 
+    def test_estimated_session_ingest_rows_carry_pricing_provenance(self):
+        """Phase 1 item 6: `_base_metric`/`_tally` never call `pricing.estimate_cost_usd`
+        themselves — every metric row, session-ingest included, is priced by the SAME shared
+        `runtime.meter`/`record_batch.build_record` path an orchestrated bridge row goes through
+        (`ingest_file`/`ingest_paths` write `stream: 'metric'` records via `write_batch`, which
+        calls `build_record`, which calls `meter`). So an estimated interactive-session row must
+        carry the same `cost_rate_model`/`cost_rate_source`/`cost_rate_verified_on` provenance a
+        live orchestrated row does — confirming the audit's 'not directly verified' flag on
+        `ingest.py`'s pricing path resolves to already-correct, not a defect.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d, 'state')
+            with self._env(root):
+                summary = ingest_file(humain_terminal_log(Path(d, 'session.jsonl')), state_root=root)
+            self.assertGreater(summary['estimated_cost_usd'], 0)
+            rows = load_jsonl(root / 'metrics.jsonl')
+            estimated = [r for r in rows if r['cost_source'] == 'estimated-from-reported-tokens']
+            self.assertEqual(len(estimated), 1)
+            row = estimated[0]
+            direct = estimate_cost_usd(model=row['model'], input_tokens=row.get('input_tokens'),
+                                       output_tokens=row.get('output_tokens'), cached_input_tokens=row.get('cached_input_tokens'),
+                                       cache_write_tokens=row.get('cache_write_tokens'))
+            self.assertIsNotNone(direct)
+            self.assertIsNotNone(row.get('cost_rate_source'))
+            self.assertEqual(row['cost_rate_source'], direct['cost_rate_source'])
+            self.assertEqual(row['cost_rate_model'], direct['cost_rate_model'])
+            self.assertEqual(row.get('cost_rate_verified_on'), direct['cost_rate_verified_on'])
+
     def test_re_ingesting_the_same_log_adds_nothing(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d, 'state')

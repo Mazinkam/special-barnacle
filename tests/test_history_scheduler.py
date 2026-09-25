@@ -245,3 +245,41 @@ class T(unittest.TestCase):
         self.assertEqual(r['explanation']['run_samples'],1)
         self.assertEqual(r['explanation']['min_samples'],12)
         self.assertEqual(r['selected'],r['default'])
+
+    def test_factual_verification_evidence_without_a_quality_score_keeps_routing_insufficient(self):
+        """Phase 1 item 5: recording factual evidence (checks/tested_revision/review_verdicts) on
+        an outcome row must not, on its own, manufacture the `quality_evidence_score` that
+        `Engine.verify_task` alone is trusted to produce. Even with far more verified tasks than
+        `min_samples` requires, a cohort with no measured quality score can never become
+        `historical` (`scheduler.package_history` requires both a verified cost AND a measured
+        quality score) -- so `mode: 'enforce'` must stay `recommended_only`/insufficient, exactly
+        as it does with zero history at all.
+        """
+        rows=[]
+        outcomes=[]
+        base={'task_class':'crud','complexity':3,'risk':'low','capability_class':'implementation_fast',
+              'effort':'low','verification_depth':'targeted','run_id':'R1'}
+        for i in range(20):
+            task_id=f'T{i}'
+            rows.append({**base,'task_id':task_id,'event':'model_call','model':'m','cost_usd':.01,'cost_source':'reported'})
+            # A verification outcome row carrying the new factual-evidence fields (Phase 1 item 5)
+            # but explicitly no `quality_evidence_score` -- that field is written only by
+            # `Engine.verify_task`, never fabricated from check/review evidence.
+            outcomes.append({
+                'run_id':'R1','task_id':task_id,'outcome':'verified',
+                'checks':[{'id':'typecheck','result':'pass'}],
+                'checks_unavailable':[],
+                'tested_revision':'deadbeef','tested_revision_dirty':False,
+                'review_verdicts':[{'role':'qa_agent','verdict':'pass'}],
+                'artifacts':[],'outcome_finality':'immediate',
+            })
+        stats=build_route_stats(rows,outcomes)
+        self.assertEqual(stats[0]['verified_tasks'],20)
+        # Factual evidence populated the task-level verdict; it did not populate a quality score.
+        self.assertIs(stats[0]['avg_quality_evidence'],NO_DATA)
+        f={'adaptive_routing':{'mode':'enforce'},'historical_learning':{'enabled':True,'minimum_samples':12}}
+        r=adaptive_route(run_id='y',task_class='crud',complexity=3,risk='low',quality_floor=.9,cost_aggressiveness=.8,
+                         stats=stats,features=f,default_efforts={'implementation_fast':'low','implementation_strong':'standard'},min_samples=12)
+        self.assertFalse(r['history_sufficient'])
+        self.assertEqual(r['explanation']['action'],'fallback_insufficient_history')
+        self.assertEqual(r['selected'],r['default'])

@@ -20,7 +20,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 from orchestrator.dashboard import (INSTRUMENTATION, MIN_TAIL_SAMPLES, build_data, build_ingest_status,
-                                    generate_dashboard, safe, tail_ratio)
+                                    generate_dashboard, safe, tail_ratio, _parse_row_ts)
 from orchestrator.economics import quantile
 from orchestrator.records import NO_DATA, is_no_data, to_json
 
@@ -345,6 +345,87 @@ class AttributionSummaryTests(StreamCase):
         self.assertEqual(provenance['models'], [])
         self.assertTrue(is_no_data(provenance['dominant_model']))
         self.assertEqual(provenance['rate_rows'], 0)
+
+    def test_source_predates_provenance_only_when_every_row_actually_predates_the_commit(self):
+        # Phase 1 review finding T7: the dashboard previously labelled ANY sourceless group
+        # "predates provenance tracking", whatever its age. Now the claim must be justified by the
+        # rows' own timestamps against when `cost_rate_source` was introduced (commit d57b327,
+        # 2026-09-23T18:42:05Z).
+        before = per_call(1.0, cost_rate_model='old-model', ts='2026-09-23T18:00:00Z')
+        provenance = self.summary([before])['rate_provenance']
+        entry = next(m for m in provenance['models'] if m['model'] == 'old-model')
+        self.assertIsNone(entry['source'])
+        self.assertTrue(entry['source_predates_provenance'])
+
+    def test_source_unknown_when_a_sourceless_row_postdates_the_provenance_commit(self):
+        after = per_call(1.0, cost_rate_model='new-model', ts='2026-09-24T00:00:00Z')
+        provenance = self.summary([after])['rate_provenance']
+        entry = next(m for m in provenance['models'] if m['model'] == 'new-model')
+        self.assertIsNone(entry['source'])
+        self.assertFalse(entry['source_predates_provenance'])
+
+    def test_source_unknown_when_a_sourceless_row_has_no_usable_timestamp(self):
+        no_ts = per_call(1.0, cost_rate_model='undated-model', ts=None)
+        provenance = self.summary([no_ts])['rate_provenance']
+        entry = next(m for m in provenance['models'] if m['model'] == 'undated-model')
+        self.assertIsNone(entry['source'])
+        self.assertFalse(entry['source_predates_provenance'])
+
+    def test_source_predates_provenance_is_false_once_any_row_in_the_group_postdates_it(self):
+        # A group mixing an old and a new sourceless row must not read as "predates": the newer
+        # row's absence is unexplained by age even though the older one's is.
+        rows = [per_call(1.0, cost_rate_model='mixed-model', ts='2026-09-01T00:00:00Z'),
+                per_call(1.0, cost_rate_model='mixed-model', ts='2026-09-24T00:00:00Z')]
+        provenance = self.summary(rows)['rate_provenance']
+        entry = next(m for m in provenance['models'] if m['model'] == 'mixed-model')
+        self.assertIsNone(entry['source'])
+        self.assertFalse(entry['source_predates_provenance'])
+
+    def test_source_predates_provenance_is_false_once_a_source_exists(self):
+        # A group that DOES carry a source has nothing to explain by age; the field is simply False
+        # (the renderer never reads it once `source` itself is truthy).
+        row = per_call(1.0, cost_rate_source='provider-pricing-page', ts='2026-09-01T00:00:00Z')
+        provenance = self.summary([row])['rate_provenance']
+        entry = provenance['models'][0]
+        self.assertEqual(entry['source'], 'provider-pricing-page')
+        self.assertFalse(entry['source_predates_provenance'])
+
+
+class ParseRowTsOffsetNaiveTests(unittest.TestCase):
+    """Phase 1 review B4: an offset-naive `ts` must read as unknown, never crash the comparison
+    against the aware `PROVENANCE_INTRODUCED_AT` in `_rate_provenance`."""
+
+    def test_offset_naive_iso_timestamp_reads_as_none(self):
+        self.assertIsNone(_parse_row_ts('2026-09-23T18:00:00'))
+        self.assertIsNone(_parse_row_ts('2026-09-23T18:00:00.123456'))
+
+    def test_offset_aware_iso_timestamp_still_parses(self):
+        self.assertIsNotNone(_parse_row_ts('2026-09-23T18:00:00Z'))
+        self.assertIsNotNone(_parse_row_ts('2026-09-23T18:00:00+00:00'))
+
+    def test_missing_and_malformed_still_read_as_none(self):
+        self.assertIsNone(_parse_row_ts(None))
+        self.assertIsNone(_parse_row_ts(''))
+        self.assertIsNone(_parse_row_ts('not-a-timestamp'))
+
+    def test_dashboard_build_does_not_crash_on_a_mix_of_naive_aware_and_invalid_timestamps(self):
+        # Before the B4 fix, the naive row's ts would raise TypeError comparing it against the
+        # aware PROVENANCE_INTRODUCED_AT inside _rate_provenance, taking the whole build down.
+        rows = [
+            per_call(1.0, cost_rate_model='mixed-offsets', ts='2026-09-23T18:00:00'),       # naive
+            per_call(1.0, cost_rate_model='mixed-offsets', ts='2026-09-24T00:00:00Z'),       # aware
+            per_call(1.0, cost_rate_model='mixed-offsets', ts='not-a-timestamp'),            # invalid
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            write_stream(directory, metrics=rows)
+            data = build_data(Path(directory), config={})  # must not raise
+        provenance = data['summary']['rate_provenance']
+        entry = next(m for m in provenance['models'] if m['model'] == 'mixed-offsets')
+        self.assertIsNone(entry['source'])
+        # A naive/invalid ts in the group means it is not provably ALL before the provenance
+        # commit, so the label must be "source unknown" (source_predates_provenance=False), never
+        # "predates provenance tracking".
+        self.assertFalse(entry['source_predates_provenance'])
 
 
 class VerificationSummaryTests(StreamCase):
@@ -885,3 +966,111 @@ class SpendCapBreachTests(StreamCase):
             html = generate_dashboard(directory, config={}).read_text(encoding='utf-8')
         self.assertIn('id="spendcaps"', html)
         self.assertIn('Spend-cap breaches', html)
+
+
+class NestedCostReconciliationTests(StreamCase):
+    """Phase 1 items 2-3: nested subagent spend must reach `build_data`'s totals, by_role,
+    by_runtime and coordination_rate exactly once, whether via detail rows or a residual."""
+
+    def _dispatch_finished(self, run_id='r1', task_id='r1-lead', nested_cost=4.19, rows_emitted=None):
+        event = {'event': 'dispatch_finished', 'run_id': run_id, 'task_id': task_id,
+                 'nested_cost_usd': nested_cost, 'record_id': f'df-{task_id}'}
+        if rows_emitted is not None:
+            event['nested_rows_emitted'] = rows_emitted
+        return event
+
+    def test_historical_aggregate_with_no_detail_rows_becomes_an_unknown_nested_residual(self):
+        own = per_call(1.0, task_id='r1-lead', role='lead', run_id='r1')
+        data = self.build([own], [self._dispatch_finished()])
+        self.assertAlmostEqual(data['summary']['total_cost'], 5.19)
+        self.assertIn('unknown_nested', data['by_role'])
+        self.assertAlmostEqual(data['by_role']['unknown_nested']['cost'], 4.19)
+        # Unknown attribution never leaks into the coordination bucket.
+        self.assertAlmostEqual(data['summary']['coordination_rate'], 1.0 / 5.19)
+
+    def test_detail_rows_suppress_the_residual_and_carry_their_own_real_role(self):
+        own = per_call(1.0, task_id='r1-lead', role='lead', run_id='r1')
+        nested_detail = per_call(4.19, task_id='r1-lead:impl-0', role='implementation_strong', run_id='r1')
+        nested_detail['parent_task_id'] = 'r1-lead'
+        nested_detail['nested'] = True
+        data = self.build([own, nested_detail],
+                          [self._dispatch_finished(rows_emitted=1)])
+        self.assertAlmostEqual(data['summary']['total_cost'], 5.19)
+        self.assertNotIn('unknown_nested', data['by_role'])
+        self.assertIn('implementation_strong', data['by_role'])
+        self.assertAlmostEqual(data['by_role']['implementation_strong']['cost'], 4.19)
+        # implementation_strong is production work: coordination_rate reflects only the lead's own
+        # $1.00 over the $5.19 total, not a double-booked aggregate.
+        self.assertAlmostEqual(data['summary']['coordination_rate'], 1.0 / 5.19)
+
+    def test_without_any_nested_cost_totals_are_unaffected(self):
+        own = per_call(1.0, task_id='r1-lead', role='lead', run_id='r1')
+        data = self.build([own], [])
+        self.assertAlmostEqual(data['summary']['total_cost'], 1.0)
+        self.assertNotIn('unknown_nested', data['by_role'])
+
+    def test_by_runtime_carries_the_residual_too(self):
+        own = per_call(1.0, task_id='r1-lead', role='lead', run_id='r1', agent_runtime='humain-terminal')
+        data = self.build([own], [self._dispatch_finished()])
+        self.assertAlmostEqual(data['by_runtime']['humain-terminal']['cost'], 5.19)
+
+    def test_quota_fallbacks_two_dispatch_finished_events_reconcile_independently_by_attempt(self):
+        # Phase 1 review T1/T2, end to end: a codex -> Bedrock quota fallback writes two
+        # `dispatch_finished` events for the SAME task_id, each carrying only its own attempt's
+        # nested cost and its own `dispatch_attempt`. Both must reach `by_role`/totals exactly
+        # once each — never summed together, never dropped.
+        own = per_call(1.0, task_id='r1-lead', role='lead', run_id='r1')
+        events = [
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 'r1-lead', 'dispatch_attempt': 0,
+             'nested_cost_usd': 2.0, 'record_id': 'df-r1-lead-0'},
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 'r1-lead', 'dispatch_attempt': 1,
+             'nested_cost_usd': 5.0, 'record_id': 'df-r1-lead-1'},
+        ]
+        data = self.build([own], events)
+        # 1.00 (lead) + 2.00 (attempt 0 residual) + 5.00 (attempt 1 residual) = 8.00, never 1 + 7
+        # (which would double-count attempt 0 the way a single shared key used to).
+        self.assertAlmostEqual(data['summary']['total_cost'], 8.0)
+        self.assertAlmostEqual(data['by_role']['unknown_nested']['cost'], 7.0)
+
+
+class RunStatusCountsTests(StreamCase):
+    """Phase 1 item 4: the dashboard's run_evidence summary must count cancelled and
+    restart-reconciled runs separately from completed/failed/incomplete, end to end through
+    `build_data` (not just the `run_evidence` unit tests)."""
+
+    def test_run_cancelled_event_counts_as_cancelled_not_incomplete_or_failed(self):
+        events = [{'event': 'run_started', 'run_id': 'rc1', 'pid': 111, 'hostname': 'h'},
+                  {'event': 'run_cancelled', 'run_id': 'rc1', 'reason': 'signal',
+                   'started_at': '2026-09-23T10:00:00Z', 'finished_at': '2026-09-23T10:00:01Z',
+                   'elapsed_ms': 1000, 'elapsed_source': 'monotonic'}]
+        data = self.build([per_call(0.01, task_id='rc1-t1', run_id='rc1')], events)
+        cov = data['run_evidence']
+        self.assertEqual(cov['runs_cancelled'], 1)
+        self.assertEqual(cov['runs_failed'], 0)
+        self.assertEqual(cov['runs_incomplete'], 0)
+        run = next(r for r in data['runs'] if r['run_id'] == 'rc1')
+        self.assertEqual(run['status'], 'cancelled')
+
+    def test_a_run_with_no_terminal_event_and_no_ownership_evidence_is_still_incomplete(self):
+        data = self.build([per_call(0.01, task_id='old-t1', run_id='old')], [])
+        cov = data['run_evidence']
+        self.assertEqual(cov['runs_incomplete'], 1)
+        self.assertEqual(cov['runs_interrupted'], 0)
+
+    def test_completed_failed_cancelled_and_incomplete_counts_are_mutually_exclusive(self):
+        events = [
+            {'event': 'run_completed', 'run_id': 'a'},
+            {'event': 'run_failed', 'run_id': 'b'},
+            {'event': 'run_cancelled', 'run_id': 'c', 'reason': 'orchestrate_cancel'},
+        ]
+        data = self.build([per_call(0.01, task_id=f'{r}-t1', run_id=r) for r in ('a', 'b', 'c', 'd')], events)
+        cov = data['run_evidence']
+        self.assertEqual(cov['runs'], 4)
+        self.assertEqual(cov['runs_completed'], 1)
+        self.assertEqual(cov['runs_failed'], 1)
+        self.assertEqual(cov['runs_cancelled'], 1)
+        self.assertEqual(cov['runs_incomplete'], 1)
+        self.assertEqual(cov['runs_interrupted'], 0)
+        total_classified = (cov['runs_completed'] + cov['runs_failed'] + cov['runs_cancelled']
+                            + cov['runs_incomplete'] + cov['runs_interrupted'])
+        self.assertEqual(total_classified, cov['runs'])

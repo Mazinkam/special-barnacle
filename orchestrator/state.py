@@ -28,6 +28,8 @@ def reduce_event(state:dict[str,Any], e:dict[str,Any])->dict[str,Any]:
         state['runs'].setdefault(rid,{}) .update({**e,'status':'completed'})
     elif t=='run_failed' and rid:
         state['runs'].setdefault(rid,{}) .update({**e,'status':'failed'})
+    elif t=='run_cancelled' and rid:
+        state['runs'].setdefault(rid,{}) .update({**e,'status':'cancelled'})
     elif t=='routing_explained' and rid:
         state['adaptive'].setdefault(rid,{}) .update(e)
     elif t=='task_created' and tid:

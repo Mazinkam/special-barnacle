@@ -33,8 +33,8 @@ from unittest.mock import patch
 
 from orchestrator import dashboard, outcomes as outcomes_module, records, runtime
 from orchestrator.economics import (ESTIMATED, REPORTED, UNMETERED, cost_attribution, cost_class, fanout_rework,
-                                    is_call_row, is_session_ingest, orchestration_overhead, row_cost, unique_records,
-                                    waste_cost)
+                                    is_call_row, is_session_ingest, nested_reconciliation, orchestration_overhead,
+                                    row_cost, unique_records, waste_cost)
 from orchestrator.features import feature_inventory
 from orchestrator.history import build_route_stats
 from orchestrator.outcomes import outcome_summary
@@ -296,6 +296,16 @@ def _ref_tokens(row) -> int:
     return int(_ref_num(row.get('input_tokens'))) + int(_ref_num(row.get('output_tokens')))
 
 
+def _ref_ts(row) -> object:
+    value = row.get('ts')
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+
+
 def _ref_runtime(row) -> str:
     return str(row.get('agent_runtime') or row.get('runtime') or 'unknown')
 
@@ -330,6 +340,10 @@ def reference_build_data(root: Path, config: dict | None = None):
     outcomes = list(unique_records(load_jsonl(root / 'outcomes.jsonl')))
     ingested = [r for r in metrics if is_session_ingest(r)]
     orchestrated = [r for r in metrics if not is_session_ingest(r)]
+    # Mirrors `dashboard.build_data`'s injection point exactly: the residual rows must be present
+    # before ANY other reducer below reads `orchestrated`, and `ambiguous` never joins any total.
+    nested = nested_reconciliation(events, orchestrated)
+    orchestrated = orchestrated + nested['rows']
 
     # -- spend ---------------------------------------------------------------------------------
     total = sum(row_cost(r) for r in orchestrated)
@@ -423,8 +437,12 @@ def reference_build_data(root: Path, config: dict | None = None):
         rows = [r for r in estimated_rows if str(r.get('cost_rate_model') or r.get('model') or 'unknown') == name]
         sources = [str(r['cost_rate_source']) for r in rows if r.get('cost_rate_source')]
         verified_on = [str(r['cost_rate_verified_on']) for r in rows if r.get('cost_rate_verified_on')]
+        timestamps = [_ref_ts(r) for r in rows]
+        predates = (not sources and all(t is not None for t in timestamps)
+                   and all(t < dashboard.PROVENANCE_INTRODUCED_AT for t in timestamps))
         rate_models.append({'model': name, 'rows': len(rows), 'cost': sum(row_cost(r) for r in rows),
-                            'source': sources[0] if sources else None, 'verified_on': verified_on[-1] if verified_on else None})
+                            'source': sources[0] if sources else None, 'verified_on': verified_on[-1] if verified_on else None,
+                            'source_predates_provenance': predates})
     rate_models.sort(key=lambda m: -m['cost'])
     dominant = rate_models[0] if rate_models else None
     rate_provenance = {'scope': 'all metric rows (orchestrated + ingested)', 'estimated_cost': sum(m['cost'] for m in rate_models),
@@ -444,12 +462,21 @@ def reference_build_data(root: Path, config: dict | None = None):
         'runs': run_cov['runs'], 'runs_fully_priced': run_cov['runs_fully_priced'], 'runs_with_elapsed': run_cov['runs_with_elapsed'],
         'priced_run_coverage': run_cov['priced_run_coverage'], 'duration_coverage': run_cov['duration_coverage'],
         'verification_coverage': run_cov['verification_coverage'], 'cost_provenance': run_cov['cost_provenance'],
+        'runs_with_verification_evidence': run_cov['runs_with_verification_evidence'],
+        'runs_with_tested_revision': run_cov['runs_with_tested_revision'],
+        'runs_with_check_commands': run_cov['runs_with_check_commands'],
+        'runs_with_review_verdict': run_cov['runs_with_review_verdict'],
+        'runs_with_unavailable_checks_listed': run_cov['runs_with_unavailable_checks_listed'],
+        'tested_revision_coverage': run_cov['tested_revision_coverage'],
+        'check_commands_coverage': run_cov['check_commands_coverage'],
+        'review_verdict_coverage': run_cov['review_verdict_coverage'],
         'verified_tasks': len(verified), 'verified_cost': _ref_ratio(total, len(verified)),
         'dispatch_pass_tasks': len(dispatch_passed), 'dispatch_pass_cost': _ref_ratio(total, len(dispatch_passed)),
         'waste_cost': sum(waste.values()), 'waste_rate': _ref_ratio(sum(waste.values()), total),
         'orchestration_overhead': overhead, 'coordination_rate': overhead['coordination_rate'], 'verification_rate': overhead['verification_rate'],
         'coordination_cost': overhead['coordination_cost'], 'verification_cost': overhead['verification_cost'],
         'spend_cap_breaches': sum(e.get('event') == 'spend_cap_exceeded' for e in events),
+        'nested_reconciliation_ambiguous': nested['ambiguous_count'],
         'fanout_rework': fanout_rework(events), 'context_miss_rate': _ref_ratio(context_misses, context_packets),
         'conflicts': conflicts or None, 'review_wait_p90_s': _ref_quantile(review_wait, .9),
         'shadow_reviews': len(shadow), 'shadow_false_pass_rate': _ref_ratio(false_pass, len(shadow)), 'shadow_over_reject_rate': _ref_ratio(over_reject, len(shadow)),
@@ -489,6 +516,7 @@ def reference_build_data(root: Path, config: dict | None = None):
             'run_evidence': run_cov, 'runs': runs[-dashboard.RECENT_RUNS:],
             'lead_sizes': dashboard._lead_sizes(orchestrated, runs),
             'spend_caps': dashboard._spend_caps([e for e in events if e.get('event') == 'spend_cap_exceeded'], runs),
+            'nested_reconciliation_ambiguous': nested['ambiguous'],
             'flaky': flaky_stats(orchestrated),
             'interactive_sessions': interactive_sessions,
             'ingest_status': _ref_ingest_status(root),

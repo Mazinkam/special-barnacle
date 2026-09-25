@@ -280,5 +280,274 @@ class TopologyRegretTests(unittest.TestCase):
         self.assertAlmostEqual(economics.topology_regret(current, comparable), .6)
 
 
+class NestedResidualRowsTests(unittest.TestCase):
+    """Phase 1 items 2-3: `dispatch_finished.nested_cost_usd` must reach totals exactly once,
+    never twice, and never as a guessed real role."""
+
+    def test_no_dispatch_finished_events_yields_nothing(self):
+        self.assertEqual(economics.nested_residual_rows([], []), [])
+
+    def test_a_zero_or_missing_nested_cost_synthesizes_nothing(self):
+        events = [{'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'nested_cost_usd': 0},
+                  {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't2'}]
+        self.assertEqual(economics.nested_residual_rows(events, []), [])
+
+    def test_positive_nested_cost_with_no_detail_rows_becomes_one_unknown_nested_residual(self):
+        events = [{'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'nested_cost_usd': 4.19}]
+        residuals = economics.nested_residual_rows(events, [])
+        self.assertEqual(len(residuals), 1)
+        row = residuals[0]
+        self.assertEqual(row['role'], 'unknown_nested')
+        self.assertEqual(row['capability_class'], 'unknown_nested')
+        self.assertAlmostEqual(row_cost(row), 4.19)
+        self.assertEqual(row['cost_source'], 'reported')
+        self.assertTrue(row['nested'])
+        self.assertEqual(row['parent_task_id'], 't1')
+
+    def test_full_write_nested_rows_emitted_matches_durable_rows_and_reconciles_exactly(self):
+        # Phase 1 review T3: `nested_rows_emitted` alone must never suppress the residual — only a
+        # durable detail row sum that actually EXPLAINS the aggregate does.
+        events = [{'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1',
+                   'nested_cost_usd': 4.19, 'nested_rows_emitted': 1}]
+        calls = [{'event': 'model_call', 'run_id': 'r1', 'parent_task_id': 't1', 'nested': True,
+                  'role': 'implementation_strong', 'cost_usd': 4.19}]
+        self.assertEqual(economics.nested_residual_rows(events, calls), [])
+        reconciled = economics.nested_reconciliation(events, calls)
+        self.assertEqual(reconciled['ambiguous'], [])
+
+    def test_partial_write_books_only_the_shortfall_not_the_full_aggregate(self):
+        # Phase 1 review T3 (the confirmed bug): the old rule suppressed the ENTIRE residual
+        # whenever `nested_rows_emitted > 0` or even one matching detail row existed, so a crash
+        # between writing detail row 1 and detail row 2 of a claimed 2 lost the second row's
+        # dollars forever. The fix books exactly the unexplained remainder.
+        events = [{'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1',
+                   'nested_cost_usd': 4.19, 'nested_rows_emitted': 2}]
+        calls = [{'event': 'model_call', 'run_id': 'r1', 'parent_task_id': 't1', 'nested': True,
+                  'role': 'implementation_strong', 'cost_usd': 1.19}]
+        residuals = economics.nested_residual_rows(events, calls)
+        self.assertEqual(len(residuals), 1)
+        self.assertAlmostEqual(row_cost(residuals[0]), 3.0)
+        self.assertEqual(residuals[0]['role'], 'unknown_nested')
+        reconciled = economics.nested_reconciliation(events, calls)
+        self.assertEqual(reconciled['ambiguous'], [])
+
+    def test_unexplained_mismatch_books_nothing_but_is_reported_ambiguous(self):
+        # The claimed row count IS fully durable, yet the dollars still don't add up. Booking a
+        # residual here would be a guess (which of the N rows is wrong, or is the aggregate
+        # itself wrong?) — so nothing is added to totals, but the mismatch is surfaced.
+        events = [{'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1',
+                   'nested_cost_usd': 4.19, 'nested_rows_emitted': 1}]
+        calls = [{'event': 'model_call', 'run_id': 'r1', 'parent_task_id': 't1', 'nested': True,
+                  'role': 'implementation_strong', 'cost_usd': 1.0}]
+        self.assertEqual(economics.nested_residual_rows(events, calls), [])
+        reconciled = economics.nested_reconciliation(events, calls)
+        self.assertEqual(reconciled['rows'], [])
+        self.assertEqual(reconciled['ambiguous_count'], 1)
+        ambiguous = reconciled['ambiguous'][0]
+        self.assertEqual(ambiguous['run_id'], 'r1')
+        self.assertEqual(ambiguous['task_id'], 't1')
+        self.assertEqual(ambiguous['dispatch_attempt'], 0)
+        self.assertAlmostEqual(ambiguous['aggregate_usd'], 4.19)
+        self.assertAlmostEqual(ambiguous['detail_usd'], 1.0)
+        self.assertAlmostEqual(ambiguous['gap_usd'], 3.19)
+        self.assertEqual(ambiguous['nested_rows_emitted'], 1)
+        self.assertEqual(ambiguous['durable_rows_found'], 1)
+
+    def test_dispatch_attempt_keeps_a_quota_fallbacks_two_dispatch_finished_events_independent(self):
+        # Phase 1 review T1: a codex -> Bedrock quota fallback writes TWO `dispatch_finished`
+        # events for the SAME task_id, each carrying only its own attempt's nested cost. Keying
+        # reconciliation on `(run_id, task_id)` alone would let one attempt's detail rows satisfy
+        # the OTHER attempt's aggregate; `dispatch_attempt` keeps them independent.
+        events = [
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'dispatch_attempt': 0,
+             'nested_cost_usd': 2.0, 'nested_rows_emitted': 1},
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'dispatch_attempt': 1,
+             'nested_cost_usd': 5.0, 'nested_rows_emitted': 1},
+        ]
+        calls = [
+            {'event': 'model_call', 'run_id': 'r1', 'parent_task_id': 't1', 'dispatch_attempt': 0,
+             'nested': True, 'role': 'implementation_strong', 'cost_usd': 2.0},
+            {'event': 'model_call', 'run_id': 'r1', 'parent_task_id': 't1', 'dispatch_attempt': 1,
+             'nested': True, 'role': 'implementation_strong', 'cost_usd': 5.0},
+        ]
+        self.assertEqual(economics.nested_residual_rows(events, calls), [])
+        reconciled = economics.nested_reconciliation(events, calls)
+        self.assertEqual(reconciled['ambiguous'], [])
+
+        # If attempt 1's detail row were missing, attempt 0's row must not mask that gap.
+        residuals = economics.nested_residual_rows(events, calls[:1])
+        self.assertEqual(len(residuals), 1)
+        self.assertEqual(residuals[0]['dispatch_attempt'], 1)
+        self.assertAlmostEqual(row_cost(residuals[0]), 5.0)
+
+    def test_an_actual_detail_row_suppresses_the_residual_even_without_the_emitted_count(self):
+        # Durability net: an older event written before `nested_rows_emitted` existed, but detail
+        # rows for its dispatch are demonstrably present.
+        events = [{'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'nested_cost_usd': 4.19}]
+        calls = [{'event': 'model_call', 'run_id': 'r1', 'parent_task_id': 't1', 'nested': True,
+                  'role': 'implementation_strong', 'cost_usd': 4.19}]
+        self.assertEqual(economics.nested_residual_rows(events, calls), [])
+
+    def test_detail_rows_for_a_different_dispatch_do_not_suppress_this_ones_residual(self):
+        events = [{'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'nested_cost_usd': 4.19}]
+        calls = [{'event': 'model_call', 'run_id': 'r1', 'parent_task_id': 't-other', 'nested': True,
+                  'role': 'implementation_strong', 'cost_usd': 1.0}]
+        residuals = economics.nested_residual_rows(events, calls)
+        self.assertEqual(len(residuals), 1)
+
+    def test_nested_detail_rows_flow_into_totals_by_role_and_coordination_rate(self):
+        # A lead's own row (coordination) plus one nested implementer detail row (production,
+        # neither coordination nor verification): total spend and coordination_rate must both
+        # move once the detail row is present, and the detail row's real role participates in
+        # `by_role`-style aggregation the same way `dashboard.py` performs it.
+        own = {'event': 'model_call', 'run_id': 'r1', 'task_id': 't1', 'role': 'lead', 'cost_usd': 1.0}
+        nested_detail = {'event': 'model_call', 'run_id': 'r1', 'task_id': 't1:impl-0', 'parent_task_id': 't1',
+                          'role': 'implementation_strong', 'cost_usd': 4.19, 'nested': True, 'cost_source': 'reported'}
+        without_nested = orchestration_overhead([own])
+        with_nested = orchestration_overhead([own, nested_detail])
+        self.assertAlmostEqual(without_nested['total_cost'], 1.0)
+        self.assertAlmostEqual(with_nested['total_cost'], 5.19)
+        self.assertAlmostEqual(without_nested['coordination_rate'], 1.0)
+        # implementation_strong is production work, not coordination, so the rate DROPS once the
+        # nested spend (previously invisible) enters the denominator without joining the numerator.
+        self.assertAlmostEqual(with_nested['coordination_rate'], 1.0 / 5.19)
+
+    def test_a_residual_and_its_own_detail_rows_are_never_summed_together(self):
+        # If a caller mistakenly ran nested_residual_rows twice against a growing rows list that
+        # already contains its own prior output, the SECOND call must still refuse to double it:
+        # the residual row it already added carries `parent_task_id` equal to the dispatch's own
+        # task_id, which the detail-row scan already treats as authoritative.
+        events = [{'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'nested_cost_usd': 4.19}]
+        first_pass = economics.nested_residual_rows(events, [])
+        self.assertEqual(len(first_pass), 1)
+        second_pass = economics.nested_residual_rows(events, first_pass)
+        self.assertEqual(second_pass, [])
+
+
+class DispatchAttemptValidationTests(unittest.TestCase):
+    """Phase 1 review F4: `dispatch_attempt` must validate (finite, integral, 0<=n<=16); malformed
+    input reads as ambiguous/unprovable, never crashes and never masquerades as a trustworthy
+    identity."""
+
+    def test_plain_ints_in_range_are_valid(self):
+        self.assertEqual(economics._valid_dispatch_attempt(0), 0)
+        self.assertEqual(economics._valid_dispatch_attempt(1), 1)
+        self.assertEqual(economics._valid_dispatch_attempt(16), 16)
+
+    def test_integral_floats_are_accepted_as_their_int_value(self):
+        self.assertEqual(economics._valid_dispatch_attempt(1.0), 1)
+
+    def test_out_of_range_is_invalid(self):
+        self.assertIsNone(economics._valid_dispatch_attempt(17))
+        self.assertIsNone(economics._valid_dispatch_attempt(-1))
+
+    def test_non_integral_float_is_invalid(self):
+        self.assertIsNone(economics._valid_dispatch_attempt(1.5))
+
+    def test_infinity_and_nan_never_crash_and_are_invalid(self):
+        self.assertIsNone(economics._valid_dispatch_attempt(float('inf')))
+        self.assertIsNone(economics._valid_dispatch_attempt(float('-inf')))
+        self.assertIsNone(economics._valid_dispatch_attempt(float('nan')))
+
+    def test_strings_and_bools_are_invalid(self):
+        self.assertIsNone(economics._valid_dispatch_attempt('1'))
+        self.assertIsNone(economics._valid_dispatch_attempt(True))
+        self.assertIsNone(economics._valid_dispatch_attempt(None))
+
+    def test_dispatch_attempt_defaults_malformed_to_zero_never_crashes(self):
+        self.assertEqual(economics._dispatch_attempt({'dispatch_attempt': float('inf')}), 0)
+        self.assertEqual(economics._dispatch_attempt({'dispatch_attempt': 'bogus'}), 0)
+        self.assertEqual(economics._dispatch_attempt({}), 0)
+
+
+class DynamicAmbiguityGroupingTests(unittest.TestCase):
+    """Phase 1 review F1: dynamic reconciliation must apply the SAME ambiguity rule the backfill
+    script applies to historical data — a (run_id, task_id) group of dispatch_finished events that
+    cannot be proven to carry pairwise-distinct dispatch_attempt values must never get a residual
+    booked for any of its members, and is reported as one ambiguous entry naming the event count
+    and the total aggregate dollars at stake."""
+
+    def test_two_events_missing_dispatch_attempt_book_nothing_and_are_reported_ambiguous(self):
+        events = [
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'nested_cost_usd': 2.0},
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'nested_cost_usd': 3.0},
+        ]
+        self.assertEqual(economics.nested_residual_rows(events, []), [])
+        reconciled = economics.nested_reconciliation(events, [])
+        self.assertEqual(reconciled['rows'], [])
+        self.assertEqual(reconciled['ambiguous_count'], 1)
+        entry = reconciled['ambiguous'][0]
+        self.assertEqual(entry['run_id'], 'r1')
+        self.assertEqual(entry['task_id'], 't1')
+        self.assertEqual(entry['events'], 2)
+        self.assertAlmostEqual(entry['aggregate_usd'], 5.0)
+        self.assertIn('cumulative-sum', entry['reason'])
+
+    def test_old_bug_cumulative_sum_shape_books_nothing_even_with_full_detail_coverage(self):
+        # The historical bug: the SECOND event's nested_cost_usd is the SUM of both attempts.
+        # Even though durable detail rows exist that would fully reconcile the FIRST event alone,
+        # the pair as a whole is unprovable, so nothing is booked for either.
+        events = [
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'nested_cost_usd': 2.0,
+             'superseded_by_fallback': True},
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'nested_cost_usd': 9.0},
+        ]
+        calls = [{'event': 'model_call', 'run_id': 'r1', 'parent_task_id': 't1', 'nested': True,
+                 'role': 'implementation_strong', 'cost_usd': 2.0}]
+        self.assertEqual(economics.nested_residual_rows(events, calls), [])
+        reconciled = economics.nested_reconciliation(events, calls)
+        self.assertEqual(reconciled['ambiguous_count'], 1)
+        self.assertAlmostEqual(reconciled['ambiguous'][0]['aggregate_usd'], 11.0)
+
+    def test_two_events_with_the_same_explicit_attempt_are_ambiguous_not_booked(self):
+        events = [
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'dispatch_attempt': 0,
+             'nested_cost_usd': 2.0},
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'dispatch_attempt': 0,
+             'nested_cost_usd': 3.0},
+        ]
+        reconciled = economics.nested_reconciliation(events, [])
+        self.assertEqual(reconciled['rows'], [])
+        self.assertEqual(reconciled['ambiguous_count'], 1)
+
+    def test_more_than_two_events_sharing_a_task_id_are_ambiguous(self):
+        events = [
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'dispatch_attempt': 0,
+             'nested_cost_usd': 1.0},
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'dispatch_attempt': 1,
+             'nested_cost_usd': 2.0},
+            {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'dispatch_attempt': 2,
+             'nested_cost_usd': 3.0},
+        ]
+        reconciled = economics.nested_reconciliation(events, [])
+        self.assertEqual(reconciled['rows'], [])
+        self.assertEqual(reconciled['ambiguous_count'], 1)
+        self.assertEqual(reconciled['ambiguous'][0]['events'], 3)
+
+    def test_a_malformed_dispatch_attempt_on_one_event_makes_the_pair_unprovable(self):
+        # F1 + F4 together: a NaN/Infinity/string dispatch_attempt on one event of a pair must not
+        # crash, and must not be trusted as "distinct from the other" — it makes the pair exactly
+        # as unprovable as a missing field would.
+        for bad in (float('nan'), float('inf'), 'not-a-number', 1.5):
+            with self.subTest(bad=bad):
+                events = [
+                    {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'dispatch_attempt': bad,
+                     'nested_cost_usd': 2.0},
+                    {'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'dispatch_attempt': 1,
+                     'nested_cost_usd': 3.0},
+                ]
+                reconciled = economics.nested_reconciliation(events, [])
+                self.assertEqual(reconciled['rows'], [])
+                self.assertEqual(reconciled['ambiguous_count'], 1)
+
+    def test_a_single_event_group_is_still_separable_and_reconciles_normally(self):
+        # Sanity: the new grouping pre-pass must not regress the single-event (overwhelming
+        # majority) case.
+        events = [{'event': 'dispatch_finished', 'run_id': 'r1', 'task_id': 't1', 'nested_cost_usd': 4.19}]
+        residuals = economics.nested_residual_rows(events, [])
+        self.assertEqual(len(residuals), 1)
+        self.assertAlmostEqual(row_cost(residuals[0]), 4.19)
+
+
 if __name__ == '__main__':
     unittest.main()

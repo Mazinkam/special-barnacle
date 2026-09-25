@@ -110,7 +110,7 @@ def build_route_stats(metrics:list[dict], outcomes:list[dict]|None=None, width:i
     # does on the dashboard.
     for task_outcomes in out_by_task.values():
         for o in task_outcomes:
-            if o.get('task_id') in {'run-complete','run-failed'}: continue
+            if o.get('task_id') in {'run-complete','run-failed','run-cancelled'}: continue
             verdict=_verdict(o)
             if verdict is None and isinstance(o.get('verification'), bool):
                 verdict=records.VERIFIED if o['verification'] else records.FAILED

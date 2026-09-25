@@ -46,7 +46,7 @@ import {
 	renameSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { hostname, homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -101,7 +101,7 @@ import { bedrockFallbackFor, isQuotaError } from "./provider-fallback.ts";
 import { parseLeadAssignments, planLeadWaves, type LeadAssignment } from "./lead-plan.ts";
 import { classifyRunOutcome, externalChangeFiles, parseLeadStatus } from "./run-outcome.ts";
 import { SpendCapTracker, capFor, type SpendCapVerdict } from "./spend-cap.ts";
-import { NestedCostTracker } from "./nested-cost.ts";
+import { NestedCostTracker, type NestedCallDetail } from "./nested-cost.ts";
 import { escalateLeadCapability, isLeadCapability, isLeadSize, leadSizeOf, sizeLead, type LeadSizeDecision } from "./lead-sizing.ts";
 import { planEscalation, type EscalationLeadInput } from "./escalation.ts";
 import { ingestArgs, SessionIngestScheduler } from "./ingest.ts";
@@ -825,6 +825,8 @@ interface SubagentProcessResult {
 	costUsd: number;
 	/** Spend of `subagent` calls the child made itself (not bridge dispatches); excluded from `costUsd`. */
 	nestedCostUsd?: number;
+	/** Per-task detail behind `nestedCostUsd` — see nested-cost.ts for the vantage-point/depth caveat. */
+	nestedCalls?: NestedCallDetail[];
 	/** True only when every received usage block explicitly reported a valid cost (including $0). */
 	costReported: boolean;
 	durationMs: number;
@@ -2028,6 +2030,7 @@ export async function runSubagentProcess(opts: {
 				usage,
 				costUsd: usage.cost,
 				nestedCostUsd: nestedCost.total(),
+				nestedCalls: nestedCost.entries(),
 				costReported,
 				durationMs: Date.now() - startedAt,
 				stopReason,
@@ -2674,7 +2677,28 @@ export function recordOutcome(outcome: Record<string, unknown>): void {
 	recordQueue.enqueue("outcome", outcome);
 }
 
-export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality: number, note: string): Record<string, unknown> {
+/**
+ * Whether any parsed QA check actually ran to a `pass`/`fail` verdict, as opposed to every check
+ * being `skipped`/`unavailable` (or there being no checks at all). Phase 1 review finding T8:
+ * this is a claim recorded ALONGSIDE the gate verdict, never a replacement for it — `passed` above
+ * is computed exactly as before (`qaResult.exitCode === 0 && failedChecks.length === 0`), so an
+ * all-skipped QA run still passes the gate. `evidence_status` exists so a downstream reader never
+ * has to mistake "exited 0" for "something was actually checked".
+ */
+export function evidenceStatusFor(checks: CheckResult[]): "verified" | "unverified_checks_unavailable" {
+	return checks.length > 0 && checks.some((c) => c.result === "pass" || c.result === "fail")
+		? "verified"
+		: "unverified_checks_unavailable";
+}
+
+export function qaVerificationOutcomeFor(
+	runId: string,
+	passed: boolean,
+	quality: number,
+	note: string,
+	evidence: VerificationEvidencePayload = {},
+): Record<string, unknown> {
+	const checks = evidence.checks ?? [];
 	return {
 		run_id: runId,
 		task_id: `${runId}-qa`,
@@ -2682,6 +2706,40 @@ export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality
 		verification_scope: "run",
 		quality,
 		note,
+		// Factual verification evidence (Phase 1 item 5) — additive fields alongside the existing
+		// pass/fail `outcome`/`quality`. Never a manufactured score: `checks` is exactly what the QA
+		// agent's own output reported, `tested_revision` is read from git, and anything not actually
+		// observed is recorded as null/empty plus an explicit reason, never guessed.
+		checks,
+		// Checks the QA agent could not evaluate at all (environment failures) or explicitly
+		// skipped, listed by id so a consumer never has to infer "unavailable" from a missing row.
+		checks_unavailable: checks.filter((c) => c.result === "unavailable" || c.result === "skipped").map((c) => c.id),
+		// Phase 1 review finding T8: `outcome`/`quality`/`verification_scope` above are the GATE
+		// verdict and are deliberately UNCHANGED by this field — an exit-0 QA dispatch whose checks
+		// are all `skipped`/`unavailable` (or that reported none at all) still passes the gate exactly
+		// as it did before (a gate-behaviour change is out of scope here; see the Phase 1 audit doc's
+		// "Review fixes" section for the Phase 3 follow-up). `evidence_status` records, alongside that
+		// verdict, whether any of it is backed by a check that actually ran to a pass/fail result — so
+		// a consumer reading this row (`orchestrator/run_evidence.py`'s `evidence_coverage`) can count
+		// it as unverified evidence without having to re-derive the same judgement from `checks` itself
+		// (which it also does, independently — this field is a claim, not the only proof).
+		evidence_status: evidenceStatusFor(checks),
+		// The QA agent's own free-text output has no structured field for the literal shell command
+		// each check ran — only a check name and a pass/fail/skip word (see `parseCheckResults`).
+		// Recording a guessed command would be a fabrication; this stays explicitly null with a
+		// reason until the QA output format itself is extended to report commands.
+		check_commands: null,
+		check_commands_unavailable_reason: "QA agent output has no structured command field; only check name + pass/fail/skip status is parsed",
+		tested_revision: evidence.tested_revision ?? null,
+		tested_revision_dirty: evidence.tested_revision_dirty ?? null,
+		...(evidence.tested_revision_unavailable_reason ? { tested_revision_unavailable_reason: evidence.tested_revision_unavailable_reason } : {}),
+		review_verdicts: evidence.review_verdicts ?? [],
+		artifacts: evidence.artifacts ?? [],
+		// This row is the immediate verdict from the QA dispatch itself. A later signal about the
+		// same task (`reopened`/`regression`/`rollback`/`human_correction` on a subsequent outcomes
+		// row, already tracked by `orchestrator/outcomes.py`'s delayed-outcome maturity windows) is a
+		// separate row, not a rewrite of this one — `outcome_finality` names which kind this is.
+		outcome_finality: evidence.outcome_finality ?? "immediate",
 	};
 }
 
@@ -2698,12 +2756,59 @@ export function runCompletionOutcomeFor(runId: string, summary: Record<string, u
 	};
 }
 
-/** Terminal-boundary time fields written to the run outcome row. */
+/** Terminal-boundary time fields written to the run outcome row. `elapsed_ms` is omitted
+ *  (never `0`) when the caller has no session to derive it from — see `RunSession.terminalTiming`. */
 export interface RunTiming {
 	started_at: string;
 	finished_at: string;
 	elapsed_ms: number;
 	elapsed_source: "monotonic";
+}
+
+/**
+ * Durable evidence that THIS process owns a run, cheap enough to capture with no syscalls
+ * beyond what Node already tracks. `process_started_at_ms` is derived from `process.uptime()`,
+ * not `/proc` (portable across macOS/Linux without a native call): it is stable for the life of
+ * this process and changes whenever a pid is reused by a different process, which is exactly
+ * the ambiguity a liveness check on the Python side needs to rule out (same host + same pid but
+ * a DIFFERENT process must never be read as "still running").
+ */
+function processIdentity(): { pid: number; hostname: string; process_started_at_ms: number } {
+	return { pid: process.pid, hostname: hostname(), process_started_at_ms: Math.round(Date.now() - process.uptime() * 1000) };
+}
+
+/**
+ * Record that a run has started, with durable ownership evidence (pid/hostname/process-start
+ * identity + a session identity, when available) so a later Python-side reconciliation can tell
+ * "this run's owning process is confirmed gone" from "we simply have no evidence either way" —
+ * see `orchestrator/run_evidence.py`'s restart classifier (which reads only `pid`/`hostname`; it
+ * never reads `session_id`). No heartbeat/timer is added: this is a single fact recorded once, at
+ * the run's start boundary, alongside the process that will also write its own terminal event
+ * when it exits normally.
+ *
+ * `sessionId`, when the runtime supplies one, is the session's own file path — an ABSOLUTE path on
+ * the host machine, which can embed the OS username / home-directory layout into a durable,
+ * shared telemetry log for no functional benefit (liveness never reads it; see above). Only the
+ * basename is recorded, matching the identity a human or a later reconciliation actually needs to
+ * find the right session without leaking the rest of the path.
+ */
+export function recordRunStarted(runId: string, sessionId: string | null): void {
+	recordEvent("run_started", { run_id: runId, started_at: new Date().toISOString(), session_id: sessionId ? basename(sessionId) : null, ...processIdentity() });
+}
+
+/** Runs whose terminal event (`run_completed`/`run_failed`/`run_cancelled`) has already been
+ *  recorded. Exactly one terminal event may ever be written per run_id — a second terminal path
+ *  firing for the same run (for example a signal cancelling a run whose own catch block is
+ *  already writing `run_failed`) must be a no-op here, not a second row. */
+const runsWithTerminalEvent = new Set<string>();
+
+function claimTerminalEvent(runId: string, kind: string): boolean {
+	if (runsWithTerminalEvent.has(runId)) {
+		console.warn(`[orchestrator] run ${runId} already has a terminal event; skipping duplicate ${kind}`);
+		return false;
+	}
+	runsWithTerminalEvent.add(runId);
+	return true;
 }
 
 /**
@@ -2718,8 +2823,10 @@ export interface RunTiming {
  */
 export async function completeRun(runId: string, summary: Record<string, unknown>, timing?: RunTiming, since?: QueueStats): Promise<FlushReport> {
 	const session = ACTIVE_RUN?.runId === runId ? ACTIVE_RUN : null;
-	recordEvent("run_completed", { run_id: runId, ...timing });
-	recordOutcome({ ...runCompletionOutcomeFor(runId, summary), ...timing });
+	if (claimTerminalEvent(runId, "run_completed")) {
+		recordEvent("run_completed", { run_id: runId, ...timing });
+		recordOutcome({ ...runCompletionOutcomeFor(runId, summary), ...timing });
+	}
 	const report = reportSince(await recordQueue.flush(), since);
 	session?.acknowledgeTerminal(report.ok);
 	return report;
@@ -2727,16 +2834,63 @@ export async function completeRun(runId: string, summary: Record<string, unknown
 
 export async function failRun(runId: string, error: string, timing?: RunTiming, since?: QueueStats): Promise<FlushReport> {
 	const session = ACTIVE_RUN?.runId === runId ? ACTIVE_RUN : null;
-	recordEvent("run_failed", { run_id: runId, error, ...timing });
-	recordOutcome({
-		run_id: runId,
-		task_id: "run-failed",
-		outcome: "fail",
-		verification_scope: "run",
-		quality: 0,
-		note: error,
-		...timing,
-	});
+	if (claimTerminalEvent(runId, "run_failed")) {
+		recordEvent("run_failed", { run_id: runId, error, ...timing });
+		recordOutcome({
+			run_id: runId,
+			task_id: "run-failed",
+			outcome: "fail",
+			verification_scope: "run",
+			quality: 0,
+			note: error,
+			...timing,
+		});
+	}
+	const report = reportSince(await recordQueue.flush(), since);
+	session?.acknowledgeTerminal(report.ok);
+	return report;
+}
+
+/**
+ * Reasons stamped on `run_cancelled`. `signal` covers OS-level interrupts (Ctrl+C sends
+ * `SIGINT`, same as `SIGTERM`/`SIGHUP`); HUMAIN Terminal exposes no extension hook for the
+ * Esc key by itself distinct from Ctrl+C at this layer, so an Esc-driven cancel of a
+ * background orchestration surfaces here as `signal` too. `session_shutdown` is the
+ * best-effort drain on process exit; `orchestrate_cancel` is the explicit `/orchestrate-cancel`
+ * command.
+ */
+export function cancelReasonLabel(reason: "user" | "shutdown" | "signal" | undefined): string {
+	switch (reason) {
+		case "shutdown":
+			return "session_shutdown";
+		case "signal":
+			return "signal";
+		case "user":
+			return "orchestrate_cancel";
+		default:
+			return "unknown";
+	}
+}
+
+/**
+ * Record a run's terminal outcome as CANCELLED (never as failed): distinct from `failRun` so a
+ * dead-process reconciliation and a dashboard status count can tell a deliberate stop from a
+ * crash. Same timing/draining contract as `completeRun`/`failRun`.
+ */
+export async function cancelRun(runId: string, reason: string, timing?: RunTiming, since?: QueueStats): Promise<FlushReport> {
+	const session = ACTIVE_RUN?.runId === runId ? ACTIVE_RUN : null;
+	if (claimTerminalEvent(runId, "run_cancelled")) {
+		recordEvent("run_cancelled", { run_id: runId, reason, ...timing });
+		recordOutcome({
+			run_id: runId,
+			task_id: "run-cancelled",
+			outcome: "cancelled",
+			verification_scope: "run",
+			quality: 0,
+			note: reason,
+			...timing,
+		});
+	}
 	const report = reportSince(await recordQueue.flush(), since);
 	session?.acknowledgeTerminal(report.ok);
 	return report;
@@ -2828,6 +2982,8 @@ export interface DispatchResult {
 	costUsd: number;
 	/** Spend of the dispatch's own `subagent` calls (a lead's implementers/reviewers); not in `costUsd`. */
 	nestedCostUsd?: number;
+	/** Per-task detail behind `nestedCostUsd`, when any nested subagent calls were observed. */
+	nestedCalls?: NestedCallDetail[];
 	costReported: boolean;
 	stopReason?: string;
 	outcome?: SubagentProcessResult["outcome"];
@@ -2848,9 +3004,11 @@ export async function dispatchParallel(
 	deps: {
 		recordEvent: typeof recordEvent;
 		runProcess: typeof runSubagentProcess;
+		/** Routed through `deps` so tests can observe nested per-task rows without a real queue. */
+		recordModelCall?: typeof recordModelCall;
 		/** Alias table for the codex -> Bedrock quota fallback; defaults to the active run's. */
 		aliasTable?: AliasTable | null;
-	} = { recordEvent, runProcess: runSubagentProcess },
+	} = { recordEvent, runProcess: runSubagentProcess, recordModelCall },
 ): Promise<DispatchResult[]> {
 	if (tasks.length === 0) return [];
 
@@ -2943,11 +3101,30 @@ export async function dispatchParallel(
 			const eligible = r.exitCode !== 0 && r.outcome !== "timed_out" && r.outcome !== "cancelled" &&
 				r.stopReason !== "spend_cap" && !(session ?? ACTIVE_RUN)?.cancellation.isCancelled;
 			const twin = eligible && table && isQuotaError(r.stderr) ? bedrockFallbackFor(input.model, table) : null;
+			// `dispatchAttempt` disambiguates the two dispatch_finished events a quota fallback can
+			// write for the SAME task_id: 0 is the original (superseded) attempt, 1 is the Bedrock
+			// retry. Each attempt's event carries ONLY that attempt's own nested cost/rows — never a
+			// running sum — so Python-side reconciliation (`economics.nested_residual_rows`, keyed on
+			// `(run_id, task_id, dispatch_attempt)`) never has two events double-claiming attempt 0's
+			// nested spend (Phase 1 review finding T1). The nested per-task detail rows carry the same
+			// attempt tag in their `record_id` (Phase 1 review finding T2): the two attempts are
+			// separate child processes with independently-numbered tool-call ids, so without the
+			// attempt tag a coincidental `(toolCallId, taskId, attempt)` collision across attempts
+			// would dedup away a paid nested call from one of them.
+			let dispatchAttempt = 0;
+			let ownNestedCalls = r.nestedCalls;
+			let ownNestedCostUsd = r.nestedCostUsd;
 			if (twin) {
+				const first = r;
+				const firstNestedRows = nestedModelCallRowsFor({
+					runId, parentTaskId: input._taskId ?? `unknown-${runId}`, dispatchDepth: depth, dispatchAttempt: 0,
+				}, first.nestedCalls ?? []);
+				for (const row of firstNestedRows) (deps.recordModelCall ?? recordModelCall)(row);
 				deps.recordEvent("dispatch_finished", {
-					run_id: runId, task_id: input._taskId, capability: input._capability, model: r.model ?? input.model,
-					exit_code: r.exitCode, duration_ms: r.durationMs, cost_usd: r.costUsd, turns: r.usage.turns,
-					stop_reason: r.stopReason, log_dir: ACTIVE_RUN?.dir, superseded_by_fallback: true,
+					run_id: runId, task_id: input._taskId, capability: input._capability, model: first.model ?? input.model,
+					exit_code: first.exitCode, duration_ms: first.durationMs, cost_usd: first.costUsd,
+					nested_cost_usd: first.nestedCostUsd, nested_rows_emitted: firstNestedRows.length, dispatch_attempt: 0,
+					turns: first.usage.turns, stop_reason: first.stopReason, log_dir: ACTIVE_RUN?.dir, superseded_by_fallback: true,
 				});
 				deps.recordEvent("route_degraded", {
 					run_id: runId, task_id: input._taskId, capability: input._capability,
@@ -2955,17 +3132,34 @@ export async function dispatchParallel(
 					detail: summarizeStderr(r.stderr, 240),
 				});
 				ACTIVE_RUN?.log(`${input._taskId}: ${input.model} hit a provider quota; retrying once on ${twin}`);
-				const first = r;
 				const second = await runOn(twin, input._taskId ? `${input._taskId}-fallback` : undefined, `${shortId}↻`);
 				r = {
 					...second,
 					usage: sumUsage(first.usage, second.usage),
+					// `costUsd`/`nestedCostUsd`/`durationMs` on the RETURNED `DispatchResult` are the
+					// dispatch's true total across both billed attempts — callers of `dispatchParallel`
+					// (e.g. `dispatchRecordsFor`) still see one row for the dispatch's own full spend.
+					// This total is never re-derived from the `dispatch_finished` EVENT stream, so it
+					// staying cumulative here does not reintroduce the double-count the events avoid.
 					costUsd: first.costUsd + second.costUsd,
 					nestedCostUsd: (first.nestedCostUsd ?? 0) + (second.nestedCostUsd ?? 0),
+					// Both attempts spawned separate child processes with their own tool-call ids, so
+					// concatenating (not deduping) is safe: no key can collide across attempts. Both
+					// attempts' detail rows are still emitted (own-attempt at a time, below and above),
+					// so this concatenated list is ONLY for the returned `DispatchResult.nestedCalls`,
+					// never re-emitted as rows itself.
+					nestedCalls: [...(first.nestedCalls ?? []), ...(second.nestedCalls ?? [])],
 					costReported: first.costReported && second.costReported,
 					durationMs: first.durationMs + second.durationMs,
 				};
+				dispatchAttempt = 1;
+				ownNestedCalls = second.nestedCalls;
+				ownNestedCostUsd = second.nestedCostUsd;
 			}
+			const nestedRows = nestedModelCallRowsFor({
+				runId, parentTaskId: input._taskId ?? `unknown-${runId}`, dispatchDepth: depth, dispatchAttempt,
+			}, ownNestedCalls ?? []);
+			for (const row of nestedRows) (deps.recordModelCall ?? recordModelCall)(row);
 			deps.recordEvent("dispatch_finished", {
 				run_id: runId,
 				task_id: input._taskId,
@@ -2974,7 +3168,15 @@ export async function dispatchParallel(
 				exit_code: r.exitCode,
 				duration_ms: r.durationMs,
 				cost_usd: r.costUsd,
-				nested_cost_usd: r.nestedCostUsd,
+				// This attempt's OWN nested cost only (see the `dispatchAttempt` comment above) — never
+				// the fallback-merged sum, so `economics.nested_residual_rows` reconciling per
+				// `(run_id, task_id, dispatch_attempt)` never double-books attempt 0's spend.
+				nested_cost_usd: ownNestedCostUsd,
+				// So Python-side aggregation never double-books an aggregate residual for a dispatch
+				// that already has detail rows (orchestrator/economics.py; see the audit doc's
+				// "Nested cost semantics" section).
+				nested_rows_emitted: nestedRows.length,
+				dispatch_attempt: dispatchAttempt,
 				turns: r.usage.turns,
 				stop_reason: r.stopReason,
 				log_dir: ACTIVE_RUN?.dir,
@@ -3201,6 +3403,30 @@ export function gitHead(cwd: string): string | null {
 		cwd, encoding: "utf-8", input: "", timeout: 10_000,
 	});
 	return empty.status === 0 && /^[0-9a-f]{40,64}$/.test(empty.stdout.trim()) ? empty.stdout.trim() : null;
+}
+
+/**
+ * The exact revision + working-tree state verification actually ran against, captured with the
+ * same cheap `git` calls `gitHead`/`gitDirtySnapshot` already use (short-timeout subprocesses,
+ * no new mechanism). `dirty` distinguishes "verified a clean committed SHA" from "verified an
+ * uncommitted worktree" — collapsing the two would let a caller believe a dirty run tested a
+ * specific commit it did not. `revision: null` always comes with an explicit
+ * `unavailable_reason` (never a bare, unexplained null) so a non-Git checkout reads as
+ * "not available, here's why" rather than "forgot to record it".
+ */
+export interface TestedRevision {
+	revision: string | null;
+	dirty: boolean | null;
+	unavailable_reason?: string;
+}
+
+export function testedRevisionFor(cwd: string): TestedRevision {
+	const revision = gitHead(cwd);
+	const snapshot = gitDirtySnapshot(cwd);
+	if (revision === null && snapshot === null) {
+		return { revision: null, dirty: null, unavailable_reason: "not a git repository, or git is unavailable in this environment" };
+	}
+	return { revision, dirty: snapshot === null ? null : snapshot.size > 0 };
 }
 
 /** Current worktree content for a path that was already dirty when the run began. */
@@ -3527,6 +3753,104 @@ export function dispatchRecordsFor(
 	}];
 }
 
+/**
+ * Best-effort capability/role for a nested subagent call, derived only from the agent name the
+ * runtime reports (never guessed from context). Covers both the plain `orch-<capability>`
+ * convention and the aliases `CAPABILITY_AGENT_ALIASES` installs under a different persona name.
+ * An agent name that matches neither is reported as the explicit role `"unknown"` — per the Phase 1
+ * plan, unknown attribution must stay unknown rather than be guessed.
+ */
+const AGENT_NAME_TO_ROLE: Record<string, string> = Object.fromEntries(
+	// Several capabilities alias onto ONE persona (all lead sizes -> "orchestrator-lead"; four
+	// review capabilities -> "orch-technical-review"). The agent name alone cannot disambiguate
+	// which one actually ran, so this necessarily picks one (the last entry in
+	// `CAPABILITY_AGENT_ALIASES`) as a representative label. This is a cosmetic ambiguity only:
+	// `orchestrator/economics.py`'s coordination/verification buckets key off role SUFFIXES
+	// (`*_lead`, `*_review`) and treat every alias in a collision the same way.
+	Object.entries(CAPABILITY_AGENT_ALIASES).map(([capability, agent]) => [agent, capability]),
+);
+
+export function roleForAgentName(agentName: string | null | undefined): string {
+	if (!agentName) return "unknown";
+	if (AGENT_NAME_TO_ROLE[agentName]) return AGENT_NAME_TO_ROLE[agentName];
+	const m = /^orch-(.+)$/.exec(agentName);
+	if (!m || !m[1]) return "unknown";
+	return m[1].replace(/-/g, "_");
+}
+
+/**
+ * One `model_call` row per nested subagent task observed on a dispatch, tagged `nested: true` so
+ * it is never mistaken for the dispatch's own (already-emitted) row. Cost is included only when
+ * the runtime reported one (`cost_source: "reported"`); an unknown cost omits `cost_usd`
+ * entirely so `meter()` (orchestrator/record_batch.py) can estimate it from tokens — or leave it
+ * explicitly unmetered — exactly as it does for a dispatch's own row. `record_id` is a pure
+ * function of stable identity (run, parent dispatch, DISPATCH attempt, nested key) so re-emitting
+ * the same nested call (crash replay, backfill) is deduplicated by `unique_records`
+ * (orchestrator/economics.py) instead of double-booked.
+ *
+ * `opts.dispatchAttempt` (default 0) is the codex -> Bedrock quota-fallback attempt index (0 =
+ * original, 1 = the retry) — see the `dispatchAttempt` comment in `dispatchParallel`. It is folded
+ * into `record_id` (and stamped as `dispatch_attempt` on the row) because the two attempts are
+ * separate child processes with independently-numbered tool-call ids: without this, a coincidental
+ * `(toolCallId, taskId, attempt)` collision across the two attempts would dedup away a paid nested
+ * call from one of them (Phase 1 review finding T2).
+ */
+export function nestedModelCallRowsFor(
+	opts: {
+		runId: string;
+		parentTaskId: string;
+		dispatchDepth?: number;
+		dispatchAttempt?: number;
+		taskClass?: string;
+		complexity?: string;
+		risk?: string;
+		planId?: string;
+	},
+	calls: NestedCallDetail[],
+): Record<string, unknown>[] {
+	const dispatchAttempt = opts.dispatchAttempt ?? 0;
+	return calls.map((c) => {
+		const role = roleForAgentName(c.agent);
+		const model = c.model ?? "unknown";
+		const provider = model.includes("/") ? model.split("/")[0] : "unknown";
+		const depth = c.depth ?? (opts.dispatchDepth ?? 0) + 1;
+		return {
+			event: "model_call",
+			run_id: opts.runId,
+			task_id: `${opts.parentTaskId}:${c.taskId}`,
+			parent_task_id: opts.parentTaskId,
+			task_class: opts.taskClass,
+			complexity: opts.complexity,
+			risk: opts.risk,
+			role,
+			capability_class: role,
+			agent_runtime: "humain-terminal",
+			provider,
+			model,
+			input_tokens: (c.usage.input ?? 0) + (c.usage.cacheRead ?? 0),
+			cached_input_tokens: c.usage.cacheRead ?? 0,
+			cache_write_tokens: c.usage.cacheWrite ?? 0,
+			output_tokens: c.usage.output ?? 0,
+			...(c.costReported ? { cost_usd: c.usage.cost, cost_source: "reported" } : {}),
+			result: c.exitCode === 0 ? "pass" : "fail",
+			...(c.stopReason ? { stop_reason: c.stopReason } : {}),
+			nested: true,
+			nesting_depth: depth,
+			nested_call_id: c.key,
+			...(c.attempt !== undefined ? { attempt: c.attempt } : {}),
+			// The dispatch-fallback attempt this row belongs to (0 = original, 1 = the Bedrock
+			// quota retry) — distinct from `attempt` above, which is the NESTED subagent's own
+			// retry number. Always stamped (never omitted, even at the default 0) so
+			// `economics.py` can key reconciliation on `(run_id, parent_task_id, dispatch_attempt)`
+			// without treating "absent" and "0" as different things.
+			dispatch_attempt: dispatchAttempt,
+			plan_id: opts.planId,
+			...runTagFields(),
+			record_id: `nested:${opts.runId}:${opts.parentTaskId}:${dispatchAttempt}:${c.key}`,
+		};
+	});
+}
+
 /** HT thinking level -> method.json effort vocabulary (minimal|low|standard|high|maximum). */
 export function methodEffortFor(thinking: string | undefined): string {
 	switch (thinking) {
@@ -3638,7 +3962,16 @@ async function runVerification(
 	const failedChecks = parseFailedChecks(out);
 	const passed = qaResult.exitCode === 0 && failedChecks.length === 0;
 
-	recordOutcome(qaVerificationOutcomeFor(runId, passed, passed ? 0.95 : 0.0, out.slice(0, 2000)));
+	const checks = parseCheckResults(out);
+	const revision = testedRevisionFor(cwd);
+	recordOutcome(qaVerificationOutcomeFor(runId, passed, passed ? 0.95 : 0.0, out.slice(0, 2000), {
+		checks,
+		tested_revision: revision.revision,
+		tested_revision_dirty: revision.dirty,
+		...(revision.unavailable_reason ? { tested_revision_unavailable_reason: revision.unavailable_reason } : {}),
+		review_verdicts: [{ role: "qa_agent", verdict: passed ? "pass" : "fail" }],
+		artifacts: [],
+	}));
 
 	return {
 		passed,
@@ -3662,6 +3995,59 @@ function parseFailedChecks(text: string): string[] {
 		fails.push(m[1].trim());
 	}
 	return Array.from(new Set(fails));
+}
+
+export type CheckOutcome = "pass" | "fail" | "skipped" | "unavailable";
+
+export interface CheckResult {
+	id: string;
+	result: CheckOutcome;
+}
+
+/** Factual verification evidence attachable to a verification outcome row (Phase 1 item 5).
+ *  Every field defaults to "not observed" (empty/null), never a guess. */
+export interface VerificationEvidencePayload {
+	checks?: CheckResult[];
+	tested_revision?: string | null;
+	tested_revision_dirty?: boolean | null;
+	tested_revision_unavailable_reason?: string;
+	review_verdicts?: { role: string; verdict: string }[];
+	artifacts?: string[];
+	outcome_finality?: "immediate" | "delayed";
+}
+
+const CHECK_STATUS_WORDS: Record<string, CheckOutcome> = {
+	pass: "pass", passed: "pass", ok: "pass", "✓": "pass", "✔": "pass",
+	fail: "fail", failed: "fail", "✗": "fail", error: "fail",
+	skip: "skipped", skipped: "skipped", "n/a": "skipped", na: "skipped",
+	unavailable: "unavailable", blocked: "unavailable",
+};
+
+/**
+ * Every check the QA agent reported a status for — pass, fail, skipped, or unavailable — not
+ * just the failures `parseFailedChecks` extracts. Factual verification evidence (Phase 1 item 5)
+ * needs the full set, including checks the QA agent explicitly could not run, so a missing check
+ * reads as "not reported" rather than silently absent. The `environment` check name is special:
+ * `QA_SCOPE_RULES` tells the QA agent to report it as FAIL when a test command cannot run at all
+ * (missing interpreter/dependency/service) — that is evidence the check was unavailable, not that
+ * the code under test failed, so it is normalized to `unavailable` here rather than left as `fail`.
+ */
+export function parseCheckResults(text: string): CheckResult[] {
+	const byId = new Map<string, CheckOutcome>();
+	const record = (idRaw: string, wordRaw: string) => {
+		const id = idRaw.trim();
+		if (!id) return;
+		const word = CHECK_STATUS_WORDS[wordRaw.trim().toLowerCase()];
+		if (!word) return;
+		byId.set(id, id.toLowerCase() === "environment" && word === "fail" ? "unavailable" : word);
+	};
+	const statusAlt = "pass(?:ed)?|fail(?:ed)?|skip(?:ped)?|unavailable|blocked|error|n\\/?a|\u2713|\u2714|\u2717";
+	const rowRe = new RegExp(`\\|\\s*([^|]+?)\\s*\\|\\s*[^|]*?\\b(${statusAlt})\\b[^|]*?\\|`, "gi");
+	let m: RegExpExecArray | null;
+	while ((m = rowRe.exec(text)) !== null) record(m[1], m[2]);
+	const bulletRe = new RegExp(`^[-*]\\s+(.+?):\\s*(${statusAlt})\\b`, "gim");
+	while ((m = bulletRe.exec(text)) !== null) record(m[1], m[2]);
+	return Array.from(byId, ([id, result]) => ({ id, result }));
 }
 
 // planEscalation now lives in escalation.ts as a pure, independently tested
@@ -4580,6 +4966,7 @@ export default function (pi: ExtensionAPI) {
 			ACTIVE_RUN = session;
 			CURRENT_RUN_TAGS = { profile: resolved.profileName, policy_id: policyIdFor(resolved.profileName, adapter) };
 			CURRENT_ALIAS_TABLE = resolved.table;
+			recordRunStarted(runId, ctx.sessionManager?.getSessionFile?.() ?? null);
 			session.log(`policy: ${CURRENT_RUN_TAGS.policy_id}`);
 			session.log(`models (profile "${resolved.profileName}"):\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
 			for (const n of resolved.notes) session.log(`note: ${n}`);
@@ -5094,7 +5481,7 @@ export default function (pi: ExtensionAPI) {
 							: cancelReason === "signal"
 								? "cancelled (signal)"
 								: "cancelled by user (/orchestrate-cancel)";
-					warnTelemetry(ctx, await failRun(runId, cancelNote, session.terminalTiming(), session.telemetryBaseline));
+					warnTelemetry(ctx, await cancelRun(runId, cancelReasonLabel(cancelReason), session.terminalTiming(), session.telemetryBaseline));
 					const cancelText = `Orchestration cancelled. ${stopped.length ? `Stopped: ${stopped.join(", ")}. ` : "No child dispatch was active. "}See ${session.file("run.log")}`;
 					safeUi(() => ctx.ui.notify(cancelText, "info"));
 					// Only a user-initiated cancel (/orchestrate-cancel) has a live session to post

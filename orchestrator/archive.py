@@ -51,7 +51,7 @@ MANIFEST_FILE = 'archive.manifest.json'
 ARCHIVE_LOCK_FILE = 'archive.lock'
 ARCHIVE_SUFFIX = '.gz'
 DEFAULT_OLDER_THAN_DAYS = 30
-TERMINAL_TASK_IDS = frozenset({'run-complete', 'run-failed'})
+TERMINAL_TASK_IDS = frozenset({'run-complete', 'run-failed', 'run-cancelled'})
 #: Authoritative streams and their integrity/recovery metadata: never archived, wherever they appear.
 NEVER_ARCHIVE = frozenset({'events.jsonl', 'metrics.jsonl', 'outcomes.jsonl', 'discoveries.jsonl', LEDGER_FILE, WRITER_LOCK_FILE,
                            RECORD_INDEX_FILE, DATABASE_FILE, 'ingest_status.json', MANIFEST_FILE, ARCHIVE_LOCK_FILE})
@@ -364,7 +364,7 @@ def plan_run(run_dir: Path, terminal: Optional[dict[str, Any]], *, older_than_da
     seal = load_seal(run_dir)
     if terminal is None:
         return _skip(run_id, run_dir, 'no_terminal_outcome',
-                     f'no durable run-complete/run-failed outcome for {run_id} in outcomes.jsonl; the run may still be active or its status is unknown')
+                     f'no durable run-complete/run-failed/run-cancelled outcome for {run_id} in outcomes.jsonl; the run may still be active or its status is unknown')
     if seal is None and any((run_dir / name).exists() for name in (OWNER_FILE, SEAL_FILE)):
         return _skip(run_id, run_dir, 'writers_unsealed',
                      'managed diagnostic ownership is incomplete: producers may still be draining; no snapshots or raw removal',
