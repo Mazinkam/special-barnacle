@@ -1127,9 +1127,9 @@ describe("RunSession terminal timing", () => {
 	});
 
 	test("run terminal outcomes carry the timing fields", () => {
-		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-		const complete = source.slice(source.indexOf("async function completeRun("), source.indexOf("async function failRun("));
-		const fail = source.slice(source.indexOf("async function failRun("), source.indexOf("// Subagent dispatch"));
+		const finalizeSource = readFileSync(new URL("./run/finalize.ts", import.meta.url), "utf8");
+		const complete = finalizeSource.slice(finalizeSource.indexOf("async function completeRun("), finalizeSource.indexOf("async function failRun("));
+		const fail = finalizeSource.slice(finalizeSource.indexOf("async function failRun("), finalizeSource.indexOf("export function createDispatchCostCapture("));
 		for (const fn of [complete, fail]) {
 			expect(fn).toContain("...timing");
 		}
@@ -1317,8 +1317,9 @@ describe("batched telemetry through the Python batch CLI", () => {
 
 	test("every terminal path in the /orchestrate handler awaits the drained terminal write", () => {
 		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-		const complete = source.slice(source.indexOf("async function completeRun("), source.indexOf("async function failRun("));
-		const fail = source.slice(source.indexOf("async function failRun("), source.indexOf("// Subagent dispatch"));
+		const finalizeSource = readFileSync(new URL("./run/finalize.ts", import.meta.url), "utf8");
+		const complete = finalizeSource.slice(finalizeSource.indexOf("async function completeRun("), finalizeSource.indexOf("async function failRun("));
+		const fail = finalizeSource.slice(finalizeSource.indexOf("async function failRun("), finalizeSource.indexOf("export function createDispatchCostCapture("));
 		for (const fn of [complete, fail]) expect(fn).toContain("flush()");
 		// Every terminal call reports telemetry cumulatively since the run started, not just the final drain.
 		const orchestrateSource = readFileSync(new URL("./commands/orchestrate.ts", import.meta.url), "utf8");

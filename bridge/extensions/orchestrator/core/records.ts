@@ -75,6 +75,24 @@ export function methodEffortFor(thinking: string | undefined): string {
 }
 
 /**
+ * The run's terminal outcome row (`completeRun`'s `run-complete` / `failRun`'s
+ * `run-failed`, run/finalize.ts B4.6). Pure: takes the run's final summary
+ * object and derives the training-eligible outcome from it — a blocked run
+ * (stopped at a precondition) trains neither a verified success nor a
+ * quality failure of the route.
+ */
+export function runCompletionOutcomeFor(runId: string, summary: Record<string, unknown>): Record<string, unknown> {
+	return {
+		run_id: runId,
+		task_id: "run-complete",
+		outcome: summary.blocked === true ? "blocked" : summary.verification_passed === false ? "fail" : "verified",
+		verification_scope: "run",
+		quality: summary.success_rate ?? 0,
+		note: JSON.stringify(summary),
+	};
+}
+
+/**
  * A lead that reports changed files but never mentions dispatching an
  * implementer did the implementation itself — the costliest pattern in the
  * 2026-09-24 data. Flagged for the dashboard, not blocked here.

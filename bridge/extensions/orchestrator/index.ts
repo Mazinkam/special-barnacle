@@ -63,6 +63,7 @@ export { telemetryHealthy, telemetryWarning };
 import { createOrchestratorCli } from "./adapters/orchestrator-cli.ts";
 import { reapOrphanedPersonaDirs } from "./adapters/process-reaper.ts";
 import { createTelemetry } from "./adapters/telemetry.ts";
+import { createRunFinalizer, createDispatchCostCapture } from "./run/finalize.ts";
 import {
 	type Adapter,
 	FALLBACK_ADAPTER,
@@ -93,6 +94,7 @@ import {
 	dispatchRecordsFor,
 	leadSelfImplemented,
 	methodEffortFor,
+	runCompletionOutcomeFor,
 } from "./core/records.ts";
 import {
 	architectPrompt,
@@ -167,6 +169,7 @@ export {
 	parseArgs,
 	policyIdFor,
 	QA_SCOPE_RULES,
+	runCompletionOutcomeFor,
 };
 export type { DispatchResult, DispatchTask };
 
@@ -558,102 +561,29 @@ const telemetry = createTelemetry({
 	},
 });
 export const recordQueue = telemetry.queue;
-
-/** Queue an event row. Synchronous: progress never waits on a Python process. */
-export function recordEvent(event: string, payload: Record<string, unknown>): void {
-	telemetry.recordEvent(event, payload);
-}
-
-/** Queue a metric row (model_call / route_executed). */
-export function recordModelCall(metric: Record<string, unknown>): void {
-	telemetry.recordModelCall(metric);
-}
-
-/** Queue an outcome row. Terminal run outcomes go through completeRun/failRun, which also drain. */
-export function recordOutcome(outcome: Record<string, unknown>): void {
-	telemetry.recordOutcome(outcome);
-}
+export const recordEvent = telemetry.recordEvent;
+export const recordModelCall = telemetry.recordModelCall;
+/** Terminal run outcomes go through completeRun/failRun, which also drain. */
+export const recordOutcome = telemetry.recordOutcome;
 
 // qaVerificationOutcomeFor moved to pipeline/verify-loop.ts (pure; B4.6); imported below.
 
-export function runCompletionOutcomeFor(runId: string, summary: Record<string, unknown>): Record<string, unknown> {
-	return {
-		run_id: runId,
-		task_id: "run-complete",
-		// A blocked run stopped at a precondition: neither a verified success nor
-		// a quality failure of the route, so it must not train routing either way.
-		outcome: summary.blocked === true ? "blocked" : summary.verification_passed === false ? "fail" : "verified",
-		verification_scope: "run",
-		quality: summary.success_rate ?? 0,
-		note: JSON.stringify(summary),
-	};
-}
+// runCompletionOutcomeFor moved to core/records.ts (pure; B4.6); imported below.
 
 // RunTiming moved to run/session.ts (pure type; B4.6); imported above.
 
-/**
- * Record the run's terminal outcome and drain everything queued for it. Resolves
- * only once Python has acknowledged the writes (or definitively failed them), so
- * the terminal status is never delayed behind the coalescing window and the
- * caller can surface any write failure.
- *
- * With `since` (the queue counters when the run started) the report covers every
- * record failure since then: a timer flush that failed mid-run must not vanish from
- * the summary just because the final drain went through.
- */
-export async function completeRun(runId: string, summary: Record<string, unknown>, timing?: RunTiming, since?: QueueStats): Promise<FlushReport> {
-	// No RunContext parameter here either (see the telemetry onError comment
-	// above): every call site already holds its own `session`/`RunContext`
-	// directly and could pass it, but completeRun/failRun are also meant to be
-	// callable with just a runId. `runRegistry.active()` plus the runId check
-	// preserves the exact old `ACTIVE_RUN?.runId === runId ? ACTIVE_RUN : null`
-	// guard: a stale/older run's terminal call must never acknowledge a newer run.
-	const active = runRegistry.active();
-	const session = active?.session.runId === runId ? active.session : null;
-	recordEvent("run_completed", { run_id: runId, ...timing });
-	recordOutcome({ ...runCompletionOutcomeFor(runId, summary), ...timing });
-	const report = reportSince(await recordQueue.flush(), since);
-	session?.acknowledgeTerminal(report.ok);
-	return report;
-}
-
-export async function failRun(runId: string, error: string, timing?: RunTiming, since?: QueueStats): Promise<FlushReport> {
-	const active = runRegistry.active();
-	const session = active?.session.runId === runId ? active.session : null;
-	recordEvent("run_failed", { run_id: runId, error, ...timing });
-	recordOutcome({
-		run_id: runId,
-		task_id: "run-failed",
-		outcome: "fail",
-		verification_scope: "run",
-		quality: 0,
-		note: error,
-		...timing,
-	});
-	const report = reportSince(await recordQueue.flush(), since);
-	session?.acknowledgeTerminal(report.ok);
-	return report;
-}
-
-/** Widen a final-drain report to everything the queue did since `since` (cumulative for the run). */
-function reportSince(drain: FlushReport, since?: QueueStats): FlushReport {
-	if (!since) return drain;
-	const now = recordQueue.stats;
-	const failed = Math.max(drain.failed, now.failed - since.failed);
-	const derivedStale = Math.max(drain.derivedStale, now.derivedStale - since.derivedStale);
-	const report: FlushReport = {
-		ok: failed === 0,
-		batches: drain.batches,
-		acknowledged: Math.max(drain.acknowledged, now.acknowledged - since.acknowledged),
-		failed,
-		derivedStale,
-	};
-	// Prefer the final drain's own messages; fall back to the queue's last message for
-	// failures that happened in an earlier timer flush.
-	if (failed > 0) report.error = drain.error ?? recordQueue.lastFailure ?? undefined;
-	if (derivedStale > 0) report.staleReason = drain.staleReason ?? recordQueue.lastStaleReason ?? undefined;
-	return report;
-}
+// completeRun/failRun/reportSince moved to run/finalize.ts (B4.6): they read
+// the active run through `runRegistry` and drain `recordQueue`, both of
+// which are wired here instead of being read as module globals inside that
+// file (`run/*` must not import index.ts).
+const runFinalizer = createRunFinalizer({
+	runRegistry,
+	recordEvent,
+	recordOutcome,
+	recordQueue,
+});
+export const completeRun = runFinalizer.completeRun;
+export const failRun = runFinalizer.failRun;
 
 /**
  * Summary lines when telemetry did not fully land; empty when all is well. Lost records
@@ -734,19 +664,9 @@ export function dispatchParallel(
 // below passes `run?.tags` (B4.4: RunContext, not CURRENT_RUN_TAGS), so
 // behaviour is unchanged.
 
-async function captureDispatchCost(
-	opts: CaptureOpts,
-	result: DispatchResult,
-	/** The dispatching run's context, for its tag set; null outside a run. Typed
-	 * structurally over `DispatchSession` (not the concrete `RunSession`) so
-	 * this can be handed to pipeline/* modules as a `TriageDeps`/hierarchy dep
-	 * without them needing to know `RunSession`'s full shape. */
-	run: RunContext<DispatchSession> | null,
-): Promise<void> {
-	for (const record of dispatchRecordsFor(opts, result, run?.tags ?? {})) {
-		recordModelCall(record);
-	}
-}
+// captureDispatchCost moved to run/finalize.ts (B4.6) as `createDispatchCostCapture`,
+// bound here to the real `recordModelCall`.
+const captureDispatchCost = createDispatchCostCapture(recordModelCall);
 
 // sumUsage moved to dispatch/parallel.ts (B4.5 step 5), its only caller.
 
