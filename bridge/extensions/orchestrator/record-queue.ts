@@ -443,3 +443,25 @@ function describeFailure(result: CliResult, body: BatchBody | null): string {
 function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
+
+/**
+ * Summary lines when telemetry did not fully land; empty when all is well. Lost records
+ * and durable-but-unrefreshed records are different problems and are worded differently.
+ */
+export function telemetryWarning(report: FlushReport): string[] {
+	const lines: string[] = [];
+	if (!report.ok || report.failed > 0) {
+		lines.push(`telemetry: ${report.failed} record(s) could not be written to the ledger — ${report.error ?? "see run.log"}`);
+	}
+	if (report.derivedStale > 0) {
+		lines.push(
+			`telemetry: ${report.derivedStale} record(s) are durable but the ledger/dashboard refresh failed; derived views are stale until the next successful write — ${report.staleReason ?? "see run.log"}`,
+		);
+	}
+	return lines;
+}
+
+/** True when every record landed and the derived views were refreshed. */
+export function telemetryHealthy(report: FlushReport): boolean {
+	return report.ok && report.failed === 0 && report.derivedStale === 0;
+}

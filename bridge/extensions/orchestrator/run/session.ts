@@ -22,9 +22,9 @@
  *
  * run/* must not import index.ts.
  */
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import type { ExtensionContext } from "@humain/terminal";
 
@@ -45,6 +45,34 @@ import {
 	shortArgs,
 	type WorktreeInfo,
 } from "./board.ts";
+
+/** Manifest `python3 -m orchestrator.cli archive-runs --execute` leaves next to a run's `<name>.gz` files. */
+const ARCHIVE_MANIFEST = "archive.manifest.json";
+
+/**
+ * Where a run diagnostic can be read *now*. The opt-in `archive-runs --execute` command replaces
+ * the diagnostics of old completed runs with `<name>.gz` + a manifest (`run.log` itself is never
+ * archived), so a path remembered from the progress board or an old notification may no longer
+ * exist as-is. Returns the path unchanged while it is readable; otherwise a lookup/restore hint
+ * instead of a silently broken link.
+ */
+export function describeRunArtifact(path: string): string {
+	if (existsSync(path)) return path;
+	const runDir = dirname(path);
+	const name = basename(path);
+	const archived = join(runDir, `${name}.gz`);
+	let listed = false;
+	try {
+		const manifest = JSON.parse(readFileSync(join(runDir, ARCHIVE_MANIFEST), "utf-8"));
+		listed = manifest?.format_version === 1 && typeof manifest?.files?.[name] === "object";
+	} catch {
+		/* no readable manifest: the file was never archived by us */
+	}
+	if (listed && existsSync(archived)) {
+		return `${path} (archived as ${archived} — read with \`gunzip -c\`, or restore the run with \`python3 -m orchestrator.cli restore-run ${basename(runDir)}\`)`;
+	}
+	return `${path} (missing)`;
+}
 
 /**
  * Detect the git worktree the orchestrator is running in. Cheap: two short
