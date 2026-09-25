@@ -183,6 +183,13 @@ import {
 	type RunTiming,
 } from "./run/session.ts";
 import { triageTask as triageTaskCore } from "./pipeline/triage-step.ts";
+import {
+	collectBilledResults,
+	dispatchHierarchical as dispatchHierarchicalCore,
+	dispatchReconAndLeads as dispatchReconAndLeadsCore,
+	summarizeReconWorkers,
+} from "./pipeline/hierarchy.ts";
+export { collectBilledResults, summarizeReconWorkers };
 import type { OrchestratorStatus, WorktreeInfo } from "./run/board.ts";
 import { formatOrchestratorStatus } from "./run/board.ts";
 export type { OrchestratorStatus, RunTiming, WorktreeInfo };
@@ -1071,285 +1078,37 @@ function parseFailedChecks(text: string): string[] {
 // Hierarchical dispatch
 // -----------------------------------------------------------------------------
 
+// dispatchHierarchical, dispatchReconAndLeads, collectBilledResults and
+// summarizeReconWorkers moved to pipeline/hierarchy.ts (B4.6); imported below.
+// dispatchHierarchical dropped the `escalationResults: []` field it used to
+// return for the verify/retry loop below to push into after the fact (a
+// mutable sink smuggled through a return value) — the loop now owns and
+// returns its own `escalationResults` array instead.
+
 /**
- * Dispatch work according to the topology the planner returned. Two paths:
- *
- * - depth <= 2: dispatch a single orchestrator-lead agent at the recommended
- *   capability. The lead handles its own workers via the subagent tool. This
- *   is the common case for complexity < 7.
- *
- * - depth >= 3: dispatch `leads` orchestrator-lead agents in parallel; each
- *   lead fans out its own workers. Used for complexity 7+ where the
- *   architect has multiple independent sub-domains to attack.
- *
- * Returns the flat list of leaf (worker) dispatches for bookkeeping. Lead
- * dispatches themselves get recorded as their own model_call + route_executed.
+ * Parent-owned recon/lead sequencing (pipeline/hierarchy.ts, B4.6). Re-exported
+ * under its original name/signature so every existing call site and test
+ * (`orchestrator.dispatchReconAndLeads`) is unchanged: this wrapper is the one
+ * place that supplies config.ts's `MAX_LEADS`/`RECON_EVIDENCE_MAX_CHARS` as
+ * defaults for the core function's required `maxLeads`/`evidenceMaxChars`, so
+ * pipeline/* itself never has to read them from a module singleton.
  */
-async function dispatchHierarchical(
-	cwd: string,
-	runId: string,
-	planId: string,
-	goal: string,
-	plan: PlanResponse,
-	adapter: Adapter,
-	ctx: ExtensionContext,
-	/** The run this dispatch belongs to; threaded through to dispatchParallel,
-	 *  captureDispatchCost and dispatchReconAndLeads's effects instead of an
-	 *  implicit "active run" read (B4.4). */
-	run: RunContext<RunSession> | null,
-	leadCapability = "lead",
-): Promise<{
-	leadResults: DispatchResult[];
-	workerResults: DispatchResult[];
-	/** Leads not started because a dependency failed or was blocked. */
-	skippedLeads: number;
-	/** The architect dispatch, when the topology called for one. Billed by the caller. */
-	architectResult?: DispatchResult;
-	/** Mutable sink the caller appends escalation dispatches to, so they get billed. */
-	escalationResults: DispatchResult[];
-	/** Original DispatchTask objects dispatched for each lead, paired with leadResults by taskId — needed to build faithful retry prompts (BUG 2). */
-	leadTasks: DispatchTask[];
-}> {
-	const { depth } = plan.topology;
-
-	// Always: dispatch the architect first if it's a high-complexity / new-domain
-	// task. The architect's output feeds into subsequent dispatch prompts.
-	// For depth=1, skip — the lead IS the architect.
-	let architectResult: DispatchResult | undefined;
-	const needsArchitect = depth >= 2 && complexityNeedsArchitect(plan.complexity);
-	if (needsArchitect) {
-		run?.session.setPhase(
-			`architect planning on ${shortName(adapter.architect?.model ?? "?")} (complexity ${plan.complexity} ≥ 5)`,
-		);
-		[architectResult] = await dispatchParallel(
-			cwd,
-			runId,
-			[
-				{
-					capability: "architect",
-					task: architectPrompt(goal, plan, MAX_LEADS),
-					taskId: `${runId}-architect`,
-				},
-			],
-			adapter,
-			ctx,
-			run,
-		);
-		await captureDispatchCost(
-			{ runId, planId, taskClass: plan.task_class, complexity: plan.complexity,
-			  risk: plan.risk, recommended: plan.route.recommended, mode: plan.route.mode },
-			architectResult,
-			run,
-		);
-		// The leads proceed without a plan rather than aborting the run, but the
-		// operator must be told the decomposition step was lost — it silently
-		// changes what the leads are working from.
-		if (!architectResult || architectResult.exitCode !== 0) {
-			ctx.ui.notify(
-				`Architect dispatch failed (exit ${architectResult?.exitCode ?? "n/a"}): ${
-					summarizeStderr(architectResult?.stderr ?? "no result", 300) || "(no output)"
-				}\nLeads will run without an architect plan.`,
-				"warning",
-			);
-		} else if (architectResult) {
-			run?.session.setPhase(
-				`architect done in ${fmtElapsed(architectResult.durationMs)} ($${architectResult.costUsd.toFixed(4)}) — ${architectResult.stdout.split("\n").filter((l) => /^\s*\d+[.)]/.test(l)).length} tasks planned`,
-			);
-		}
-	}
-
-	const captureOpts: CaptureOpts = {
-		runId, planId, taskClass: plan.task_class, complexity: plan.complexity,
-		risk: plan.risk, recommended: plan.route.recommended, mode: plan.route.mode,
-	};
-	const results = await dispatchReconAndLeads({ runId, goal, plan, adapter, architectResult, leadCapability }, {
-		dispatch: (tasks) => dispatchParallel(cwd, runId, tasks, adapter, ctx, run),
-		capture: (result) => captureDispatchCost(captureOpts, result, run),
-		setPhase: (phase) => run?.session.setPhase(phase),
-		throwIfCancelled: () => run?.session.cancellation.throwIfCancelled(),
-	});
-	return { ...results, architectResult, escalationResults: [] };
-}
-
-/** Parent-owned recon/lead sequencing; effects are supplied by the bridge. */
-export async function dispatchReconAndLeads(
-	input: {
-		runId: string;
-		goal: string;
-		plan: PlanResponse;
-		adapter: Adapter;
-		architectResult?: DispatchResult;
+export function dispatchReconAndLeads(
+	input: Omit<Parameters<typeof dispatchReconAndLeadsCore>[0], "maxLeads" | "evidenceMaxChars"> & {
+		maxLeads?: number;
 		evidenceMaxChars?: number;
-		/** Sized lead capability (lead_small | lead | lead_large); defaults to "lead". */
-		leadCapability?: string;
 	},
-	effects: {
-		dispatch: (tasks: DispatchTask[]) => Promise<DispatchResult[]>;
-		capture: (result: DispatchResult) => Promise<void>;
-		setPhase: (phase: string) => void;
-		throwIfCancelled: () => void;
-	},
-): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[] }> {
-	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars = RECON_EVIDENCE_MAX_CHARS, leadCapability = "lead" } = input;
-	const requestedLeadCount = effectiveLeadCount(plan, MAX_LEADS);
-
-	// Rule 2: parent-owned, read-only recon dispatched directly by the bridge
-	// (not left to a lead's discretion) so it is an observable, billed dispatch
-	// with its own progress row, log files, and cost — not an optimistic claim
-	// that "workers fan out inside each lead".
-	const reconTasks: DispatchTask[] = planReconTasks({
-		method: METHOD.rules.pre_implementation_recon,
-		complexity: plan.complexity,
-		taskClass: plan.task_class,
-		goal,
-		runId,
-	});
-	// Cancellation boundaries. A cancelled run must (1) dispatch nothing new,
-	// but (2) never lose the accounting for children that already finished.
-	// So the check runs BEFORE each dispatch batch and AFTER the whole capture
-	// loop for a completed batch — never between captures, or a cancellation
-	// that lands mid-billing would leave some finished workers unbilled.
-	effects.throwIfCancelled();
-	let workerResults: DispatchResult[] = [];
-	if (reconTasks.length === 0) {
-		// Name the actual reason; "below threshold OR exempt" made the operator
-		// guess, and read as false for an exempt class at high complexity.
-		const rule = METHOD.rules.pre_implementation_recon;
-		const reason = plan.complexity < rule.min_complexity
-			? `complexity ${plan.complexity} is below the Rule-2 threshold ${rule.min_complexity}`
-			: `task class "${plan.task_class}" is exempt (skip_for_task_classes)`;
-		effects.setPhase(`no parent-owned recon required: ${reason}`);
-	} else {
-		effects.setPhase(`recon: 0/${reconTasks.length} starting`);
-		workerResults = await effects.dispatch(reconTasks);
-		for (const result of workerResults) await effects.capture(result);
-		// Every finished recon worker is now billed exactly once; if the run was
-		// cancelled while recon ran (or while billing it), stop here — before any
-		// lead is announced or started.
-		effects.throwIfCancelled();
-		const completedRecon = workerResults.filter((r) => r.exitCode === 0).length;
-		effects.setPhase(`recon: ${completedRecon}/${reconTasks.length} completed; dispatching lead(s)`);
-	}
-	// Every completed/failed recon result is folded into one bounded evidence
-	// packet; failed workers are represented as unavailable, never silently
-	// dropped. If ALL recon calls failed, say so explicitly rather than
-	// letting the per-worker diagnostics read as ordinary partial coverage.
-	const reconEvidenceBody = formatReconEvidence(workerResults, evidenceMaxChars);
-	const reconAllFailed = reconTasks.length > 0 && workerResults.every((r) => r.exitCode !== 0);
-	const reconEvidence = reconAllFailed
-		? `DEGRADED: all ${workerResults.length} parent-owned recon worker(s) failed; no verified recon evidence is available for this run. Raw diagnostics follow for context only:\n\n${reconEvidenceBody}`
-		: reconEvidenceBody;
-
-	// Several leads need the architect's Lead assignments (scope + depends on).
-	// Without them, run ONE lead with the whole goal rather than N clones.
-	const architectText = architectResult && architectResult.exitCode === 0 ? architectResult.stdout : "";
-	const assignments = requestedLeadCount > 1 ? parseLeadAssignments(architectText, requestedLeadCount) : null;
-	const leadCount = assignments ? requestedLeadCount : 1;
-	if (requestedLeadCount > 1 && !assignments) {
-		effects.setPhase(`topology asked for ${requestedLeadCount} leads but the architect gave no valid Lead assignments; running a single lead`);
-	}
-	const waves = assignments ? planLeadWaves(assignments) : [[0]];
-	const leadTaskFor = (i: number): DispatchTask => ({
-		capability: leadCapability,
-		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter, assignments?.[i]),
-		taskId: `${runId}-lead-${i}`,
-	});
-
-	const completedReconCount = workerResults.filter((r) => r.exitCode === 0).length;
-	const reconPhaseNote =
-		reconTasks.length > 0
-			? `${completedReconCount}/${reconTasks.length} completed recon packet(s)`
-			: "no parent-owned recon packets (not required for this task)";
-	effects.throwIfCancelled();
-	effects.setPhase(
-		`${leadCount} lead(s) in ${waves.length} wave(s) executing on ${shortName(adapter[leadCapability]?.model ?? "?")} with ${reconPhaseNote}; nested subagent calls inside a lead are not authoritative worker accounting`,
+	effects: Parameters<typeof dispatchReconAndLeadsCore>[1],
+): ReturnType<typeof dispatchReconAndLeadsCore> {
+	return dispatchReconAndLeadsCore(
+		{
+			...input,
+			maxLeads: input.maxLeads ?? MAX_LEADS,
+			evidenceMaxChars: input.evidenceMaxChars ?? RECON_EVIDENCE_MAX_CHARS,
+		},
+		effects,
 	);
-	const leadResults: DispatchResult[] = [];
-	// The exact DispatchTask objects dispatched for each lead, in the same
-	// order/identity as leadResults (paired by taskId). BUG 2: escalation
-	// retries were built from the failed lead's REPORT because the original
-	// prompt was never kept anywhere past this function; callers now use this
-	// to recover the lead's original goal/scope/model-routing prompt on retry.
-	const leadTasks: DispatchTask[] = [];
-	const stopped = new Set<number>();
-	for (const [w, wave] of waves.entries()) {
-		// A lead whose dependency failed or reported STATUS: blocked is not started.
-		const runnable = wave.filter((i) => !(assignments?.[i]?.dependsOn ?? []).some((d) => stopped.has(d)));
-		for (const i of wave) if (!runnable.includes(i)) stopped.add(i);
-		const skipped = wave.filter((i) => !runnable.includes(i));
-		if (skipped.length > 0) {
-			effects.setPhase(`wave ${w + 1}: not starting lead(s) ${skipped.map((i) => i + 1).join(", ")} — a lead they depend on failed or was blocked`);
-		}
-		if (runnable.length === 0) continue;
-		if (waves.length > 1) effects.setPhase(`wave ${w + 1}/${waves.length}: lead(s) ${runnable.map((i) => i + 1).join(", ")}`);
-		const tasks = runnable.map(leadTaskFor);
-		const results = await effects.dispatch(tasks);
-		for (const r of results) await effects.capture(r);
-		// Same contract as recon: bill every finished lead, then honour cancellation.
-		effects.throwIfCancelled();
-		for (const [k, r] of results.entries()) {
-			if (r.exitCode !== 0 || parseLeadStatus(r.stdout) === "blocked") stopped.add(runnable[k]);
-		}
-		leadResults.push(...results);
-		leadTasks.push(...tasks);
-	}
-
-	// Recon is parent-owned and returned for billing/reporting. Any further
-	// fan-out a lead performs via HT's own subagent tool happens inside that
-	// lead's own context window; the bridge has no visibility into it and does
-	// not count it as part of this run's authoritative worker accounting.
-	// Leads never started because a lead they depend on failed or was blocked.
-	const skippedLeads = [...stopped].filter((i) => !leadResults.some((r) => r.taskId === `${runId}-lead-${i}`)).length;
-	return { leadResults, workerResults, skippedLeads, leadTasks };
 }
-
-/**
- * Every dispatch this run paid for, in lifecycle order. Parent-owned recon
- * workers are billed dispatches like any other; omitting them under-reported
- * total spend, which is the number the cost policy is judged on. Each result
- * appears exactly once — recon is captured to the ledger during
- * `dispatchReconAndLeads()`, and this list is only the final-summary view.
- */
-export function collectBilledResults(input: {
-	architectResult?: DispatchResult;
-	workerResults: DispatchResult[];
-	leadResults: DispatchResult[];
-	verificationResults: DispatchResult[];
-	escalationResults: DispatchResult[];
-}): DispatchResult[] {
-	return [
-		...(input.architectResult ? [input.architectResult] : []),
-		...input.workerResults,
-		...input.leadResults,
-		...input.verificationResults,
-		...input.escalationResults,
-	];
-}
-
-/**
- * Operator-facing summary line for parent-owned recon. Failed workers are
- * named with a summarized (never raw) stderr so the final notification stays
- * bounded and readable.
- */
-export function summarizeReconWorkers(workerResults: DispatchResult[]): string {
-	if (workerResults.length === 0) return "recon workers: none (not required for this task)";
-	const completed = workerResults.filter((r) => r.exitCode === 0).length;
-	const cost = workerResults.reduce((s, r) => s + r.costUsd, 0);
-	const failures = workerResults
-		.filter((r) => r.exitCode !== 0)
-		.map((r) => `${r.taskId} exit ${r.exitCode}: ${summarizeStderr(r.stderr, 120) || "(no output)"}`);
-	return [
-		`recon workers: ${completed}/${workerResults.length} completed · $${cost.toFixed(4)}`,
-		...failures.map((f) => `  failed ${f}`),
-	].join("\n");
-}
-
-// complexityNeedsArchitect, architectPrompt, QA_SCOPE_RULES, effectiveLeadCount,
-// leadAssignmentInstructions, modelTableForLead, leadPrompt, LEAD_DELEGATION_RULE,
-// LEAD_STATUS_CONTRACT moved to core/prompts.ts (pure; B4.1); imported below.
-// architectPrompt/effectiveLeadCount now take maxLeads as an explicit parameter
-// (default 8, matching the old MAX_LEADS default) instead of reading the
-// MAX_LEADS module constant; call sites below pass MAX_LEADS explicitly.
 
 // -----------------------------------------------------------------------------
 // Argument parsing
@@ -1909,8 +1668,7 @@ export default function (pi: ExtensionAPI) {
 				const headBefore = gitHead(cwd);
 				// `workerResults` carries the parent-owned recon dispatches; they must stay
 				// destructured here or the run stops billing them (plan Task 3).
-				const { leadResults, workerResults, architectResult, escalationResults, skippedLeads, leadTasks } = await dispatchHierarchical(
-					cwd,
+				const { leadResults, workerResults, architectResult, skippedLeads, leadTasks } = await dispatchHierarchicalCore(
 					runId,
 					plan.plan_id,
 					parsed.goal,
@@ -1919,7 +1677,16 @@ export default function (pi: ExtensionAPI) {
 					ctx,
 					claimed,
 					leadDecision.capability,
+					{
+						dispatch: (tasks) => dispatchParallel(cwd, runId, tasks, adapter, ctx, claimed),
+						captureDispatchCost,
+						maxLeads: MAX_LEADS,
+						evidenceMaxChars: RECON_EVIDENCE_MAX_CHARS,
+					},
 				);
+				// dispatchHierarchical no longer hands back a mutable `escalationResults`
+				// sink to push into (B4.6); the retry loop below owns its own.
+				const escalationResults: DispatchResult[] = [];
 				session.cancellation.throwIfCancelled();
 
 				for (const r of leadResults) {
