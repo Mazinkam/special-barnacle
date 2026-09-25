@@ -54,6 +54,19 @@ def __getattr__(name: str):
         return _capability_tier_target()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+#: Explicit so `from orchestrator.dynamic_adapter import *` (which uses `__all__` when present)
+#: still resolves `CAPABILITY_TIER_TARGET` through `__getattr__` above instead of silently
+#: dropping it: without an `__all__`, `import *` only takes names already in the module's
+#: `__dict__`, and `CAPABILITY_TIER_TARGET` is deliberately not one of those (see
+#: `_capability_tier_target()`/`__getattr__` above) — B2 review finding.
+__all__ = [
+    'Any', 'CAPABILITY_TIER_TARGET', 'DISABLE_VALUES', 'EXCLUDED_MODEL_PREFIXES',
+    'MODEL_FAMILY_DEFAULT', 'MODEL_FAMILY_ENV_VAR', 'MODEL_FAMILY_PRESETS', 'Path',
+    'TIER_BOUNDARIES', 'adapter_tier_targets', 'argparse', 'defaultdict', 'is_excluded_model',
+    'json', 'load_catalog', 'load_ht_store', 'main', 'os', 'provider_for_model',
+    'resolve_adapter', 'resolve_model_family', 'resolve_models', 'sys', 'tier_for',
+]
+
 # Cost-tier thresholds (USD per million output tokens). Models below fall in
 # the cheapest bucket, above into expensive, the rest into mid. Calibrated to
 # the model catalog dated 2026-09-21.

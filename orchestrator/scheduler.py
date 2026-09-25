@@ -23,6 +23,16 @@ def __getattr__(name: str):
         return efforts()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+#: Explicit so `from orchestrator.scheduler import *` (which uses `__all__` when present) still
+#: resolves `EFFORTS` through `__getattr__` above instead of silently dropping it: without an
+#: `__all__`, `import *` only takes names already in the module's `__dict__`, and `EFFORTS` is
+#: deliberately not one of those (see `efforts()`/`__getattr__` above) — B2 review finding.
+__all__ = [
+    'Any', 'ComputePackage', 'DEFAULT_PACKAGES', 'EFFORTS', 'SCHEDULER_MIN_SAMPLES',
+    'asdict', 'bucket_complexity', 'dataclass', 'effort_levels', 'efforts', 'is_no_data',
+    'measured', 'package_history', 'recommend_package', 'topology_for',
+]
+
 
 def measured(value:Any)->Any:
     """`value`, or None when it is `None` or `records.NO_DATA`.

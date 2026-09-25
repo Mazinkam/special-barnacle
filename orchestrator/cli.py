@@ -157,10 +157,11 @@ def _write(records)->tuple[int,dict]:
     outcome through this one function, so a rejected batch or an interrupted append is always a
     structured body with `persisted`/`retry` and never an uncaught traceback.
     """
-    try: result=write_batch(_root(),records)
+    root=_root()
+    try: result=write_batch(root,records)
     except BatchValidationError as exc: return EXIT_INVALID,_failure(STATUS_INVALID,str(exc))
     except BatchAppendError as exc: return EXIT_APPEND_FAILED,_failure(STATUS_APPEND_FAILED,str(exc),exc.persisted,RETRY_SAME_IDS)
-    result=refresh_after_write(_root(),result,config=cfg())
+    result=refresh_after_write(root,result,config=cfg())
     return (EXIT_OK if result['ok'] else EXIT_REFRESH_FAILED),{k:v for k,v in result.items() if k!='records'}
 
 def write_records(records)->int:
@@ -274,7 +275,8 @@ def main():
         print('Initialized V3 state'); return
     if args.cmd=='status': print(json.dumps(load_or_rebuild(_root()),indent=2)); return
     if args.cmd=='dashboard': print(generate_dashboard(_root(),config=C)); return
-    if args.cmd=='rebuild': print(json.dumps(rebuild(_root()),indent=2)); generate_dashboard(_root(),config=C); return
+    if args.cmd=='rebuild':
+        root=_root(); print(json.dumps(rebuild(root),indent=2)); generate_dashboard(root,config=C); return
     if args.cmd=='features':
         f=FeaturePolicy(C.get('features',{})).resolve(); print(json.dumps(feature_inventory(f),indent=2)); return
     if args.cmd=='recommend-policy': print(json.dumps(eng().recommend_policy(),indent=2)); return
@@ -348,11 +350,12 @@ def main():
 def _fmt_bytes(n:int)->str: return f'{n:,}'
 
 def _archive_runs_command(args)->int:
-    try: entries=archive_runs(_root(),older_than_days=args.older_than_days,execute=args.execute)
+    root=_root()
+    try: entries=archive_runs(root,older_than_days=args.older_than_days,execute=args.execute)
     except (ValueError,OSError) as exc: print(f'archive-runs: {exc}',file=sys.stderr); return EXIT_INVALID
     planned=[e for e in entries if e['files']]
     skipped=[e for e in entries if e['status']=='skipped']
-    summary={'executed':args.execute,'older_than_days':args.older_than_days,'state_root':str(_root()),'runs':entries,
+    summary={'executed':args.execute,'older_than_days':args.older_than_days,'state_root':str(root),'runs':entries,
              'originals_retained':all(e.get('originals_retained',True) for e in planned),
              'reclaimed_bytes':max(0,-sum(e.get('storage_delta_bytes',0) for e in planned)),
              'storage_delta_bytes':sum(e.get('storage_delta_bytes',0) for e in planned),
@@ -366,7 +369,7 @@ def _archive_runs_command(args)->int:
              'not_archived_files':sum(1 for e in planned for f in e['files'] if f['status']!='archived')}
     failed=args.execute and summary['not_archived_files']>0
     if args.json: print(json.dumps(summary,indent=2,default=str)); return EXIT_INVALID if failed else EXIT_OK
-    if not args.execute: print(f'DRY RUN — nothing written. Re-run with --execute to archive. (runs under {_root()/"runs"}, older than {args.older_than_days:g} days)')
+    if not args.execute: print(f'DRY RUN — nothing written. Re-run with --execute to archive. (runs under {root/"runs"}, older than {args.older_than_days:g} days)')
     for e in entries:
         if e['status']=='skipped' and not e['files']: print(f"skipped  {e['run_id']}  {e['reason']}: {e['detail']}"); continue
         size=f"{_fmt_bytes(e['raw_bytes'])} raw bytes -> "+(f"{_fmt_bytes(e['compressed_bytes'])} compressed" if args.execute else f"~{_fmt_bytes(e['estimated_compressed_bytes'])} estimated compressed")
