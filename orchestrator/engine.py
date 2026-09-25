@@ -9,8 +9,8 @@ from .history import load_stats
 from .method import default_efforts
 from .adaptive import adaptive_route, configured_min_samples, recommend_topology, should_canary
 from .features import FeaturePolicy, feature_inventory
-from .policy_simulation import compare_policies
-from .policy_recommendations import recommend_policy as build_policy_recommendation
+from .routing.policy import compare_policies
+from .routing.policy import recommend_policy as build_policy_recommendation
 from .vocab import DEFAULT_MIN_SAMPLES
 
 

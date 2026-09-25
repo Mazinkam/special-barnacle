@@ -60,6 +60,10 @@ FORBIDDEN_EDGES: dict[str, set[str]] = {
     'archive.plan': {'dashboard', 'presentation', 'app', 'engine', 'cli', 'ingest'},
     'archive.execute': {'dashboard', 'presentation', 'app', 'engine', 'cli', 'ingest'},
     'archive.restore': {'dashboard', 'presentation', 'app', 'engine', 'cli', 'ingest'},
+    # B3: `routing` (merged `policy_simulation`+`policy_recommendations`) sits below
+    # `presentation`/`app`/`cli`/`engine` in the B2 layer order.
+    'routing': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'routing.policy': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
 }
 
 #: Only these module prefixes may import `orchestrator.app`; every other module must not.
