@@ -70,11 +70,11 @@ class SealedArchiveTests(ArchiveFixture):
     def test_partial_manifest_resumes_after_enospc_without_recompressing_first_file(self):
         run = self.completed_run(files={'a.txt': b'A' * 20000, 'b.txt': b'B' * 20000})
         seal_fixture(run)
-        compress = archive._compress_to_temp
+        compress = archive.execute._compress_to_temp
         def full_on_second(src, dest):
             if src.name == 'b.txt': raise OSError(errno.ENOSPC, 'disk full')
             return compress(src, dest)
-        with patch.object(archive, '_compress_to_temp', full_on_second):
+        with patch.object(archive.execute, '_compress_to_temp', full_on_second):
             self.assertEqual(self.execute()[0]['status'], 'partial')
         self.assertFalse((run / 'a.txt').exists())
         inode = (run / 'a.txt.gz').stat().st_ino
@@ -88,11 +88,11 @@ class SealedArchiveTests(ArchiveFixture):
     def test_crash_after_gzip_publication_adopts_verified_orphan_without_overwrite(self):
         run = self.completed_run(files={'a.txt': b'A' * 20000})
         seal_fixture(run)
-        with patch.object(archive, '_write_manifest', side_effect=OSError(errno.ENOSPC, 'disk full')):
+        with patch.object(archive.execute, '_write_manifest', side_effect=OSError(errno.ENOSPC, 'disk full')):
             self.execute()
         self.assertTrue((run / 'a.txt').exists())
         inode = (run / 'a.txt.gz').stat().st_ino
-        with patch.object(archive, '_compress_to_temp', side_effect=AssertionError('must adopt, not recompress')):
+        with patch.object(archive.execute, '_compress_to_temp', side_effect=AssertionError('must adopt, not recompress')):
             result = self.execute()[0]
         self.assertEqual(result['status'], 'archived')
         self.assertFalse((run / 'a.txt').exists())
@@ -110,7 +110,7 @@ import os, sys
 from pathlib import Path
 from orchestrator import archive
 from tests.test_archive import NOW
-archive._write_manifest = lambda *a: os._exit(91)
+archive.execute._write_manifest = lambda *a: os._exit(91)
 archive.archive_runs(Path(sys.argv[1]), execute=True, now=NOW)
 ''', str(self.root)], cwd=REPO, env={**os.environ, 'PYTHONPATH': str(REPO), 'PYTHONDONTWRITEBYTECODE': '1'})
         self.assertEqual(proc.returncode, 91)

@@ -48,6 +48,18 @@ FORBIDDEN_EDGES: dict[str, set[str]] = {
     'ingest.parsers.codex': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
     'ingest.parsers._shared': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
     'ingest_checkpoint': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    # B3: `archive/` sits below `presentation`/`app`/`cli` in the B2 layer order (it may import
+    # core/contract/vocab/records/store/record_index/state; it must not import presentation, app,
+    # engine, cli or ingest). `cli` -> `archive` is fine (and expected: `cli.py` imports
+    # `archive.archive_runs`/`restore_run`/`archive.execute.summarize_archive_results`), so only
+    # the reverse direction is forbidden here.
+    'archive': {'dashboard', 'presentation', 'app', 'engine', 'cli', 'ingest'},
+    'archive.codec': {'dashboard', 'presentation', 'app', 'engine', 'cli', 'ingest'},
+    'archive.manifest': {'dashboard', 'presentation', 'app', 'engine', 'cli', 'ingest'},
+    'archive.seal': {'dashboard', 'presentation', 'app', 'engine', 'cli', 'ingest'},
+    'archive.plan': {'dashboard', 'presentation', 'app', 'engine', 'cli', 'ingest'},
+    'archive.execute': {'dashboard', 'presentation', 'app', 'engine', 'cli', 'ingest'},
+    'archive.restore': {'dashboard', 'presentation', 'app', 'engine', 'cli', 'ingest'},
 }
 
 #: Only these module prefixes may import `orchestrator.app`; every other module must not.

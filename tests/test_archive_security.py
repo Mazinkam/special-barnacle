@@ -93,13 +93,13 @@ class ArchiveSecurityTests(ArchiveFixture):
     def test_late_append_after_final_stat_is_preserved_in_original_inode(self):
         run = self.completed_run(files={'a.txt': b'original\n'})
         raw = run / 'a.txt'
-        real = archive._write_manifest
+        real = archive.execute._write_manifest
         with raw.open('ab', buffering=0) as writer:
             def publish_then_append(*args, **kwargs):
                 result = real(*args, **kwargs)
                 writer.write(b'late bytes\n')  # after final stat, before the old unlink
                 return result
-            with patch.object(archive, '_write_manifest', publish_then_append):
+            with patch.object(archive.execute, '_write_manifest', publish_then_append):
                 self.execute()
             writer.write(b'even later bytes\n')
             self.assertTrue(raw.exists(), 'an open writer must not be orphaned by unlink/rename')
@@ -109,7 +109,7 @@ class ArchiveSecurityTests(ArchiveFixture):
     def test_late_append_after_final_stat_of_existing_snapshot_keeps_original(self):
         run, _ = self.legacy_archive()
         raw = run / 'a.txt'; raw.write_bytes(b'original\n'); set_age(raw, 40)
-        real_digest = archive._decompressed_digest
+        real_digest = archive.execute._decompressed_digest
         real_stat = Path.stat
         ready = False
         def verified(*args):
@@ -124,21 +124,21 @@ class ArchiveSecurityTests(ArchiveFixture):
                 ready = False
                 with raw.open('ab') as writer: writer.write(b'late append\n')
             return result
-        with patch.object(archive, '_decompressed_digest', verified), patch.object(Path, 'stat', stat_then_append):
+        with patch.object(archive.execute, '_decompressed_digest', verified), patch.object(Path, 'stat', stat_then_append):
             self.execute()
         self.assertTrue(raw.exists(), 'existing snapshots must not authorize unlink of a live original')
         self.assertEqual(raw.read_bytes(), b'original\nlate append\n')
 
     def test_restore_never_overwrites_writer_creating_raw_after_initial_check(self):
         run, _ = self.legacy_archive()
-        real = archive._decompress_to_temp
+        real = archive.restore._decompress_to_temp
         def create_raw(*args):
             result = real(*args)
             (run / 'a.txt').write_bytes(b'new writer bytes\n')
             return result
         before_archive = (run / 'a.txt.gz').read_bytes()
         before_manifest = (run / archive.MANIFEST_FILE).read_bytes()
-        with patch.object(archive, '_decompress_to_temp', create_raw):
+        with patch.object(archive.restore, '_decompress_to_temp', create_raw):
             result = archive.restore_run(self.root, run.name)
         self.assertEqual((run / 'a.txt').read_bytes(), b'new writer bytes\n')
         self.assertTrue(result['errors'])
@@ -147,11 +147,11 @@ class ArchiveSecurityTests(ArchiveFixture):
 
     def test_manifest_created_during_publish_is_never_overwritten(self):
         run = self.completed_run(files={'a.txt': b'original'})
-        real = archive._write_manifest
+        real = archive.execute._write_manifest
         def competing_manifest(*args):
             (run / archive.MANIFEST_FILE).write_bytes(b'unique recovery metadata')
             return real(*args)
-        with patch.object(archive, '_write_manifest', competing_manifest):
+        with patch.object(archive.execute, '_write_manifest', competing_manifest):
             result = self.execute()
         self.assertEqual((run / archive.MANIFEST_FILE).read_bytes(), b'unique recovery metadata')
         self.assertEqual((run / 'a.txt').read_bytes(), b'original')
@@ -168,12 +168,12 @@ class ArchiveSecurityTests(ArchiveFixture):
 
     def test_archive_publish_does_not_clobber_late_destination(self):
         run = self.completed_run(files={'a.txt': b'original'})
-        real = archive._decompressed_digest
+        real = archive.execute._decompressed_digest
         def competing_archive(*args):
             result = real(*args)
             (run / 'a.txt.gz').write_bytes(b'late recovery archive')
             return result
-        with patch.object(archive, '_decompressed_digest', competing_archive):
+        with patch.object(archive.execute, '_decompressed_digest', competing_archive):
             self.execute()
         self.assertEqual((run / 'a.txt.gz').read_bytes(), b'late recovery archive')
         self.assertEqual((run / 'a.txt').read_bytes(), b'original')
@@ -197,8 +197,8 @@ class ArchiveSecurityTests(ArchiveFixture):
     def test_private_permissions_hold_during_compress_and_restore(self):
         run = self.completed_run(files={'a.txt': b'secret'})
         raw = run / 'a.txt'; raw.chmod(0o600)
-        compress = archive._compress_to_temp
-        decompress = archive._decompress_to_temp
+        compress = archive.execute._compress_to_temp
+        decompress = archive.restore._decompress_to_temp
         def check_temp(fn):
             def checked(*args):
                 result = fn(*args)
@@ -207,11 +207,11 @@ class ArchiveSecurityTests(ArchiveFixture):
             return checked
         old_umask = os.umask(0o022)
         try:
-            with patch.object(archive, '_compress_to_temp', check_temp(compress)):
+            with patch.object(archive.execute, '_compress_to_temp', check_temp(compress)):
                 self.execute()
             self.assertEqual(stat.S_IMODE((run / 'a.txt.gz').stat().st_mode), 0o600)
             raw.unlink()  # emulate an old-format archive whose original has gone
-            with patch.object(archive, '_decompress_to_temp', check_temp(decompress)):
+            with patch.object(archive.restore, '_decompress_to_temp', check_temp(decompress)):
                 archive.restore_run(self.root, run.name)
             self.assertEqual(stat.S_IMODE(raw.stat().st_mode), 0o600)
         finally:
@@ -220,13 +220,13 @@ class ArchiveSecurityTests(ArchiveFixture):
     def test_cli_low_disk_and_modified_eligible_file_return_nonzero(self):
         run = self.completed_run(files={'a.txt': b'original'})
         args = argparse.Namespace(older_than_days=30, execute=True, json=True)
-        real = archive._compress_to_temp
+        real = archive.execute._compress_to_temp
         def append(*a):
             result = real(*a)
             with (run / 'a.txt').open('ab') as f: f.write(b'late')
             return result
         for hook in (patch.object(archive.shutil, 'disk_usage', return_value=shutil._ntuple_diskusage(10, 10, 0)),
-                     patch.object(archive, '_compress_to_temp', append)):
+                     patch.object(archive.execute, '_compress_to_temp', append)):
             set_age(run / 'a.txt', 40)
             with hook, patch.object(cli, 'ROOT', self.root), patch.object(cli, 'archive_runs',
                     side_effect=lambda *a, **k: archive.archive_runs(*a, now=NOW, **k)):

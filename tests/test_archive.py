@@ -315,7 +315,7 @@ class FailureTests(ArchiveFixture):
 
     def test_verification_failure_keeps_raw_and_writes_no_archive(self):
         d = self.completed_run(); before = snapshot(d)
-        with patch.object(archive, '_decompressed_digest', return_value=('0' * 64, 0)):
+        with patch.object(archive.execute, '_decompressed_digest', return_value=('0' * 64, 0)):
             entry = self.by_run(self.execute())['old-done']
         self.assertEqual(entry['status'], 'failed')
         self.assertTrue(all(f['reason'] == 'verification_failed' for f in entry['files']))
@@ -337,7 +337,7 @@ class FailureTests(ArchiveFixture):
     def test_file_appended_during_compression_is_not_replaced(self):
         d = self.completed_run(); name = 'old-done-lead-0.events.jsonl'; target = d / name
         original = target.read_bytes()
-        real = archive._compress_to_temp
+        real = archive.execute._compress_to_temp
 
         def racing(src, *a, **k):
             result = real(src, *a, **k)
@@ -346,7 +346,7 @@ class FailureTests(ArchiveFixture):
                 set_age(target, 40)
             return result
 
-        with patch.object(archive, '_compress_to_temp', racing):
+        with patch.object(archive.execute, '_compress_to_temp', racing):
             entry = self.by_run(self.execute())['old-done']
         f = next(x for x in entry['files'] if x['name'] == name)
         self.assertEqual((f['status'], f['reason']), ('skipped', 'modified_during_archive'))
@@ -358,13 +358,13 @@ class FailureTests(ArchiveFixture):
     def test_second_archiver_waits_for_the_first(self):
         self.completed_run()
         entered = threading.Event(); release = threading.Event(); order = []
-        real = archive._compress_to_temp
+        real = archive.execute._compress_to_temp
 
         def slow(src, *a, **k):
             entered.set(); release.wait(5); return real(src, *a, **k)
 
         def first():
-            with patch.object(archive, '_compress_to_temp', slow): order.append(('first', self.execute()))
+            with patch.object(archive.execute, '_compress_to_temp', slow): order.append(('first', self.execute()))
 
         t = threading.Thread(target=first); t.start(); self.assertTrue(entered.wait(5))
         t2 = threading.Thread(target=lambda: order.append(('second', self.execute()))); t2.start()

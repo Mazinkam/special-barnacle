@@ -16,7 +16,7 @@ from .ingest import discover_logs, ingest_paths
 from .ingest.service import INGEST_ERROR_LIMIT, _bound_error, _redact_paths, make_ingest_status
 from .ingest.service import process_ingest as _ingest_process_ingest
 from .dynamic_adapter import resolve_adapter
-from .archive import archive_runs, restore_run, DEFAULT_OLDER_THAN_DAYS, RESTORE_COMMAND
+from .archive import DEFAULT_OLDER_THAN_DAYS, RESTORE_COMMAND, archive_runs, restore_run
 from .contract import (
     EXIT_APPEND_FAILED as CONTRACT_EXIT_APPEND_FAILED,
     EXIT_INVALID as CONTRACT_EXIT_INVALID,
