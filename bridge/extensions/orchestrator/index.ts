@@ -27,7 +27,6 @@
  * skill's history has (recommended, executed, observed) triples to learn from.
  */
 
-import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -61,14 +60,13 @@ export { agentNameFor };
 import { fmtElapsed } from "./run-ui.ts";
 import { telemetryHealthy, telemetryWarning, type FlushReport, type QueueStats } from "./record-queue.ts";
 export { telemetryHealthy, telemetryWarning };
-import { createPythonCli } from "./adapters/python-cli.ts";
+import { createOrchestratorCli } from "./adapters/orchestrator-cli.ts";
 import { reapOrphanedPersonaDirs } from "./adapters/process-reaper.ts";
 import { createTelemetry } from "./adapters/telemetry.ts";
 import {
 	type Adapter,
 	FALLBACK_ADAPTER,
 	type FullResolution,
-	loadDynamicAdapter as loadDynamicAdapterAdapter,
 	policyIdFor,
 	resolveAdapter as resolveAdapterAdapter,
 } from "./adapters/adapter-resolver.ts";
@@ -235,32 +233,26 @@ function runsDir(): string {
 // `--interactive` explicitly opts in to the confirmation gates.
 
 /**
- * The one Python spawner for this extension (C1 in the architecture review):
- * `loadDynamicAdapter`, `runModule`, `planRun`, the RecordQueue runner, the
- * session-ingest runner, and the `/orchestrator-roi` handler all build one of
- * these (never their own `spawn()` call) and go through `.run()`. One env
- * builder means every caller now consistently gets
- * `CODING_AGENT_ORCHESTRATOR_HOME`, unlike the old per-call-site `spawn()`s
- * this replaces.
- *
- * Built fresh per call rather than once at module load: `spawn` here is a
- * bare reference to the `node:child_process` import, re-read at the moment
- * this function runs. A module-level singleton would instead capture
- * whatever `spawn` resolved to at import time, permanently missing any
- * later `spyOn(childProcess, "spawn")` (index.test.ts installs several).
- * `pythonOverride` is `runModule`'s test-only `python` option.
+ * The one Python spawner for this extension (C1 in the architecture review;
+ * moved into adapters/orchestrator-cli.ts in B4.6): `loadDynamicAdapter`,
+ * `runModule`, `planRun`, the RecordQueue runner, the session-ingest runner,
+ * and the `/orchestrator-roi` handler all go through `orchestratorCli.cli()`
+ * (never their own `spawn()` call). One env builder means every caller
+ * consistently gets `CODING_AGENT_ORCHESTRATOR_HOME`, unlike the old
+ * per-call-site `spawn()`s this replaces.
  */
-function orchestratorPythonCli(pythonOverride?: string) {
-	return createPythonCli({
-		python: pythonOverride ?? PYTHON,
-		skillRoot: expandedSkillRoot,
-		stateRoot: expandedStateRoot,
-		spawn,
-		defaultTimeoutMs: PYTHON_TIMEOUT_MS,
-		baseEnv: liveEnv(),
-		extraEnv: PYTHON_EXTRA_ENV,
-	});
-}
+const orchestratorCli = createOrchestratorCli({
+	python: PYTHON,
+	skillRoot: expandedSkillRoot,
+	stateRoot: expandedStateRoot,
+	defaultTimeoutMs: PYTHON_TIMEOUT_MS,
+	baseEnv: liveEnv,
+	extraEnv: PYTHON_EXTRA_ENV,
+});
+const orchestratorPythonCli = orchestratorCli.cli;
+const runModule = orchestratorCli.runModule;
+const planRun = orchestratorCli.planRun;
+export { runModule };
 
 // `dispatchTimeoutFor()` + LEAD_DISPATCH_TIMEOUT_MS lived here. Dropped in
 // favour of main's progress-aware lead timeouts (`cb9f51e`): a flat per-
@@ -315,9 +307,10 @@ const PERSONA_TMP_TTL_MS = Math.max(2 * 60 * 60 * 1000, DISPATCH_TIMEOUT_MS * 6)
 
 // ModelOverrides + emptyOverrides moved to core/args.ts (pure; B4.1); imported below.
 
-async function loadDynamicAdapter(): Promise<{ adapter: Adapter; warning?: string }> {
-	return loadDynamicAdapterAdapter(orchestratorPythonCli());
-}
+// loadDynamicAdapter's local index.ts wrapper (`loadDynamicAdapterAdapter(orchestratorPythonCli())`)
+// was dead code — `resolveAdapter` below calls adapters/adapter-resolver.ts's
+// `loadDynamicAdapter` itself via `deps.dynamicCli` — and nothing else called
+// the wrapper; deleted (B4.6).
 
 // -----------------------------------------------------------------------------
 // Profiles file I/O
@@ -522,84 +515,21 @@ function triageTask(
 	});
 }
 
-function slugGoal(goal: string): string {
-	return goal
-		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "-")
-		.replace(/^-+|-+$/g, "")
-		.slice(0, 40) || "untitled";
-}
+// slugGoal was dead code (nothing called it) — deleted (B4.6).
 
 // -----------------------------------------------------------------------------
 // Python CLI bridge
 // -----------------------------------------------------------------------------
 
-interface CliResult {
-	stdout: string;
-	stderr: string;
-	exitCode: number;
-}
-
-/**
- * Run a Python module through `orchestratorPythonCli()`. `python`, when
- * given, builds a one-off spawner with a different interpreter but every
- * other setting unchanged; tests use this to exercise a missing interpreter.
- * The `/orchestrator-roi` handler runs a script (not a module) the same way,
- * directly against `orchestratorPythonCli().run()`, instead of through this
- * module-shaped wrapper.
- *
- * Always resolves exactly once — on close, spawn error, or timeout — because
- * `python-cli.ts`'s `run()` does. A spawn failure or timeout is reported as exit
- * code -1 with the error in `stderr`, which the record queue treats as
- * ambiguous and replays.
- */
-export function runModule(module: string, args: string[] = [], stdin?: string, options: { python?: string } = {}): Promise<CliResult> {
-	return orchestratorPythonCli(options.python)
-		.run(module, args, { stdin })
-		.then((r) => ({
-			stdout: r.stdout,
-			stderr: r.stderr,
-			exitCode: r.code ?? -1,
-		}));
-}
+// CliResult, runModule, PlanOptions and planRun moved to
+// adapters/orchestrator-cli.ts (B4.6); imported above as `orchestratorCli`'s
+// `runModule`/`planRun` (re-bound to this file's config).
 
 // -----------------------------------------------------------------------------
 // Plan + route types
 // -----------------------------------------------------------------------------
 
 // PlanResponse moved to core/prompts.ts (pure type; B4.1); imported below.
-
-interface PlanOptions {
-	goal: string;
-	taskClass: string;
-	complexity: number;
-	risk: string;
-	qualityFloor?: number;
-	costAggressiveness?: number;
-}
-
-async function planRun(runId: string, opts: PlanOptions): Promise<PlanResponse> {
-	const args = [
-		"plan",
-		runId,
-		opts.taskClass,
-		String(opts.complexity),
-		opts.risk,
-		"--coupling",
-		"0.5",
-		"--parallelizable",
-		"0.5",
-	];
-	if (opts.qualityFloor !== undefined) args.push("--quality-floor", String(opts.qualityFloor));
-	if (opts.costAggressiveness !== undefined)
-		args.push("--cost-aggressiveness", String(opts.costAggressiveness));
-	const res = await runModule("orchestrator.cli", args);
-	if (res.exitCode !== 0) {
-		throw new Error(`plan failed (exit ${res.exitCode}): ${res.stderr}`);
-	}
-	// The plan command emits a single pretty-printed JSON object on stdout.
-	return JSON.parse(res.stdout.trim());
-}
 
 // -----------------------------------------------------------------------------
 // Telemetry: batched event/metric/outcome records

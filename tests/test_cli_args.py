@@ -20,16 +20,25 @@ from orchestrator.cli import build_parser, _format_adapter_table
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BRIDGE_TS = REPO_ROOT / 'bridge' / 'extensions' / 'orchestrator' / 'index.ts'
+# `planRun` moved out of index.ts into adapters/orchestrator-cli.ts (B4.6, part of the
+# bridge/extensions/orchestrator module split); it's a closure returned by
+# `createOrchestratorCli()` there rather than a bare `function planRun(...)`, so it's found by
+# name (not `function `-prefixed) in this file instead of index.ts.
+ORCHESTRATOR_CLI_TS = REPO_ROOT / 'bridge' / 'extensions' / 'orchestrator' / 'adapters' / 'orchestrator-cli.ts'
 
 
 def _bridge_source() -> str:
     return BRIDGE_TS.read_text(encoding='utf-8')
 
 
-def _extract_function(source: str, name: str) -> str:
+def _orchestrator_cli_source() -> str:
+    return ORCHESTRATOR_CLI_TS.read_text(encoding='utf-8')
+
+
+def _extract_function(source: str, name: str, path: Path = BRIDGE_TS) -> str:
     """Return the balanced-brace body text of `function <name>(...) { ... }` (async or not)."""
     m = re.search(rf'(?:async\s+)?function\s+{re.escape(name)}\s*\([^)]*\)[^{{]*\{{', source)
-    assert m, f'could not find function {name} in {BRIDGE_TS}'
+    assert m, f'could not find function {name} in {path}'
     start = m.end() - 1  # position of the opening '{'
     depth = 0
     for i in range(start, len(source)):
@@ -45,7 +54,7 @@ def _extract_function(source: str, name: str) -> str:
 def test_plan_run_argv_from_bridge_is_accepted_by_the_real_parser():
     """Extract the literal argv `planRun` builds (including the conditional policy flags) and
     feed a representative instance through the real argparse parser; it must not raise."""
-    body = _extract_function(_bridge_source(), 'planRun')
+    body = _extract_function(_orchestrator_cli_source(), 'planRun', ORCHESTRATOR_CLI_TS)
     literals = re.findall(r'"(--[a-z-]+)"', body)
     assert '--quality-floor' in literals
     assert '--cost-aggressiveness' in literals
@@ -78,7 +87,7 @@ def test_every_bridge_flag_literal_is_accepted_by_its_subparser(command, functio
     fails the moment the bridge and cli.py's subparsers disagree on the flags of any of `plan`,
     `route`, `metric`, `outcome` (or any other command added here later).
     """
-    body = _extract_function(_bridge_source(), function_name)
+    body = _extract_function(_orchestrator_cli_source(), function_name, ORCHESTRATOR_CLI_TS)
     flags = sorted(set(re.findall(r'"(--[a-z-]+)"', body)))
     parser = build_parser()
     subparsers_actions = [a for a in parser._subparsers._group_actions if hasattr(a, 'choices')]
