@@ -7,18 +7,23 @@ from .store.documents import JsonDocument
 class ContextRegistry:
     def __init__(self, root: str|Path|None=None):
         root=Path(root) if root is not None else default_state_root()
-        self._doc=JsonDocument(root/'context_registry.json', {'schema_version':3,'artifacts':{}})
+        self.path=root/'context_registry.json'
+        self._doc=JsonDocument(self.path, {'schema_version':3,'artifacts':{}})
+        self.data=self._doc.read()
+    def save(self):
+        self.data=self._doc.update(lambda _data: self.data)
     def put(self, artifact_id:str, content:Any, *, source:str, status:str='observed', repo_revision:str|None=None, dependencies:list[str]|None=None, token_estimate:int|None=None):
         obj={'id':artifact_id,'hash':stable_hash(content),'content':content,'source':source,'status':status,'repo_revision':repo_revision,'dependencies':dependencies or [],'token_estimate':token_estimate,'valid':True,'updated_at':utc_now()}
         def _apply(data):
             data['artifacts'][artifact_id]=obj; return data
-        self._doc.update(_apply); return obj
+        self.data=self._doc.update(_apply); return obj
     def invalidate(self,artifact_id:str,reason:str):
         def _apply(data):
-            if artifact_id in data['artifacts']:
-                data['artifacts'][artifact_id]['valid']=False; data['artifacts'][artifact_id]['invalid_reason']=reason; data['artifacts'][artifact_id]['invalidated_at']=utc_now()
+            if artifact_id not in data['artifacts']:
+                return None
+            data['artifacts'][artifact_id]['valid']=False; data['artifacts'][artifact_id]['invalid_reason']=reason; data['artifacts'][artifact_id]['invalidated_at']=utc_now()
             return data
-        self._doc.update(_apply)
+        self.data=self._doc.update(_apply)
     def invalidate_dependents(self,artifact_id:str,reason:str='dependency invalidated'):
         def _apply(data):
             queue=[artifact_id]; seen=set()
@@ -30,9 +35,9 @@ class ContextRegistry:
                     if a.get('valid',True) and parent in a.get('dependencies',[]):
                         a['valid']=False; a['invalid_reason']=reason; a['invalidated_at']=utc_now(); queue.append(aid)
             return data
-        self._doc.update(_apply)
+        self.data=self._doc.update(_apply)
     def packet(self, ids:list[str], budget_tokens:int)->dict:
-        data=self._doc.read()
+        data=self.data
         selected=[]; used=0; missing=[]
         for aid in ids:
             a=data['artifacts'].get(aid)

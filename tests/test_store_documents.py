@@ -24,10 +24,14 @@ class JsonDocumentConcurrencyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             doc = JsonDocument(Path(d) / 'counter.json', {'count': 0})
             threads_n, increments = 8, 25
+            errors: list[BaseException] = []
 
             def worker():
-                for _ in range(increments):
-                    doc.update(lambda data: {**data, 'count': data['count'] + 1})
+                try:
+                    for _ in range(increments):
+                        doc.update(lambda data: {**data, 'count': data['count'] + 1})
+                except BaseException as exc:  # noqa: BLE001 - surface any worker failure
+                    errors.append(exc)
 
             threads = [threading.Thread(target=worker) for _ in range(threads_n)]
             for t in threads:
@@ -35,6 +39,7 @@ class JsonDocumentConcurrencyTests(unittest.TestCase):
             for t in threads:
                 t.join()
 
+            self.assertEqual(errors, [])
             self.assertEqual(doc.read()['count'], threads_n * increments)
 
     def test_concurrent_context_registry_puts_do_not_lose_writes(self):
@@ -44,10 +49,14 @@ class JsonDocumentConcurrencyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             registry = ContextRegistry(d)
             threads_n, per_thread = 6, 15
+            errors: list[BaseException] = []
 
             def worker(i):
-                for j in range(per_thread):
-                    registry.put(f'artifact-{i}-{j}', f'content-{i}-{j}', source='test')
+                try:
+                    for j in range(per_thread):
+                        registry.put(f'artifact-{i}-{j}', f'content-{i}-{j}', source='test')
+                except BaseException as exc:  # noqa: BLE001 - surface any worker failure
+                    errors.append(exc)
 
             threads = [threading.Thread(target=worker, args=(i,)) for i in range(threads_n)]
             for t in threads:
@@ -55,6 +64,7 @@ class JsonDocumentConcurrencyTests(unittest.TestCase):
             for t in threads:
                 t.join()
 
+            self.assertEqual(errors, [])
             data = registry._doc.read()
             self.assertEqual(len(data['artifacts']), threads_n * per_thread)
             for i in range(threads_n):
@@ -65,10 +75,14 @@ class JsonDocumentConcurrencyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cache = VerificationCache(d)
             threads_n, per_thread = 6, 15
+            errors: list[BaseException] = []
 
             def worker(i):
-                for j in range(per_thread):
-                    cache.put(command=f'cmd-{i}-{j}', revision='rev', environment_fingerprint='env', result='pass')
+                try:
+                    for j in range(per_thread):
+                        cache.put(command=f'cmd-{i}-{j}', revision='rev', environment_fingerprint='env', result='pass')
+                except BaseException as exc:  # noqa: BLE001 - surface any worker failure
+                    errors.append(exc)
 
             threads = [threading.Thread(target=worker, args=(i,)) for i in range(threads_n)]
             for t in threads:
@@ -76,8 +90,38 @@ class JsonDocumentConcurrencyTests(unittest.TestCase):
             for t in threads:
                 t.join()
 
+            self.assertEqual(errors, [])
             data = cache._doc.read()
             self.assertEqual(len(data['entries']), threads_n * per_thread)
+
+
+class JsonDocumentNoOpUpdateTests(unittest.TestCase):
+    """Regression for B3 review finding: `update` must not write (or create the file) when `fn`
+    reports there is nothing to change, by returning `None`."""
+
+    def test_update_returning_none_does_not_create_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'doc.json'
+            doc = JsonDocument(path, {'count': 0})
+
+            result = doc.update(lambda data: None)
+
+            self.assertFalse(path.exists())
+            self.assertEqual(result, {'count': 0})
+
+    def test_update_returning_none_does_not_rewrite_existing_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'doc.json'
+            doc = JsonDocument(path, {'count': 0})
+            doc.update(lambda data: {'count': 1})
+            before = path.read_bytes()
+            before_mtime = path.stat().st_mtime_ns
+
+            result = doc.update(lambda data: None)
+
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(path.stat().st_mtime_ns, before_mtime)
+            self.assertEqual(result, {'count': 1})
 
 
 class JsonDocumentByteIdenticalTests(unittest.TestCase):

@@ -46,11 +46,18 @@ class JsonDocument:
         and atomically write its return value back — all while holding the exclusive lock, so a
         concurrent `update` on the same path cannot interleave with this one. Returns what `fn`
         returned (and wrote).
+
+        If `fn` returns `None`, nothing is written (and the file is not created if it didn't
+        already exist) — this is how callers signal a no-op update (e.g. invalidating an artifact
+        that isn't present), matching the pre-B3 unlocked code's behaviour of only writing when it
+        actually changed something. The current (unwritten) snapshot is returned in that case.
         """
         lock_path = self._lock_path()
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with exclusive_file_lock(lock_path):
             data = read_json(self.path, copy.deepcopy(self.default))
-            data = fn(data)
-            write_json(self.path, data)
-            return data
+            result = fn(data)
+            if result is None:
+                return data
+            write_json(self.path, result)
+            return result
