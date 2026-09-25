@@ -65,10 +65,7 @@ import {
 	policyIdFor,
 	resolveAdapter as resolveAdapterAdapter,
 } from "./adapters/adapter-resolver.ts";
-import {
-	loadProfiles as loadProfilesAdapter,
-	writeProfilesFile as writeProfilesFileAdapter,
-} from "./adapters/profiles-store.ts";
+import { createProfilesStore } from "./adapters/profiles-store.ts";
 import {
 	changedFilesSinceRunStart,
 	diffDirtySnapshots,
@@ -313,24 +310,17 @@ const PERSONA_TMP_TTL_MS = Math.max(2 * 60 * 60 * 1000, DISPATCH_TIMEOUT_MS * 6)
 // Profiles file I/O
 // -----------------------------------------------------------------------------
 
+// writeProfilesFile/loadProfiles moved to adapters/profiles-store.ts (B4.6)
+// as `createProfilesStore`, bound here to `config.ts`'s real `PROFILES_PATH`/
+// `LEGACY_ADAPTER_PATH`/`shippedProfilesPath`.
+const profilesStore = createProfilesStore({
+	profilesPath: PROFILES_PATH,
+	legacyAdapterPath: LEGACY_ADAPTER_PATH,
+	shippedProfilesPath,
+});
+const loadProfiles = profilesStore.loadProfiles;
+const writeProfilesFile = profilesStore.writeProfilesFile;
 type LoadedProfiles = ReturnType<typeof loadProfiles>;
-
-function writeProfilesFile(file: ProfilesFile): void {
-	writeProfilesFileAdapter(PROFILES_PATH, file);
-}
-
-/**
- * Load profiles. When the file does not exist but the legacy adapter file
- * does, migrate it into profile "default" once and write the new file, so the
- * user's existing bindings keep working under the new scheme.
- */
-function loadProfiles() {
-	return loadProfilesAdapter({
-		profilesPath: PROFILES_PATH,
-		legacyAdapterPath: LEGACY_ADAPTER_PATH,
-		shippedProfilesPath,
-	});
-}
 
 function availableModels(ctx: ExtensionContext): AvailableModel[] {
 	try {

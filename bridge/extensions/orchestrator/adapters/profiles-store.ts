@@ -33,7 +33,6 @@ export interface LoadProfilesOptions {
 	/** Where the profiles shipped with the skill live, for the "run install.sh" note. */
 	shippedProfilesPath: () => string;
 }
-
 /**
  * Load profiles. When the file does not exist, the caller falls back to the
  * dynamic resolver + fallback bindings; loading never writes (install.sh is
@@ -68,4 +67,29 @@ export function loadProfiles(opts: LoadProfilesOptions): LoadedProfiles {
 		notes.push(`${legacyAdapterPath} is ignored; the shipped profiles replace it.`);
 	}
 	return { file: emptyProfilesFile(), present: false, problems: [], notes };
+}
+
+export interface ProfilesStoreConfig {
+	profilesPath: string;
+	legacyAdapterPath: string;
+	/** Where the profiles shipped with the skill live, for the "run install.sh" note. */
+	shippedProfilesPath: () => string;
+}
+
+export interface ProfilesStore {
+	loadProfiles(): LoadedProfiles;
+	writeProfilesFile(file: ProfilesFile): void;
+}
+
+/**
+ * Bind `loadProfiles`/`writeProfilesFile` to one `profilesPath` (B4.6):
+ * index.ts calls this once with `config.ts`'s real path and re-exports the
+ * two bound functions instead of writing its own one-line wrappers around
+ * each.
+ */
+export function createProfilesStore(config: ProfilesStoreConfig): ProfilesStore {
+	return {
+		loadProfiles: () => loadProfiles(config),
+		writeProfilesFile: (file) => writeProfilesFile(config.profilesPath, file),
+	};
 }
