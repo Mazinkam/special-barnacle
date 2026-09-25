@@ -10,7 +10,9 @@ stays `unmetered` rather than silently reporting a fabricated number.
 from pathlib import Path
 from typing import Any, Optional
 
-from .runtime import read_json
+# core.fs, not runtime: runtime.meter re-exports through records.metering, which imports this
+# module top-level; importing runtime here would cycle (see docs/architecture-review.md B2.2/B2.3).
+from .core.fs import read_json
 
 _MTOK = 1_000_000
 

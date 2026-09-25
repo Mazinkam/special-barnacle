@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, NamedTuple
 
-from .vocab import CALL, SESSION
+from ..vocab import CALL, SESSION
 
 # --- granularity -----------------------------------------------------------------------------
 
