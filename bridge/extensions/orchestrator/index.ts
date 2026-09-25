@@ -128,7 +128,7 @@ import { RunCancellation } from "./cancellation.ts";
 import { applyObservation, applyWarnings, createProgressView, fmtElapsed, formatNestedWorkerRows, formatProgressLine, formatWarningLine, spinnerFrame } from "./run-ui.ts";
 import type { DispatchProgressView } from "./run-ui.ts";
 import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
-import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.ts";
+import { type FlushReport, type QueueStats } from "./record-queue.ts";
 // Rule-2 recon planning/evidence helpers (pure; see recon.ts). `dispatchHierarchical()`
 // dispatches these as ordinary parent-owned tasks through the existing
 // `dispatchParallel()` path. `DispatchTask` below is declared independently;
@@ -138,6 +138,7 @@ import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.t
 import { formatReconEvidence, planReconTasks } from "./recon.ts";
 import { createPythonCli } from "./adapters/python-cli.ts";
 import { killProcessTree, installDispatchReaper, reapOrphanedPersonaDirs } from "./adapters/process-reaper.ts";
+import { createTelemetry } from "./adapters/telemetry.ts";
 import {
 	changedFilesSinceRunStart,
 	diffDirtySnapshots,
@@ -2415,8 +2416,8 @@ async function planRun(runId: string, opts: PlanOptions): Promise<PlanResponse> 
  * the console and to the active run's log; terminal flushes also return it.
  * Other runtimes keep using the single-record `event`/`metric`/`outcome` commands.
  */
-export const recordQueue = new RecordQueue({
-	run: (records) => runModule("orchestrator.cli", ["batch", "-"], JSON.stringify(records)),
+const telemetry = createTelemetry({
+	runBatch: (records) => runModule("orchestrator.cli", ["batch", "-"], JSON.stringify(records)),
 	maxBatch: TELEMETRY_MAX_BATCH,
 	flushDelayMs: TELEMETRY_FLUSH_MS,
 	onError: (message) => {
@@ -2424,20 +2425,21 @@ export const recordQueue = new RecordQueue({
 		ACTIVE_RUN?.log(`telemetry: ${message}`);
 	},
 });
+export const recordQueue = telemetry.queue;
 
 /** Queue an event row. Synchronous: progress never waits on a Python process. */
 export function recordEvent(event: string, payload: Record<string, unknown>): void {
-	recordQueue.enqueue("event", { ...payload, event });
+	telemetry.recordEvent(event, payload);
 }
 
 /** Queue a metric row (model_call / route_executed). */
 export function recordModelCall(metric: Record<string, unknown>): void {
-	recordQueue.enqueue("metric", metric);
+	telemetry.recordModelCall(metric);
 }
 
 /** Queue an outcome row. Terminal run outcomes go through completeRun/failRun, which also drain. */
 export function recordOutcome(outcome: Record<string, unknown>): void {
-	recordQueue.enqueue("outcome", outcome);
+	telemetry.recordOutcome(outcome);
 }
 
 export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality: number, note: string): Record<string, unknown> {
