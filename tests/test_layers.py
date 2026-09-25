@@ -64,6 +64,10 @@ FORBIDDEN_EDGES: dict[str, set[str]] = {
     # `presentation`/`app`/`cli`/`engine` in the B2 layer order.
     'routing': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
     'routing.policy': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    # B3: `analytics` (moved `verification.flaky_stats` here) sits below
+    # `presentation`/`app`/`cli`/`engine` in the B2 layer order too.
+    'analytics': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'analytics.verification': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
 }
 
 #: Only these module prefixes may import `orchestrator.app`; every other module must not.

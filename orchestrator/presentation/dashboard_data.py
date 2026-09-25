@@ -45,7 +45,7 @@ from ..records import NO_DATA
 from ..core.fs import read_json
 from ..core.jsonl import iter_jsonl
 from ..run_evidence import evidence_coverage, summarize_runs
-from ..verification import flaky_stats
+from ..analytics import flaky_stats
 from ..contract import INGEST_STATUS_FILE, STREAMS
 
 #: `orchestrator/config.json`, read relative to the `orchestrator` package root, not this
