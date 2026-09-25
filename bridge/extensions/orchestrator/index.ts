@@ -138,6 +138,7 @@ import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.t
 // time, so a planned recon task still needs no conversion step.
 import { formatReconEvidence, planReconTasks } from "./recon.ts";
 import { createPythonCli } from "./adapters/python-cli.ts";
+import { killProcessTree, installDispatchReaper, reapOrphanedPersonaDirs } from "./adapters/process-reaper.ts";
 import contract from "./contract.json";
 
 // Pure logic split out of this file per docs/architecture-review.md B4.1.
@@ -323,30 +324,6 @@ function orchestratorPythonCli(pythonOverride?: string) {
  */
 const liveDispatchPids = new Set<number>();
 
-/**
- * Kill a dispatched child AND everything it spawned.
- *
- * `kill(-pid)` targets the child's process group, which exists because we spawn
- * detached. Killing the bare pid instead leaves a dispatched lead's own
- * subagents running as orphans - unreadable, unbilled, and still burning provider
- * quota. Falls back to the direct pid when the group is already gone.
- */
-function killProcessTree(proc: { pid?: number; kill: (signal?: NodeJS.Signals) => boolean }): void {
-	if (typeof proc.pid === "number") {
-		try {
-			process.kill(-proc.pid, "SIGKILL");
-			return;
-		} catch {
-			/* no such group: already reaped, or never became a group leader */
-		}
-	}
-	try {
-		proc.kill("SIGKILL");
-	} catch {
-		/* already gone */
-	}
-}
-
 /** Ensure failures in a child stream listener cannot escape into the TUI. */
 export function guardChildStreamHandler(
 	handlerName: string,
@@ -394,38 +371,9 @@ export function appendTrimmedEventLog(eventsLog: string | undefined, event: unkn
 	}
 }
 
-let dispatchReaperInstalled = false;
-
-/** Kill every in-flight dispatch subtree when this process goes down. */
-function installDispatchReaper(): void {
-	if (dispatchReaperInstalled) return;
-	dispatchReaperInstalled = true;
-	const reap = () => {
-		for (const pid of liveDispatchPids) {
-			try {
-				process.kill(-pid, "SIGKILL");
-			} catch {
-				/* already gone */
-			}
-		}
-		liveDispatchPids.clear();
-	};
-	process.once("exit", reap);
-	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-		// `once` + re-raise keeps HT's own handlers intact: we only add cleanup,
-		// we don't change whether the parent exits.
-		process.once(signal, () => {
-			ACTIVE_RUN?.cancel("signal");
-			// Best effort only. A signal handler cannot await, so this merely *starts* a drain of
-			// records still inside the coalescing window; whether the Python child gets to run
-			// before HT exits depends on HT's own shutdown sequencing. Anything it does not
-			// reach is lost with the process. The guaranteed drains are the awaited ones: the
-			// run's terminal path (complete/fail/cancel/crash) and the `session_shutdown` hook.
-			void recordQueue.flush();
-			reap();
-		});
-	}
-}
+// installDispatchReaper() moved to adapters/process-reaper.ts (B4.3); called
+// below (activation) with the real liveDispatchPids set and ACTIVE_RUN/
+// recordQueue as injected deps instead of module globals it reached into itself.
 
 const PERSONA_TMP_PREFIX = "orch-agent-";
 /**
@@ -434,35 +382,9 @@ const PERSONA_TMP_PREFIX = "orch-agent-";
  * once when its child starts, so the TTL only needs to cover spawn.
  */
 const PERSONA_TMP_TTL_MS = Math.max(2 * 60 * 60 * 1000, DISPATCH_TIMEOUT_MS * 6);
-
-/**
- * Best-effort reap of persona prompt dirs left behind when a parent orchestrator
- * was killed mid-dispatch (SIGKILL skips every cleanup path we control). Runs
- * once at activation; age-gated so concurrently running dispatches are safe.
- */
-function reapOrphanedPersonaDirs(): void {
-	try {
-		const root = tmpdir();
-		const cutoff = Date.now() - PERSONA_TMP_TTL_MS;
-		let reaped = 0;
-		for (const entry of readdirSync(root)) {
-			if (!entry.startsWith(PERSONA_TMP_PREFIX)) continue;
-			const full = join(root, entry);
-			try {
-				if (statSync(full).mtimeMs > cutoff) continue;
-				rmSync(full, { recursive: true, force: true });
-				reaped++;
-			} catch {
-				/* another process may own or have already removed it */
-			}
-		}
-		if (reaped > 0) {
-			console.warn(`[orchestrator] reaped ${reaped} orphaned persona temp dir(s) in ${root}`);
-		}
-	} catch {
-		/* temp dir unreadable — nothing to reap */
-	}
-}
+// reapOrphanedPersonaDirs() moved to adapters/process-reaper.ts (B4.3); called
+// below (activation) with tmpdir()/PERSONA_TMP_PREFIX/PERSONA_TMP_TTL_MS as
+// explicit parameters instead of module globals.
 
 /**
  * Run `worker` over `items` with at most `limit` in flight, preserving input
@@ -3748,8 +3670,21 @@ function postRunMessage(
 }
 
 export default function (pi: ExtensionAPI) {
-	reapOrphanedPersonaDirs();
-	installDispatchReaper();
+	reapOrphanedPersonaDirs({ tmpRoot: tmpdir(), prefix: PERSONA_TMP_PREFIX, ttlMs: PERSONA_TMP_TTL_MS });
+	installDispatchReaper({
+		liveDispatchPids,
+		onSignal: () => {
+			ACTIVE_RUN?.cancel("signal");
+		},
+		// Best effort only. A signal handler cannot await, so this merely *starts* a drain of
+		// records still inside the coalescing window; whether the Python child gets to run
+		// before HT exits depends on HT's own shutdown sequencing. Anything it does not
+		// reach is lost with the process. The guaranteed drains are the awaited ones: the
+		// run's terminal path (complete/fail/cancel/crash) and the `session_shutdown` hook.
+		flush: () => {
+			void recordQueue.flush();
+		},
+	});
 	installTelemetryDrain(pi);
 	installSessionIngest(pi);
 	registerOrchestratorStatusTool(pi);
