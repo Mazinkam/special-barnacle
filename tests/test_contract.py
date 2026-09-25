@@ -182,11 +182,18 @@ def test_runtime_state_root_env_var_matches_contract() -> None:
 
 
 def test_install_sh_default_state_root_matches_contract() -> None:
-    """`install.sh` hard-codes the default state root as a shell fallback (see the comment
-    above the literal in install.sh, next to `orchestrator/contract.json`'s `state_root.default`).
-    The contract default is `~/...`; install.sh spells the same path as `$HOME/...`, so compare
-    the path suffix rather than the literal string.
-    """
+    """The active shell fallback must match `state_root.default` in the contract."""
+    import re
+
     install_sh = (REPO_ROOT / 'install.sh').read_text(encoding='utf-8')
-    suffix = contract.DEFAULT_STATE_ROOT.removeprefix('~/')
-    assert suffix and suffix in install_sh
+    assignments = [
+        line for line in install_sh.splitlines()
+        if not line.lstrip().startswith('#') and re.match(r'\s*STATE_ROOT=', line)
+    ]
+    assert len(assignments) == 1
+    match = re.fullmatch(
+        r'\s*STATE_ROOT="\$\{HUMAIN_ORCHESTRATOR_STATE_ROOT:-(?P<default>[^}]*)\}"\s*',
+        assignments[0],
+    )
+    assert match is not None
+    assert match.group('default') == '$HOME' + contract.DEFAULT_STATE_ROOT.removeprefix('~')

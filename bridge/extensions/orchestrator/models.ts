@@ -18,11 +18,10 @@ import method from "./method.json";
  * `Tier` is a hand-written literal union, not derived via `(typeof METHOD.tiers)[number]`:
  * `method.json` is imported as plain JSON, so TS widens its `tiers` array to `string[]` at the
  * import boundary — there is no way to recover a literal union from a JSON module import. The
- * `MethodFile` interface above already asserts (via the `as unknown as MethodFile` cast) that
- * `METHOD.tiers` is `Tier[]`, but that cast is unchecked; `TIER_LITERALS` and the exhaustiveness
- * check just below make the *type* checked at compile time — if method.json ever gains or drops
- * a tier without `Tier` (and `TIER_LITERALS`) being updated to match, `tsc` fails on the
- * `AssertTierExhaustive` line, and the bun test below fails on the runtime value.
+ * `MethodFile` is applied via an unchecked `as unknown as MethodFile` cast, so changes to
+ * `method.json` do not make `tsc` fail. `TIER_LITERALS` and the exhaustiveness check below ensure
+ * the literal union and its list agree at compile time. Drift between `method.json` and those
+ * literals is caught by the runtime parity test in `models.test.ts`.
  */
 export type Tier = "cheap" | "mid" | "premium" | "frontier";
 
