@@ -321,7 +321,7 @@ def _role_kind(name: Any) -> str | None:
 
 
 @lru_cache(maxsize=1)
-def _role_sets() -> dict[str, frozenset[str]]:
+def _role_sets_cached() -> dict[str, frozenset[str]]:
     """Role vocabulary derived from `method.json` plus the live-stream aliases.
 
     `method.json` is the canonical vocabulary (its `roles` map names both the role keys — `verifier`,
@@ -337,6 +337,17 @@ def _role_sets() -> dict[str, frozenset[str]]:
         COORDINATION: frozenset(n for n in names if _role_kind(n) == COORDINATION),
         VERIFICATION: frozenset(n for n in names if _role_kind(n) == VERIFICATION),
     }
+
+
+def _role_sets() -> dict[str, frozenset[str]]:
+    """Return a fresh dict wrapping the memoized role sets.
+
+    The frozensets themselves are immutable, but the dict `_role_sets_cached()` returns is the
+    same object on every call; a caller that did `_role_sets()['new_key'] = ...` would otherwise
+    corrupt what every later caller sees. `dict(...)` is enough here (no need to deep-copy
+    frozenset members).
+    """
+    return dict(_role_sets_cached())
 
 
 def coordination_roles() -> frozenset[str]:

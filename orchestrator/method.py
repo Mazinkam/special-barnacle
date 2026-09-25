@@ -8,6 +8,7 @@ state lives under ~/.local/state/coding-agent-orchestrator/.
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 from functools import lru_cache
@@ -24,10 +25,22 @@ LEAD_SIZE_ORDER = ["small", "standard", "large"]
 
 
 @lru_cache(maxsize=1)
-def load_method(path: Path | None = None) -> dict[str, Any]:
+def _load_method_cached(path: Path | None = None) -> dict[str, Any]:
     data = json.loads((path or METHOD_PATH).read_text())
     _validate(data)
     return data
+
+
+def load_method(path: Path | None = None) -> dict[str, Any]:
+    """Return method.json's parsed contents, memoized by path (it never changes mid-process).
+
+    Returns a deep copy of the memoized parse: `_load_method_cached` is shared across every
+    caller, so returning the cached object itself would let one caller's in-place edit (e.g.
+    `load_method()['tiers'].append(...)` in a test) leak into every other caller for the rest of
+    the process. The parse is small, so copying it on every call is cheap relative to reloading
+    the file.
+    """
+    return copy.deepcopy(_load_method_cached(path))
 
 
 def _validate(m: dict[str, Any]) -> None:
