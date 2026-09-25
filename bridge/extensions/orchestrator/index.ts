@@ -189,6 +189,13 @@ import {
 	dispatchReconAndLeads as dispatchReconAndLeadsCore,
 	summarizeReconWorkers,
 } from "./pipeline/hierarchy.ts";
+import {
+	qaVerificationOutcomeFor,
+	runVerification as runVerificationCore,
+	type VerificationResult,
+} from "./pipeline/verify-loop.ts";
+export { qaVerificationOutcomeFor };
+export type { VerificationResult };
 export { collectBilledResults, summarizeReconWorkers };
 import type { OrchestratorStatus, WorktreeInfo } from "./run/board.ts";
 import { formatOrchestratorStatus } from "./run/board.ts";
@@ -763,16 +770,7 @@ export function recordOutcome(outcome: Record<string, unknown>): void {
 	telemetry.recordOutcome(outcome);
 }
 
-export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality: number, note: string): Record<string, unknown> {
-	return {
-		run_id: runId,
-		task_id: `${runId}-qa`,
-		outcome: passed ? "verified" : "fail",
-		verification_scope: "run",
-		quality,
-		note,
-	};
-}
+// qaVerificationOutcomeFor moved to pipeline/verify-loop.ts (pure; B4.6); imported below.
 
 export function runCompletionOutcomeFor(runId: string, summary: Record<string, unknown>): Record<string, unknown> {
 	return {
@@ -968,105 +966,9 @@ async function captureDispatchCost(
 
 // sumUsage moved to dispatch/parallel.ts (B4.5 step 5), its only caller.
 
-// Verification + escalation
-// -----------------------------------------------------------------------------
+// VerificationResult, qaVerificationOutcomeFor, runVerification and
+// parseFailedChecks moved to pipeline/verify-loop.ts (B4.6); imported below.
 
-interface VerificationResult {
-	passed: boolean;
-	summary: string;
-	failedChecks: string[];
-	/** True when no QA agent ran at all (nothing changed) — `passed` is vacuous. */
-	skipped?: boolean;
-	/** The QA dispatch, so the caller can bill it into the run total. */
-	dispatch?: DispatchResult;
-}
-
-/**
- * Run the QA agent against the union of files changed by workers. Returns a
- * pass/fail verdict that downstream escalation logic can act on. Parses a
- * tolerant output shape: ANY "FAIL" token in the QA output flips the verdict.
- */
-async function runVerification(
-	cwd: string,
-	runId: string,
-	planId: string,
-	filesChanged: string[],
-	adapter: Adapter,
-	ctx: ExtensionContext,
-	/** The run this QA pass belongs to; threaded through to dispatchParallel and
-	 *  captureDispatchCost instead of an implicit "active run" read (B4.4). */
-	run: RunContext<RunSession> | null,
-	captureOpts: CaptureOpts,
-): Promise<VerificationResult> {
-	if (filesChanged.length === 0) {
-		return {
-			passed: true,
-			skipped: true,
-			summary: "No files changed — verification skipped.",
-			failedChecks: [],
-		};
-	}
-
-	const qaTask = [
-		`Run the project verification suite for these changed files:`,
-		"",
-		...filesChanged.map((f) => `- \`${f}\``),
-		"",
-		"Run typecheck, unit tests, integration tests, lint as applicable.",
-		...QA_SCOPE_RULES,
-		"Respond with the standard QA output format.",
-	].join("\n");
-
-	const [qaResult] = await dispatchParallel(
-		cwd,
-		runId,
-		[{ capability: "qa_agent", task: qaTask, taskId: `${runId}-qa` }],
-		adapter,
-		ctx,
-		run,
-	);
-
-	if (!qaResult) {
-		return {
-			passed: false,
-			summary: "QA dispatch produced no result.",
-			failedChecks: ["qa-dispatch"],
-		};
-	}
-
-	// The QA agent is a billable dispatch like any other. Recording only its
-	// outcome left its spend out of both metrics.jsonl and the run total.
-	await captureDispatchCost({ ...captureOpts, planId }, qaResult, run);
-
-	const out = qaResult.stdout;
-	const failedChecks = parseFailedChecks(out);
-	const passed = qaResult.exitCode === 0 && failedChecks.length === 0;
-
-	recordOutcome(qaVerificationOutcomeFor(runId, passed, passed ? 0.95 : 0.0, out.slice(0, 2000)));
-
-	return {
-		passed,
-		summary: out.slice(0, 500),
-		failedChecks,
-		dispatch: qaResult,
-	};
-}
-
-function parseFailedChecks(text: string): string[] {
-	const fails: string[] = [];
-	// Markdown table rows that contain "FAIL" or "✗" — tolerant.
-	const rowRe = /\|\s*([^|]+?)\s*\|\s*[^|]*?(FAIL|✗|failed|error)[^|]*?\|/gi;
-	let m: RegExpExecArray | null;
-	while ((m = rowRe.exec(text)) !== null) {
-		fails.push(m[1].trim());
-	}
-	// Bullet points labelled FAIL: `- foo: FAIL`.
-	const bulletRe = /^[-*]\s+(.+?):\s*(FAIL|failed|✗)/gim;
-	while ((m = bulletRe.exec(text)) !== null) {
-		fails.push(m[1].trim());
-	}
-	return Array.from(new Set(fails));
-}
 
 // planEscalation now lives in escalation.ts as a pure, independently tested
 // module (see BUG 2 fix note there): it keeps the original lead task/prompt
@@ -1774,15 +1676,18 @@ export default function (pi: ExtensionAPI) {
 								: `QA retry ${retries + 1}/${parsed.maxRetries + 1} on ${allFiles.length} changed file(s)`,
 						);
 					}
-					lastVerification = await runVerification(
-						cwd,
+					lastVerification = await runVerificationCore(
 						runId,
 						plan.plan_id,
 						allFiles,
-						adapter,
 						ctx,
 						claimed,
 						captureOpts,
+						{
+							dispatch: (tasks) => dispatchParallel(cwd, runId, tasks, adapter, ctx, claimed),
+							captureDispatchCost,
+							recordOutcome,
+						},
 					);
 					session.cancellation.throwIfCancelled();
 					if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
