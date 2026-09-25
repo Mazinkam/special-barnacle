@@ -30,9 +30,9 @@ This used to be one 967-line module (B3, `docs/architecture-review.md`); it is n
 * `service.py` — the coordinated ingest write path (`ingest_file`/`ingest_paths`) plus the
   CLI-facing sweep bookkeeping moved out of `cli.py` (`make_ingest_status`/`process_ingest`).
 
-`orchestrator.ingest_checkpoint` (the per-source checkpoint codec/ledger) is unchanged by this
-split and still provides `IngestLedger`/`add_totals`/etc.; it splits into `ingest/checkpoint.py`/
-`ingest/ledger.py` in a follow-up commit.
+`orchestrator.ingest_checkpoint` (the per-source checkpoint codec/ledger) splits alongside this
+into `ingest/checkpoint.py` (codec/validators) and `ingest/ledger.py` (`IngestLedger`);
+`orchestrator/ingest_checkpoint.py` stays a re-export shim of both.
 
 Every name that used to be importable from `orchestrator.ingest` (public API, private helpers,
 and the stdlib/typing names it imported for its own use) stays importable from here — see
@@ -48,9 +48,10 @@ from typing import Any, BinaryIO, Callable, Iterable, Iterator, NamedTuple, Opti
 from ..record_batch import BatchAppendError, MAX_BATCH_RECORDS, build_record, settle_streams, write_batch
 from ..records import CALL, SESSION
 from ..runtime import EventStore, default_state_root, iter_jsonl_from, open_binary, stable_hash, tail_fingerprint, writer_lock
-from .. import ingest_checkpoint as ckpt
-from ..ingest_checkpoint import COUNT_FIELDS, IngestLedger, TOKEN_FIELDS, add_totals, empty_totals, totals_equal
+from . import checkpoint as ckpt
+from .checkpoint import COUNT_FIELDS, TOKEN_FIELDS, add_totals, empty_totals, totals_equal
 from .discovery import LOG_GLOBS, _TEMP_MARKERS, discover_logs, is_scratch_log
+from .ledger import IngestLedger
 from .parsers import (
     CODEX,
     HUMAIN_TERMINAL,

@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from ..runtime import stable_hash
-from ..ingest_checkpoint import IngestLedger, add_totals, empty_totals, totals_equal
+from .checkpoint import add_totals, empty_totals, totals_equal
+from .ledger import IngestLedger
 from .parsers import HUMAIN_TERMINAL
 
 

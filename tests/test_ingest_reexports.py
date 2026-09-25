@@ -1,17 +1,17 @@
-"""B3 review requirement (`docs/architecture-review.md`): `orchestrator.ingest` must keep
-re-exporting every name that was importable from it before the `ingest.py` -> `ingest/` package
-split, and `orchestrator.cli` must keep `make_ingest_status`/`process_ingest` importable under
-those exact names even though their implementation moved to `orchestrator.ingest.service`.
-(`orchestrator.ingest_checkpoint`'s own re-exports are covered separately once it splits into
-`ingest/checkpoint.py`/`ingest/ledger.py`.)
+"""B3 review requirement (`docs/architecture-review.md`): `orchestrator.ingest` and
+`orchestrator.ingest_checkpoint` must keep re-exporting every name that was importable from them
+before the B3 split, and `orchestrator.cli` must keep `make_ingest_status`/`process_ingest`
+importable under those exact names even though their implementation moved to
+`orchestrator.ingest.service`.
 
-The expected-name set below is the literal set of every module-level name (`ast`-derived:
+The expected-name sets below are the literal set of every module-level name (`ast`-derived:
 `def`/`class` statements, plain assignments/annotated assignments, and every name bound by an
 `import`/`from ... import` statement, excluding the `from __future__ import annotations` binding)
-in `orchestrator/ingest.py` at the pre-split commit (the tip of `refactor/modular` immediately
-before this split). Anything previously reachable as `orchestrator.ingest.<name>` — a private
-helper, a stdlib/typing name reached through the module for `unittest.mock.patch(...)`, a
-re-exported constant — must stay reachable, per ground rule 2 ("don't change what's importable").
+in `orchestrator/ingest.py` and `orchestrator/ingest_checkpoint.py` at the pre-split commit (the
+tip of `refactor/modular` immediately before this split). Anything previously reachable as
+`orchestrator.ingest.<name>` or `orchestrator.ingest_checkpoint.<name>` — a private helper, a
+stdlib/typing name reached through the module for `unittest.mock.patch(...)`, a re-exported
+constant — must stay reachable, per ground rule 2 ("don't change what's importable").
 """
 from __future__ import annotations
 
@@ -32,8 +32,8 @@ import os as _stdlib_os
 
 import orchestrator.ingest as ingest
 import orchestrator.ingest_checkpoint as ingest_checkpoint
-from orchestrator import cli, record_batch, records, runtime
-from orchestrator.ingest import discovery, parsers, reconcile, service
+from orchestrator import cli, contract, record_batch, records, runtime, vocab
+from orchestrator.ingest import checkpoint, discovery, ledger, parsers, reconcile, service
 from orchestrator.ingest.parsers import _shared as parsers_shared
 from orchestrator.ingest.parsers import humain_terminal
 
@@ -122,13 +122,13 @@ INGEST_NEW_HOME_IDENTITY: dict = {
     '_int': parsers_shared._int,
     '_is_int': parsers_shared._is_int,
     '_optional_str': parsers_shared._optional_str,
-    'COUNT_FIELDS': ingest_checkpoint.COUNT_FIELDS,
-    'TOKEN_FIELDS': ingest_checkpoint.TOKEN_FIELDS,
-    'add_totals': ingest_checkpoint.add_totals,
-    'empty_totals': ingest_checkpoint.empty_totals,
-    'totals_equal': ingest_checkpoint.totals_equal,
-    'IngestLedger': ingest_checkpoint.IngestLedger,
-    'ckpt': ingest_checkpoint,
+    'COUNT_FIELDS': checkpoint.COUNT_FIELDS,
+    'TOKEN_FIELDS': checkpoint.TOKEN_FIELDS,
+    'add_totals': checkpoint.add_totals,
+    'empty_totals': checkpoint.empty_totals,
+    'totals_equal': checkpoint.totals_equal,
+    'IngestLedger': ledger.IngestLedger,
+    'ckpt': checkpoint,
 }
 
 #: name -> the stdlib/typing object it must be the exact same singleton as.
@@ -144,6 +144,129 @@ INGEST_STDLIB_IDENTITY: dict = {
     'json': _stdlib_json,
     'time': _stdlib_time,
 }
+
+#: Every module-level name `orchestrator/ingest_checkpoint.py` bound just before the B3 split.
+EXPECTED_CHECKPOINT_REEXPORTS: frozenset = frozenset({
+    'Any', 'BinaryIO', 'CALL', 'CHECKPOINT_DIR', 'COUNT_FIELDS', 'FORMAT_VERSION',
+    'GRANULARITIES', 'INGEST_SOURCE', 'INGEST_TOKEN_FIELDS', 'IngestLedger', 'Iterable',
+    'MAX_CHECKPOINT_BYTES', 'MAX_TAIL_BYTES', 'Optional', 'PROMOTION_EVENT', 'PROMOTION_VERSION',
+    'Path', 'SESSION', 'STREAMS', 'TAIL_FINGERPRINT_BYTES', 'TOKEN_FIELDS', '_blank_state',
+    '_int', '_is_int', '_state_from_json', '_state_to_json', '_valid_hash', '_valid_identity',
+    '_valid_observed', '_valid_recorded', '_valid_stat', '_valid_totals', 'add_totals',
+    'changed_while_reading', 'checkpoint_path', 'empty_totals', 'file_identity', 'hashlib',
+    'head_fingerprint', 'iter_jsonl_from', 'json', 'load_checkpoint', 'open_binary', 'os',
+    'prefix_fingerprint', 'promotion_record', 'read_json', 'save_checkpoint', 'source_key',
+    'source_prefix_intact', 'source_signature', 'stable_hash', 'tail_fingerprint', 'totals_equal',
+    'valid_session_provenance', 'verify_prefix', 'write_json',
+})
+
+CHECKPOINT_NEW_HOME_IDENTITY: dict = {
+    'CHECKPOINT_DIR': checkpoint.CHECKPOINT_DIR,
+    'COUNT_FIELDS': checkpoint.COUNT_FIELDS,
+    'FORMAT_VERSION': checkpoint.FORMAT_VERSION,
+    'GRANULARITIES': checkpoint.GRANULARITIES,
+    'INGEST_SOURCE': checkpoint.INGEST_SOURCE,
+    'MAX_CHECKPOINT_BYTES': checkpoint.MAX_CHECKPOINT_BYTES,
+    'MAX_TAIL_BYTES': checkpoint.MAX_TAIL_BYTES,
+    'PROMOTION_EVENT': checkpoint.PROMOTION_EVENT,
+    'PROMOTION_VERSION': checkpoint.PROMOTION_VERSION,
+    'TOKEN_FIELDS': checkpoint.TOKEN_FIELDS,
+    '_blank_state': checkpoint._blank_state,
+    '_int': checkpoint._int,
+    '_is_int': checkpoint._is_int,
+    '_state_from_json': checkpoint._state_from_json,
+    '_state_to_json': checkpoint._state_to_json,
+    '_valid_hash': checkpoint._valid_hash,
+    '_valid_identity': checkpoint._valid_identity,
+    '_valid_observed': checkpoint._valid_observed,
+    '_valid_recorded': checkpoint._valid_recorded,
+    '_valid_stat': checkpoint._valid_stat,
+    '_valid_totals': checkpoint._valid_totals,
+    'add_totals': checkpoint.add_totals,
+    'changed_while_reading': checkpoint.changed_while_reading,
+    'checkpoint_path': checkpoint.checkpoint_path,
+    'empty_totals': checkpoint.empty_totals,
+    'file_identity': checkpoint.file_identity,
+    'head_fingerprint': checkpoint.head_fingerprint,
+    'load_checkpoint': checkpoint.load_checkpoint,
+    'prefix_fingerprint': checkpoint.prefix_fingerprint,
+    'promotion_record': checkpoint.promotion_record,
+    'save_checkpoint': checkpoint.save_checkpoint,
+    'source_key': checkpoint.source_key,
+    'source_prefix_intact': checkpoint.source_prefix_intact,
+    'source_signature': checkpoint.source_signature,
+    'totals_equal': checkpoint.totals_equal,
+    'valid_session_provenance': checkpoint.valid_session_provenance,
+    'verify_prefix': checkpoint.verify_prefix,
+    'IngestLedger': ledger.IngestLedger,
+    'CALL': vocab.CALL,
+    'SESSION': vocab.SESSION,
+    'INGEST_TOKEN_FIELDS': vocab.INGEST_TOKEN_FIELDS,
+    'STREAMS': contract.STREAMS,
+    'TAIL_FINGERPRINT_BYTES': runtime.TAIL_FINGERPRINT_BYTES,
+    'stable_hash': runtime.stable_hash,
+    'read_json': runtime.read_json,
+    'write_json': runtime.write_json,
+    'iter_jsonl_from': runtime.iter_jsonl_from,
+    'open_binary': runtime.open_binary,
+    'tail_fingerprint': runtime.tail_fingerprint,
+}
+
+CHECKPOINT_STDLIB_IDENTITY: dict = {
+    'Any': _stdlib_Any,
+    'BinaryIO': _stdlib_BinaryIO,
+    'Iterable': _stdlib_Iterable,
+    'Optional': _stdlib_Optional,
+    'Path': _stdlib_Path,
+    'hashlib': _stdlib_hashlib,
+    'json': _stdlib_json,
+    'os': _stdlib_os,
+}
+
+
+class IngestReexportTests(unittest.TestCase):
+    def test_every_previously_importable_name_is_still_importable(self):
+        for name in sorted(EXPECTED_INGEST_REEXPORTS):
+            self.assertTrue(hasattr(ingest, name),
+                             f'orchestrator.ingest no longer has {name!r}, previously importable '
+                             f'from it (see docs/architecture-review.md B3)')
+
+    def test_every_expected_reexport_is_covered_by_exactly_one_identity_map(self):
+        self.assertEqual(set(INGEST_NEW_HOME_IDENTITY) | set(INGEST_STDLIB_IDENTITY),
+                          EXPECTED_INGEST_REEXPORTS)
+
+    def test_moved_names_are_identical_to_their_new_home(self):
+        for name, expected in INGEST_NEW_HOME_IDENTITY.items():
+            self.assertIs(getattr(ingest, name), expected,
+                           f'orchestrator.ingest.{name} is not the same object as its new home')
+
+    def test_stdlib_reexports_are_the_same_singleton(self):
+        for name, expected in INGEST_STDLIB_IDENTITY.items():
+            self.assertIs(getattr(ingest, name), expected,
+                           f'orchestrator.ingest.{name} is not the same object callers used to get')
+
+
+class IngestCheckpointReexportTests(unittest.TestCase):
+    def test_every_previously_importable_name_is_still_importable(self):
+        for name in sorted(EXPECTED_CHECKPOINT_REEXPORTS):
+            self.assertTrue(hasattr(ingest_checkpoint, name),
+                             f'orchestrator.ingest_checkpoint no longer has {name!r}, previously '
+                             f'importable from it (see docs/architecture-review.md B3)')
+
+    def test_every_expected_reexport_is_covered_by_exactly_one_identity_map(self):
+        self.assertEqual(set(CHECKPOINT_NEW_HOME_IDENTITY) | set(CHECKPOINT_STDLIB_IDENTITY),
+                          EXPECTED_CHECKPOINT_REEXPORTS)
+
+    def test_moved_names_are_identical_to_their_new_home(self):
+        for name, expected in CHECKPOINT_NEW_HOME_IDENTITY.items():
+            self.assertIs(getattr(ingest_checkpoint, name), expected,
+                           f'orchestrator.ingest_checkpoint.{name} is not the same object as its new home')
+
+    def test_stdlib_reexports_are_the_same_singleton(self):
+        for name, expected in CHECKPOINT_STDLIB_IDENTITY.items():
+            self.assertIs(getattr(ingest_checkpoint, name), expected,
+                           f'orchestrator.ingest_checkpoint.{name} is not the same object callers used to get')
+
 
 class CliIngestNameReexportTests(unittest.TestCase):
     """`make_ingest_status`/`process_ingest` moved from `cli.py` to `ingest.service` (B3); both

@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator import ingest_checkpoint
+from orchestrator.ingest import checkpoint as ingest_checkpoint_impl
 from orchestrator.ingest import CALL, SESSION, ingest_file, ingest_paths
 from orchestrator.record_batch import BatchAppendError, settle_streams, write_batch
 from orchestrator.runtime import EventStore, load_jsonl, read_json
@@ -536,7 +537,7 @@ class SessionProvenanceTests(CheckpointTestCase):
         first = self.one(log, CALL)
         ht_session(log, 1, session='sess-B')
         metrics_before = (self.root / 'metrics.jsonl').read_bytes()
-        with patch.object(ingest_checkpoint, 'save_checkpoint', side_effect=OSError('checkpoint lost')):
+        with patch.object(ingest_checkpoint_impl, 'save_checkpoint', side_effect=OSError('checkpoint lost')):
             failed = self.ingest(log, CALL)
         self.assertEqual(len(failed['failures']), 1)
         events = load_jsonl(self.root / 'events.jsonl')
@@ -960,7 +961,7 @@ class RecoveryTests(CheckpointTestCase):
         log = ht_session(self.dir / 'session.jsonl', 3)
         self.one(log)
         append(log, ht_call(3, tokens=400))
-        with patch.object(ingest_checkpoint, 'save_checkpoint', side_effect=OSError('disk went away')):
+        with patch.object(ingest_checkpoint_impl, 'save_checkpoint', side_effect=OSError('disk went away')):
             with self.assertRaises(OSError):
                 ingest_file(log, state_root=self.root, granularity=SESSION, runtime='humain-terminal')
         self.assertEqual(recorded_input_tokens(self.root), 3400, 'the append was durable before the crash')
@@ -974,7 +975,7 @@ class RecoveryTests(CheckpointTestCase):
         pc = ht_session(self.dir / 'pc.jsonl', 2, session='sess-c')
         self.one(pc, CALL)
         append(pc, ht_call(2))
-        with patch.object(ingest_checkpoint, 'save_checkpoint', side_effect=OSError('disk went away')):
+        with patch.object(ingest_checkpoint_impl, 'save_checkpoint', side_effect=OSError('disk went away')):
             with self.assertRaises(OSError):
                 ingest_file(pc, state_root=self.root, granularity=CALL, runtime='humain-terminal')
         again = self.one(pc, CALL)
@@ -983,7 +984,7 @@ class RecoveryTests(CheckpointTestCase):
 
     def test_crash_with_no_prior_checkpoint_is_recovered(self):
         log = ht_session(self.dir / 'session.jsonl', 3)
-        with patch.object(ingest_checkpoint, 'save_checkpoint', side_effect=OSError('nope')):
+        with patch.object(ingest_checkpoint_impl, 'save_checkpoint', side_effect=OSError('nope')):
             with self.assertRaises(OSError):
                 ingest_file(log, state_root=self.root, granularity=SESSION, runtime='humain-terminal')
         self.assertIsNone(self.checkpoint(log))
@@ -1769,7 +1770,7 @@ class RecoveryRoundTwoTests(CheckpointTestCase):
         self.one(log)
         ht_session(log, 1)
         append(log, ht_call(7, tokens=200))
-        with patch.object(ingest_checkpoint, 'save_checkpoint', side_effect=OSError('checkpoint unavailable')):
+        with patch.object(ingest_checkpoint_impl, 'save_checkpoint', side_effect=OSError('checkpoint unavailable')):
             failed = self.ingest(log)
         self.assertEqual(len(failed['failures']), 1)
         self.assertEqual(recorded_input_tokens(self.root), 3200)

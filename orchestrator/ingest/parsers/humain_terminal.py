@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ._shared import _int, _is_int, _optional_str
-from ... import ingest_checkpoint as ckpt
+from .. import checkpoint as ckpt
 
 _PROBE_LIMIT = 4_000
 

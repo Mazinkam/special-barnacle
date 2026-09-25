@@ -23,8 +23,9 @@ from ..record_batch import BatchAppendError, MAX_BATCH_RECORDS, build_record, se
 # cli.py) import them from `orchestrator.ingest`.
 from ..records import CALL, SESSION
 from ..runtime import EventStore, default_state_root, read_json, tail_fingerprint, utc_now, write_json, writer_lock
-from .. import ingest_checkpoint as ckpt
-from ..ingest_checkpoint import COUNT_FIELDS, TOKEN_FIELDS, IngestLedger, add_totals, empty_totals, totals_equal
+from . import checkpoint as ckpt
+from .checkpoint import COUNT_FIELDS, TOKEN_FIELDS, add_totals, empty_totals, totals_equal
+from .ledger import IngestLedger
 from .parsers import HUMAIN_TERMINAL, PARSERS, detect_runtime, read_calls
 from .reconcile import SourceConflict, _reconcile_source_calls, call_id_for
 

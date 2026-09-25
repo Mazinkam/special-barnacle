@@ -38,6 +38,8 @@ FORBIDDEN_EDGES: dict[str, set[str]] = {
     # is fine (and expected: `cli.py` imports `ingest.service.process_ingest` etc.), so only the
     # reverse direction is forbidden here.
     'ingest': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'ingest.checkpoint': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'ingest.ledger': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
     'ingest.discovery': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
     'ingest.reconcile': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
     'ingest.service': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
@@ -45,6 +47,7 @@ FORBIDDEN_EDGES: dict[str, set[str]] = {
     'ingest.parsers.humain_terminal': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
     'ingest.parsers.codex': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
     'ingest.parsers._shared': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'ingest_checkpoint': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
 }
 
 #: Only these module prefixes may import `orchestrator.app`; every other module must not.
