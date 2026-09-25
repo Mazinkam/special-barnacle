@@ -120,6 +120,7 @@ import {
 import { RunCancellation } from "./cancellation.ts";
 import { buildChildArgs, buildChildEnv, personaCanMutateFor } from "./dispatch/child-args.ts";
 import { resolvePersona } from "./dispatch/persona.ts";
+import { ChildEventAccumulator, type ChildEventDelta } from "./dispatch/child-events.ts";
 import { applyObservation, applyWarnings, createProgressView, fmtElapsed, formatNestedWorkerRows, formatProgressLine, formatWarningLine, spinnerFrame } from "./run-ui.ts";
 import type { DispatchProgressView } from "./run-ui.ts";
 import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
@@ -562,9 +563,8 @@ async function resolveAdapter(
 // main declares a byte-identical alias further down (`cc9836d`), which is the
 // shape `f2ddaa6` adopted precisely so this merge would converge. Two aliases
 // would be a duplicate-identifier error; the one below serves both call sites.
-function reportedCost(total: unknown): number | undefined {
-	return typeof total === "number" && Number.isFinite(total) && total >= 0 ? total : undefined;
-}
+// `reportedCost` moved into dispatch/child-events.ts (B4.5 step 3), the one
+// place it's called from now.
 
 interface SubagentProcessResult {
 	exitCode: number;
@@ -959,8 +959,11 @@ export class RunSession {
 		this.scheduleRender();
 	}
 
-	/** Feed a parsed `--mode json` event from a child. */
-	onChildEvent(taskId: string, event: any): void {
+	/** Feed a parsed `--mode json` event from a child, plus the delta
+	 * `dispatch/child-events.ts`'s accumulator already computed for it (B4.5
+	 * step 3: this is UI/board bookkeeping only now — turns/cost come from the
+	 * delta, not from re-deriving them off `event` a second time). */
+	onChildEvent(taskId: string, event: any, delta: ChildEventDelta): void {
 		const d = this.dispatches.get(taskId);
 		if (!d) return;
 		// Nested worker counts/turns are derived by render() from the single
@@ -985,9 +988,9 @@ export class RunSession {
 				if (event.message?.role === "assistant") changed = "thinking";
 				break;
 			case "message_end":
-				if (event.message?.role === "assistant") {
+				if (delta.turn) {
 					d.turns += 1;
-					d.costUsd += reportedCost(event.message?.usage?.cost?.total) ?? 0;
+					d.costUsd += delta.turn.costDelta;
 					changed = `turn ${d.turns} done (${d.toolCalls} tools)`;
 				}
 				break;
@@ -1497,10 +1500,6 @@ export async function runSubagentProcess(opts: {
 	 */
 	spawnChild?: ChildSpawner;
 }): Promise<SubagentProcessResult> {
-	const emptyUsage: SubagentUsageStats = {
-		input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
-		cost: 0, contextTokens: 0, turns: 0,
-	};
 	const session = opts.session;
 	session?.cancellation.throwIfCancelled();
 	const taskId = opts.taskId ?? `${opts.agentName}-${Date.now()}`;
@@ -1551,15 +1550,13 @@ export async function runSubagentProcess(opts: {
 		// Node can truncate a chatty child's async pipe at 64 KiB, so retain both
 		// the runtime header and the diagnostic tail without unbounded memory use.
 		const stderrCapture = new BoundedCapture();
-		let model: string | undefined;
-		const usage: SubagentUsageStats = { ...emptyUsage };
+		// The one accumulator for this dispatch's child event stream (B4.5 step 3):
+		// owns usage/cost/turns/model/stopReason/settled-flags so neither this
+		// function nor `session.onChildEvent` re-derives them independently.
+		const events = new ChildEventAccumulator();
 		const nestedCost = new NestedCostTracker();
 		/** Own turns plus the child's own subagent calls: what the dispatch has cost so far. */
-		const spentSoFar = () => usage.cost + nestedCost.total();
-		let costReported = false;
-		let stopReason: string | undefined;
-		let sawAgentSettled = false;
-		let sawAgentEnd = false;
+		const spentSoFar = () => events.usage.cost + nestedCost.total();
 		let timedOut = false;
 		let cancelledByListener = false;
 		let timeoutReason: "inactivity" | "absolute" | undefined;
@@ -1658,10 +1655,10 @@ export async function runSubagentProcess(opts: {
 			// completed normally; failures before settlement still fail the dispatch.
 			const outcome = classifyDispatchOutcome({
 				exitCode: processExitCode,
-				sawAgentSettled,
-				sawAgentEnd,
+				sawAgentSettled: events.sawAgentSettled,
+				sawAgentEnd: events.sawAgentEnd,
 				hasFinalText: Boolean(finalText),
-				lastStopReason: stopReason,
+				lastStopReason: events.stopReason,
 				timedOut,
 				cancelled,
 				spawnFailed,
@@ -1703,7 +1700,7 @@ export async function runSubagentProcess(opts: {
 					if (stderrTarget!.persistName === stderrName) noteWriteBytes = currentStderrFileBytes();
 				}
 			}
-			session?.endDispatch(taskId, outcome.effectiveExitCode, usage.cost, interruptionNote ? summarizeInterruption(interruption!) : outcome.note);
+			session?.endDispatch(taskId, outcome.effectiveExitCode, events.usage.cost, interruptionNote ? summarizeInterruption(interruption!) : outcome.note);
 			resolve({
 				exitCode: outcome.effectiveExitCode,
 				stdout: assistantTexts.join("\n\n"),
@@ -1711,60 +1708,19 @@ export async function runSubagentProcess(opts: {
 				rawStdout: stdoutCapture.text(),
 				personaCanMutate,
 				stderr,
-				model,
-				usage,
-				costUsd: usage.cost,
+				model: events.model,
+				usage: events.usage,
+				costUsd: events.usage.cost,
 				nestedCostUsd: nestedCost.total(),
-				costReported,
+				costReported: events.costReported,
 				durationMs: Date.now() - startedAt,
-				stopReason,
+				stopReason: events.stopReason,
 				outcome: outcome.status,
 				processExitCode,
 				timeoutReason,
 				interruption,
 				postCompletionError: outcome.status === "completed_after_process_error" ? outcome.note : undefined,
 			});
-		};
-
-		const absorbAssistantMessage = (msg: any) => {
-			if (msg.model) model = msg.responseModel ?? msg.model;
-			if (msg.usage) {
-				usage.turns += 1;
-				usage.input += msg.usage.input || 0;
-				usage.output += msg.usage.output || 0;
-				usage.cacheRead += msg.usage.cacheRead || 0;
-				usage.cacheWrite += msg.usage.cacheWrite || 0;
-				const cost = reportedCost(msg.usage.cost?.total);
-				costReported = (usage.turns === 1 || costReported) && cost !== undefined;
-				usage.cost += cost ?? 0;
-				usage.contextTokens = msg.usage.totalTokens || usage.contextTokens;
-			}
-			if (msg.stopReason) stopReason = msg.stopReason;
-			// A provider error arrives as a turn with stopReason "error" and an
-			// errorMessage, not on stderr (the child still exits 0 in json mode).
-			// Keep it in the stderr capture so the failure is explainable and the
-			// codex -> Bedrock quota fallback can see it.
-			if ((msg.stopReason === "error" || msg.stopReason === "aborted") && typeof msg.errorMessage === "string" && msg.errorMessage) {
-				stderrCapture.append(`\n[provider ${msg.stopReason}] ${msg.errorMessage}`);
-			}
-			if (Array.isArray(msg.content)) {
-				const text = msg.content
-					.filter((b: any) => b?.type === "text" && typeof b.text === "string")
-					.map((b: any) => b.text)
-					.join("\n")
-					.trim();
-				if (text) assistantTexts.push(text);
-			} else if (typeof msg.content === "string" && msg.content.trim()) {
-				assistantTexts.push(msg.content.trim());
-			}
-			// Spend cap is checked AFTER the message text is kept, so an enforced
-			// stop never discards the turn that crossed the cap. A final turn
-			// (stopReason "stop") is only warned about: killing it would throw away
-			// a finished report to save nothing.
-			if (msg.usage) {
-				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar()) ?? "ok";
-				if (verdict !== "ok") handleSpendCap(verdict === "stop" && msg.stopReason === "stop" ? "warn" : verdict);
-			}
 		};
 
 		const processLine = (line: string) => {
@@ -1784,16 +1740,30 @@ export async function runSubagentProcess(opts: {
 			if (settled) return;
 			const now = Date.now();
 			const observation = cancelledByListener ? undefined : progressTracker?.observe(event, now);
-			session?.onChildEvent(taskId, event);
-			if (event.type === "agent_settled") sawAgentSettled = true;
-			if (event.type === "agent_end") sawAgentEnd = true;
-			if (typeof event.stopReason === "string") stopReason = event.stopReason;
-			// `message_end` is the authoritative per-turn record. `turn_end` and
-			// `agent_end` repeat the same assistant messages, so ignoring them
-			// keeps usage from being double-counted.
-			if (event.type === "message_end" && event.message?.role === "assistant") {
+			// The one place cost/turns/model/stopReason/settled-flags are derived from
+			// the raw event (dispatch/child-events.ts); both the board update below
+			// and this function's own bookkeeping consume its delta instead of each
+			// re-deriving the same numbers from `event` independently.
+			const delta = events.absorb(event);
+			session?.onChildEvent(taskId, event, delta);
+			if (delta.turn) {
 				assistantTurns += 1;
-				absorbAssistantMessage(event.message);
+				// A provider error arrives as a turn with stopReason "error" and an
+				// errorMessage, not on stderr (the child still exits 0 in json mode).
+				// Keep it in the stderr capture so the failure is explainable and the
+				// codex -> Bedrock quota fallback can see it.
+				if (delta.turn.errorMessage && delta.turn.errorKind) {
+					stderrCapture.append(`\n[provider ${delta.turn.errorKind}] ${delta.turn.errorMessage}`);
+				}
+				if (delta.turn.text) assistantTexts.push(delta.turn.text);
+				// Spend cap is checked AFTER the message text is kept, so an enforced
+				// stop never discards the turn that crossed the cap. A final turn
+				// (stopReason "stop") is only warned about: killing it would throw away
+				// a finished report to save nothing.
+				if (delta.turn.hadUsage) {
+					const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar()) ?? "ok";
+					if (verdict !== "ok") handleSpendCap(verdict === "stop" && delta.turn.stopReason === "stop" ? "warn" : verdict);
+				}
 			}
 			if (nestedCost.observe(event)) {
 				session?.setNestedCost(taskId, nestedCost.total());
@@ -1902,7 +1872,7 @@ export async function runSubagentProcess(opts: {
 			});
 			session?.ctx.ui?.notify?.(`${message}${verdict === "stop" ? " — stopping it" : ""}`, "warning");
 			if (verdict !== "stop") return;
-			stopReason = "spend_cap";
+			events.stopReason = "spend_cap";
 			stderrCapture.append(`\n[orchestrator] ${message}; dispatch stopped (dispatch_spend_cap.mode=enforce)`);
 			if (proc) killProcessTree(proc);
 			finish(125);
