@@ -22,13 +22,13 @@ ORCHESTRATOR_ROOT = Path(__file__).resolve().parents[1] / 'orchestrator'
 #: module dotted-name (relative to the `orchestrator` package) -> modules it must not import,
 #: directly or transitively through a re-export. Extend this as later B2/B3 steps add layers.
 FORBIDDEN_EDGES: dict[str, set[str]] = {
-    'record_batch': {'dashboard', 'app'},
-    'runtime': {'dashboard', 'app'},
-    'state': {'dashboard', 'app'},
-    'record_index': {'dashboard', 'app'},
+    'record_batch': {'dashboard', 'app', 'cli'},
+    'runtime': {'dashboard', 'app', 'cli'},
+    'state': {'dashboard', 'app', 'cli'},
+    'record_index': {'dashboard', 'app', 'cli'},
     'records': {'dashboard', 'app', 'store', 'engine', 'cli'},
     'records.metering': {'dashboard', 'app', 'store', 'engine', 'cli'},
-    'engine': {'dashboard', 'app'},
+    'engine': {'dashboard', 'app', 'cli'},
     'store': {'dashboard', 'app', 'engine', 'cli'},
     'presentation.dashboard_data': {'app', 'engine', 'cli'},
     'presentation.dashboard_html': {'app', 'engine', 'cli'},
@@ -75,6 +75,11 @@ FORBIDDEN_EDGES: dict[str, set[str]] = {
 
 #: Only these module prefixes may import `orchestrator.app`; every other module must not.
 ALLOWED_APP_IMPORTERS = {'app', 'cli'}
+
+#: Only `cli` itself (and `cli.__main__`, which is `_top_level`-equal to `cli`) may import
+#: `orchestrator.cli`; every other module (B3, `docs/architecture-review.md`) sits below it in the
+#: layer order and must not, directly or transitively.
+ALLOWED_CLI_IMPORTERS = {'cli'}
 
 
 def _dotted_name(path: Path) -> str:
@@ -176,6 +181,15 @@ class LayerTests(unittest.TestCase):
             imported_tops = {_top_level(name) for name in imported}
             self.assertNotIn('app', imported_tops,
                              f'{module}.py must not import orchestrator.app (imports: {sorted(imported)})')
+
+    def test_only_cli_imports_the_cli_package(self):
+        for module, imported in self.graph.items():
+            top = _top_level(module)
+            if top in ALLOWED_CLI_IMPORTERS:
+                continue
+            imported_tops = {_top_level(name) for name in imported}
+            self.assertNotIn('cli', imported_tops,
+                             f'{module}.py must not import orchestrator.cli (imports: {sorted(imported)})')
 
     def test_runtime_has_no_function_level_orchestrator_imports(self):
         """B2.2/B2.3: `runtime.py` is a pure re-export shim now — every import in it is a

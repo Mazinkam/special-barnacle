@@ -599,14 +599,21 @@ def main() -> None:
     if not 1 <= args.batch_size <= MAX_BATCH_RECORDS: ap.error(f'--batch-size must be 1..{MAX_BATCH_RECORDS}')
     args.checkout = args.checkout.expanduser().resolve()
     for module in ('cli', 'engine'):  # both workloads' child entry points; fail before any workload runs
-        if not (args.checkout / f'orchestrator/{module}.py').is_file(): ap.error(f'--checkout must contain orchestrator/{module}.py')
+        # `cli` moved from `orchestrator/cli.py` to the package `orchestrator/cli/__init__.py`
+        # (B3, docs/architecture-review.md); accept either shape so this driver still measures
+        # both the pre- and post-split checkout without an edit.
+        if not ((args.checkout / f'orchestrator/{module}.py').is_file()
+                or (args.checkout / f'orchestrator/{module}/__init__.py').is_file()):
+            ap.error(f'--checkout must contain orchestrator/{module}.py')
     if args.source is not None:
         args.source = args.source.expanduser().resolve()
         if not args.source.is_dir() or not any((args.source / n).is_file() for n in STREAMS):
             ap.error('--source must be a copied root containing JSONL streams')
     if args.compare_legacy is not None:
         args.compare_legacy=args.compare_legacy.expanduser().resolve()
-        if not (args.compare_legacy/'orchestrator/cli.py').is_file(): ap.error('--compare-legacy must contain orchestrator/cli.py')
+        if not ((args.compare_legacy/'orchestrator/cli.py').is_file()
+                or (args.compare_legacy/'orchestrator/cli/__init__.py').is_file()):
+            ap.error('--compare-legacy must contain orchestrator/cli.py')
         if args.source is None or not args.json: ap.error('--compare-legacy requires --source and --json')
         results=[compare_legacy(args.source,scale,args) for scale in scales]
         print(json.dumps({'meta':{'before':str(args.compare_legacy),'after':str(args.checkout),'repeat':args.repeat,
