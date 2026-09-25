@@ -1,7 +1,12 @@
 /**
- * Pure child-process outcome and stderr handling for the orchestrator bridge.
- * Keeping this separate from the HT extension makes teardown recovery testable
- * without importing terminal runtime APIs.
+ * Pure child-process outcome and stderr handling for the orchestrator bridge
+ * (B4.5 step 4: moved from dispatch-outcome.ts to dispatch/stderr-sink.ts —
+ * `classifyDispatchOutcome` below is exactly the "pure decision table" the
+ * B4 plan calls for: given exit code, agent_settled/agent_end flags, the
+ * last stop reason, timeout/cancellation/spawn-failure booleans, and a
+ * stderr summary, it decides the dispatch's outcome status with no I/O of
+ * its own). Keeping this separate from the HT extension makes teardown
+ * recovery testable without importing terminal runtime APIs.
  */
 import { closeSync, constants, existsSync, fstatSync, openSync, readSync, writeSync } from "node:fs";
 

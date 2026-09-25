@@ -105,7 +105,7 @@ import {
 	readStderrFileBounded,
 	summarizeStderr,
 	trimEventForLog,
-} from "./dispatch-outcome.ts";
+} from "./dispatch/stderr-sink.ts";
 import {
 	DispatchProgressTracker,
 	ORCHESTRATING_CAPABILITIES,

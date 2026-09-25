@@ -12,7 +12,7 @@ import { planReconTasks } from "./recon.ts";
 import { METHOD, TIER_CAPABILITIES, buildAliasTable } from "./models.ts";
 import type { DispatchResult, DispatchTask } from "./index.ts";
 import { RunCancellation } from "./cancellation.ts";
-import { MAX_CHILD_STDERR_DISK_BYTES } from "./dispatch-outcome.ts";
+import { MAX_CHILD_STDERR_DISK_BYTES } from "./dispatch/stderr-sink.ts";
 import contract from "./contract.json";
 import { planEscalation } from "./escalation.ts";
 import { pickModel } from "./core/routing.ts";

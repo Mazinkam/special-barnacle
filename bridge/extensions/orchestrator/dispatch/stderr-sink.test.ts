@@ -12,7 +12,7 @@ import {
 	rewriteFileInPlace,
 	summarizeStderr,
 	trimEventForLog,
-} from "./dispatch-outcome.ts";
+} from "./stderr-sink.ts";
 
 const recoveredInput = {
 	exitCode: 1,

@@ -12,7 +12,7 @@
  * fold completed results back into a bounded evidence packet for the lead.
  */
 
-import { summarizeStderr } from "./dispatch-outcome.ts";
+import { summarizeStderr } from "./dispatch/stderr-sink.ts";
 
 /** The slice of `METHOD.rules.pre_implementation_recon` this module needs. */
 export interface ReconPolicy {
