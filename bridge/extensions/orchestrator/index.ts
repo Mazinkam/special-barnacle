@@ -137,7 +137,7 @@ import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.t
 // `const reconTasks: DispatchTask[] = planReconTasks(...)` checks at compile
 // time, so a planned recon task still needs no conversion step.
 import { formatReconEvidence, planReconTasks } from "./recon.ts";
-import { createPythonCli } from "./python-cli.ts";
+import { createPythonCli } from "./adapters/python-cli.ts";
 import contract from "./contract.json";
 
 // Pure logic split out of this file per docs/architecture-review.md B4.1.
