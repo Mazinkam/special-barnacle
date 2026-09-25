@@ -14,6 +14,8 @@ import type { DispatchResult, DispatchTask } from "./index.ts";
 import { RunCancellation } from "./cancellation.ts";
 import { MAX_CHILD_STDERR_DISK_BYTES } from "./dispatch-outcome.ts";
 import contract from "./contract.json";
+import { planEscalation } from "./escalation.ts";
+import { pickModel } from "./core/routing.ts";
 
 mock.module("@humain/terminal", () => ({
 	BorderedLoader: class {
@@ -4012,11 +4014,11 @@ describe("lead sizing wiring (Phase A)", () => {
 		const t = (capability: string) => [
 			{ task: { capability, task: "t", taskId: "r-lead-0" }, result: { exitCode: 0, stdout: "report", filesChanged: [] } },
 		];
-		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_small"), 2, "low", 0, 2)[0].capability).toBe("lead");
-		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_small"), 2, "low", 1, 2)[0].capability).toBe("lead_large");
-		expect(orchestrator.planEscalationForTest(["tests failed"], t("lead_large"), 9, "low", 0, 2)[0].capability).toBe("lead_large");
-		expect(orchestrator.planEscalationForTest(["tests failed"], t("technical_review"), 5, "low", 0, 2)[0].capability).toBe("technical_review");
-		expect(orchestrator.planEscalationForTest(["x"], t("lead"), 5, "high", 0, 2)[0].task).toContain("at least the premium tier");
+		expect(planEscalation(["tests failed"], t("lead_small"), 2, "low", 0, 2)[0].capability).toBe("lead");
+		expect(planEscalation(["tests failed"], t("lead_small"), 2, "low", 1, 2)[0].capability).toBe("lead_large");
+		expect(planEscalation(["tests failed"], t("lead_large"), 9, "low", 0, 2)[0].capability).toBe("lead_large");
+		expect(planEscalation(["tests failed"], t("technical_review"), 5, "low", 0, 2)[0].capability).toBe("technical_review");
+		expect(planEscalation(["x"], t("lead"), 5, "high", 0, 2)[0].task).toContain("at least the premium tier");
 	});
 
 	test("policyIdFor is stable for identical bindings and changes with them", () => {
@@ -4202,7 +4204,7 @@ describe("review fixes (Phase A review)", () => {
 			security_review: { model: "openai-codex/gpt-6-astra" },
 			lead_large: { model: "amazon-bedrock/global.anthropic.claude-fable-5-1" },
 		};
-		const picked = orchestrator.pickModelForTest("technical_review", adapter, 1, "medium");
+		const picked = pickModel("technical_review", adapter, 1, "medium");
 		expect(picked).toBe("humain-node/glm-5.2");
 	});
 

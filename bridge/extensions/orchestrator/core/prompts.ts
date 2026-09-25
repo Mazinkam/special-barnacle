@@ -1,0 +1,252 @@
+/**
+ * Prompt construction for the architect and lead dispatches, plus the
+ * lead-report contract lines. Pure string formatting: everything the run
+ * needs is passed in as a parameter (no `process.env`, no globals).
+ */
+
+import type { Binding } from "../models.ts";
+import { METHOD } from "../models.ts";
+import type { LeadAssignment } from "../lead-plan.ts";
+
+type Adapter = Record<string, Binding>;
+
+export interface DispatchTask {
+	taskId: string;
+	capability: string;
+	task: string;
+	/**
+	 * Explicit tool allow-list, overriding whatever the bound persona permits.
+	 * Recon always specifies this; other dispatches omit it and inherit their
+	 * persona's own tools.
+	 */
+	tools?: string[];
+	retryOf?: string;
+	retryCount?: number;
+}
+
+export interface PlanResponse {
+	plan_id: string;
+	run_id: string;
+	task_class: string;
+	complexity: number;
+	risk: string;
+	topology: {
+		depth: number;
+		leads: number;
+		workers: number;
+		shape: string;
+	};
+	route: {
+		selected: {
+			capability: string;
+			effort: string;
+			verification_depth: string;
+		};
+		recommended: {
+			capability: string;
+			effort: string;
+			verification_depth: string;
+		};
+		mode: string;
+		history_sufficient: boolean;
+		explanation: Record<string, unknown>;
+	};
+	effective_quality_floor: number;
+	cost_aggressiveness: number;
+}
+
+/** Minimal shape `architectPrompt`/`leadPrompt` need from a dispatch result. */
+export interface PromptDispatchResult {
+	exitCode: number;
+	stdout: string;
+	durationMs: number;
+	costUsd: number;
+}
+
+export function complexityNeedsArchitect(complexity: number): boolean {
+	return complexity >= METHOD.rules.pre_implementation_recon.min_complexity;
+}
+
+/** Clamp the planner's lead count the same way dispatchReconAndLeads does. */
+export function effectiveLeadCount(plan: PlanResponse, maxLeads = 8): number {
+	const { leads } = plan.topology;
+	return Number.isFinite(leads) ? Math.min(maxLeads, Math.max(1, Math.trunc(leads))) : 1;
+}
+
+function leadAssignmentInstructions(plan: PlanResponse, maxLeads: number): string[] {
+	const n = effectiveLeadCount(plan, maxLeads);
+	if (n <= 1) return [];
+	return [
+		"## Lead assignments",
+		`The topology has ${n} leads. Assign each lead a distinct, non-overlapping scope, one line per lead, exactly:`,
+		"Lead 1: <scope> (depends on: none)",
+		"Lead 2: <scope> (depends on: 1)",
+		"A lead that needs another lead's output MUST list it under depends on; dependent leads run after the leads they depend on, never in parallel. If the work cannot be split into independent or clearly ordered scopes, give Lead 1 the whole goal and give the other leads `(depends on: 1)` scopes that only verify or extend it. Without this section the orchestrator runs a single lead.",
+		"",
+	];
+}
+
+export function architectPrompt(goal: string, plan: PlanResponse, maxLeads = 8): string {
+	return [
+		`You are the architect for this orchestration. Produce a concrete task plan.`,
+		"",
+		`Goal: ${goal}`,
+		`Task class: ${plan.task_class}`,
+		`Complexity: ${plan.complexity}`,
+		`Risk: ${plan.risk}`,
+		`Topology: ${plan.topology.shape} (depth=${plan.topology.depth}, leads=${plan.topology.leads}, workers=${plan.topology.workers})`,
+		`Recommended capability: ${plan.route.recommended.capability} @ ${plan.route.recommended.effort}`,
+		`Quality floor: ${plan.effective_quality_floor}`,
+		"",
+		"Output:",
+		"## Tasks",
+		"One numbered task per line, each with: capability (technical_lead | implementation_strong | implementation_fast | qa_agent | technical_review | security_review), a one-line description, and acceptance criteria.",
+		"",
+		"## Dependencies",
+		"Which tasks block which.",
+		"",
+		...leadAssignmentInstructions(plan, maxLeads),
+		"## Done When",
+		"Observable end-state.",
+	].join("\n");
+}
+
+/** Keeps QA on this run's files and stops it from debugging the environment. */
+export const QA_SCOPE_RULES = [
+	"Scope: verify ONLY the files listed above and the tests that cover them. Do not read or judge other files, even if they look modified.",
+	"Environment: use the project's documented test commands. If they cannot run after 2 attempts (missing interpreter, dependency, or service), stop and report FAIL with check name `environment` and the exact error; do not try alternative interpreters or install anything.",
+];
+
+/**
+ * The model table the lead must forward to HT's `subagent` tool. The subagent
+ * tool ignores the `model:` frontmatter in the orch-* persona files and runs
+ * every child on the PARENT's model unless the call passes `model` explicitly —
+ * so without this block every cheap worker silently ran on the lead's model.
+ */
+export function modelTableForLead(adapter: Adapter): string[] {
+	const row = (agent: string, cap: string) =>
+		`- ${agent}: model "${adapter[cap]?.model ?? adapter.worker?.model ?? "unknown"}"`;
+	return [
+		"Model routing (REQUIRED): every `subagent` call MUST pass the `model` field below for the agent it dispatches. The subagent tool does not read the agent's frontmatter; omitting `model` runs the child on your own model and breaks the cost policy.",
+		row("orch-scout", "scout"),
+		row("orch-worker", "worker"),
+		row("orch-implementation-fast", "implementation_fast"),
+		row("orch-implementation-strong", "implementation_strong"),
+		row("orch-technical-lead", "technical_lead"),
+		row("orch-technical-review", "technical_review"),
+		row("orch-security-review", "security_review"),
+		// No orch-qa-agent row: final QA is the orchestrator's own dispatch, not the lead's.
+		row("orch-architect", "architect"),
+	];
+}
+
+export function leadPrompt(
+	goal: string,
+	plan: PlanResponse,
+	architectResult: PromptDispatchResult | undefined,
+	reconEvidence: string,
+	leadIndex: number,
+	leadCount: number,
+	adapter: Adapter,
+	assignment?: LeadAssignment,
+): string {
+	// Only forward a plan the architect actually produced. A failed architect
+	// dispatch used to be pasted in as an empty "Architect's plan:" section,
+	// which reads to the lead as "the architect decided nothing is needed".
+	const architectOutput =
+		architectResult && architectResult.exitCode === 0 && architectResult.stdout.trim()
+			? `\nArchitect's plan:\n\n${architectResult.stdout.slice(0, 3000)}\n`
+			: "";
+	const scopeNote =
+		leadCount > 1 && assignment
+			? [
+				`You are lead ${leadIndex + 1} of ${leadCount}. Your scope (from the architect's Lead assignments): ${assignment.scope}`,
+				assignment.dependsOn.length > 0
+					? `Leads ${assignment.dependsOn.map((d) => d + 1).join(", ")} ran before you and completed; build on their work, do not redo it.`
+					: "No other lead's work is a precondition for your scope.",
+				"Do only your scope; other leads own the rest.",
+			].join("\n")
+			: leadCount > 1
+				? `You are lead ${leadIndex + 1} of ${leadCount}. Focus on your assigned sub-domain; other leads handle parallel sub-domains.`
+				: "You are the sole lead for this orchestration.";
+	// The orchestrator already dispatched and billed the required Rule-2 recon
+	// workers before this lead ever started (see dispatchHierarchical). State
+	// that plainly, whether evidence exists or not, instead of letting the lead
+	// assume no recon happened just because this section is silent.
+	const reconSection = [
+		"Recon evidence (already gathered by dedicated parent-owned recon workers the orchestrator dispatched and billed before you started; treat it as ground truth for this run):",
+		"",
+		reconEvidence || "(none: this task's complexity/task class does not require parent-owned recon)",
+		"",
+		"Do not repeat broad repository discovery already covered by the recon evidence above. You may still use your own tools to verify a specific, material uncertainty before acting.",
+	].join("\n");
+	return [
+		`You are the orchestrator lead for the following goal. Drive it to completion.`,
+		"",
+		`Goal: ${goal}`,
+		`Task class: ${plan.task_class} | Complexity: ${plan.complexity} | Risk: ${plan.risk}`,
+		`Quality floor: ${plan.effective_quality_floor}`,
+		`Recommended capability: ${plan.route.recommended.capability} @ ${plan.route.recommended.effort}`,
+		`Topology: ${plan.topology.shape} (depth=${plan.topology.depth}, leads=${plan.topology.leads}, workers=${plan.topology.workers})`,
+		"",
+		scopeNote,
+		architectOutput,
+		"",
+		reconSection,
+		"",
+		"You are running non-interactively: there is no human to answer questions mid-run. If the goal is ambiguous, make the conservative choice, do the unambiguous part, and list every open question under '## Open items' in your final report instead of stopping to ask.",
+		"",
+		LEAD_DELEGATION_RULE,
+		"",
+		"Use the subagent tool for implementation and review work. Nested subagent calls you make run inside your own context: the orchestrator bridge bills their reported cost to your dispatch and counts it toward your spend cap, but does not log them as dispatches the way it does the parent-owned recon above, so they are not authoritative worker accounting for this run — only your own final report is. For each nested dispatch:",
+		"- Choose the right agent (orch-worker, orch-implementation-strong, orch-implementation-fast, orch-technical-review, orch-security-review).",
+		"- Pass a narrowly-scoped task prompt.",
+		"- Pass the `model` for that agent from the routing table below.",
+		"- After implementation, run the targeted verification commands for each task yourself (read-only). Do not dispatch orch-qa-agent: the orchestrator runs independent QA on the union of changed files after you finish. If your verification or a review fails, escalate per method.json rules.review_after_fix (Rule 1).",
+		"",
+		...modelTableForLead(adapter),
+		"",
+		LEAD_STATUS_CONTRACT,
+	].join("\n");
+}
+
+/** Leads cannot edit (persona tools exclude write/edit); this states it in the prompt too. */
+export const LEAD_DELEGATION_RULE =
+	"Delegation rule: you do not have write or edit tools. All source changes go to orch-implementation-strong or orch-implementation-fast through the subagent tool. Do not modify files through bash redirection, sed -i, heredocs, patch tools, or scripts. You may run read-only and verification commands.";
+
+/** Machine-readable last line every lead report must end with (parsed by parseLeadStatus). */
+export const LEAD_STATUS_CONTRACT =
+	"End your final report with exactly one line `STATUS: completed`, `STATUS: partial`, or `STATUS: blocked` (blocked = you stopped before changing anything because a stop condition or precondition failed).";
+
+export function formatTaskPrompt(
+	t: DispatchTask,
+	runId: string,
+	userMessages: string[] = [],
+): string {
+	const retryNote = t.retryOf
+		? `\n\n[Retry context: this is retry #${(t.retryCount ?? 0) + 1} of a previous failed attempt on task_id=${t.retryOf}. The previous attempt's review/QA feedback is captured in the orchestrator ledger; if you need that context, ask the lead before starting. Per method.json rules.review_after_fix: re-review at or above the original reviewer's tier, never the cheap tier.]`
+		: "";
+	const userNote = userMessages.length > 0
+		? `\n\n[User messages while this run was in progress — ${userMessages.length === 1 ? "1 message" : `${userMessages.length} messages`}, addressed to you]:\n${userMessages.map((m, i) => `  ${i + 1}. ${m}`).join("\n")}\n\nTreat these as high-priority steering from the operator. Adjust your plan and execution accordingly. If a message asks you to stop, finish the current sub-step and report back; do not start new work.`
+		: "";
+	return [
+		`[orchestrator:run_id=${runId}]`,
+		`[capability=${t.capability}]`,
+		`[task_id=${t.taskId}]`,
+		"",
+		t.task,
+		retryNote,
+		userNote,
+		"",
+		"---",
+		"Output format (required):",
+		"## Completed",
+		"What was done.",
+		"## Files Changed",
+		"- `path/to/file` — what changed",
+		"## Verification",
+		"Checks run + result.",
+		"## Notes / Escalation",
+		"Anything the lead should know — reply to any user messages here.",
+	].join("\n");
+}
