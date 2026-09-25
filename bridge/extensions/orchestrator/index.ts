@@ -68,6 +68,7 @@ import {
 	type AliasTable,
 	type AvailableModel,
 	type Binding,
+	type BindingSource,
 	buildAliasTable,
 	DEFAULT_PROVIDER_PREFERENCE,
 	emptyProfilesFile,
@@ -99,7 +100,7 @@ import {
 } from "./models.ts";
 import { bedrockFallbackFor, isQuotaError } from "./provider-fallback.ts";
 import { parseLeadAssignments, planLeadWaves, type LeadAssignment } from "./lead-plan.ts";
-import { classifyRunOutcome, externalChangeFiles, parseLeadStatus } from "./run-outcome.ts";
+import { classifyRunOutcome, externalChangeFiles, parseLeadFilesChanged, parseLeadStatus } from "./run-outcome.ts";
 import { SpendCapTracker, capFor, type SpendCapVerdict } from "./spend-cap.ts";
 import { NestedCostTracker, type NestedCallDetail } from "./nested-cost.ts";
 import { escalateLeadCapability, isLeadCapability, isLeadSize, leadSizeOf, sizeLead, type LeadSizeDecision } from "./lead-sizing.ts";
@@ -137,6 +138,20 @@ import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.t
 // `const reconTasks: DispatchTask[] = planReconTasks(...)` checks at compile
 // time, so a planned recon task still needs no conversion step.
 import { formatReconEvidence, planReconTasks } from "./recon.ts";
+import { DispatchTelemetryTracker, type DispatchTelemetryFields } from "./dispatch-telemetry.ts";
+import { loadEfficiencyControls, type EfficiencyControls } from "./efficiency-flags.ts";
+import { canonicalizePath, findOwnershipOverlaps, observedEditConflicts, pathsOverlap, serializeWaves, type OwnershipInput } from "./file-ownership.ts";
+import { assignCanary, canaryTelemetryFields, parseModelCanaries, type CanaryAssignment } from "./model-canary.ts";
+import {
+	boundHandoff,
+	decideContinuation,
+	extractHandoff,
+	handoffStaleness,
+	scopedPhasePrompt,
+	validateHandoff,
+	type ExpectedHandoff,
+	type LeadHandoff,
+} from "./lead-handoff.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -492,6 +507,10 @@ interface RunTags {
 let CURRENT_RUN_TAGS: RunTags = {};
 /** Alias table of the active run, for codex -> Bedrock quota fallback. */
 let CURRENT_ALIAS_TABLE: AliasTable | null = null;
+/** `resolved.sources` of the active run's adapter, for model-canary `explicitOverride` detection
+ *  (a capability whose binding source is `"flag"` was pinned by the operator, so a canary must
+ *  never override it). Reset per run, like `CURRENT_ALIAS_TABLE`. */
+let CURRENT_MODEL_SOURCES: Record<string, BindingSource> = {};
 
 /** `<profile>-<sha256(canonical adapter)[:8]>`: stable for identical bindings. */
 export function policyIdFor(profileName: string, adapter: Record<string, Binding>): string {
@@ -839,6 +858,11 @@ interface SubagentProcessResult {
 	processExitCode: number;
 	/** Teardown error retained alongside a valid settled result. */
 	postCompletionError?: string;
+	/** Observational-only (Phase 2) counting of this dispatch's own tool calls/peak context;
+	 *  never influences dispatch behaviour. See dispatch-telemetry.ts. Optional so test doubles
+	 *  that construct a `SubagentProcessResult` directly (without going through the real event
+	 *  parser) need not populate it. */
+	telemetry?: DispatchTelemetryFields;
 }
 
 /**
@@ -1882,6 +1906,9 @@ export async function runSubagentProcess(opts: {
 		let dispatchStartedAt = startedAt;
 		let toolCalls = 0;
 		let assistantTurns = 0;
+		// Observational only (Phase 2 telemetry): counts what the dispatch's own
+		// tool calls/peak context already were; never changes dispatch behaviour.
+		const telemetryTracker = new DispatchTelemetryTracker();
 		let interruptionNote: string | undefined;
 		let armTimer: () => void = () => {};
 		let handleExpiry: (reason: "inactivity" | "absolute") => void = () => {};
@@ -2039,6 +2066,7 @@ export async function runSubagentProcess(opts: {
 				timeoutReason,
 				interruption,
 				postCompletionError: outcome.status === "completed_after_process_error" ? outcome.note : undefined,
+				telemetry: telemetryTracker.fields(usage.turns),
 			});
 		};
 
@@ -2054,6 +2082,7 @@ export async function runSubagentProcess(opts: {
 				costReported = (usage.turns === 1 || costReported) && cost !== undefined;
 				usage.cost += cost ?? 0;
 				usage.contextTokens = msg.usage.totalTokens || usage.contextTokens;
+				telemetryTracker.observeContextTokens(msg.usage.totalTokens);
 			}
 			if (msg.stopReason) stopReason = msg.stopReason;
 			// A provider error arrives as a turn with stopReason "error" and an
@@ -2115,6 +2144,9 @@ export async function runSubagentProcess(opts: {
 				session?.setNestedCost(taskId, nestedCost.total());
 				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar()) ?? "ok";
 				if (verdict !== "ok") handleSpendCap(verdict);
+			}
+			if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
+				telemetryTracker.observeToolCall(event.toolName, event.args);
 			}
 			if (progressTracker && observation) {
 				if (event.type === "tool_execution_start") toolCalls += 1;
@@ -2968,6 +3000,9 @@ export interface DispatchTask {
 	tools?: string[];
 	retryOf?: string;
 	retryCount?: number;
+	/** Optional operator-supplied phase label for telemetry (e.g. "implementation", "review");
+	 *  never read by dispatch logic itself. */
+	phase?: string;
 }
 
 export interface DispatchResult {
@@ -2992,6 +3027,20 @@ export interface DispatchResult {
 	filesChanged: string[];
 	/** HT thinking level the dispatch ran at (from the binding), when one was set. */
 	effort?: string;
+	/** Observational-only (Phase 2) per-dispatch telemetry; see dispatch-telemetry.ts. */
+	telemetry?: DispatchTelemetryFields;
+	/** Model canary assignment/telemetry for this dispatch (baseline under the shipped config);
+	 *  see model-canary.ts. Observational only — never changes which model is dispatched. */
+	canary?: Record<string, unknown>;
+	/** `loadEfficiencyControls().enabled` at dispatch time — which efficiency switches were on. */
+	experimentFlags?: string[];
+	/** `scoped_leads`: set ONLY by `finalizeScopedLeadResult`, on the copy it returns for a
+	 *  scoped lead's chain — every plan/integrate/report/fallback phase that chain actually ran,
+	 *  in order. Not billed (the phases themselves are billed individually via `capture()`/
+	 *  `scopedLeadPhaseResults`); read only by `qaScopeEvidenceFor` to build synthetic QA-scope
+	 *  evidence across the whole chain instead of trusting the final phase's own prose. Absent
+	 *  on every ordinary (non-scoped, or scoped_leads-off) `DispatchResult`. */
+	scopedPhaseReports?: Array<{ phase: string; exitCode: number; stdout: string }>;
 }
 
 export async function dispatchParallel(
@@ -3008,6 +3057,12 @@ export async function dispatchParallel(
 		recordModelCall?: typeof recordModelCall;
 		/** Alias table for the codex -> Bedrock quota fallback; defaults to the active run's. */
 		aliasTable?: AliasTable | null;
+		/** Per-capability binding source of the active run's adapter (`"flag"` = explicit operator
+		 *  override), for model-canary `explicitOverride` detection; defaults to the active run's
+		 *  resolved sources. Test seam. */
+		modelSources?: Record<string, BindingSource>;
+		/** Efficiency-controls snapshot for the `experiment_flags` telemetry field; test seam. */
+		efficiencyControls?: ReturnType<typeof loadEfficiencyControls>;
 	} = { recordEvent, runProcess: runSubagentProcess, recordModelCall },
 ): Promise<DispatchResult[]> {
 	if (tasks.length === 0) return [];
@@ -3022,6 +3077,13 @@ export async function dispatchParallel(
 		: `${tasks.length} ${tasks[0].capability} tasks`;
 	const userMessages = session ? session.drainMessages(recipient) : [];
 
+	// Phase 2 telemetry (observational only — see model-canary.ts / efficiency-flags.ts):
+	// resolved once per batch, not per task, since they are run-wide config, not per-dispatch state.
+	const modelSources = deps.modelSources ?? CURRENT_MODEL_SOURCES;
+	const canaryConfig = parseModelCanaries((METHOD as unknown as { rules: Record<string, unknown> }).rules.model_canaries).config;
+	const efficiencyControls = deps.efficiencyControls ?? loadEfficiencyControls();
+	const canaryAliasTable = deps.aliasTable === undefined ? CURRENT_ALIAS_TABLE : deps.aliasTable;
+
 	const taskInputs = tasks.map((t) => {
 		// Adapter lookups can return undefined if the dynamic adapter
 		// didn't surface every capability (rare but seen during plan-time
@@ -3033,6 +3095,18 @@ export async function dispatchParallel(
 			adapter.scout ??
 			Object.values(adapter).find((v) => v && typeof v === "object") ??
 			{ model: "unknown" };
+		// Observational only: computed for telemetry, never used to decide which model is
+		// dispatched (`model:` below always stays `binding.model`). With the shipped
+		// (disabled) `model_canaries` config this always assigns cohort "baseline" with
+		// `requestedModel === baselineModel`.
+		const canaryAssignment = assignCanary({
+			runId,
+			capability: t.capability,
+			baselineModel: binding.model ?? "unknown",
+			explicitOverride: modelSources[t.capability] === "flag",
+			config: canaryConfig,
+			aliasTable: canaryAliasTable,
+		});
 		return {
 			agent: agentNameFor(t.capability),
 			task: formatTaskPrompt(t, runId, userMessages),
@@ -3044,6 +3118,8 @@ export async function dispatchParallel(
 			_taskId: t.taskId,
 			_retryOf: t.retryOf,
 			_retryCount: t.retryCount,
+			_phase: t.phase,
+			_canaryAssignment: canaryAssignment,
 		};
 	});
 
@@ -3206,6 +3282,19 @@ export async function dispatchParallel(
 				// or QA agent would "report" every path it merely mentioned.
 				filesChanged: r.personaCanMutate ? parseFilesChanged(r.stdout) : [],
 				...(input.effort ? { effort: input.effort } : {}),
+				...(r.telemetry
+					? { telemetry: input._phase ? { ...r.telemetry, dispatch_phase: input._phase } : r.telemetry }
+					: {}),
+				...(input._canaryAssignment
+					? {
+						canary: canaryTelemetryFields(
+							input._canaryAssignment,
+							r.model ?? input.model,
+							`${input._taskId ?? "unknown"}${(input._retryCount ?? 0) > 0 ? `#retry${input._retryCount}` : ""}`,
+						),
+					}
+					: {}),
+				experimentFlags: efficiencyControls.enabled,
 			};
 		} catch (err) {
 			return {
@@ -3720,6 +3809,11 @@ export function dispatchRecordsFor(
 		plan_id: opts.planId,
 		...runTagFields(),
 		...(isLeadCapability(result?.capability ?? "") && leadSelfImplemented(result) ? { lead_self_implemented: true } : {}),
+		// Phase 2 telemetry (observational only — see dispatch-telemetry.ts / model-canary.ts /
+		// efficiency-flags.ts). Added fields; every existing field above is unchanged.
+		...(result?.telemetry ?? {}),
+		...(result?.canary ?? {}),
+		...(result?.experimentFlags ? { experiment_flags: result.experimentFlags } : {}),
 	}, {
 		// 2. The executed-route record. This is the closing half of the
 		//    (recommended, executed, observed) triple: the plan-time
@@ -3906,6 +4000,78 @@ interface VerificationResult {
 }
 
 /**
+ * `scoped_leads`: `externalChangeFiles` (run-outcome.ts) classifies "changed by someone
+ * else" purely from each lead's own report prose (`## Files Changed: None`) — correct for
+ * an ordinary long-lived lead, whose one dispatch's report IS the whole story. A scoped
+ * lead's final result is a REPORT phase that legitimately says "None" for its OWN phase
+ * while an earlier plan/integrate phase in the SAME chain made real edits. The de-duplicated
+ * `filesChanged` union `finalizeScopedLeadResult` attaches is not by itself trustworthy
+ * evidence of "no files changed": `parseFilesChanged` (index.ts) only recognizes backtick-
+ * quoted paths with a known extension, so a phase reporting `- Dockerfile` or `- src/a.ts`
+ * (unbackticked, or extensionless) contributes nothing to that union even though
+ * `parseLeadFilesChanged` (run-outcome.ts) — what `externalChangeFiles` itself uses — would
+ * read it as a real listed file. An empty union therefore never proves no edits happened;
+ * only every phase's own prose, reparsed the same way `externalChangeFiles` reparses an
+ * ordinary lead's, can prove that.
+ *
+ * So for a lead that ran as a scoped chain (`scopedPhaseReports` present, attached only by
+ * `finalizeScopedLeadResult`): reparse EVERY phase's stdout with `parseLeadFilesChanged` and
+ * combine with the union.
+ *   - `exitCode`: the final phase's exit code if every phase in the chain exited 0,
+ *     otherwise a non-zero code (so `externalChangeFiles`'s exit-code gate never treats a
+ *     chain with a failed phase as "all clean").
+ *   - Evidence is exactly `## Files Changed\nNone` only when every phase exited 0 AND every
+ *     phase's own `parseLeadFilesChanged` reads `"none"` AND the union is empty — the only
+ *     configuration in which no phase, anywhere in the chain, could have changed anything.
+ *   - Otherwise, if the union is non-empty OR any phase parses as a `"list"`, evidence lists
+ *     the union plus every path any phase's `parseLeadFilesChanged` found — a real edit
+ *     somewhere in the chain, so QA must scope it in.
+ *   - Otherwise (some phase is unparseable — no `## Files Changed` section at all — and
+ *     nothing above proved either "none" or "list"): emit no `## Files Changed` section at
+ *     all. `parseLeadFilesChanged` reads that as `"unknown"`, the same conservative default
+ *     `externalChangeFiles` already applies to an ordinary lead whose report never mentions
+ *     files changed — QA keeps ownership of whatever git shows changed.
+ *
+ * A lead without `scopedPhaseReports` has only one dispatch whose report IS the whole
+ * story; this passes that dispatch's real `stdout` through unchanged, byte-identical to
+ * before this function existed. The metadata itself records whether scoped finalization
+ * occurred, so classification does not depend on a later read of the feature switch.
+ */
+export function qaScopeEvidenceFor(
+	leadResults: Array<Pick<DispatchResult, "exitCode" | "stdout" | "filesChanged" | "scopedPhaseReports">>,
+): Array<{ exitCode: number; stdout: string }> {
+	return leadResults.map((r) => {
+		const phases = r.scopedPhaseReports;
+		if (!phases) return { exitCode: r.exitCode, stdout: r.stdout };
+
+		const allPhasesCleanExit = phases.every((p) => p.exitCode === 0);
+		const firstFailedExit = phases.find((p) => p.exitCode !== 0)?.exitCode;
+		const exitCode = allPhasesCleanExit ? r.exitCode : (firstFailedExit ?? 1);
+
+		const parsedPhases = phases.map((p) => parseLeadFilesChanged(p.stdout));
+		const union = new Set<string>(r.filesChanged);
+		let anyList = false;
+		for (const parsed of parsedPhases) {
+			if (parsed.kind === "list") {
+				anyList = true;
+				for (const f of parsed.files) union.add(f);
+			}
+		}
+
+		if (allPhasesCleanExit && union.size === 0 && parsedPhases.every((p) => p.kind === "none")) {
+			return { exitCode, stdout: "## Files Changed\nNone" };
+		}
+		if (union.size > 0 || anyList) {
+			return { exitCode, stdout: `## Files Changed\n${[...union].map((f) => `- \`${f}\``).join("\n")}` };
+		}
+		// No phase proved "none" and no phase (nor the union) proved "list" — at least one
+		// phase's report has no `## Files Changed` section at all. Emit none here either;
+		// `parseLeadFilesChanged` reads that as `"unknown"`, keeping QA scope conservative.
+		return { exitCode, stdout: "" };
+	});
+}
+
+/**
  * Run the QA agent against the union of files changed by workers. Returns a
  * pass/fail verdict that downstream escalation logic can act on. Parses a
  * tolerant output shape: ANY "FAIL" token in the QA output flips the verdict.
@@ -4074,112 +4240,42 @@ export function parseCheckResults(text: string): CheckResult[] {
  * Returns the flat list of leaf (worker) dispatches for bookkeeping. Lead
  * dispatches themselves get recorded as their own model_call + route_executed.
  */
-async function dispatchHierarchical(
-	cwd: string,
-	runId: string,
-	planId: string,
-	goal: string,
-	plan: PlanResponse,
-	adapter: Adapter,
-	ctx: ExtensionContext,
-	leadCapability = "lead",
-): Promise<{
-	leadResults: DispatchResult[];
-	workerResults: DispatchResult[];
-	/** Leads not started because a dependency failed or was blocked. */
-	skippedLeads: number;
-	/** The architect dispatch, when the topology called for one. Billed by the caller. */
-	architectResult?: DispatchResult;
-	/** Mutable sink the caller appends escalation dispatches to, so they get billed. */
-	escalationResults: DispatchResult[];
-	/** Original DispatchTask objects dispatched for each lead, paired with leadResults by taskId — needed to build faithful retry prompts (BUG 2). */
-	leadTasks: DispatchTask[];
-}> {
-	const { depth } = plan.topology;
-
-	// Always: dispatch the architect first if it's a high-complexity / new-domain
-	// task. The architect's output feeds into subsequent dispatch prompts.
-	// For depth=1, skip — the lead IS the architect.
-	let architectResult: DispatchResult | undefined;
-	const needsArchitect = depth >= 2 && complexityNeedsArchitect(plan.complexity);
-	if (needsArchitect) {
-		ACTIVE_RUN?.setPhase(
-			`architect planning on ${shortName(adapter.architect?.model ?? "?")} (complexity ${plan.complexity} ≥ 5)`,
-		);
-		[architectResult] = await dispatchParallel(
-			cwd,
-			runId,
-			[
-				{
-					capability: "architect",
-					task: architectPrompt(goal, plan),
-					taskId: `${runId}-architect`,
-				},
-			],
-			adapter,
-			ctx,
-		);
-		await captureDispatchCost(
-			{ runId, planId, taskClass: plan.task_class, complexity: plan.complexity,
-			  risk: plan.risk, recommended: plan.route.recommended, mode: plan.route.mode },
-			architectResult,
-		);
-		// The leads proceed without a plan rather than aborting the run, but the
-		// operator must be told the decomposition step was lost — it silently
-		// changes what the leads are working from.
-		if (!architectResult || architectResult.exitCode !== 0) {
-			ctx.ui.notify(
-				`Architect dispatch failed (exit ${architectResult?.exitCode ?? "n/a"}): ${
-					summarizeStderr(architectResult?.stderr ?? "no result", 300) || "(no output)"
-				}\nLeads will run without an architect plan.`,
-				"warning",
-			);
-		} else if (architectResult) {
-			ACTIVE_RUN?.setPhase(
-				`architect done in ${fmtElapsed(architectResult.durationMs)} ($${architectResult.costUsd.toFixed(4)}) — ${architectResult.stdout.split("\n").filter((l) => /^\s*\d+[.)]/.test(l)).length} tasks planned`,
-			);
-		}
-	}
-
-	const captureOpts: CaptureOpts = {
-		runId, planId, taskClass: plan.task_class, complexity: plan.complexity,
-		risk: plan.risk, recommended: plan.route.recommended, mode: plan.route.mode,
-	};
-	const results = await dispatchReconAndLeads({ runId, goal, plan, adapter, architectResult, leadCapability }, {
-		dispatch: (tasks) => dispatchParallel(cwd, runId, tasks, adapter, ctx),
-		capture: (result) => captureDispatchCost(captureOpts, result),
-		setPhase: (phase) => ACTIVE_RUN?.setPhase(phase),
-		throwIfCancelled: () => ACTIVE_RUN?.cancellation.throwIfCancelled(),
-	});
-	return { ...results, architectResult, escalationResults: [] };
+export interface ReconRunEffects {
+	dispatch: (tasks: DispatchTask[]) => Promise<DispatchResult[]>;
+	capture: (result: DispatchResult) => Promise<void>;
+	setPhase: (phase: string) => void;
+	throwIfCancelled: () => void;
 }
 
-/** Parent-owned recon/lead sequencing; effects are supplied by the bridge. */
-export async function dispatchReconAndLeads(
-	input: {
-		runId: string;
-		goal: string;
-		plan: PlanResponse;
-		adapter: Adapter;
-		architectResult?: DispatchResult;
-		evidenceMaxChars?: number;
-		/** Sized lead capability (lead_small | lead | lead_large); defaults to "lead". */
-		leadCapability?: string;
-	},
-	effects: {
-		dispatch: (tasks: DispatchTask[]) => Promise<DispatchResult[]>;
-		capture: (result: DispatchResult) => Promise<void>;
-		setPhase: (phase: string) => void;
-		throwIfCancelled: () => void;
-	},
-): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[] }> {
-	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars = RECON_EVIDENCE_MAX_CHARS, leadCapability = "lead" } = input;
-	const requestedLeadCount = effectiveLeadCount(plan);
+export interface ReconRunResult {
+	reconTasks: DispatchTask[];
+	workerResults: DispatchResult[];
+	/** Bounded evidence packet for the lead(s); "" when recon wasn't required. */
+	reconEvidence: string;
+	/** Human-readable reason recon didn't run, set only when `reconTasks.length === 0`. */
+	unavailableReason?: string;
+}
 
-	// Rule 2: parent-owned, read-only recon dispatched directly by the bridge
-	// (not left to a lead's discretion) so it is an observable, billed dispatch
-	// with its own progress row, log files, and cost — not an optimistic claim
-	// that "workers fan out inside each lead".
+/**
+ * Rule 2: parent-owned, read-only recon dispatched directly by the bridge
+ * (not left to a lead's discretion) so it is an observable, billed dispatch
+ * with its own progress row, log files, and cost — not an optimistic claim
+ * that "workers fan out inside each lead". Extracted so both the normal
+ * (recon runs alongside/after the architect) sequencing and the
+ * `recon_before_architect` switch (recon runs first, feeds the architect,
+ * then is reused rather than re-dispatched) share the exact same dispatch,
+ * cancellation-checkpoint, and billing-before-cancel contract.
+ *
+ * `completionPhaseSuffix` only changes the human-readable phase string after
+ * recon completes (e.g. "; dispatching lead(s)" vs "; dispatching architect");
+ * it never changes what is dispatched or billed.
+ */
+export async function runParentOwnedRecon(
+	input: { runId: string; goal: string; plan: PlanResponse; evidenceMaxChars?: number },
+	effects: ReconRunEffects,
+	completionPhaseSuffix = "",
+): Promise<ReconRunResult> {
+	const { runId, goal, plan, evidenceMaxChars = RECON_EVIDENCE_MAX_CHARS } = input;
 	const reconTasks: DispatchTask[] = planReconTasks({
 		method: METHOD.rules.pre_implementation_recon,
 		complexity: plan.complexity,
@@ -4194,24 +4290,25 @@ export async function dispatchReconAndLeads(
 	// that lands mid-billing would leave some finished workers unbilled.
 	effects.throwIfCancelled();
 	let workerResults: DispatchResult[] = [];
+	let unavailableReason: string | undefined;
 	if (reconTasks.length === 0) {
 		// Name the actual reason; "below threshold OR exempt" made the operator
 		// guess, and read as false for an exempt class at high complexity.
 		const rule = METHOD.rules.pre_implementation_recon;
-		const reason = plan.complexity < rule.min_complexity
+		unavailableReason = plan.complexity < rule.min_complexity
 			? `complexity ${plan.complexity} is below the Rule-2 threshold ${rule.min_complexity}`
 			: `task class "${plan.task_class}" is exempt (skip_for_task_classes)`;
-		effects.setPhase(`no parent-owned recon required: ${reason}`);
+		effects.setPhase(`no parent-owned recon required: ${unavailableReason}`);
 	} else {
 		effects.setPhase(`recon: 0/${reconTasks.length} starting`);
 		workerResults = await effects.dispatch(reconTasks);
 		for (const result of workerResults) await effects.capture(result);
 		// Every finished recon worker is now billed exactly once; if the run was
 		// cancelled while recon ran (or while billing it), stop here — before any
-		// lead is announced or started.
+		// lead (or, with recon_before_architect, the architect) is announced or started.
 		effects.throwIfCancelled();
 		const completedRecon = workerResults.filter((r) => r.exitCode === 0).length;
-		effects.setPhase(`recon: ${completedRecon}/${reconTasks.length} completed; dispatching lead(s)`);
+		effects.setPhase(`recon: ${completedRecon}/${reconTasks.length} completed${completionPhaseSuffix}`);
 	}
 	// Every completed/failed recon result is folded into one bounded evidence
 	// packet; failed workers are represented as unavailable, never silently
@@ -4222,6 +4319,304 @@ export async function dispatchReconAndLeads(
 	const reconEvidence = reconAllFailed
 		? `DEGRADED: all ${workerResults.length} parent-owned recon worker(s) failed; no verified recon evidence is available for this run. Raw diagnostics follow for context only:\n\n${reconEvidenceBody}`
 		: reconEvidenceBody;
+	return unavailableReason !== undefined
+		? { reconTasks, workerResults, reconEvidence, unavailableReason }
+		: { reconTasks, workerResults, reconEvidence };
+}
+
+export async function dispatchHierarchical(
+	cwd: string,
+	runId: string,
+	planId: string,
+	goal: string,
+	plan: PlanResponse,
+	adapter: Adapter,
+	ctx: ExtensionContext,
+	leadCapability = "lead",
+	controls: EfficiencyControls = loadEfficiencyControls().controls,
+	/** Test seam: overrides for the effects `dispatchHierarchical` uses for its own architect
+	 * dispatch and for what it hands `dispatchReconAndLeads`. Production code never passes this
+	 * — every field defaults to exactly today's behaviour (real `dispatchParallel`/
+	 * `captureDispatchCost` bound to `cwd`/`ctx`, `ACTIVE_RUN`'s `setPhase`/cancellation, the
+	 * module's `recordEvent`, and real `gitHead`/`gitDirtySnapshot`) — so it exists purely to let
+	 * tests exercise the recon -> architect -> leads sequencing, billing-before-cancellation, and
+	 * `recon_before_architect` contract without spawning real subagent processes. */
+	deps: {
+		dispatch?: (tasks: DispatchTask[]) => Promise<DispatchResult[]>;
+		capture?: (result: DispatchResult) => Promise<void>;
+		setPhase?: (phase: string) => void;
+		throwIfCancelled?: () => void;
+		notify?: (message: string, level: Parameters<ExtensionContext["ui"]["notify"]>[1]) => void;
+		recordEvent?: (event: string, payload: Record<string, unknown>) => void;
+		gitHead?: () => string | null;
+		treeSnapshot?: () => Map<string, string> | null;
+	} = {},
+): Promise<{
+	leadResults: DispatchResult[];
+	workerResults: DispatchResult[];
+	/** Leads not started because a dependency failed or was blocked. */
+	skippedLeads: number;
+	/** The architect dispatch, when the topology called for one. Billed by the caller. */
+	architectResult?: DispatchResult;
+	/** Mutable sink the caller appends escalation dispatches to, so they get billed. */
+	escalationResults: DispatchResult[];
+	/** Original DispatchTask objects dispatched for each lead, paired with leadResults by taskId — needed to build faithful retry prompts (BUG 2). */
+	leadTasks: DispatchTask[];
+	/** `scoped_leads`: every non-final scoped-phase dispatch result (e.g. the plan
+	 * phase when the lead continues past it) — already billed via `capture()` during
+	 * `dispatchReconAndLeads()` but not present in `leadResults` (which holds only
+	 * each lead's LAST phase, for status parsing). Callers must fold this into their
+	 * cost/billing summary alongside `leadResults` so every phase counts exactly once. */
+	scopedLeadPhaseResults: DispatchResult[];
+}> {
+	const { depth } = plan.topology;
+
+	// Always: dispatch the architect first if it's a high-complexity / new-domain
+	// task. The architect's output feeds into subsequent dispatch prompts.
+	// For depth=1, skip — the lead IS the architect.
+	let architectResult: DispatchResult | undefined;
+	const needsArchitect = depth >= 2 && complexityNeedsArchitect(plan.complexity);
+
+	const captureOpts: CaptureOpts = {
+		runId, planId, taskClass: plan.task_class, complexity: plan.complexity,
+		risk: plan.risk, recommended: plan.route.recommended, mode: plan.route.mode,
+	};
+	// Every effect below defaults to exactly today's real wiring; only tests
+	// supply `deps` overrides (see the parameter doc comment above).
+	const dispatch = deps.dispatch ?? ((tasks: DispatchTask[]) => dispatchParallel(cwd, runId, tasks, adapter, ctx));
+	const capture = deps.capture ?? ((result: DispatchResult) => captureDispatchCost(captureOpts, result));
+	const setPhase = deps.setPhase ?? ((phase: string) => ACTIVE_RUN?.setPhase(phase));
+	const throwIfCancelled = deps.throwIfCancelled ?? (() => ACTIVE_RUN?.cancellation.throwIfCancelled());
+	const notify = deps.notify ?? ((message, level) => ctx.ui.notify(message, level));
+	const reconEffects: ReconRunEffects = { dispatch, capture, setPhase, throwIfCancelled };
+	// `recon_before_architect`: run the same parent-owned recon BEFORE the
+	// architect instead of alongside the leads, so the architect gets the same
+	// bounded evidence a lead would; `dispatchReconAndLeads` below then reuses
+	// this result (via `precomputedRecon`) instead of dispatching it again, so
+	// it is billed exactly once regardless of the switch.
+	let precomputedRecon: ReconRunResult | undefined;
+	if (needsArchitect && controls.recon_before_architect.enabled) {
+		precomputedRecon = await runParentOwnedRecon({ runId, goal, plan }, reconEffects, "; dispatching architect");
+	}
+	if (needsArchitect) {
+		setPhase(
+			`architect planning on ${shortName(adapter.architect?.model ?? "?")} (complexity ${plan.complexity} ≥ 5)`,
+		);
+		const reconEvidenceForArchitect = precomputedRecon
+			? (precomputedRecon.reconEvidence || `none (${precomputedRecon.unavailableReason})`)
+			: undefined;
+		[architectResult] = await dispatch([
+			{
+				capability: "architect",
+				task: architectPrompt(goal, plan, controls, reconEvidenceForArchitect),
+				taskId: `${runId}-architect`,
+			},
+		]);
+		await capture(architectResult);
+		// The leads proceed without a plan rather than aborting the run, but the
+		// operator must be told the decomposition step was lost — it silently
+		// changes what the leads are working from.
+		if (!architectResult || architectResult.exitCode !== 0) {
+			notify(
+				`Architect dispatch failed (exit ${architectResult?.exitCode ?? "n/a"}): ${
+					summarizeStderr(architectResult?.stderr ?? "no result", 300) || "(no output)"
+				}\nLeads will run without an architect plan.`,
+				"warning",
+			);
+		} else if (architectResult) {
+			setPhase(
+				`architect done in ${fmtElapsed(architectResult.durationMs)} ($${architectResult.costUsd.toFixed(4)}) — ${architectResult.stdout.split("\n").filter((l) => /^\s*\d+[.)]/.test(l)).length} tasks planned`,
+			);
+		}
+	}
+
+	const results = await dispatchReconAndLeads({ runId, goal, plan, adapter, architectResult, leadCapability, controls, precomputedRecon }, {
+		dispatch, capture, setPhase, throwIfCancelled,
+		recordEvent: deps.recordEvent ?? ((event, payload) => recordEvent(event, payload)),
+		gitHead: deps.gitHead ?? (() => gitHead(cwd)),
+		treeSnapshot: deps.treeSnapshot ?? (() => gitDirtySnapshot(cwd)),
+	});
+	return { ...results, architectResult, escalationResults: [] };
+}
+
+/** Parent-owned recon/lead sequencing; effects are supplied by the bridge. */
+/** `scoped_leads` telemetry: bounds a `decideContinuation` reason string's comma-joined
+ * code list to at most `max` codes before it is ever recorded. Every individual code
+ * lead-handoff.ts returns is already a fixed diagnostic code, never model-supplied text
+ * (see lead-handoff.ts's module doc) — this guards only against an unexpectedly long list
+ * (e.g. every `validateHandoff` field failing at once), not against untrusted content. */
+function boundFallbackReasonCodes(reason: string, max = 10): string {
+	const colon = reason.indexOf(":");
+	if (colon === -1) return reason;
+	const prefix = reason.slice(0, colon);
+	const codes = reason.slice(colon + 1).split(",");
+	if (codes.length <= max) return reason;
+	return `${prefix}:${codes.slice(0, max).join(",")},+${codes.length - max}_more`;
+}
+
+/** `scoped_leads` freshness gate: the repo-relative paths a handoff claims are relevant to
+ * this lead — the union of its declared `file_ownership` keys and every `work[].files`
+ * entry, canonicalized the same way `file-ownership.ts` compares paths. Used only to narrow
+ * the dirty-tree comparison below to files this lead actually cares about; never trusted
+ * for anything else (the handoff itself may still be invalid/stale). */
+function relevantHandoffPaths(h: LeadHandoff): string[] {
+	const paths = new Set<string>();
+	for (const key of Object.keys(h.file_ownership)) paths.add(canonicalizePath(key).path);
+	for (const w of h.work) for (const f of w.files ?? []) paths.add(canonicalizePath(f).path);
+	return [...paths];
+}
+
+/**
+ * `scoped_leads` freshness gate: whether the bridge-observed dirty-tree fingerprint
+ * (`gitDirtySnapshot`) of the paths relevant to a lead (or the whole snapshot, when none are
+ * declared, or when any declared scope is `unsafe` per `canonicalizePath`) is unchanged
+ * between two snapshots taken around a phase boundary. `null` (unknown) whenever either
+ * snapshot itself is null — an unknown tree state is never trustworthy enough to let
+ * `decideContinuation` continue.
+ *
+ * `scopes` are exact paths, directories, or globs (a handoff's `file_ownership` keys and
+ * `work[].files` entries), NOT snapshot keys — `gitDirtySnapshot` keys are individual
+ * changed file paths, so a declared `src/**` or `src/` scope would never exact-match a
+ * changed `src/a.ts` key. Every key present in EITHER snapshot is considered: a key is
+ * relevant when it `pathsOverlap`s any declared scope, and a relevant key whose
+ * fingerprint differs (including a key present in only one snapshot) means the tree
+ * changed. Keys irrelevant to every declared scope are ignored so an unrelated file
+ * change never forces an unnecessary fallback.
+ */
+export function treeUnchangedFor(before: Map<string, string> | null, after: Map<string, string> | null, scopes: string[]): boolean | null {
+	if (!before || !after) return null;
+	// `NON_FILE_FINGERPRINT` and `UNHASHABLE_FINGERPRINT` are constant sentinels — a
+	// symlink/submodule/nested-repo, or a path `hash-object` cannot accept, fingerprints
+	// the SAME regardless of whether its actual content changed between snapshots. Two
+	// equal sentinels therefore prove nothing; treat that key as unknown rather than
+	// "unchanged". `DELETED_FINGERPRINT` is a real, comparable state (a path is either
+	// present or it isn't) and is deliberately excluded from this check.
+	const isSentinel = (fp: string | undefined) => fp === NON_FILE_FINGERPRINT || fp === UNHASHABLE_FINGERPRINT;
+	const wholeTreeUnchanged = (): boolean | null => {
+		for (const v of before.values()) if (isSentinel(v)) return null;
+		for (const v of after.values()) if (isSentinel(v)) return null;
+		if (before.size !== after.size) return false;
+		for (const [k, v] of before) if (after.get(k) !== v) return false;
+		return true;
+	};
+	// No declared scope, or a scope that can never be proven disjoint from anything
+	// (`canonicalizePath` flags it `unsafe`): fall back to comparing the whole tree
+	// rather than trust a narrowed-but-meaningless relevance check.
+	if (scopes.length === 0 || scopes.some((s) => canonicalizePath(s).unsafe)) return wholeTreeUnchanged();
+	const keys = new Set<string>([...before.keys(), ...after.keys()]);
+	for (const key of keys) {
+		if (!scopes.some((scope) => pathsOverlap(key, scope))) continue;
+		if (isSentinel(before.get(key)) || isSentinel(after.get(key))) return null;
+		if (before.get(key) !== after.get(key)) return false;
+	}
+	return true;
+}
+
+/**
+ * `scoped_leads`: the final result returned for a scoped lead's chain must carry the
+ * de-duplicated union of `filesChanged` from EVERY phase that chain ran (plan, integrate,
+ * report, or a fallback long-lived-lead dispatch) — a REPORT phase that made no edits of
+ * its own (legitimately: it only reports on the prior handoff) must not erase files a
+ * prior plan/integrate phase actually changed, or QA scope / external-change
+ * classification / retry prompts silently drop them (see `qaScopeEvidenceFor`). Also
+ * attaches `scopedPhaseReports`: the `exitCode`/`stdout` of every phase in this chain
+ * (plan/integrate/report/fallback, in run order), tagged by phase name from each
+ * `taskId`'s `-plan`/`-integrate`/`-report` suffix (a bare `taskId` — the ordinary
+ * long-lived-lead dispatch's own — is tagged `"fallback"`). `qaScopeEvidenceFor` uses this
+ * to rebuild QA-scope evidence from every phase's own report instead of trusting only the
+ * union above, which `parseFilesChanged` can under-count (e.g. an extensionless or
+ * unbackticked path like `Dockerfile`). Returns a shallow copy; `priorPhases`' own
+ * `DispatchResult` objects are never mutated — they are billed exactly once, unchanged,
+ * via `scopedLeadPhaseResults`.
+ */
+function scopedPhaseNameFor(taskId: string): string {
+	if (taskId.endsWith("-plan")) return "plan";
+	if (taskId.endsWith("-integrate")) return "integrate";
+	if (taskId.endsWith("-report")) return "report";
+	return "fallback";
+}
+
+export function finalizeScopedLeadResult(finalResult: DispatchResult, priorPhases: DispatchResult[]): DispatchResult {
+	if (priorPhases.length === 0) return finalResult;
+	const files = new Set<string>();
+	for (const p of priorPhases) for (const f of p.filesChanged) files.add(f);
+	for (const f of finalResult.filesChanged) files.add(f);
+	const scopedPhaseReports = [...priorPhases, finalResult].map((p) => ({
+		phase: scopedPhaseNameFor(p.taskId),
+		exitCode: p.exitCode,
+		stdout: p.stdout,
+	}));
+	return { ...finalResult, filesChanged: [...files], scopedPhaseReports };
+}
+
+
+export async function dispatchReconAndLeads(
+	input: {
+		runId: string;
+		goal: string;
+		plan: PlanResponse;
+		adapter: Adapter;
+		architectResult?: DispatchResult;
+		evidenceMaxChars?: number;
+		/** Sized lead capability (lead_small | lead | lead_large); defaults to "lead". */
+		leadCapability?: string;
+		/** Efficiency-controls snapshot; defaults to `loadEfficiencyControls().controls` (all switches off). */
+		controls?: EfficiencyControls;
+		/** Recon already dispatched and billed before the architect ran
+		 * (`recon_before_architect` switch). When present, recon is NOT
+		 * dispatched again here — it is reused so it is billed exactly once. */
+		precomputedRecon?: ReconRunResult;
+	},
+	effects: {
+		dispatch: (tasks: DispatchTask[]) => Promise<DispatchResult[]>;
+		capture: (result: DispatchResult) => Promise<void>;
+		setPhase: (phase: string) => void;
+		throwIfCancelled: () => void;
+		/** Efficiency-controls test seam for `file_ownership` evidence; defaults to a no-op, so
+		 * callers/tests that don't care about ownership evidence need not supply it. */
+		recordEvent?: (event: string, payload: Record<string, unknown>) => void;
+		/** `scoped_leads` freshness gate: current repo HEAD, or null when unknown. Defaults to
+		 * `() => null`, which makes every scoped-lead handoff decision fall back to the ordinary
+		 * long-lived lead (an unknown head is never trustworthy) — safe for tests that don't set it up. */
+		gitHead?: () => string | null;
+		/** `scoped_leads` freshness gate: a bridge-observed dirty-tree fingerprint (see
+		 * `gitDirtySnapshot`), or null when unavailable. Defaults to `() => null`, which — like a
+		 * missing `gitHead` — makes every scoped-lead handoff decision fall back to the ordinary
+		 * long-lived lead rather than trust an unknown tree state. */
+		treeSnapshot?: () => Map<string, string> | null;
+	},
+): Promise<{
+	leadResults: DispatchResult[];
+	workerResults: DispatchResult[];
+	skippedLeads: number;
+	leadTasks: DispatchTask[];
+	/** See the identically-named field on `dispatchHierarchical()`'s return type. */
+	scopedLeadPhaseResults: DispatchResult[];
+}> {
+	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars = RECON_EVIDENCE_MAX_CHARS, leadCapability = "lead", precomputedRecon } = input;
+	const controls = input.controls ?? loadEfficiencyControls().controls;
+	const requestedLeadCount = effectiveLeadCount(plan);
+
+	let reconTasks: DispatchTask[];
+	let workerResults: DispatchResult[];
+	let reconEvidence: string;
+	if (precomputedRecon) {
+		// recon_before_architect already ran (and billed) this recon before the
+		// architect was dispatched; do not dispatch or bill it a second time.
+		({ reconTasks, workerResults, reconEvidence } = precomputedRecon);
+		effects.throwIfCancelled();
+		effects.setPhase(
+			reconTasks.length > 0
+				? `recon already gathered before the architect ran: ${workerResults.filter((r) => r.exitCode === 0).length}/${reconTasks.length} completed; dispatching lead(s)`
+				: `no parent-owned recon required (already determined before the architect ran); dispatching lead(s)`,
+		);
+	} else {
+		({ reconTasks, workerResults, reconEvidence } = await runParentOwnedRecon(
+			{ runId, goal, plan, evidenceMaxChars },
+			effects,
+			"; dispatching lead(s)",
+		));
+	}
 
 	// Several leads need the architect's Lead assignments (scope + depends on).
 	// Without them, run ONE lead with the whole goal rather than N clones.
@@ -4231,10 +4626,31 @@ export async function dispatchReconAndLeads(
 	if (requestedLeadCount > 1 && !assignments) {
 		effects.setPhase(`topology asked for ${requestedLeadCount} leads but the architect gave no valid Lead assignments; running a single lead`);
 	}
-	const waves = assignments ? planLeadWaves(assignments) : [[0]];
+	const plannedWaves = assignments ? planLeadWaves(assignments) : [[0]];
+
+	// `file_ownership`: off leaves plannedWaves untouched with no evidence;
+	// report leaves waves untouched but emits overlap/undeclared evidence;
+	// serialize splits waves so no two co-scheduled leads overlap or are
+	// undeclared. See file-ownership.ts.
+	const ownershipMode = controls.file_ownership.mode;
+	const owners: OwnershipInput[] = assignments
+		? assignments.map((a) => (a.owns ? { lead: a.index, owns: a.owns } : { lead: a.index }))
+		: [{ lead: 0 }];
+	const { waves, evidence: ownershipEvidence } = serializeWaves(plannedWaves, owners, ownershipMode);
+	if (ownershipMode !== "off") {
+		for (const row of ownershipEvidence) effects.recordEvent?.("lead_ownership", { run_id: runId, ...row });
+		// `unsafe`: `serializeWaves` already schedules around an unsafe declared path (it
+		// forces `pathsOverlap` to report overlap with everything it's compared against),
+		// but `ownershipEvidence` above only ever names both sides of an overlap pair, not
+		// which lead's OWN path was malformed. Surface that as its own row so an unsafe
+		// path that happens to have no co-scheduled overlap partner is never silently lost.
+		const { unsafe } = findOwnershipOverlaps(owners);
+		for (const lead of unsafe) effects.recordEvent?.("lead_ownership", { run_id: runId, kind: "ownership_unsafe_path", lead });
+	}
+
 	const leadTaskFor = (i: number): DispatchTask => ({
 		capability: leadCapability,
-		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter, assignments?.[i]),
+		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter, assignments?.[i], controls),
 		taskId: `${runId}-lead-${i}`,
 	});
 
@@ -4254,7 +4670,202 @@ export async function dispatchReconAndLeads(
 	// prompt was never kept anywhere past this function; callers now use this
 	// to recover the lead's original goal/scope/model-routing prompt on retry.
 	const leadTasks: DispatchTask[] = [];
+	// Ground truth (not declared ownership) for file_ownership's post-run
+	// `lead_edit_conflict` evidence — only populated when the mode is on.
+	const leadFileChanges: Array<{ lead: number; files: string[] }> = [];
 	const stopped = new Set<number>();
+	// `scoped_leads`: non-final phase results (e.g. the plan phase, when a lead
+	// continues to integrate) are billed via `capture()` below like any other
+	// dispatch, but are not `leadResults` entries themselves (that list holds
+	// each lead's LAST phase, for status parsing) — collected here so the
+	// caller can fold their cost into its summary without double-billing.
+	const scopedLeadPhaseResults: DispatchResult[] = [];
+
+	/**
+	 * `scoped_leads`: run lead `i` as plan -> integrate -> report, each phase a
+	 * fresh dispatch of the SAME long-lived lead task id, decided between
+	 * phases from a machine-checkable `## Handoff` block instead of re-reading
+	 * the whole transcript. Any problem extracting/validating the handoff,
+	 * staleness against the current HEAD, a dirty-tree fingerprint that changed
+	 * or is unknown since the prior phase, or an over-budget bounded handoff
+	 * falls back to the ordinary long-lived lead (after plan) or lets the last
+	 * good phase stand (after integrate) — never guesses. A failed/blocked plan
+	 * dispatch is a lead failure exactly like today: no further phases, nothing
+	 * to fall back to.
+	 *
+	 * Every already-captured phase result (`planResult`/`integrateResult`) is
+	 * pushed into `scopedLeadPhaseResults` as soon as it is known NOT to be the
+	 * final result returned for this lead — including every fallback path — so
+	 * `collectBilledResults()` counts its cost/nested cost/duration/dispatch
+	 * exactly once no matter which phase ends up being the lead's last one.
+	 *
+	 * `abort` is the current wave's shared abort state (see the call site below):
+	 * once ANY sibling lead's chain in this wave has thrown, `checkAbort()` makes
+	 * every other chain throw that SAME error (preserving its identity, including
+	 * a cancellation error) before starting any further phase of its own. A
+	 * dispatch/capture already in flight for this chain's CURRENT phase is never
+	 * interrupted — only the next phase is prevented from starting.
+	 */
+	const runScopedLead = async (i: number, abort: { errored: boolean; error?: unknown }): Promise<DispatchResult> => {
+		const baseTask = leadTaskFor(i);
+		const leadTaskId = baseTask.taskId;
+		const currentHead = () => effects.gitHead?.() ?? null;
+		const treeSnapshot = () => effects.treeSnapshot?.() ?? null;
+		// Before starting any new phase (including the very first): a sibling's
+		// error/cancellation already recorded on `abort` takes priority — rethrown
+		// with its original identity — over the ordinary run-level cancellation check.
+		const checkAbort = () => {
+			if (abort.errored) throw abort.error;
+			effects.throwIfCancelled();
+		};
+		const fallbackToLongLivedLead = async (): Promise<DispatchResult> => {
+			checkAbort();
+			const [fallbackResult] = await effects.dispatch([baseTask]);
+			await effects.capture(fallbackResult);
+			effects.throwIfCancelled();
+			return fallbackResult;
+		};
+
+		checkAbort();
+		const planTask: DispatchTask = {
+			capability: baseTask.capability,
+			taskId: `${leadTaskId}-plan`,
+			phase: "plan",
+			task: scopedPhasePrompt("plan", baseTask.task),
+		};
+		const [planResult] = await effects.dispatch([planTask]);
+		await effects.capture(planResult);
+		checkAbort();
+
+		if (planResult.exitCode !== 0 || parseLeadStatus(planResult.stdout) === "blocked") {
+			effects.recordEvent?.("scoped_lead_phase", {
+				run_id: runId, lead_task_id: leadTaskId, phase: "plan", handoff_valid: false, stale: false, truncated: false,
+			});
+			return planResult;
+		}
+		// BLOCKER fix: `planResult` is never the final result past this point (either
+		// a fallback dispatch or `integrateResult`/`reportResult` will be), so bill it
+		// via `scopedLeadPhaseResults` now, before any fallback branch can return early.
+		scopedLeadPhaseResults.push(planResult);
+
+		const postPlanSnapshot = treeSnapshot();
+		const planExtract = extractHandoff(planResult.stdout);
+		const planExpect: ExpectedHandoff = { phase: "plan", runId, leadTaskId };
+		const planValid = planExtract.problems.length === 0 && !!planExtract.handoff && validateHandoff(planExtract.handoff, planExpect).length === 0;
+		const planStale = planValid && planExtract.handoff ? handoffStaleness(planExtract.handoff, currentHead()).stale : false;
+		// Freshness gate: snapshot taken immediately before the integrate phase would
+		// start, compared against the snapshot taken right after the plan phase
+		// finished, restricted to the paths this handoff says are relevant (or the
+		// whole tree, when none are declared).
+		const preIntegrateSnapshot = treeSnapshot();
+		// `relevantHandoffPaths` assumes the shapes `validateHandoff` guarantees (e.g. iterating
+		// `file_ownership` keys and `work[].files`); a malformed handoff (missing/wrong-typed
+		// fields) must never reach it — gate on `planValid`, not merely on `planExtract.handoff`
+		// being present, so an invalid handoff falls back through the ordinary path instead of
+		// throwing here.
+		const planRelevantPaths = planValid && planExtract.handoff ? relevantHandoffPaths(planExtract.handoff) : [];
+		const planTreeUnchanged = treeUnchangedFor(postPlanSnapshot, preIntegrateSnapshot, planRelevantPaths);
+		const planDecision = decideContinuation({
+			handoff: planExtract.handoff, problems: planExtract.problems, currentHead: currentHead(), expect: planExpect,
+			treeUnchanged: planTreeUnchanged,
+		});
+		const planBound = planDecision.action === "continue" && planExtract.handoff
+			? boundHandoff(planExtract.handoff, controls.scoped_leads.max_handoff_chars)
+			: undefined;
+		effects.recordEvent?.("scoped_lead_phase", {
+			run_id: runId, lead_task_id: leadTaskId, phase: "plan",
+			handoff_valid: planValid, stale: planStale, truncated: planBound?.truncated ?? false,
+		});
+
+		if (planDecision.action === "fallback_long_lived_lead") {
+			effects.recordEvent?.("scoped_lead_fallback", {
+				run_id: runId, lead_task_id: leadTaskId, phase: "plan", reason: boundFallbackReasonCodes(planDecision.reason),
+			});
+			// Fallback after plan: dispatch the ordinary long-lived lead; its result IS the lead's
+			// result — but the plan phase may already have made real edits ("Files Changed"),
+			// so the union with the plan phase's own filesChanged must still be carried forward.
+			return finalizeScopedLeadResult(await fallbackToLongLivedLead(), [planResult]);
+		}
+		if (planBound && !planBound.withinBudget) {
+			effects.recordEvent?.("scoped_lead_fallback", {
+				run_id: runId, lead_task_id: leadTaskId, phase: "plan", reason: "handoff_over_budget",
+			});
+			return finalizeScopedLeadResult(await fallbackToLongLivedLead(), [planResult]);
+		}
+
+		checkAbort();
+		const integrateTask: DispatchTask = {
+			capability: baseTask.capability,
+			taskId: `${leadTaskId}-integrate`,
+			phase: "integrate",
+			task: scopedPhasePrompt("integrate", baseTask.task, { text: planBound!.text }),
+		};
+		const [integrateResult] = await effects.dispatch([integrateTask]);
+		await effects.capture(integrateResult);
+		checkAbort();
+
+		if (integrateResult.exitCode !== 0 || parseLeadStatus(integrateResult.stdout) === "blocked") {
+			effects.recordEvent?.("scoped_lead_phase", {
+				run_id: runId, lead_task_id: leadTaskId, phase: "integrate", handoff_valid: false, stale: false, truncated: false,
+			});
+			return finalizeScopedLeadResult(integrateResult, [planResult]);
+		}
+
+		const postIntegrateSnapshot = treeSnapshot();
+		const integrateExtract = extractHandoff(integrateResult.stdout);
+		const integrateExpect: ExpectedHandoff = { phase: "integrate", runId, leadTaskId };
+		const integrateValid = integrateExtract.problems.length === 0 && !!integrateExtract.handoff && validateHandoff(integrateExtract.handoff, integrateExpect).length === 0;
+		const integrateStale = integrateValid && integrateExtract.handoff ? handoffStaleness(integrateExtract.handoff, currentHead()).stale : false;
+		// Freshness gate for integrate -> report, mirroring plan -> integrate above.
+		const preReportSnapshot = treeSnapshot();
+		// Same gate as the plan boundary above: only a `validateHandoff`-clean handoff is safe
+		// to pass to `relevantHandoffPaths`.
+		const integrateRelevantPaths = integrateValid && integrateExtract.handoff ? relevantHandoffPaths(integrateExtract.handoff) : [];
+		const integrateTreeUnchanged = treeUnchangedFor(postIntegrateSnapshot, preReportSnapshot, integrateRelevantPaths);
+		const integrateDecision = decideContinuation({
+			handoff: integrateExtract.handoff, problems: integrateExtract.problems, currentHead: currentHead(), expect: integrateExpect,
+			treeUnchanged: integrateTreeUnchanged,
+		});
+		const integrateBound = integrateDecision.action === "continue" && integrateExtract.handoff
+			? boundHandoff(integrateExtract.handoff, controls.scoped_leads.max_handoff_chars)
+			: undefined;
+		effects.recordEvent?.("scoped_lead_phase", {
+			run_id: runId, lead_task_id: leadTaskId, phase: "integrate",
+			handoff_valid: integrateValid, stale: integrateStale, truncated: integrateBound?.truncated ?? false,
+		});
+
+		if (integrateDecision.action === "fallback_long_lived_lead") {
+			effects.recordEvent?.("scoped_lead_fallback", {
+				run_id: runId, lead_task_id: leadTaskId, phase: "integrate", reason: boundFallbackReasonCodes(integrateDecision.reason),
+			});
+			// Fallback after integrate: the integrate result stands as the lead's
+			// result — skip report, and do not re-dispatch workers or re-run tests. The plan
+			// phase's own filesChanged is unioned in so QA scope still covers it.
+			return finalizeScopedLeadResult(integrateResult, [planResult]);
+		}
+		if (integrateBound && !integrateBound.withinBudget) {
+			effects.recordEvent?.("scoped_lead_fallback", {
+				run_id: runId, lead_task_id: leadTaskId, phase: "integrate", reason: "handoff_over_budget",
+			});
+			// Same contract as the ordinary integrate fallback above: the integrate
+			// result stands, report is not dispatched.
+			return finalizeScopedLeadResult(integrateResult, [planResult]);
+		}
+		scopedLeadPhaseResults.push(integrateResult);
+
+		checkAbort();
+		const reportTask: DispatchTask = {
+			capability: baseTask.capability,
+			taskId: `${leadTaskId}-report`,
+			phase: "report",
+			task: scopedPhasePrompt("report", baseTask.task, { text: integrateBound!.text }),
+		};
+		const [reportResult] = await effects.dispatch([reportTask]);
+		await effects.capture(reportResult);
+		effects.throwIfCancelled();
+		return finalizeScopedLeadResult(reportResult, [planResult, integrateResult]);
+	};
+
 	for (const [w, wave] of waves.entries()) {
 		// A lead whose dependency failed or reported STATUS: blocked is not started.
 		const runnable = wave.filter((i) => !(assignments?.[i]?.dependsOn ?? []).some((d) => stopped.has(d)));
@@ -4265,16 +4876,75 @@ export async function dispatchReconAndLeads(
 		}
 		if (runnable.length === 0) continue;
 		if (waves.length > 1) effects.setPhase(`wave ${w + 1}/${waves.length}: lead(s) ${runnable.map((i) => i + 1).join(", ")}`);
-		const tasks = runnable.map(leadTaskFor);
-		const results = await effects.dispatch(tasks);
-		for (const r of results) await effects.capture(r);
-		// Same contract as recon: bill every finished lead, then honour cancellation.
-		effects.throwIfCancelled();
-		for (const [k, r] of results.entries()) {
-			if (r.exitCode !== 0 || parseLeadStatus(r.stdout) === "blocked") stopped.add(runnable[k]);
+		if (!controls.scoped_leads.enabled) {
+			const tasks = runnable.map(leadTaskFor);
+			const results = await effects.dispatch(tasks);
+			for (const r of results) await effects.capture(r);
+			// Same contract as recon: bill every finished lead, then honour cancellation.
+			effects.throwIfCancelled();
+			for (const [k, r] of results.entries()) {
+				if (r.exitCode !== 0 || parseLeadStatus(r.stdout) === "blocked") stopped.add(runnable[k]);
+				if (ownershipMode !== "off") leadFileChanges.push({ lead: runnable[k], files: r.filesChanged });
+			}
+			leadResults.push(...results);
+			leadTasks.push(...tasks);
+		} else {
+			// `scoped_leads`: each runnable lead moves through its own plan/integrate/report
+			// (or falls back) independently; dependency skipping and the stopped-set contract
+			// below are unchanged. Independent leads within the SAME wave (already known not
+			// to depend on each other) run concurrently — one lead's phase chain is still
+			// strictly sequential internally, but two leads' chains overlap in time. Every
+			// phase within a chain is captured (billed) before that chain's own
+			// `checkAbort`/`throwIfCancelled` check, exactly as in the sequential case.
+			//
+			// `Promise.all` would reject as soon as the FIRST chain throws, returning
+			// control to the caller (which tears down `ACTIVE_RUN`) while sibling chains
+			// are still dispatching in the background — a sibling's next `throwIfCancelled`
+			// would then be checking against an already-cleared run and could dispatch a
+			// phase nothing is listening for anymore. `waveAbort` plus `Promise.allSettled`
+			// instead: (1) the first chain to throw records that error (identity preserved)
+			// on `waveAbort` so every OTHER chain's own `checkAbort()` throws the SAME error
+			// before starting its own next phase — no new phase starts anywhere in this wave
+			// once any chain has errored; (2) this function does not return/reject until
+			// EVERY chain has settled, so an in-flight dispatch a sibling already started is
+			// always finished and billed via `capture()` first; (3) the error rethrown below
+			// is the actual first-to-occur one (not settled-array order), so a cancellation
+			// error still propagates as a cancellation.
+			const waveAbort: { errored: boolean; error?: unknown } = { errored: false };
+			const settled = await Promise.allSettled(
+				runnable.map(async (i) => {
+					try {
+						return await runScopedLead(i, waveAbort);
+					} catch (err) {
+						if (!waveAbort.errored) {
+							waveAbort.errored = true;
+							waveAbort.error = err;
+						}
+						throw err;
+					}
+				}),
+			);
+			if (waveAbort.errored) throw waveAbort.error;
+			for (const [k, settledResult] of settled.entries()) {
+				// Unreachable when `waveAbort.errored` is false: every chain either
+				// fulfilled or its rejection would have set `waveAbort.errored` above.
+				if (settledResult.status !== "fulfilled") continue;
+				const i = runnable[k];
+				const final = settledResult.value;
+				if (final.exitCode !== 0 || parseLeadStatus(final.stdout) === "blocked") stopped.add(i);
+				if (ownershipMode !== "off") leadFileChanges.push({ lead: i, files: final.filesChanged });
+				leadResults.push(final);
+				leadTasks.push(leadTaskFor(i));
+			}
 		}
-		leadResults.push(...results);
-		leadTasks.push(...tasks);
+	}
+
+	// file_ownership: ground-truth edit conflicts observed from what leads
+	// actually changed (not what they declared), reported only in report/serialize.
+	if (ownershipMode !== "off") {
+		for (const conflict of observedEditConflicts(leadFileChanges)) {
+			effects.recordEvent?.("lead_edit_conflict", { run_id: runId, ...conflict });
+		}
 	}
 
 	// Recon is parent-owned and returned for billing/reporting. Any further
@@ -4282,8 +4952,11 @@ export async function dispatchReconAndLeads(
 	// lead's own context window; the bridge has no visibility into it and does
 	// not count it as part of this run's authoritative worker accounting.
 	// Leads never started because a lead they depend on failed or was blocked.
-	const skippedLeads = [...stopped].filter((i) => !leadResults.some((r) => r.taskId === `${runId}-lead-${i}`)).length;
-	return { leadResults, workerResults, skippedLeads, leadTasks };
+	// A scoped lead's final result may carry a `-plan`/`-integrate`/`-report`
+	// suffix instead of the bare `${runId}-lead-${i}` id, so match either form.
+	const leadResultExists = (i: number) => leadResults.some((r) => r.taskId === `${runId}-lead-${i}` || r.taskId.startsWith(`${runId}-lead-${i}-`));
+	const skippedLeads = [...stopped].filter((i) => !leadResultExists(i)).length;
+	return { leadResults, workerResults, skippedLeads, leadTasks, scopedLeadPhaseResults };
 }
 
 /**
@@ -4299,11 +4972,16 @@ export function collectBilledResults(input: {
 	leadResults: DispatchResult[];
 	verificationResults: DispatchResult[];
 	escalationResults: DispatchResult[];
+	/** `scoped_leads`: non-final scoped-phase results (e.g. a completed plan phase whose
+	 * lead continued to integrate). Absent/empty when the switch is off or no lead used
+	 * it; `leadResults` never contains these, so including them here does not double-bill. */
+	scopedLeadPhaseResults?: DispatchResult[];
 }): DispatchResult[] {
 	return [
 		...(input.architectResult ? [input.architectResult] : []),
 		...input.workerResults,
 		...input.leadResults,
+		...(input.scopedLeadPhaseResults ?? []),
 		...input.verificationResults,
 		...input.escalationResults,
 	];
@@ -4332,7 +5010,12 @@ function complexityNeedsArchitect(complexity: number): boolean {
 	return complexity >= METHOD.rules.pre_implementation_recon.min_complexity;
 }
 
-export function architectPrompt(goal: string, plan: PlanResponse): string {
+export function architectPrompt(
+	goal: string,
+	plan: PlanResponse,
+	controls: EfficiencyControls = loadEfficiencyControls().controls,
+	reconEvidence?: string,
+): string {
 	return [
 		`You are the architect for this orchestration. Produce a concrete task plan.`,
 		"",
@@ -4344,6 +5027,13 @@ export function architectPrompt(goal: string, plan: PlanResponse): string {
 		`Recommended capability: ${plan.route.recommended.capability} @ ${plan.route.recommended.effort}`,
 		`Quality floor: ${plan.effective_quality_floor}`,
 		"",
+		// `recon_before_architect`: the bridge already ran the same parent-owned
+		// recon Rule 2 would have given a lead, and billed it once, before this
+		// architect dispatch — hand it the same bounded evidence. Absent only when
+		// the switch is off (the default), in which case behaviour is unchanged.
+		...(controls.recon_before_architect.enabled && reconEvidence !== undefined
+			? ["Recon evidence:", "", reconEvidence, ""]
+			: []),
 		"Output:",
 		"## Tasks",
 		"One numbered task per line, each with: capability (technical_lead | implementation_strong | implementation_fast | qa_agent | technical_review | security_review), a one-line description, and acceptance criteria.",
@@ -4351,10 +5041,36 @@ export function architectPrompt(goal: string, plan: PlanResponse): string {
 		"## Dependencies",
 		"Which tasks block which.",
 		"",
-		...leadAssignmentInstructions(plan),
+		...leadAssignmentInstructions(plan, controls),
 		"## Done When",
 		"Observable end-state.",
+		...(controls.delegation_guidance.enabled ? ["", ...delegationGuidanceSection("architect", controls)] : []),
+		...(controls.event_waiting_guidance.enabled ? ["", ...eventWaitingGuidanceSection()] : []),
 	].join("\n");
+}
+
+/**
+ * `delegation_guidance` / `event_waiting_guidance`: guidance-only text, never
+ * enforced — no dispatch is ever killed or blocked for exceeding the budget
+ * described here, and no timers are added anywhere the guidance is emitted.
+ */
+function delegationGuidanceSection(role: "architect" | "lead", controls: EfficiencyControls): string[] {
+	const budget = controls.delegation_guidance.own_tool_budget[role];
+	const reads = controls.delegation_guidance.targeted_reads_allowed;
+	return [
+		"Delegation guidance (own-tool budget — guidance only; this dispatch is never killed or blocked for exceeding it):",
+		`- You have an own-tool budget of about ${budget} tool calls, including up to ${reads} targeted file/diff reads.`,
+		"- Targeted file/diff reads (a specific file, a specific diff) are fine within that budget.",
+		"- For broad exploration or follow-up research, dispatch orch-scout instead (with its routed model) rather than reading broadly yourself.",
+		"- Test runs may be delegated to orch-worker.",
+		"- Once you are past your own-tool budget, delegate the rest instead of continuing to use your own tools.",
+	];
+}
+
+function eventWaitingGuidanceSection(): string[] {
+	return [
+		"Subagent waiting guidance: subagent calls block until completion. Do not `sleep` or poll, and do not call orchestrator_status in a loop. Wait on the subagent result directly; use at most one status check, and only when diagnosing an apparent stall.",
+	];
 }
 
 /** Clamp the planner's lead count the same way dispatchReconAndLeads does. */
@@ -4369,17 +5085,23 @@ function effectiveLeadCount(plan: PlanResponse): number {
 	return Number.isFinite(leads) ? Math.min(MAX_LEADS, Math.max(1, Math.trunc(leads))) : 1;
 }
 
-function leadAssignmentInstructions(plan: PlanResponse): string[] {
+function leadAssignmentInstructions(plan: PlanResponse, controls: EfficiencyControls): string[] {
 	const n = effectiveLeadCount(plan);
 	if (n <= 1) return [];
-	return [
+	const lines = [
 		"## Lead assignments",
 		`The topology has ${n} leads. Assign each lead a distinct, non-overlapping scope, one line per lead, exactly:`,
 		"Lead 1: <scope> (depends on: none)",
 		"Lead 2: <scope> (depends on: 1)",
 		"A lead that needs another lead's output MUST list it under depends on; dependent leads run after the leads they depend on, never in parallel. If the work cannot be split into independent or clearly ordered scopes, give Lead 1 the whole goal and give the other leads `(depends on: 1)` scopes that only verify or extend it. Without this section the orchestrator runs a single lead.",
-		"",
 	];
+	// `file_ownership` (report/serialize): the architect must also say which
+	// files/paths each lead owns, so overlap can be reported or serialized.
+	if (controls.file_ownership.mode !== "off") {
+		lines.push("Also declare each lead's owned files/paths with `(owns: path, ...)` on the same line, e.g. `Lead 1: <scope> (depends on: none) (owns: src/foo.ts, src/bar/**)`.");
+	}
+	lines.push("");
+	return lines;
 }
 
 /**
@@ -4405,6 +5127,19 @@ function modelTableForLead(adapter: Adapter): string[] {
 	];
 }
 
+/**
+ * `file_ownership` (report/serialize): tells the lead its declared owned
+ * paths and instructs it to pass `ownerPaths` on its own subagent tasks, so
+ * the subagent tool's existing ownership-based scheduling can keep the
+ * lead's own parallel workers from colliding.
+ */
+function fileOwnershipLeadSection(owns: string[]): string[] {
+	return [
+		`File ownership: you own the following path(s) for this run: ${owns.map((p) => `\`${p}\``).join(", ")}.`,
+		"When you dispatch your own parallel subagent tasks via the subagent tool, pass `ownerPaths` (scoped within your owned paths above) on each task so the subagent tool's own ownership-based scheduling keeps your parallel workers from colliding.",
+	];
+}
+
 export function leadPrompt(
 	goal: string,
 	plan: PlanResponse,
@@ -4414,6 +5149,7 @@ export function leadPrompt(
 	leadCount: number,
 	adapter: Adapter,
 	assignment?: LeadAssignment,
+	controls: EfficiencyControls = loadEfficiencyControls().controls,
 ): string {
 	// Only forward a plan the architect actually produced. A failed architect
 	// dispatch used to be pasted in as an empty "Architect's plan:" section,
@@ -4472,6 +5208,9 @@ export function leadPrompt(
 		...modelTableForLead(adapter),
 		"",
 		LEAD_STATUS_CONTRACT,
+		...(controls.delegation_guidance.enabled ? ["", ...delegationGuidanceSection("lead", controls)] : []),
+		...(controls.event_waiting_guidance.enabled ? ["", ...eventWaitingGuidanceSection()] : []),
+		...(controls.file_ownership.mode !== "off" && assignment?.owns ? ["", ...fileOwnershipLeadSection(assignment.owns)] : []),
 	].join("\n");
 }
 
@@ -4966,6 +5705,7 @@ export default function (pi: ExtensionAPI) {
 			ACTIVE_RUN = session;
 			CURRENT_RUN_TAGS = { profile: resolved.profileName, policy_id: policyIdFor(resolved.profileName, adapter) };
 			CURRENT_ALIAS_TABLE = resolved.table;
+			CURRENT_MODEL_SOURCES = resolved.sources;
 			recordRunStarted(runId, ctx.sessionManager?.getSessionFile?.() ?? null);
 			session.log(`policy: ${CURRENT_RUN_TAGS.policy_id}`);
 			session.log(`models (profile "${resolved.profileName}"):\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
@@ -5146,7 +5886,7 @@ export default function (pi: ExtensionAPI) {
 				const headBefore = gitHead(cwd);
 				// `workerResults` carries the parent-owned recon dispatches; they must stay
 				// destructured here or the run stops billing them (plan Task 3).
-				const { leadResults, workerResults, architectResult, escalationResults, skippedLeads, leadTasks } = await dispatchHierarchical(
+				const { leadResults, workerResults, architectResult, escalationResults, skippedLeads, leadTasks, scopedLeadPhaseResults } = await dispatchHierarchical(
 
 					cwd,
 					runId,
@@ -5220,7 +5960,15 @@ export default function (pi: ExtensionAPI) {
 				// Only when EVERY lead exited 0 and says it changed nothing: a lead that
 				// failed, timed out or hit the spend cap may have edited files it never
 				// got to report, and those must still be verified.
-				const externalFiles = runOutcome === "blocked" ? [...allFiles] : externalChangeFiles(allFiles, leadResults);
+				// `qaScopeEvidenceFor`: a scoped lead's final result may be a REPORT phase that
+				// correctly says "Files Changed: None" for itself while an earlier plan/integrate
+				// phase in the same chain made real edits (already unioned into `filesChanged`,
+				// see `finalizeScopedLeadResult`); classify from that union rather than only the
+				// final phase's prose, or those files are wrongly treated as changed by someone
+				// else and dropped from QA.
+				const externalFiles = runOutcome === "blocked"
+					? [...allFiles]
+					: externalChangeFiles(allFiles, qaScopeEvidenceFor(leadResults));
 				if (externalFiles.length > 0) {
 					session.log(
 						`${externalFiles.length} file(s) changed during the run but no lead reported changing them (likely a concurrent session); excluded from QA: ${externalFiles.join(", ")}`,
@@ -5264,7 +6012,9 @@ export default function (pi: ExtensionAPI) {
 					// per-lead whether a retry is warranted instead of only ever
 					// retrying lead 0.
 					const leadsForEscalation: EscalationLeadInput[] = leadResults.map((r) => {
-						const task = leadTasks.find((t) => t.taskId === r.taskId) ?? { capability: r.capability, task: r.stdout, taskId: r.taskId };
+						// A scoped-lead's final result may carry a `-plan`/`-integrate`/`-report` suffix
+						// instead of the bare lead task id; either form recovers the original prompt.
+						const task = leadTasks.find((t) => t.taskId === r.taskId || r.taskId.startsWith(`${t.taskId}-`)) ?? { capability: r.capability, task: r.stdout, taskId: r.taskId };
 						return { task, result: { exitCode: r.exitCode, stdout: r.stdout, filesChanged: r.filesChanged } };
 					});
 					const escalationTasks = planEscalation(
@@ -5364,6 +6114,7 @@ export default function (pi: ExtensionAPI) {
 					leadResults,
 					verificationResults,
 					escalationResults,
+					scopedLeadPhaseResults,
 				});
 				// Leads' own subagent calls are billed too: they were the bulk of real spend
 				// (ht-orch-1790256789245-1a3fms: $13.22 nested vs $1.56 reported).
@@ -5390,6 +6141,11 @@ export default function (pi: ExtensionAPI) {
 					retries,
 					models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
 					log_dir: session.dir,
+					// Observational only (Phase 2 telemetry): distinguishes wall time from the
+					// summed billed duration of every dispatch this run paid for, so the two are
+					// never conflated when reading the run outcome.
+					summed_dispatch_ms: billedResults.reduce((s, r) => s + (r.durationMs ?? 0), 0),
+					run_wall_ms: session.terminalTiming().elapsed_ms,
 				}, session.terminalTiming(), session.telemetryBaseline);
 
 				// The lead's final report is the only place its reasoning, open
@@ -5511,6 +6267,7 @@ export default function (pi: ExtensionAPI) {
 						ACTIVE_RUN = null;
 						CURRENT_RUN_TAGS = {};
 						CURRENT_ALIAS_TABLE = null;
+						CURRENT_MODEL_SOURCES = {};
 					}
 					session.finish();
 				}

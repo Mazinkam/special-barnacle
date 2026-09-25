@@ -115,6 +115,27 @@
       "mode": "warn",
       "usd_by_capability": { "lead_small": 1.5, "lead": 4.0, "lead_large": 10.0, "architect": 2.0 },
       "default_usd": 1.0
+    },
+    "efficiency_controls": {
+      "summary": "Phase-2 opt-in efficiency switches. Every switch defaults OFF; each is independent. Off = byte-identical baseline behaviour.",
+      "config_version": "2026-09-25.1",
+      "recon_before_architect": { "enabled": false },
+      "delegation_guidance": { "enabled": false, "own_tool_budget": { "architect": 12, "lead": 25 }, "targeted_reads_allowed": 8 },
+      "event_waiting_guidance": { "enabled": false },
+      "scoped_leads": { "enabled": false, "max_handoff_chars": 12000 },
+      "file_ownership": { "mode": "off" }
+    },
+    "model_canaries": {
+      "summary": "Comparison candidates only; never primary replacements or automatic promotions. 0% exposure until explicitly enabled AND qualification is available.",
+      "config_version": "2026-09-25.1",
+      "enabled": false,
+      "activation_available": false,
+      "activation_unavailable_reason": "catalog model qualification (tool/context/reasoning requirement checks) is not on main; it exists only on the unmerged feat/model-failover branch",
+      "exclude_capabilities": ["security_review"],
+      "candidates": [
+        { "id": "premium-gpt-5.6-sol", "tier": "premium", "model": "gpt-5.6-sol", "percentage": 0 },
+        { "id": "impl-gpt-6-sol", "capabilities": ["implementation_fast", "implementation_strong"], "model": "gpt-6-sol", "percentage": 0 }
+      ]
     }
   }
 }

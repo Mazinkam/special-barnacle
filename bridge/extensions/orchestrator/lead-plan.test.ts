@@ -30,6 +30,29 @@ describe("parseLeadAssignments", () => {
 	});
 });
 
+describe("parseLeadAssignments — owns", () => {
+	test("absent owns parenthesis leaves owns undefined", () => {
+		const a = parseLeadAssignments(plan("Lead 1: a\nLead 2: b (depends on: 1)"), 2);
+		expect(a?.[0].owns).toBeUndefined();
+		expect(a?.[1].owns).toBeUndefined();
+	});
+	test("owns parenthesis parses paths, strips backticks, splits on commas/semicolons", () => {
+		const a = parseLeadAssignments(plan(
+			"Lead 1: backend (owns: `src/a.ts`, src/b.ts; src/c.ts) (depends on: none)\n" +
+			"Lead 2: frontend",
+		), 2);
+		expect(a?.[0].owns).toEqual(["src/a.ts", "src/b.ts", "src/c.ts"]);
+		expect(a?.[0].scope).toBe("backend");
+		expect(a?.[1].owns).toBeUndefined();
+	});
+	test("owns parenthesis works regardless of order relative to depends-on", () => {
+		const a = parseLeadAssignments(plan("Lead 1: a\nLead 2: b (owns: src/x) (depends on: 1)"), 2);
+		expect(a?.[1].owns).toEqual(["src/x"]);
+		expect(a?.[1].dependsOn).toEqual([0]);
+		expect(a?.[1].scope).toBe("b");
+	});
+});
+
 describe("planLeadWaves", () => {
 	test("independent leads run in one wave; chains run sequentially", () => {
 		expect(planLeadWaves([{ index: 0, scope: "a", dependsOn: [] }, { index: 1, scope: "b", dependsOn: [] }])).toEqual([[0, 1]]);

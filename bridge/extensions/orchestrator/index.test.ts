@@ -13,6 +13,8 @@ import { METHOD, TIER_CAPABILITIES, buildAliasTable } from "./models.ts";
 import type { DispatchResult, DispatchTask } from "./index.ts";
 import { RunCancellation } from "./cancellation.ts";
 import { MAX_CHILD_STDERR_DISK_BYTES } from "./dispatch-outcome.ts";
+import { loadEfficiencyControls, type EfficiencyControls } from "./efficiency-flags.ts";
+import { externalChangeFiles } from "./run-outcome.ts";
 
 mock.module("@humain/terminal", () => ({
 	BorderedLoader: class {
@@ -27,6 +29,13 @@ mock.module("@humain/terminal", () => ({
 	discoverAgents: () => ({ agents: [
 		{ name: "orch-implementation-fast", tools: ["read", "write", "edit", "bash"], systemPrompt: "" },
 		{ name: "orch-scout", tools: ["read", "grep", "find", "ls", "bash"], systemPrompt: "scout persona" },
+		// Mirrors bridge/agents/orchestrator-lead.md and orch-architect.md's real
+		// frontmatter `tools:` lists — neither carries `write`/`edit` (see the
+		// "Delegation rule (hard)" section of orchestrator-lead.md). Added for the
+		// lead/architect tool-permissions test below; every other agent name still
+		// resolves to nothing, which is what main's tests assume.
+		{ name: "orchestrator-lead", tools: ["read", "bash", "grep", "find", "ls", "subagent"], systemPrompt: "" },
+		{ name: "orch-architect", tools: ["read", "grep", "find", "ls", "bash"], systemPrompt: "" },
 	] }),
 	renderTaskWithContext: (task: string) => task,
 }));
@@ -582,6 +591,61 @@ describe("recon tool boundary", () => {
 			}),
 		});
 		expect(personas).toEqual(["orch-scout.md", "orch-scout.md", "orch-scout.md"]);
+	});
+});
+
+// Phase 2 item 3 (tool permissions): a lead/architect dispatch's own tool
+// allow-list comes ONLY from its persona frontmatter (`--tools`, see
+// runSubagentProcess's `tools = opts.tools && opts.tools.length > 0 ? opts.tools
+// : persona?.tools`) — dispatchParallel never passes a `tools:` override for
+// these capabilities (that is reserved for recon, see the boundary above).
+// This proves the child process is actually launched WITHOUT `edit`/`write` in
+// its allow-list, not just that the persona file on disk lacks them.
+describe("lead/architect tool permissions", () => {
+	for (const capability of ["lead", "architect"] as const) {
+		test(`${capability} dispatch passes --tools without edit/write`, async () => {
+			const invocations: string[][] = [];
+			const tasks: DispatchTask[] = [{ taskId: `run-${capability}`, capability, task: "do the thing" }];
+			await orchestrator.dispatchParallel(process.cwd(), "run", tasks,
+				{ [capability]: { model: "provider/some-model" } }, {} as never, 0, {
+				recordEvent: async () => {},
+				runProcess: (opts) => orchestrator.runSubagentProcess({
+					...opts,
+					spawnChild: (_command, args) => {
+						invocations.push([...args]);
+						throw new Error("test: stop at subprocess creation");
+					},
+				}),
+			});
+			expect(invocations).toHaveLength(1);
+			const args = invocations[0];
+			const toolsIndex = args.indexOf("--tools");
+			expect(toolsIndex).toBeGreaterThan(-1);
+			const tools = args[toolsIndex + 1].split(",");
+			expect(tools).not.toContain("edit");
+			expect(tools).not.toContain("write");
+			// Sanity: the allow-list is real, not accidentally empty/absent.
+			expect(tools.length).toBeGreaterThan(0);
+		});
+	}
+
+	// Ties the mock persona's `tools:` list above to the real frontmatter on disk,
+	// so the mock cannot silently drift from what production actually resolves.
+	test("mock personas' tool lists match the real bridge/agents frontmatter", () => {
+		const real: Record<string, string> = {
+			lead: readFileSync(join(import.meta.dir, "..", "..", "agents", "orchestrator-lead.md"), "utf-8"),
+			architect: readFileSync(join(import.meta.dir, "..", "..", "agents", "orch-architect.md"), "utf-8"),
+		};
+		const mocked: Record<string, string[]> = {
+			lead: ["read", "bash", "grep", "find", "ls", "subagent"],
+			architect: ["read", "grep", "find", "ls", "bash"],
+		};
+		for (const key of ["lead", "architect"] as const) {
+			const m = /^tools:\s*(.+)$/m.exec(real[key]);
+			expect(m).not.toBeNull();
+			const realTools = m![1].split(",").map((t) => t.trim());
+			expect(mocked[key].sort()).toEqual([...realTools].sort());
+		}
 	});
 });
 
@@ -2712,6 +2776,59 @@ describe("runSubagentProcess process/event handling", () => {
 			rmSync(fixtureDir, { recursive: true, force: true });
 		}
 	});
+
+	// Phase 2 telemetry (observational only): the dispatch's own tool mix, peak
+	// context tokens, and observable polls, counted from the real child event
+	// stream `runSubagentProcess` already parses.
+	test("telemetry counts own tool mix, delegated subagent calls, and observable polls", async () => {
+		const session = createSession("telemetry-tool-mix");
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "telemetry-mix", session,
+				spawnChild: spawnInlineScript([
+					'const events=[',
+					'{type:"tool_execution_start",toolName:"bash",args:{command:"sleep 5"}},',
+					'{type:"tool_execution_start",toolName:"orchestrator_status",args:{}},',
+					'{type:"tool_execution_start",toolName:"bash",args:{command:"ls"}},',
+					'{type:"tool_execution_start",toolName:"subagent",args:{tasks:[1,2]}},',
+					'{type:"tool_execution_start",toolName:"read",args:{path:"a.ts"}},',
+					'{type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:"done"}],usage:{input:1,output:1,cost:{total:0},totalTokens:4200}}},',
+					'{type:"agent_end"},{type:"agent_settled"}];',
+					'for(const e of events) process.stdout.write(JSON.stringify(e)+"\\n");',
+				].join("")),
+			});
+			expect(result.telemetry?.turns).toBe(1);
+			expect(result.telemetry?.peak_context_tokens).toBe(4200);
+			expect(result.telemetry?.context_token_semantics).toBe("provider_total_tokens_per_message");
+			expect(result.telemetry?.own_tool_calls).toBe(5);
+			expect(result.telemetry?.own_tool_mix).toEqual({ bash: 2, orchestrator_status: 1, subagent: 1, read: 1 });
+			expect(result.telemetry?.delegated_subagent_calls).toBe(1);
+			expect(result.telemetry?.observable_poll_calls).toBe(2);
+		} finally {
+			session.close();
+		}
+	});
+
+	test("telemetry's peak_context_tokens is null (never 0) when no usage was ever reported", async () => {
+		const session = createSession("telemetry-no-usage");
+		try {
+			const result = await orchestrator.runSubagentProcess({
+				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "telemetry-no-usage", session,
+				spawnChild: spawnInlineScript([
+					'const events=[',
+					'{type:"tool_execution_start",toolName:"read",args:{path:"a.ts"}},',
+					'{type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:"done"}]}},',
+					'{type:"agent_end"},{type:"agent_settled"}];',
+					'for(const e of events) process.stdout.write(JSON.stringify(e)+"\\n");',
+				].join("")),
+			});
+			expect(result.telemetry?.peak_context_tokens).toBeNull();
+		} finally {
+			session.close();
+		}
+	});
 });
 
 describe("verification outcome records", () => {
@@ -2961,6 +3078,66 @@ describe("dispatch records (T6)", () => {
 			expect(source).not.toContain(`event: passed ? "${event}"`);
 			expect(source).not.toContain(`event: "${event}"`);
 		}
+	});
+
+	// Phase 2, item 1/2: telemetry + canary fields are ADDED to the model_call row;
+	// every field this suite already asserted above must stay byte-identical.
+	test("telemetry/canary/experiment_flags are additive: the pre-existing model_call fields are unchanged", () => {
+		const withoutExtras = recordsFor({})[0];
+		const withExtras = recordsFor({
+			telemetry: { turns: 3, peak_context_tokens: 12000, context_token_semantics: "provider_total_tokens_per_message", own_tool_calls: 4, own_tool_mix: { bash: 4 }, delegated_subagent_calls: 0, observable_poll_calls: 0 },
+			canary: { canary_cohort: "baseline", canary_candidate_id: null, canary_activation: "disabled", canary_reason: "canary_disabled", canary_policy_version: "unversioned", baseline_model: "provider/model", candidate_model: null, requested_model: "provider/model", executed_model: "provider/model", canary_attempt_id: "run-1-worker-a", canary_deviation: null },
+			experimentFlags: [],
+		})[0];
+		const preExistingKeys = Object.keys(withoutExtras);
+		for (const key of preExistingKeys) expect(withExtras[key]).toEqual(withoutExtras[key]);
+	});
+
+	test("model_call carries the dispatch's telemetry fields when present", () => {
+		const [call] = recordsFor({
+			telemetry: {
+				turns: 5,
+				peak_context_tokens: 48000,
+				context_token_semantics: "provider_total_tokens_per_message",
+				own_tool_calls: 7,
+				own_tool_mix: { bash: 3, read: 4 },
+				delegated_subagent_calls: 2,
+				observable_poll_calls: 1,
+				dispatch_phase: "implementation",
+			},
+		});
+		expect(call.turns).toBe(5);
+		expect(call.peak_context_tokens).toBe(48000);
+		expect(call.context_token_semantics).toBe("provider_total_tokens_per_message");
+		expect(call.own_tool_calls).toBe(7);
+		expect(call.own_tool_mix).toEqual({ bash: 3, read: 4 });
+		expect(call.delegated_subagent_calls).toBe(2);
+		expect(call.observable_poll_calls).toBe(1);
+		expect(call.dispatch_phase).toBe("implementation");
+	});
+
+	test("model_call carries peak_context_tokens as null (never 0) when no usage was observed", () => {
+		const [call] = recordsFor({
+			telemetry: { turns: 0, peak_context_tokens: null, context_token_semantics: "provider_total_tokens_per_message", own_tool_calls: 0, own_tool_mix: {}, delegated_subagent_calls: 0, observable_poll_calls: 0 },
+		});
+		expect(call.peak_context_tokens).toBeNull();
+	});
+
+	test("model_call carries the canary assignment and experiment_flags when present", () => {
+		const [call] = recordsFor({
+			canary: {
+				canary_cohort: "baseline", canary_candidate_id: "impl-gpt-6-sol", canary_activation: "disabled",
+				canary_reason: "canary_disabled", canary_policy_version: "2026-09-25.1", baseline_model: "provider/model",
+				candidate_model: "other/candidate", requested_model: "provider/model", executed_model: "provider/model",
+				canary_attempt_id: "run-1-worker-a", canary_deviation: null,
+			},
+			experimentFlags: ["scoped_leads"],
+		});
+		expect(call.canary_cohort).toBe("baseline");
+		expect(call.requested_model).toBe("provider/model");
+		expect(call.executed_model).toBe("provider/model");
+		expect(call.canary_deviation).toBeNull();
+		expect(call.experiment_flags).toEqual(["scoped_leads"]);
 	});
 });
 
@@ -4377,6 +4554,119 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 	});
 });
 
+describe("model canary telemetry through dispatchParallel (Phase 2 item 2)", () => {
+	const nestedProc = (over: Partial<Awaited<ReturnType<typeof orchestrator.runSubagentProcess>>>) => ({
+		exitCode: 0, stdout: "ok", finalText: "ok", rawStdout: "", personaCanMutate: false, stderr: "",
+		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.01, contextTokens: 0, turns: 1 },
+		costUsd: 0.01, costReported: true, durationMs: 5, outcome: "completed" as const, processExitCode: 0, ...over,
+	});
+	const implTask: DispatchTask[] = [{ capability: "implementation_fast", task: "impl work", taskId: "run-impl-0" }];
+
+	test("under the shipped (disabled) config, cohort is baseline and requested === executed === baseline model", async () => {
+		// `worker` (cheap tier, not implementation_fast/strong) has no matching
+		// candidate at all, so eligibility is decided without needing an alias
+		// table — exercising the common case for most capabilities.
+		const workerTask: DispatchTask[] = [{ capability: "worker", task: "work", taskId: "run-worker-0" }];
+		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", workerTask,
+			{ worker: { model: "provider/worker-model" } }, {} as never, 0, {
+				recordEvent: () => {},
+				runProcess: async (opts) => nestedProc({ model: opts.model }),
+			});
+		expect(result.canary).toMatchObject({
+			canary_cohort: "baseline",
+			canary_activation: "disabled",
+			canary_reason: "no_matching_candidate",
+			baseline_model: "provider/worker-model",
+			requested_model: "provider/worker-model",
+			executed_model: "provider/worker-model",
+			canary_deviation: null,
+		});
+		// Observational only: the model actually dispatched never changes.
+		expect(result.model).toBe("provider/worker-model");
+	});
+
+	test("a resolvable matching candidate still stays on baseline while canaries are globally disabled", async () => {
+		// implementation_fast matches the "impl-gpt-6-sol" candidate by capability name;
+		// with an alias table that CAN resolve it, this exercises the full eligibility
+		// path (resolvable, not tier-lowering, not equal-to-baseline) down to the
+		// `activation === "disabled"` branch, which still returns cohort "baseline".
+		const table = buildAliasTable([{ provider: "some-provider", id: "gpt-6-sol" }]);
+		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", implTask,
+			{ implementation_fast: { model: "provider/impl-model" } }, {} as never, 0, {
+				recordEvent: () => {},
+				aliasTable: table,
+				runProcess: async (opts) => nestedProc({ model: opts.model }),
+			});
+		expect(result.canary).toMatchObject({
+			canary_cohort: "baseline",
+			canary_activation: "disabled",
+			canary_reason: "canary_disabled",
+			canary_candidate_id: "impl-gpt-6-sol",
+			candidate_model: "some-provider/gpt-6-sol",
+			baseline_model: "provider/impl-model",
+			requested_model: "provider/impl-model",
+			executed_model: "provider/impl-model",
+			canary_deviation: null,
+		});
+		expect(result.model).toBe("provider/impl-model");
+	});
+
+	test("an explicit operator override (binding source 'flag') makes the assignment ineligible", async () => {
+		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", implTask,
+			{ implementation_fast: { model: "provider/impl-model" } }, {} as never, 0, {
+				recordEvent: () => {},
+				runProcess: async (opts) => nestedProc({ model: opts.model }),
+				modelSources: { implementation_fast: "flag" },
+			});
+		expect(result.canary?.canary_cohort).toBe("ineligible");
+		expect(result.canary?.canary_reason).toBe("explicit_user_override");
+		expect(result.model).toBe("provider/impl-model");
+	});
+
+	test("a codex -> Bedrock quota fallback labels canary_deviation from executed vs requested model", async () => {
+		const table = buildAliasTable([
+			{ provider: "openai-codex", id: "gpt-6-astra" },
+			{ provider: "amazon-bedrock", id: "global.openai.gpt-6-astra" },
+		]);
+		const fallbackTask: DispatchTask[] = [{ capability: "implementation_fast", task: "impl work", taskId: "run-impl-fb" }];
+		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", fallbackTask,
+			{ implementation_fast: { model: "openai-codex/gpt-6-astra" } }, {} as never, 0, {
+				recordEvent: () => {},
+				aliasTable: table,
+				runProcess: async (opts) => opts.model === "openai-codex/gpt-6-astra"
+					? nestedProc({ exitCode: 1, stderr: "usage limit reached for this account", model: opts.model })
+					: nestedProc({ model: opts.model }),
+			});
+		expect(result.model).toBe("amazon-bedrock/global.openai.gpt-6-astra");
+		expect(result.canary?.requested_model).toBe("openai-codex/gpt-6-astra");
+		expect(result.canary?.executed_model).toBe("amazon-bedrock/global.openai.gpt-6-astra");
+		// Same underlying baseline, different provider after the quota fallback:
+		// executed != requested, so a deviation must be labelled, never silently null.
+		expect(result.canary?.canary_deviation).not.toBeNull();
+	});
+
+	test("security_review is excluded from canary comparison entirely", async () => {
+		const secTask: DispatchTask[] = [{ capability: "security_review", task: "review", taskId: "run-sec-canary" }];
+		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", secTask,
+			{ security_review: { model: "provider/sec-model" } }, {} as never, 0, {
+				recordEvent: () => {},
+				runProcess: async (opts) => nestedProc({ model: opts.model }),
+			});
+		expect(result.canary?.canary_reason).toBe("capability_excluded");
+		expect(result.canary?.canary_cohort).toBe("baseline");
+	});
+
+	test("experiment_flags reflects loadEfficiencyControls().enabled at dispatch time", async () => {
+		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", implTask,
+			{ implementation_fast: { model: "provider/impl-model" } }, {} as never, 0, {
+				recordEvent: () => {},
+				runProcess: async (opts) => nestedProc({ model: opts.model }),
+				efficiencyControls: { controls: {} as never, problems: [], enabled: ["scoped_leads"] },
+			});
+		expect(result.experimentFlags).toEqual(["scoped_leads"]);
+	});
+});
+
 describe("nested subagent cost rows (Phase 1 item 2)", () => {
 	const nestedProc = (over: Partial<Awaited<ReturnType<typeof orchestrator.runSubagentProcess>>>) => ({
 		exitCode: 0, stdout: "ok", finalText: "ok", rawStdout: "", personaCanMutate: false, stderr: "",
@@ -4632,3 +4922,1334 @@ describe("effort telemetry vocabulary", () => {
 	});
 });
 
+
+// -----------------------------------------------------------------------------
+// Efficiency controls (efficiency-flags.ts) wiring: recon_before_architect,
+// delegation_guidance, event_waiting_guidance, file_ownership. All four
+// switches default OFF; every test below that omits `controls` relies on that
+// default via loadEfficiencyControls(), matching production behaviour.
+// -----------------------------------------------------------------------------
+
+describe("efficiency controls wiring: off is byte-identical to today", () => {
+	const offControls = loadEfficiencyControls().controls;
+	const multiLeadPlan = { ...planFixture, complexity: 8, topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" } };
+
+	test("architectPrompt: explicit off controls match the default (no controls arg)", () => {
+		expect(orchestrator.architectPrompt("g", multiLeadPlan, offControls)).toBe(orchestrator.architectPrompt("g", multiLeadPlan));
+		expect(orchestrator.architectPrompt("g", planFixture, offControls)).toBe(orchestrator.architectPrompt("g", planFixture));
+	});
+
+	test("leadPrompt: explicit off controls match the default (no controls arg)", () => {
+		const assignment = { index: 1, scope: "A1-A3", dependsOn: [0], owns: ["src/a.ts"] };
+		const withOff = orchestrator.leadPrompt("g", multiLeadPlan, undefined, "", 1, 2, adapterFixture, assignment, offControls);
+		const withDefault = orchestrator.leadPrompt("g", multiLeadPlan, undefined, "", 1, 2, adapterFixture, assignment);
+		expect(withOff).toBe(withDefault);
+	});
+
+	test("dispatchReconAndLeads: explicit off controls dispatch the same task ids/prompts as the default", async () => {
+		const run = async (controls?: EfficiencyControls) => {
+			const dispatched: DispatchTask[] = [];
+			await orchestrator.dispatchReconAndLeads(
+				{ ...reconLeadInput,
+				  plan: { ...planFixture, topology: { ...planFixture.topology, leads: 2 } },
+				  architectResult: twoIndependentLeads,
+				  controls },
+				{
+					dispatch: async (tasks) => { dispatched.push(...tasks); return tasks.map((t) => dispatchResult(t)); },
+					capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+				},
+			);
+			return dispatched;
+		};
+		const withOff = await run(offControls);
+		const withDefault = await run(undefined);
+		expect(withOff.map((t) => t.taskId)).toEqual(withDefault.map((t) => t.taskId));
+		expect(withOff.map((t) => t.task)).toEqual(withDefault.map((t) => t.task));
+	});
+});
+
+describe("recon_before_architect", () => {
+	const architectNeededPlan = { ...planFixture, complexity: 6, topology: { depth: 2, leads: 1, workers: 3, shape: "lead-workers" } };
+	const belowThresholdPlan = { ...planFixture, complexity: 3, topology: { depth: 2, leads: 1, workers: 0, shape: "lead-workers" } };
+	const onControls: EfficiencyControls = structuredClone(loadEfficiencyControls().controls);
+	onControls.recon_before_architect.enabled = true;
+
+	test("runs recon once, feeds the architect prompt, and dispatchReconAndLeads reuses it instead of re-dispatching", async () => {
+		const reconDispatched: string[] = [];
+		const captured: DispatchResult[] = [];
+		const precomputed = await orchestrator.runParentOwnedRecon(
+			{ runId: "run", goal: "repair flow", plan: architectNeededPlan },
+			{
+				dispatch: async (tasks) => { reconDispatched.push(...tasks.map((t) => t.taskId)); return tasks.map((t) => dispatchResult(t)); },
+				capture: async (r) => { captured.push(r); },
+				setPhase: () => {}, throwIfCancelled: () => {},
+			},
+			"; dispatching architect",
+		);
+		expect(reconDispatched).toEqual(["run-recon-0", "run-recon-1", "run-recon-2"]);
+		expect(captured).toHaveLength(3);
+		expect(precomputed.reconEvidence).toContain("run-recon-0");
+
+		const architectText = orchestrator.architectPrompt("repair flow", architectNeededPlan, onControls, precomputed.reconEvidence);
+		expect(architectText).toContain("Recon evidence:");
+		expect(architectText).toContain("run-recon-0");
+
+		const leadDispatched: DispatchTask[] = [];
+		await orchestrator.dispatchReconAndLeads(
+			{ runId: "run", goal: "repair flow", plan: architectNeededPlan, adapter: adapterFixture, controls: onControls, precomputedRecon: precomputed },
+			{
+				dispatch: async (tasks) => { leadDispatched.push(...tasks); return tasks.map((t) => dispatchResult(t)); },
+				capture: async (r) => { captured.push(r); },
+				setPhase: () => {}, throwIfCancelled: () => {},
+			},
+		);
+		// Only the lead was dispatched here; recon was NOT dispatched a second time.
+		expect(leadDispatched.map((t) => t.taskId)).toEqual(["run-lead-0"]);
+		expect(reconDispatched).toEqual(["run-recon-0", "run-recon-1", "run-recon-2"]);
+		// Billed exactly once: 3 recon captures + 1 lead capture, no duplicates.
+		expect(captured.map((r) => r.taskId).sort()).toEqual(["run-lead-0", "run-recon-0", "run-recon-1", "run-recon-2"].sort());
+	});
+
+	test("below-threshold task dispatches no recon fan-out even with the switch on", async () => {
+		const dispatched: string[] = [];
+		const result = await orchestrator.runParentOwnedRecon(
+			{ runId: "run", goal: "small fix", plan: belowThresholdPlan },
+			{
+				dispatch: async (tasks) => { dispatched.push(...tasks.map((t) => t.taskId)); return tasks.map((t) => dispatchResult(t)); },
+				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+			},
+		);
+		expect(dispatched).toEqual([]);
+		expect(result.reconTasks).toEqual([]);
+		expect(result.reconEvidence).toBe("");
+		expect(result.unavailableReason).toContain("below the Rule-2 threshold");
+	});
+
+	test("cancellation between recon and architect: recon is billed but nothing further is dispatched", async () => {
+		const cancellation = new RunCancellation();
+		const dispatched: string[] = [];
+		const captured: DispatchResult[] = [];
+		const run = orchestrator.runParentOwnedRecon(
+			{ runId: "run", goal: "repair flow", plan: architectNeededPlan },
+			{
+				dispatch: async (tasks) => { dispatched.push(...tasks.map((t) => t.taskId)); return tasks.map((t) => dispatchResult(t)); },
+				capture: async (r) => { captured.push(r); cancellation.cancel(); },
+				setPhase: () => {}, throwIfCancelled: () => cancellation.throwIfCancelled(),
+			},
+			"; dispatching architect",
+		);
+		const err = await rejectionOf(run, 2_000, "cancel between recon and architect");
+		expect(err.message).toBe("Orchestration cancelled");
+		// Every recon worker that finished is billed exactly once.
+		expect(captured).toHaveLength(3);
+		// Nothing past recon (an architect dispatch, or a lead dispatch) ever happens:
+		// the caller (dispatchHierarchical) never gets past the rejected promise.
+		expect(dispatched).toEqual(["run-recon-0", "run-recon-1", "run-recon-2"]);
+	});
+
+	test("when no architect is needed, behaviour is unchanged regardless of the switch", async () => {
+		const singleLeadNoArchitect = { ...planFixture, complexity: 2, topology: { depth: 1, leads: 1, workers: 0, shape: "lead-only" } };
+		const run = async (controls?: EfficiencyControls) => {
+			const dispatched: string[] = [];
+			await orchestrator.dispatchReconAndLeads(
+				{ runId: "run", goal: "g", plan: singleLeadNoArchitect, adapter: adapterFixture, controls },
+				{
+					dispatch: async (tasks) => { dispatched.push(...tasks.map((t) => t.taskId)); return tasks.map((t) => dispatchResult(t)); },
+					capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+				},
+			);
+			return dispatched;
+		};
+		expect(await run(onControls)).toEqual(await run(offControlsFixture()));
+	});
+});
+
+describe("dispatchHierarchical: recon -> architect -> leads sequencing (test seam via deps)", () => {
+	// Item 8: exercises the recon_before_architect switch's ordering, recon-billed-once,
+	// and cancellation-stops-everything-further contract at the `dispatchHierarchical`
+	// level itself (not just `dispatchReconAndLeads`), plus the off-default ordering
+	// (architect -> recon -> leads), using the `deps` test seam added for this purpose.
+	// `deps` is never supplied by production code; every field there defaults to exactly
+	// today's real wiring (see dispatchHierarchical's parameter doc comment).
+	const architectNeededPlan = { ...planFixture, complexity: 6, topology: { depth: 2, leads: 1, workers: 3, shape: "lead-workers" } };
+	const fakeCtx = { ui: { notify: () => {} } } as unknown as Parameters<typeof orchestrator.dispatchHierarchical>[6];
+
+	test("recon_before_architect on: recon is billed exactly once, feeds the architect prompt, then a lead runs", async () => {
+		const onControls: EfficiencyControls = structuredClone(loadEfficiencyControls().controls);
+		onControls.recon_before_architect.enabled = true;
+		const dispatched: string[] = [];
+		const billed: string[] = [];
+		const architectPrompts: string[] = [];
+		const dispatch = async (tasks: DispatchTask[]) => {
+			dispatched.push(...tasks.map((t) => t.taskId));
+			return tasks.map((t) => {
+				if (t.capability === "architect") architectPrompts.push(t.task);
+				return dispatchResult(t);
+			});
+		};
+		const result = await orchestrator.dispatchHierarchical(
+			process.cwd(), "run", "plan-1", "repair flow", architectNeededPlan, adapterFixture, fakeCtx, "lead", onControls,
+			{
+				dispatch, capture: async (r) => { billed.push(r.taskId); },
+				setPhase: () => {}, throwIfCancelled: () => {},
+				gitHead: () => "head1", treeSnapshot: () => new Map(),
+			},
+		);
+		expect(dispatched).toEqual(["run-recon-0", "run-recon-1", "run-recon-2", "run-architect", "run-lead-0"]);
+		expect(billed).toEqual(dispatched);
+		expect(new Set(billed).size).toBe(billed.length);
+		expect(architectPrompts[0]).toContain("Recon evidence:");
+		expect(architectPrompts[0]).toContain("run-recon-0");
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+	});
+
+	test("recon_before_architect on: cancellation right after recon dispatches nothing further (no architect, no lead)", async () => {
+		const onControls: EfficiencyControls = structuredClone(loadEfficiencyControls().controls);
+		onControls.recon_before_architect.enabled = true;
+		const cancellation = new RunCancellation();
+		const dispatched: string[] = [];
+		const dispatch = async (tasks: DispatchTask[]) => { dispatched.push(...tasks.map((t) => t.taskId)); return tasks.map((t) => dispatchResult(t)); };
+		const run = orchestrator.dispatchHierarchical(
+			process.cwd(), "run", "plan-1", "repair flow", architectNeededPlan, adapterFixture, fakeCtx, "lead", onControls,
+			{
+				dispatch, capture: async () => { cancellation.cancel(); },
+				setPhase: () => {}, throwIfCancelled: () => cancellation.throwIfCancelled(),
+				gitHead: () => "head1", treeSnapshot: () => new Map(),
+			},
+		);
+		const err = await rejectionOf(run, 2_000, "cancel after recon in dispatchHierarchical");
+		expect(err.message).toBe("Orchestration cancelled");
+		expect(dispatched).toEqual(["run-recon-0", "run-recon-1", "run-recon-2"]);
+	});
+
+	test("controls off (default): architect is dispatched before recon, matching today's ordering", async () => {
+		const dispatched: string[] = [];
+		const dispatch = async (tasks: DispatchTask[]) => { dispatched.push(...tasks.map((t) => t.taskId)); return tasks.map((t) => dispatchResult(t)); };
+		await orchestrator.dispatchHierarchical(
+			process.cwd(), "run", "plan-1", "repair flow", architectNeededPlan, adapterFixture, fakeCtx, "lead", loadEfficiencyControls().controls,
+			{
+				dispatch, capture: async () => {},
+				setPhase: () => {}, throwIfCancelled: () => {},
+				gitHead: () => "head1", treeSnapshot: () => new Map(),
+			},
+		);
+		expect(dispatched).toEqual(["run-architect", "run-recon-0", "run-recon-1", "run-recon-2", "run-lead-0"]);
+	});
+});
+
+function offControlsFixture(): EfficiencyControls {
+	return loadEfficiencyControls().controls;
+}
+
+describe("delegation_guidance", () => {
+	const onControls: EfficiencyControls = structuredClone(loadEfficiencyControls().controls);
+	onControls.delegation_guidance.enabled = true;
+	const multiLeadPlan = { ...planFixture, complexity: 8, topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" } };
+
+	test("architect prompt carries own-tool-budget guidance only when enabled", () => {
+		const on = orchestrator.architectPrompt("g", multiLeadPlan, onControls);
+		const off = orchestrator.architectPrompt("g", multiLeadPlan);
+		expect(on).toContain("Delegation guidance");
+		expect(on).toContain("own-tool budget of about 12 tool calls");
+		expect(on).toContain("orch-scout");
+		expect(off).not.toContain("Delegation guidance");
+	});
+
+	test("lead prompt carries own-tool-budget guidance only when enabled, and is never killed for exceeding it", () => {
+		const on = orchestrator.leadPrompt("g", planFixture, undefined, "", 0, 1, adapterFixture, undefined, onControls);
+		const off = orchestrator.leadPrompt("g", planFixture, undefined, "", 0, 1, adapterFixture);
+		expect(on).toContain("Delegation guidance");
+		expect(on).toContain("own-tool budget of about 25 tool calls");
+		expect(on).toContain("never killed or blocked for exceeding it");
+		expect(on).toContain("orch-worker");
+		expect(off).not.toContain("Delegation guidance");
+	});
+});
+
+describe("event_waiting_guidance", () => {
+	const onControls: EfficiencyControls = structuredClone(loadEfficiencyControls().controls);
+	onControls.event_waiting_guidance.enabled = true;
+
+	test("lead and architect prompts carry the waiting guidance only when enabled", () => {
+		const leadOn = orchestrator.leadPrompt("g", planFixture, undefined, "", 0, 1, adapterFixture, undefined, onControls);
+		const leadOff = orchestrator.leadPrompt("g", planFixture, undefined, "", 0, 1, adapterFixture);
+		expect(leadOn).toContain("block until completion");
+		expect(leadOn).toContain("Do not `sleep`");
+		expect(leadOn).not.toMatch(/setTimeout|setInterval/);
+		expect(leadOff).not.toContain("block until completion");
+
+		const architectOn = orchestrator.architectPrompt("g", planFixture, onControls);
+		expect(architectOn).toContain("block until completion");
+		expect(orchestrator.architectPrompt("g", planFixture)).not.toContain("block until completion");
+	});
+});
+
+describe("file_ownership", () => {
+	const twoOwnedLeadsOverlap = {
+		taskId: "run-architect", capability: "architect", model: "m", exitCode: 0, stderr: "",
+		stdout: "## Lead assignments\nLead 1: backend (depends on: none) (owns: src/shared.ts, src/a.ts)\nLead 2: frontend (depends on: none) (owns: src/shared.ts, src/b.ts)\n",
+		usage: {} as never, durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
+	} as DispatchResult;
+	const twoOwnedLeadsDisjoint = {
+		...twoOwnedLeadsOverlap,
+		stdout: "## Lead assignments\nLead 1: backend (depends on: none) (owns: src/a.ts)\nLead 2: frontend (depends on: none) (owns: src/b.ts)\n",
+	} as DispatchResult;
+	const oneUndeclaredLead = {
+		...twoOwnedLeadsOverlap,
+		stdout: "## Lead assignments\nLead 1: backend (depends on: none) (owns: src/a.ts)\nLead 2: frontend (depends on: none)\n",
+	} as DispatchResult;
+	const twoLeadPlan = { ...planFixture, complexity: 2, topology: { ...planFixture.topology, leads: 2 } };
+	const unsafeOwnedLead = {
+		...twoOwnedLeadsOverlap,
+		stdout: "## Lead assignments\nLead 1: backend (depends on: none) (owns: /etc/passwd)\nLead 2: frontend (depends on: none) (owns: src/b.ts)\n",
+	} as DispatchResult;
+
+	function controlsWithMode(mode: "off" | "report" | "serialize"): EfficiencyControls {
+		const c = structuredClone(loadEfficiencyControls().controls);
+		c.file_ownership.mode = mode;
+		return c;
+	}
+
+	test("architect prompt asks for (owns: ...) only when mode != off", () => {
+		const multiLeadPlan = { ...planFixture, complexity: 8, topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" } };
+		expect(orchestrator.architectPrompt("g", multiLeadPlan, controlsWithMode("report"))).toContain("(owns: path, ...)");
+		expect(orchestrator.architectPrompt("g", multiLeadPlan, controlsWithMode("serialize"))).toContain("(owns: path, ...)");
+		expect(orchestrator.architectPrompt("g", multiLeadPlan, controlsWithMode("off"))).not.toContain("(owns:");
+	});
+
+	test("off: waves unchanged, no ownership evidence emitted", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const dispatched: string[][] = [];
+		await orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan: twoLeadPlan, architectResult: twoOwnedLeadsOverlap, controls: controlsWithMode("off") },
+			{
+				dispatch: async (tasks) => { dispatched.push(tasks.map((t) => t.taskId)); return tasks.map((t) => dispatchResult(t)); },
+				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+				recordEvent: (e, p) => { events.push([e, p]); },
+			},
+		);
+		expect(dispatched).toEqual([["run-lead-0", "run-lead-1"]]);
+		expect(events.filter(([e]) => e === "lead_ownership")).toEqual([]);
+	});
+
+	test("report: waves unchanged, but overlap evidence is emitted per row", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const dispatched: string[][] = [];
+		await orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan: twoLeadPlan, architectResult: twoOwnedLeadsOverlap, controls: controlsWithMode("report") },
+			{
+				dispatch: async (tasks) => { dispatched.push(tasks.map((t) => t.taskId)); return tasks.map((t) => dispatchResult(t)); },
+				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+				recordEvent: (e, p) => { events.push([e, p]); },
+			},
+		);
+		expect(dispatched).toEqual([["run-lead-0", "run-lead-1"]]);
+		const ownershipEvents = events.filter(([e]) => e === "lead_ownership");
+		expect(ownershipEvents).toHaveLength(1);
+		expect(ownershipEvents[0][1]).toMatchObject({ run_id: "run", kind: "ownership_overlap", a: 0, b: 1 });
+	});
+
+	test("report: an unsafe declared path is surfaced as its own lead_ownership evidence row", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		await orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan: twoLeadPlan, architectResult: unsafeOwnedLead, controls: controlsWithMode("report") },
+			{
+				dispatch: async (tasks) => tasks.map((t) => dispatchResult(t)),
+				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+				recordEvent: (e, p) => { events.push([e, p]); },
+			},
+		);
+		const unsafeEvents = events.filter(([e, p]) => e === "lead_ownership" && p.kind === "ownership_unsafe_path");
+		expect(unsafeEvents).toHaveLength(1);
+		expect(unsafeEvents[0][1]).toMatchObject({ run_id: "run", lead: 0 });
+	});
+
+	test("serialize: overlapping leads are split into separate waves, evidence emitted", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const dispatched: string[][] = [];
+		await orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan: twoLeadPlan, architectResult: twoOwnedLeadsOverlap, controls: controlsWithMode("serialize") },
+			{
+				dispatch: async (tasks) => { dispatched.push(tasks.map((t) => t.taskId)); return tasks.map((t) => dispatchResult(t)); },
+				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+				recordEvent: (e, p) => { events.push([e, p]); },
+			},
+		);
+		expect(dispatched).toEqual([["run-lead-0"], ["run-lead-1"]]);
+		const ownershipEvents = events.filter(([e]) => e === "lead_ownership");
+		expect(ownershipEvents.some(([, p]) => p.kind === "ownership_serialized")).toBe(true);
+	});
+
+	test("serialize: disjoint declared ownership is left in one wave", async () => {
+		const dispatched: string[][] = [];
+		await orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan: twoLeadPlan, architectResult: twoOwnedLeadsDisjoint, controls: controlsWithMode("serialize") },
+			{
+				dispatch: async (tasks) => { dispatched.push(tasks.map((t) => t.taskId)); return tasks.map((t) => dispatchResult(t)); },
+				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+			},
+		);
+		expect(dispatched).toEqual([["run-lead-0", "run-lead-1"]]);
+	});
+
+	test("serialize: undeclared ownership always runs alone, never sharing a wave", async () => {
+		const dispatched: string[][] = [];
+		await orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan: twoLeadPlan, architectResult: oneUndeclaredLead, controls: controlsWithMode("serialize") },
+			{
+				dispatch: async (tasks) => { dispatched.push(tasks.map((t) => t.taskId)); return tasks.map((t) => dispatchResult(t)); },
+				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+			},
+		);
+		expect(dispatched).toEqual([["run-lead-0"], ["run-lead-1"]]);
+	});
+
+	test("conflict events are emitted only for real file overlaps observed after leads finish", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const withFiles = (t: DispatchTask, files: string[]): DispatchResult => ({ ...dispatchResult(t), filesChanged: files });
+		await orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan: twoLeadPlan, architectResult: twoOwnedLeadsDisjoint, controls: controlsWithMode("report") },
+			{
+				dispatch: async (tasks) => tasks.map((t) => withFiles(t, t.taskId === "run-lead-0" ? ["src/a.ts", "src/shared.ts"] : ["src/b.ts", "src/shared.ts"])),
+				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+				recordEvent: (e, p) => { events.push([e, p]); },
+			},
+		);
+		const conflicts = events.filter(([e]) => e === "lead_edit_conflict");
+		expect(conflicts).toHaveLength(1);
+		expect(conflicts[0][1]).toMatchObject({ run_id: "run", file: "src/shared.ts", leads: [0, 1] });
+	});
+
+	test("no conflict events when leads touch disjoint files", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const withFiles = (t: DispatchTask, files: string[]): DispatchResult => ({ ...dispatchResult(t), filesChanged: files });
+		await orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan: twoLeadPlan, architectResult: twoOwnedLeadsDisjoint, controls: controlsWithMode("report") },
+			{
+				dispatch: async (tasks) => tasks.map((t) => withFiles(t, t.taskId === "run-lead-0" ? ["src/a.ts"] : ["src/b.ts"])),
+				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+				recordEvent: (e, p) => { events.push([e, p]); },
+			},
+		);
+		expect(events.filter(([e]) => e === "lead_edit_conflict")).toEqual([]);
+	});
+
+	test("lead prompt states owned paths and instructs passing ownerPaths, only when mode != off and paths are declared", () => {
+		const assignment = { index: 0, scope: "backend", dependsOn: [], owns: ["src/a.ts", "src/b/**"] };
+		const on = orchestrator.leadPrompt("g", twoLeadPlan, undefined, "", 0, 2, adapterFixture, assignment, controlsWithMode("report"));
+		const off = orchestrator.leadPrompt("g", twoLeadPlan, undefined, "", 0, 2, adapterFixture, assignment, controlsWithMode("off"));
+		const noOwns = orchestrator.leadPrompt("g", twoLeadPlan, undefined, "", 0, 2, adapterFixture, { index: 0, scope: "backend", dependsOn: [] }, controlsWithMode("report"));
+		expect(on).toContain("File ownership");
+		expect(on).toContain("src/a.ts");
+		expect(on).toContain("ownerPaths");
+		expect(off).not.toContain("File ownership");
+		expect(noOwns).not.toContain("File ownership");
+	});
+});
+
+describe("scoped_leads", () => {
+	const scopedLeadPlan = { ...planFixture, complexity: 2, risk: "low" as const, topology: { depth: 2, leads: 1, workers: 0, shape: "lead-workers" } };
+	const twoLeadChainPlan = { ...planFixture, complexity: 4, topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" } };
+	const chainArchitect = {
+		taskId: "run-architect", capability: "architect", model: "m", exitCode: 0, stderr: "",
+		stdout: "## Lead assignments\nLead 1: backend (depends on: none)\nLead 2: frontend (depends on: 1)\n",
+		usage: {} as never, durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
+	} as DispatchResult;
+
+	function scopedControls(): EfficiencyControls {
+		const c = structuredClone(loadEfficiencyControls().controls);
+		c.scoped_leads.enabled = true;
+		return c;
+	}
+
+	function leadHandoff(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			schema_version: 1,
+			phase: "plan",
+			run_id: "run",
+			lead_task_id: "run-lead-0",
+			base_revision: "head1",
+			decisions: [{ decision: "use approach A", rationale: "fits constraints" }],
+			constraints: ["no new deps"],
+			file_ownership: {},
+			work: [{ task_id: "w1", summary: "did the plan", result: "planned approach A" }],
+			unresolved_risks: ["risk: edge case X unhandled"],
+			verification: [],
+			artifacts: [],
+			...overrides,
+		};
+	}
+
+	function handoffStdout(overrides: Record<string, unknown> = {}): string {
+		return `report body\n\n## Handoff\n\`\`\`json\n${JSON.stringify(leadHandoff(overrides))}\n\`\`\`\n`;
+	}
+
+	function scopedDispatchResult(taskId: string, stdout: string, over: Partial<DispatchResult> = {}): DispatchResult {
+		return {
+			taskId, capability: "lead", model: "provider/model", exitCode: 0, stdout, stderr: "",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.01, contextTokens: 2, turns: 1 },
+			durationMs: 1, costUsd: 0.01, costReported: true, filesChanged: [],
+			...over,
+		};
+	}
+
+	async function runScopedDispatch(opts: {
+		controls: EfficiencyControls;
+		respond: (taskId: string) => DispatchResult;
+		gitHead?: () => string | null;
+		/** Bridge-observed dirty-tree fingerprint effect (see `gitDirtySnapshot`). Defaults to a
+		 *  stable empty snapshot every call (an "unchanged tree" — matches the intent of every
+		 *  test written before the freshness gate existed). Pass `treeSnapshot: undefined`
+		 *  explicitly to simulate the effect never being wired (an unknown tree state). */
+		treeSnapshot?: (() => Map<string, string> | null) | undefined;
+		plan?: typeof planFixture;
+		architectResult?: DispatchResult;
+	}) {
+		const dispatched: DispatchTask[] = [];
+		const batches: string[][] = [];
+		const billed: DispatchResult[] = [];
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const result = await orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan: opts.plan ?? scopedLeadPlan, controls: opts.controls, architectResult: opts.architectResult },
+			{
+				dispatch: async (tasks) => { batches.push(tasks.map((t) => t.taskId)); dispatched.push(...tasks); return tasks.map((t) => opts.respond(t.taskId)); },
+				capture: async (r) => { billed.push(r); },
+				setPhase: () => {}, throwIfCancelled: () => {},
+				recordEvent: (e, p) => { events.push([e, p]); },
+				gitHead: opts.gitHead,
+				treeSnapshot: "treeSnapshot" in opts ? opts.treeSnapshot : () => new Map(),
+			},
+		);
+		return { dispatched, batches, billed, events, result };
+	}
+
+	test("off: dispatches the single long-lived lead task, no phases", async () => {
+		const { batches, result } = await runScopedDispatch({
+			controls: loadEfficiencyControls().controls,
+			respond: (taskId) => scopedDispatchResult(taskId, "report\nSTATUS: completed"),
+		});
+		expect(batches).toEqual([["run-lead-0"]]);
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		expect(result.scopedLeadPhaseResults).toEqual([]);
+	});
+
+	test("on: valid handoffs run plan -> integrate -> report, forwarding the bounded handoff with its decisions and unresolved risks", async () => {
+		const { batches, dispatched, billed, events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({ base_revision: "head1" }));
+				if (taskId === "run-lead-0-integrate") return scopedDispatchResult(taskId, handoffStdout({
+					phase: "integrate", base_revision: "head1",
+					decisions: [{ decision: "integrated approach A", rationale: "matches plan" }],
+				}));
+				if (taskId === "run-lead-0-report") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(batches).toEqual([["run-lead-0-plan"], ["run-lead-0-integrate"], ["run-lead-0-report"]]);
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0-report"]);
+		expect(result.scopedLeadPhaseResults.map((r) => r.taskId)).toEqual(["run-lead-0-plan", "run-lead-0-integrate"]);
+		const integrateTask = dispatched.find((t) => t.taskId === "run-lead-0-integrate")!;
+		expect(integrateTask.phase).toBe("integrate");
+		expect(integrateTask.task).toContain("use approach A");
+		expect(integrateTask.task).toContain("risk: edge case X unhandled");
+		// Item 4: the report phase forwards the bounded INTEGRATE handoff (not the plan one).
+		const reportTask = dispatched.find((t) => t.taskId === "run-lead-0-report")!;
+		expect(reportTask.phase).toBe("report");
+		expect(reportTask.task).toContain("Prior handoff:");
+		expect(reportTask.task).toContain("integrated approach A");
+		expect(billed.map((r) => r.taskId)).toEqual(["run-lead-0-plan", "run-lead-0-integrate", "run-lead-0-report"]);
+		expect(events.filter(([e]) => e === "scoped_lead_fallback")).toEqual([]);
+		const planEvent = events.find(([e, p]) => e === "scoped_lead_phase" && p.phase === "plan");
+		expect(planEvent?.[1]).toMatchObject({ run_id: "run", lead_task_id: "run-lead-0", handoff_valid: true, stale: false, truncated: false });
+		const integrateEvent = events.find(([e, p]) => e === "scoped_lead_phase" && p.phase === "integrate");
+		expect(integrateEvent?.[1]).toMatchObject({ handoff_valid: true, stale: false });
+	});
+
+	test("invalid plan handoff falls back to the ordinary long-lived lead, and the already-captured plan phase is still billed", async () => {
+		const { batches, events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, "report with no handoff section\nSTATUS: completed");
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(batches).toEqual([["run-lead-0-plan"], ["run-lead-0"]]);
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		// BLOCKER fix: the plan phase was already captured before the fallback dispatch
+		// happened, so it must still show up in `scopedLeadPhaseResults` for billing.
+		expect(result.scopedLeadPhaseResults.map((r) => r.taskId)).toEqual(["run-lead-0-plan"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1]).toMatchObject({ run_id: "run", lead_task_id: "run-lead-0", phase: "plan" });
+	});
+
+	test("plan handoff whose base_revision doesn't match the current head falls back (stale)", async () => {
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head-now",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({ base_revision: "head-old" }));
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1].reason as string).toContain("base_revision");
+	});
+
+	test("no gitHead effect (unknown current head) always falls back", async () => {
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout());
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1].reason as string).toContain("unknown");
+	});
+
+	test("invalid integrate handoff: the integrate result stands, no report is dispatched", async () => {
+		const { batches, events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({ base_revision: "head1" }));
+				if (taskId === "run-lead-0-integrate") return scopedDispatchResult(taskId, "no handoff here\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(batches).toEqual([["run-lead-0-plan"], ["run-lead-0-integrate"]]);
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0-integrate"]);
+		expect(result.scopedLeadPhaseResults.map((r) => r.taskId)).toEqual(["run-lead-0-plan"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1]).toMatchObject({ phase: "integrate" });
+	});
+
+	test("plan failure is a lead failure exactly like today; dependent leads are skipped", async () => {
+		const { batches, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			plan: twoLeadChainPlan,
+			architectResult: chainArchitect,
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, "boom", { exitCode: 1, stderr: "boom" });
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(batches).toEqual([["run-lead-0-plan"]]);
+		expect(result.leadResults).toHaveLength(1);
+		expect(result.leadResults[0].exitCode).toBe(1);
+		expect(result.skippedLeads).toBe(1);
+	});
+
+	test("cancellation after the plan phase bills the plan but dispatches nothing further", async () => {
+		const cancellation = new RunCancellation();
+		const dispatched: DispatchTask[] = [];
+		const billed: DispatchResult[] = [];
+		const run = orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan: scopedLeadPlan, controls: scopedControls() },
+			{
+				dispatch: async (tasks) => { dispatched.push(...tasks); return tasks.map((t) => scopedDispatchResult(t.taskId, handoffStdout({ base_revision: "head1" }))); },
+				capture: async (r) => { billed.push(r); cancellation.cancel(); },
+				setPhase: () => {}, throwIfCancelled: () => cancellation.throwIfCancelled(),
+				gitHead: () => "head1",
+				treeSnapshot: () => new Map(),
+			},
+		);
+		expect((await rejectionOf(run, 2_000, "cancel between scoped phases")).message).toBe("Orchestration cancelled");
+		expect(dispatched.map((t) => t.taskId)).toEqual(["run-lead-0-plan"]);
+		expect(billed.map((r) => r.taskId)).toEqual(["run-lead-0-plan"]);
+	});
+
+	test("an oversized handoff is bounded before being forwarded to the integrate prompt", async () => {
+		const controls = scopedControls();
+		// Large enough that shrinking `work[].summary`/`result` alone brings the handoff
+		// within budget (see the dedicated `handoff_over_budget` test for the case where
+		// even a fully shrunk handoff can't fit).
+		controls.scoped_leads.max_handoff_chars = 600;
+		const { dispatched, events } = await runScopedDispatch({
+			controls,
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") {
+					return scopedDispatchResult(taskId, handoffStdout({
+						base_revision: "head1",
+						work: [{ task_id: "w1", summary: "s".repeat(50), result: "x".repeat(2000) }],
+						artifacts: [{ ref: "run-lead-0-plan.stdout.log", description: "full plan output" }],
+					}));
+				}
+				if (taskId === "run-lead-0-integrate") return scopedDispatchResult(taskId, handoffStdout({ phase: "integrate", base_revision: "head1" }));
+				if (taskId === "run-lead-0-report") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		const integrateTask = dispatched.find((t) => t.taskId === "run-lead-0-integrate")!;
+		expect(integrateTask.task).toContain("truncated");
+		const planEvent = events.find(([e, p]) => e === "scoped_lead_phase" && p.phase === "plan");
+		expect(planEvent?.[1].truncated).toBe(true);
+	});
+
+	test("bounding: a handoff still over budget after shrinking falls back with a fixed reason code instead of forwarding it", async () => {
+		const controls = scopedControls();
+		controls.scoped_leads.max_handoff_chars = 10;
+		const { batches, events, result } = await runScopedDispatch({
+			controls,
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({ base_revision: "head1" }));
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(batches).toEqual([["run-lead-0-plan"], ["run-lead-0"]]);
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		expect(result.scopedLeadPhaseResults.map((r) => r.taskId)).toEqual(["run-lead-0-plan"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1]).toMatchObject({ phase: "plan", reason: "handoff_over_budget" });
+	});
+
+	test("bounding: an over-budget integrate handoff stands as final, no report dispatched", async () => {
+		const controls = scopedControls();
+		controls.scoped_leads.max_handoff_chars = 2000;
+		// `decisions` is never shrunk by `boundHandoff` (only `work[].summary`/`result` are),
+		// so a large-but-otherwise-valid `decisions` array reliably stays over budget even
+		// after the shrink loop maxes out.
+		const bigDecisions = Array.from({ length: 20 }, (_, i) => ({
+			decision: `decision number ${i} `.padEnd(150, "x"),
+			rationale: `rationale number ${i} `.padEnd(150, "y"),
+		}));
+		const { batches, events, result } = await runScopedDispatch({
+			controls,
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({ base_revision: "head1" }));
+				if (taskId === "run-lead-0-integrate") return scopedDispatchResult(taskId, handoffStdout({
+					phase: "integrate", base_revision: "head1", decisions: bigDecisions,
+				}));
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(batches).toEqual([["run-lead-0-plan"], ["run-lead-0-integrate"]]);
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0-integrate"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1]).toMatchObject({ phase: "integrate", reason: "handoff_over_budget" });
+	});
+
+	test("every phase is billed exactly once and collectBilledResults includes each without double-counting", async () => {
+		const { billed, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({ base_revision: "head1" }));
+				if (taskId === "run-lead-0-integrate") return scopedDispatchResult(taskId, handoffStdout({ phase: "integrate", base_revision: "head1" }));
+				if (taskId === "run-lead-0-report") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(new Set(billed.map((r) => r.taskId)).size).toBe(billed.length);
+		expect(billed).toHaveLength(3);
+		const billedResults = orchestrator.collectBilledResults({
+			workerResults: [], leadResults: result.leadResults, verificationResults: [], escalationResults: [],
+			scopedLeadPhaseResults: result.scopedLeadPhaseResults,
+		});
+		expect(billedResults.map((r) => r.taskId).sort()).toEqual(["run-lead-0-integrate", "run-lead-0-plan", "run-lead-0-report"].sort());
+		expect(new Set(billedResults.map((r) => r.taskId)).size).toBe(billedResults.length);
+	});
+
+	test("BLOCKER: plan-fallback bills the already-captured plan phase exactly once via collectBilledResults", async () => {
+		const { result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, "no handoff section\nSTATUS: completed");
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		expect(result.scopedLeadPhaseResults.map((r) => r.taskId)).toEqual(["run-lead-0-plan"]);
+		const billedResults = orchestrator.collectBilledResults({
+			workerResults: [], leadResults: result.leadResults, verificationResults: [], escalationResults: [],
+			scopedLeadPhaseResults: result.scopedLeadPhaseResults,
+		});
+		expect(billedResults.map((r) => r.taskId).sort()).toEqual(["run-lead-0", "run-lead-0-plan"]);
+		expect(new Set(billedResults.map((r) => r.taskId)).size).toBe(billedResults.length);
+		expect(billedResults.reduce((s, r) => s + r.costUsd, 0)).toBeCloseTo(0.02);
+	});
+
+	test("BLOCKER: integrate-fallback bills plan and integrate exactly once via collectBilledResults, no report billed", async () => {
+		const { result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({ base_revision: "head1" }));
+				if (taskId === "run-lead-0-integrate") return scopedDispatchResult(taskId, "no handoff here\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0-integrate"]);
+		expect(result.scopedLeadPhaseResults.map((r) => r.taskId)).toEqual(["run-lead-0-plan"]);
+		const billedResults = orchestrator.collectBilledResults({
+			workerResults: [], leadResults: result.leadResults, verificationResults: [], escalationResults: [],
+			scopedLeadPhaseResults: result.scopedLeadPhaseResults,
+		});
+		expect(billedResults.map((r) => r.taskId).sort()).toEqual(["run-lead-0-integrate", "run-lead-0-plan"]);
+		expect(new Set(billedResults.map((r) => r.taskId)).size).toBe(billedResults.length);
+		expect(billedResults.reduce((s, r) => s + r.costUsd, 0)).toBeCloseTo(0.02);
+	});
+
+	test("freshness: a relevant file changed between plan and integrate falls back (stale:tree_changed)", async () => {
+		let call = 0;
+		const snapshots = [new Map([["src/a.ts", "hash1"]]), new Map([["src/a.ts", "hash2"]])];
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			treeSnapshot: () => snapshots[Math.min(call++, snapshots.length - 1)],
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({
+					base_revision: "head1", file_ownership: { "src/a.ts": ["owner"] },
+				}));
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1].reason).toBe("stale:tree_changed");
+	});
+
+	test("freshness: an unchanged relevant file between plan and integrate does not force a fallback", async () => {
+		const snapshot = new Map([["src/a.ts", "hash1"]]);
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			treeSnapshot: () => snapshot,
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({
+					base_revision: "head1", file_ownership: { "src/a.ts": ["owner"] },
+				}));
+				if (taskId === "run-lead-0-integrate") return scopedDispatchResult(taskId, handoffStdout({ phase: "integrate", base_revision: "head1" }));
+				if (taskId === "run-lead-0-report") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0-report"]);
+		expect(events.filter(([e]) => e === "scoped_lead_fallback")).toEqual([]);
+	});
+
+	test("freshness: no treeSnapshot effect (unknown tree state) falls back even with a fresh, valid plan handoff", async () => {
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			treeSnapshot: undefined,
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({ base_revision: "head1" }));
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1].reason).toBe("stale:tree_unknown");
+	});
+
+	test("freshness: a glob scope (src/**) detects a change to a file it covers", async () => {
+		let call = 0;
+		const snapshots = [new Map([["src/a.ts", "hash1"]]), new Map([["src/a.ts", "hash2"]])];
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			treeSnapshot: () => snapshots[Math.min(call++, snapshots.length - 1)],
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({
+					base_revision: "head1", file_ownership: { "src/**": ["owner"] },
+				}));
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1].reason).toBe("stale:tree_changed");
+	});
+
+	test("freshness: a directory scope (src/) detects a change to a file inside it", async () => {
+		let call = 0;
+		const snapshots = [new Map([["src/a.ts", "hash1"]]), new Map([["src/a.ts", "hash2"]])];
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			treeSnapshot: () => snapshots[Math.min(call++, snapshots.length - 1)],
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({
+					base_revision: "head1", file_ownership: { "src/": ["owner"] },
+				}));
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1].reason).toBe("stale:tree_changed");
+	});
+
+	test("freshness: a change to a file outside every declared scope is ignored (no fallback)", async () => {
+		let call = 0;
+		const snapshots = [
+			new Map([["src/a.ts", "hash1"], ["other/file.ts", "o1"]]),
+			new Map([["src/a.ts", "hash1"], ["other/file.ts", "o2"]]),
+		];
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			treeSnapshot: () => snapshots[Math.min(call++, snapshots.length - 1)],
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({
+					base_revision: "head1", file_ownership: { "src/a.ts": ["owner"] },
+				}));
+				if (taskId === "run-lead-0-integrate") return scopedDispatchResult(taskId, handoffStdout({ phase: "integrate", base_revision: "head1" }));
+				if (taskId === "run-lead-0-report") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0-report"]);
+		expect(events.filter(([e]) => e === "scoped_lead_fallback")).toEqual([]);
+	});
+
+	function rawHandoffStdout(raw: Record<string, unknown>): string {
+		return `report body\n\n## Handoff\n\`\`\`json\n${JSON.stringify(raw)}\n\`\`\`\n`;
+	}
+
+	test.each([
+		["empty object", {}],
+		["wrong-typed file_ownership", { file_ownership: 5 }],
+		["wrong-typed work", { work: "x" }],
+	])("malformed plan handoff (%s) falls back instead of throwing", async (_label, raw) => {
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, rawHandoffStdout(raw as Record<string, unknown>));
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1]).toMatchObject({ phase: "plan" });
+		expect((fallback?.[1].reason as string)).toMatch(/^handoff_invalid:/);
+	});
+
+	test.each([
+		["empty object", {}],
+		["wrong-typed file_ownership", { file_ownership: 5 }],
+		["wrong-typed work", { work: "x" }],
+	])("malformed integrate handoff (%s) falls back (integrate result stands) instead of throwing", async (_label, raw) => {
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({ base_revision: "head1" }));
+				if (taskId === "run-lead-0-integrate") return scopedDispatchResult(taskId, rawHandoffStdout(raw as Record<string, unknown>));
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0-integrate"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1]).toMatchObject({ phase: "integrate" });
+		expect((fallback?.[1].reason as string)).toMatch(/^handoff_invalid:/);
+	});
+
+	test("concurrency: a sibling chain's cancellation stops OTHER chains from starting a further phase, but not before their own in-flight phase finishes and is billed", async () => {
+		const plan = { ...planFixture, complexity: 4, topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" } };
+		const cancellation = new RunCancellation();
+		const dispatched: string[] = [];
+		const billed: string[] = [];
+		let resolveIntegrate1: ((r: DispatchResult) => void) | undefined;
+		const dispatch = async (tasks: DispatchTask[]) => Promise.all(tasks.map((t) => {
+			dispatched.push(t.taskId);
+			if (t.taskId === "run-lead-1-integrate") {
+				return new Promise<DispatchResult>((resolve) => { resolveIntegrate1 = resolve; });
+			}
+			if (t.taskId === "run-lead-0-plan") {
+				return Promise.resolve(scopedDispatchResult(t.taskId, handoffStdout({ base_revision: "head1", lead_task_id: "run-lead-0" })));
+			}
+			if (t.taskId === "run-lead-1-plan") {
+				return Promise.resolve(scopedDispatchResult(t.taskId, handoffStdout({ base_revision: "head1", lead_task_id: "run-lead-1" })));
+			}
+			if (t.taskId === "run-lead-0-integrate") {
+				return Promise.resolve(scopedDispatchResult(t.taskId, "no handoff\nSTATUS: completed"));
+			}
+			return Promise.resolve(scopedDispatchResult(t.taskId, "report\nSTATUS: completed"));
+		}));
+		const run = orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan, controls: scopedControls(), architectResult: twoIndependentLeads },
+			{
+				dispatch,
+				capture: async (r) => {
+					billed.push(r.taskId);
+					// Lead 0's integrate phase (invalid handoff -> fallback decision) is what
+					// cancels the run, WHILE lead 1's own integrate dispatch is still in flight.
+					if (r.taskId === "run-lead-0-integrate") cancellation.cancel();
+				},
+				setPhase: () => {}, throwIfCancelled: () => cancellation.throwIfCancelled(),
+				gitHead: () => "head1", treeSnapshot: () => new Map(),
+			},
+		);
+		// Wait for lead 1's integrate dispatch to be in flight (deferred, unresolved).
+		for (let i = 0; i < 50 && !resolveIntegrate1; i++) await Promise.resolve();
+		expect(resolveIntegrate1).toBeDefined();
+		// Flush more microtasks: lead 0's chain has by now thrown (cancellation), but the
+		// overall function must NOT have settled yet, because lead 1's in-flight dispatch
+		// has not resolved.
+		let settled = false;
+		run.then(() => { settled = true; }, () => { settled = true; });
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		expect(settled).toBe(false);
+		expect(dispatched).not.toContain("run-lead-1-report");
+		// Now let lead 1's integrate dispatch resolve. Its chain must still capture
+		// (bill) that finished phase, then stop — no report phase is ever dispatched.
+		resolveIntegrate1!(scopedDispatchResult("run-lead-1-integrate", handoffStdout({ phase: "integrate", base_revision: "head1", lead_task_id: "run-lead-1" })));
+		const err = await rejectionOf(run, 2_000, "cancel while a sibling chain is in flight");
+		expect(err.message).toBe("Orchestration cancelled");
+		expect(billed).toContain("run-lead-1-integrate");
+		expect(dispatched).not.toContain("run-lead-1-report");
+	});
+
+	test("telemetry: a hostile handoff never leaks into recorded events, and fallback reasons are bounded to 10 codes", async () => {
+		const hostileHandoff = {
+			schema_version: "SECRET_TOKEN_123",
+			phase: "SECRET_TOKEN_123",
+			run_id: 123,
+			lead_task_id: 123,
+			base_revision: 123,
+			tested_revision: 123,
+			decisions: "SECRET_TOKEN_123",
+			constraints: "SECRET_TOKEN_123",
+			file_ownership: "SECRET_TOKEN_123",
+			work: "SECRET_TOKEN_123",
+			unresolved_risks: "SECRET_TOKEN_123",
+			verification: "SECRET_TOKEN_123",
+			artifacts: "SECRET_TOKEN_123",
+		};
+		const stdout = `report body SECRET_TOKEN_123\n\n## Handoff\n\`\`\`json\n${JSON.stringify(hostileHandoff)}\n\`\`\`\n`;
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, stdout);
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		expect(JSON.stringify(events)).not.toContain("SECRET_TOKEN_123");
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1].reason as string).toMatch(/^handoff_invalid:/);
+		const reason = fallback?.[1].reason as string;
+		const codes = reason.slice(reason.indexOf(":") + 1).split(",");
+		// 13 fields are malformed above; the recorded reason must never grow unbounded.
+		expect(codes.length).toBeLessThanOrEqual(11);
+	});
+
+	test("concurrency: two independent leads in the same wave run their plan phases concurrently, not one-at-a-time", async () => {
+		const plan = { ...planFixture, complexity: 4, topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" } };
+		const started: string[] = [];
+		const planDeferred: Record<string, (r: DispatchResult) => void> = {};
+		const dispatch = async (tasks: DispatchTask[]) => Promise.all(tasks.map((t) => {
+			started.push(t.taskId);
+			if (t.taskId === "run-lead-0-plan" || t.taskId === "run-lead-1-plan") {
+				return new Promise<DispatchResult>((resolve) => { planDeferred[t.taskId] = resolve; });
+			}
+			return Promise.resolve(scopedDispatchResult(t.taskId, "report\nSTATUS: completed"));
+		}));
+		const run = orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan, controls: scopedControls(), architectResult: twoIndependentLeads },
+			{ dispatch, capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {}, gitHead: () => "head1", treeSnapshot: () => new Map() },
+		);
+		// Both leads' plan phases must already be in flight — a sequential
+		// implementation would only have dispatched lead 0's plan at this point.
+		// (`dispatchReconAndLeads` has several `await`s of already-resolved values
+		// before it reaches the wave loop, so flush microtasks rather than assert
+		// synchronously.)
+		for (let i = 0; i < 50 && started.length < 2; i++) await Promise.resolve();
+		expect(started).toEqual(["run-lead-0-plan", "run-lead-1-plan"]);
+		planDeferred["run-lead-0-plan"](scopedDispatchResult("run-lead-0-plan", "no handoff\nSTATUS: completed"));
+		planDeferred["run-lead-1-plan"](scopedDispatchResult("run-lead-1-plan", "no handoff\nSTATUS: completed"));
+		const result = await run;
+		expect(result.leadResults.map((r) => r.taskId).sort()).toEqual(["run-lead-0", "run-lead-1"]);
+	});
+
+	test("concurrency: billing-before-cancellation still holds for each lead's own chain when leads run concurrently", async () => {
+		const plan = { ...planFixture, complexity: 4, topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" } };
+		const cancellation = new RunCancellation();
+		const billed: string[] = [];
+		const dispatch = async (tasks: DispatchTask[]) => tasks.map((t) => scopedDispatchResult(t.taskId, "no handoff\nSTATUS: completed"));
+		const run = orchestrator.dispatchReconAndLeads(
+			{ ...reconLeadInput, plan, controls: scopedControls(), architectResult: twoIndependentLeads },
+			{
+				dispatch,
+				capture: async (r) => {
+					billed.push(r.taskId);
+					// Cancel while lead 0's plan phase is being billed; lead 1's own
+					// in-flight plan phase must still finish and be billed.
+					if (r.taskId === "run-lead-0-plan") cancellation.cancel();
+				},
+				setPhase: () => {}, throwIfCancelled: () => cancellation.throwIfCancelled(),
+				gitHead: () => "head1", treeSnapshot: () => new Map(),
+			},
+		);
+		expect((await rejectionOf(run, 2_000, "cancel during concurrent scoped leads")).message).toBe("Orchestration cancelled");
+		expect(billed).toContain("run-lead-0-plan");
+		expect(billed).toContain("run-lead-1-plan");
+		expect(new Set(billed).size).toBe(billed.length);
+	});
+
+	test("leadTasks keeps the original long-lived lead prompt regardless of which phase became the final result", async () => {
+		const controls = scopedControls();
+		const { result } = await runScopedDispatch({
+			controls,
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, "no handoff");
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadTasks).toHaveLength(1);
+		expect(result.leadTasks[0].taskId).toBe("run-lead-0");
+		expect(result.leadTasks[0].task).toBe(
+			orchestrator.leadPrompt("repair flow", scopedLeadPlan, undefined, "", 0, 1, adapterFixture, undefined, controls),
+		);
+	});
+
+	test("QA-scope bypass fix: the final result's filesChanged is the union of plan + integrate + report, even though the report itself changed nothing", async () => {
+		const { result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") {
+					return scopedDispatchResult(taskId, handoffStdout({ base_revision: "head1" }), { filesChanged: ["src/auth.ts"] });
+				}
+				if (taskId === "run-lead-0-integrate") {
+					return scopedDispatchResult(taskId, handoffStdout({ phase: "integrate", base_revision: "head1" }), {
+						filesChanged: ["src/auth.ts", "src/session.ts"],
+					});
+				}
+				if (taskId === "run-lead-0-report") {
+					// The report phase itself made no NEW edits — its own "Files Changed" is empty —
+					// but plan/integrate already changed real files in this same chain.
+					return scopedDispatchResult(taskId, "## Files Changed\nNone\nSTATUS: completed", { filesChanged: [] });
+				}
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults).toHaveLength(1);
+		expect(result.leadResults[0].taskId).toBe("run-lead-0-report");
+		expect([...result.leadResults[0].filesChanged].sort()).toEqual(["src/auth.ts", "src/session.ts"]);
+		// The already-billed phase results themselves are never mutated (they still
+		// report only what THEY individually changed).
+		expect(result.scopedLeadPhaseResults.find((r) => r.taskId === "run-lead-0-plan")?.filesChanged).toEqual(["src/auth.ts"]);
+		expect(result.scopedLeadPhaseResults.find((r) => r.taskId === "run-lead-0-integrate")?.filesChanged).toEqual(["src/auth.ts", "src/session.ts"]);
+	});
+
+	test("QA-scope bypass fix: a fallback-after-plan dispatch's result still carries the plan phase's own filesChanged", async () => {
+		const { result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") {
+					// No handoff -> invalid -> falls back after plan, but plan already edited a file.
+					return scopedDispatchResult(taskId, "no handoff section\nSTATUS: completed", { filesChanged: ["src/partial.ts"] });
+				}
+				if (taskId === "run-lead-0") {
+					return scopedDispatchResult(taskId, "## Files Changed\nNone\nSTATUS: completed", { filesChanged: [] });
+				}
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults).toHaveLength(1);
+		expect(result.leadResults[0].taskId).toBe("run-lead-0");
+		expect(result.leadResults[0].filesChanged).toEqual(["src/partial.ts"]);
+	});
+
+	test("QA-scope computation path: externalChangeFiles no longer excludes files a scoped lead's report phase didn't mention", () => {
+		// Exercises the ACTUAL QA-scope computation `qaScopeEvidenceFor` feeds into
+		// `externalChangeFiles` (run-outcome.ts), reproducing the HIGH bug: a scoped
+		// lead's final (report) result whose own prose says "Files Changed: None", but
+		// whose plan phase's own report lists `src/auth.ts`, must not be classified as
+		// "changed by someone else" and dropped from QA.
+		const finalLeadResult = {
+			exitCode: 0,
+			stdout: "## Completed\nDone.\n## Files Changed\nNone\n## Verification\nn/a\nSTATUS: completed",
+			filesChanged: ["src/auth.ts"],
+			scopedPhaseReports: [
+				{ phase: "plan", exitCode: 0, stdout: "## Files Changed\n- `src/auth.ts`\nSTATUS: completed" },
+				{ phase: "report", exitCode: 0, stdout: "## Files Changed\nNone\nSTATUS: completed" },
+			],
+		};
+		const ordinaryLeadResult = { exitCode: 0, stdout: finalLeadResult.stdout, filesChanged: [] };
+		const evidence = orchestrator.qaScopeEvidenceFor([ordinaryLeadResult, finalLeadResult]);
+		// Results without scoped phase reports pass through byte-identically.
+		expect(evidence[0]).toEqual({ exitCode: 0, stdout: finalLeadResult.stdout });
+		expect(externalChangeFiles(["src/auth.ts"], [evidence[0]!])).toEqual(["src/auth.ts"]);
+		// Scoped reports determine classification regardless of the current switch state.
+		expect(externalChangeFiles(["src/auth.ts"], [evidence[1]!])).toEqual([]);
+	});
+
+	test("QA-scope bypass fix: an unbackticked, extensionless path in a phase report (e.g. `Dockerfile`) is not dropped from QA scope just because the filesChanged union missed it", () => {
+		// `parseFilesChanged` (index.ts) only recognizes backtick-quoted paths with a
+		// known extension, so a report phase listing `- Dockerfile` contributes nothing
+		// to `filesChanged`. Reparsing every phase's own stdout with `parseLeadFilesChanged`
+		// (what `externalChangeFiles` itself uses) must still catch it.
+		const lead = {
+			exitCode: 0,
+			stdout: "irrelevant — final phase stdout is not consulted for Files Changed here",
+			filesChanged: [] as string[],
+			scopedPhaseReports: [
+				{ phase: "report", exitCode: 0, stdout: "## Files Changed\n- Dockerfile\nSTATUS: completed" },
+			],
+		};
+		const evidence = orchestrator.qaScopeEvidenceFor([lead]);
+		expect(externalChangeFiles(["Dockerfile"], evidence)).toEqual([]);
+	});
+
+	test("QA-scope bypass fix: an unbackticked plan-phase path (`- src/a.ts`) is kept in scope even though the report phase says None", () => {
+		const lead = {
+			exitCode: 0,
+			stdout: "irrelevant",
+			filesChanged: [] as string[],
+			scopedPhaseReports: [
+				{ phase: "plan", exitCode: 0, stdout: "## Files Changed\n- src/a.ts\nSTATUS: completed" },
+				{ phase: "report", exitCode: 0, stdout: "## Files Changed\nNone\nSTATUS: completed" },
+			],
+		};
+		const evidence = orchestrator.qaScopeEvidenceFor([lead]);
+		expect(externalChangeFiles(["src/a.ts"], evidence)).toEqual([]);
+	});
+
+	test("QA-scope: every phase explicitly None, union empty, all exit 0 — external classification preserved exactly as before the fix", () => {
+		const lead = {
+			exitCode: 0,
+			stdout: "irrelevant",
+			filesChanged: [] as string[],
+			scopedPhaseReports: [
+				{ phase: "plan", exitCode: 0, stdout: "## Files Changed\nNone\nSTATUS: completed" },
+				{ phase: "integrate", exitCode: 0, stdout: "## Files Changed\nNone\nSTATUS: completed" },
+				{ phase: "report", exitCode: 0, stdout: "## Files Changed\nNone\nSTATUS: completed" },
+			],
+		};
+		const evidence = orchestrator.qaScopeEvidenceFor([lead]);
+		expect(externalChangeFiles(["src/unrelated.ts"], evidence)).toEqual(["src/unrelated.ts"]);
+	});
+
+	test("QA-scope: a phase report with no Files Changed section parses unknown, not none — not excluded from QA", () => {
+		const lead = {
+			exitCode: 0,
+			stdout: "irrelevant",
+			filesChanged: [] as string[],
+			scopedPhaseReports: [
+				{ phase: "plan", exitCode: 0, stdout: "No files changed section here.\nSTATUS: completed" },
+				{ phase: "report", exitCode: 0, stdout: "## Files Changed\nNone\nSTATUS: completed" },
+			],
+		};
+		const evidence = orchestrator.qaScopeEvidenceFor([lead]);
+		expect(externalChangeFiles(["src/x.ts"], evidence)).toEqual([]);
+	});
+
+	test("QA-scope: a non-zero phase exit keeps the chain out of the 'all clean' external classification", () => {
+		const lead = {
+			exitCode: 0,
+			stdout: "irrelevant",
+			filesChanged: [] as string[],
+			scopedPhaseReports: [
+				{ phase: "plan", exitCode: 1, stdout: "## Files Changed\nNone\nSTATUS: blocked" },
+				{ phase: "report", exitCode: 0, stdout: "## Files Changed\nNone\nSTATUS: completed" },
+			],
+		};
+		const evidence = orchestrator.qaScopeEvidenceFor([lead]);
+		expect(evidence[0]!.exitCode).not.toBe(0);
+		expect(externalChangeFiles(["src/y.ts"], evidence)).toEqual([]);
+	});
+
+	test("QA-scope: scopedPhaseReports trigger scoped classification; absent reports pass through unchanged", () => {
+		const lead = {
+			exitCode: 0,
+			stdout: "## Files Changed\nNone\nSTATUS: completed",
+			filesChanged: ["src/auth.ts"],
+			scopedPhaseReports: [
+				{ phase: "plan", exitCode: 0, stdout: "## Files Changed\n- `src/auth.ts`" },
+			],
+		};
+		const evidence = orchestrator.qaScopeEvidenceFor([lead]);
+		expect(externalChangeFiles(["src/auth.ts"], evidence)).toEqual([]);
+	});
+
+	test("freshness: a symlink sentinel in the plan handoff's declared scope forces a fallback (stale:tree_unknown) even though the fingerprint didn't change", async () => {
+		const snapshot = new Map([["src/link", "<non-file>"]]);
+		const { events, result } = await runScopedDispatch({
+			controls: scopedControls(),
+			gitHead: () => "head1",
+			treeSnapshot: () => snapshot,
+			respond: (taskId) => {
+				if (taskId === "run-lead-0-plan") return scopedDispatchResult(taskId, handoffStdout({
+					base_revision: "head1", file_ownership: { "src/link": ["owner"] },
+				}));
+				if (taskId === "run-lead-0") return scopedDispatchResult(taskId, "report\nSTATUS: completed");
+				throw new Error(`unexpected dispatch ${taskId}`);
+			},
+		});
+		expect(result.leadResults.map((r) => r.taskId)).toEqual(["run-lead-0"]);
+		const fallback = events.find(([e]) => e === "scoped_lead_fallback");
+		expect(fallback?.[1].reason).toBe("stale:tree_unknown");
+	});
+});
+
+describe("scoped_leads: treeUnchangedFor sentinel fingerprints", () => {
+	const RELEVANT = ["src/link"];
+
+	test("a symlink/non-file (<non-file>) fingerprint unchanged in a relevant key is unknown, not unchanged", () => {
+		const before = new Map([["src/link", "<non-file>"]]);
+		const after = new Map([["src/link", "<non-file>"]]);
+		expect(orchestrator.treeUnchangedFor(before, after, RELEVANT)).toBeNull();
+	});
+
+	test("an unhashable (<unhashable>) fingerprint unchanged in a relevant key is unknown, not unchanged", () => {
+		const before = new Map([["src/link", "<unhashable>"]]);
+		const after = new Map([["src/link", "<unhashable>"]]);
+		expect(orchestrator.treeUnchangedFor(before, after, RELEVANT)).toBeNull();
+	});
+
+	test("a sentinel fingerprint on an IRRELEVANT key does not force unknown", () => {
+		const before = new Map([["src/link", "<non-file>"], ["src/a.ts", "hash1"]]);
+		const after = new Map([["src/link", "<non-file>"], ["src/a.ts", "hash1"]]);
+		expect(orchestrator.treeUnchangedFor(before, after, ["src/a.ts"])).toBe(true);
+	});
+
+	test("whole-tree mode (no declared scope): a sentinel fingerprint anywhere is unknown", () => {
+		const before = new Map([["src/link", "<non-file>"]]);
+		const after = new Map([["src/link", "<non-file>"]]);
+		expect(orchestrator.treeUnchangedFor(before, after, [])).toBeNull();
+	});
+
+	test("a DELETED_FINGERPRINT stays comparable (a real state, not a sentinel)", () => {
+		const before = new Map([["src/link", "<deleted>"]]);
+		const after = new Map([["src/link", "<deleted>"]]);
+		expect(orchestrator.treeUnchangedFor(before, after, RELEVANT)).toBe(true);
+		const afterRecreated = new Map([["src/link", "hash1"]]);
+		expect(orchestrator.treeUnchangedFor(before, afterRecreated, RELEVANT)).toBe(false);
+	});
+
+	test("a relevant key present only in `after` with a sentinel fingerprint is unknown", () => {
+		const before = new Map<string, string>();
+		const after = new Map([["src/link", "<unhashable>"]]);
+		expect(orchestrator.treeUnchangedFor(before, after, RELEVANT)).toBeNull();
+	});
+});

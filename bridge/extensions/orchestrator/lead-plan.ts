@@ -13,10 +13,13 @@ export interface LeadAssignment {
 	scope: string;
 	/** 0-based indices of leads that must finish first. */
 	dependsOn: number[];
+	/** Files/paths this lead owns, when the architect declared them. Undefined (not []) when absent. */
+	owns?: string[];
 }
 
 const LINE_RE = /^[\s>*-]*\**\s*Lead\s+(\d+)\s*:?\**\s*:?\s*(.+?)\s*$/i;
 const DEPS_RE = /\(\s*depends\s+on\s*:\s*([^)]*)\)/i;
+const OWNS_RE = /\(\s*owns\s*:\s*([^)]*)\)/i;
 
 export function parseLeadAssignments(architectText: string, leadCount: number): LeadAssignment[] | null {
 	const section = /^##\s*Lead assignments\s*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/im.exec(architectText)?.[1];
@@ -41,10 +44,20 @@ export function parseLeadAssignments(architectText: string, leadCount: number): 
 				.map((d) => Number(d) - 1);
 			dependsOn = [...new Set(ids)];
 		}
+		let owns: string[] | undefined;
+		const ownsMatch = OWNS_RE.exec(rest);
+		if (ownsMatch) {
+			rest = `${rest.slice(0, ownsMatch.index)} ${rest.slice(ownsMatch.index + ownsMatch[0].length)}`;
+			const items = ownsMatch[1]
+				.split(/,|;/)
+				.map((item) => item.replace(/`/g, "").trim())
+				.filter((item) => item.length > 0);
+			owns = items.length > 0 ? items : undefined;
+		}
 		// Strip bold markers and list punctuation only at the edges, so glob
 		// patterns like src/**/*.ts inside a scope survive.
 		const scope = rest.replace(/\s+/g, " ").trim().replace(/^[\s*.;,]+|[\s*.;,]+$/g, "");
-		out.push({ index, scope, dependsOn });
+		out.push(owns ? { index, scope, dependsOn, owns } : { index, scope, dependsOn });
 	}
 	if (out.length !== leadCount) return null;
 	const indices = new Set(out.map((a) => a.index));
