@@ -253,7 +253,7 @@ def main():
     # only ensured for commands that write or read them; the engine is built where a command needs it.
     # The archive commands never touch the streams at all, so they do not create them either.
     if not (args.cmd=='ingest' and args.dry_run) and args.cmd not in ('archive-runs','restore-run'): EventStore(ROOT)
-    def eng(): return OrchestrationEngine(ROOT)
+    def eng(): return OrchestrationEngine(ROOT, on_change=lambda: generate_dashboard(ROOT, config=C))
     if args.cmd=='init':
         # One coordinated write: durable append -> incremental ledger -> atomic dashboard, instead of
         # an append followed by a full history replay that also discards the record-id cache. A

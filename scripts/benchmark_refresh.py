@@ -460,8 +460,11 @@ def measure(root: Path, scale: int, args: argparse.Namespace, tag: str) -> dict:
     engine = []
     program = '''
 import sys
+from orchestrator.dashboard import generate_dashboard
 from orchestrator.engine import OrchestrationEngine
-engine = OrchestrationEngine()
+def on_change():
+    generate_dashboard(engine.state_root, config=engine.config)
+engine = OrchestrationEngine(on_change=on_change)
 engine.complete_run(sys.argv[1])
 engine.record_model_call(run_id=sys.argv[1], model='benchmark-unpriced', input_tokens=5)
 '''

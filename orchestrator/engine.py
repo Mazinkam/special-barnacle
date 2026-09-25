@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .runtime import EventStore, Policy, QualityEvidence, default_state_root, read_json, stable_hash
 from .state import refresh_ledger
 from .history import load_stats
 from .method import default_efforts
-from .adaptive import adaptive_route, recommend_topology, should_canary
+from .adaptive import adaptive_route, configured_min_samples, recommend_topology, should_canary
 from .features import FeaturePolicy, feature_inventory
 from .policy_simulation import compare_policies
 from .policy_recommendations import recommend_policy as build_policy_recommendation
-from .dashboard import generate_dashboard
 from .vocab import DEFAULT_MIN_SAMPLES
 
 
@@ -22,12 +21,17 @@ class OrchestrationEngine:
     effort, context, and verification policy. The harness resolves those through an adapter.
     """
 
-    def __init__(self, state_root: str | Path | None = None, config_path: str | Path | None = None):
+    def __init__(self, state_root: str | Path | None = None, config_path: str | Path | None = None,
+                 on_change: Callable[[], None] | None = None):
         self.state_root = Path(state_root) if state_root is not None else default_state_root()
         self.store = EventStore(self.state_root)
         self.config_path = Path(config_path) if config_path else Path(__file__).with_name("config.json")
         self.config = read_json(self.config_path, {})
         self.feature_policy = FeaturePolicy(self.config.get('features', {}))
+        # The engine never imports the presentation layer (`dashboard.py`); publishing it after a
+        # state change is an app-layer decision the caller injects. `cli.py` passes the dashboard
+        # render so CLI commands keep refreshing it at the same points as before this was injected.
+        self._on_change: Callable[[], None] = on_change or (lambda: None)
 
     def policy(self) -> Policy:
         o = self.config.get("optimization", {})
@@ -59,7 +63,8 @@ class OrchestrationEngine:
         decay = features.get('historical_learning',{}).get('decay_half_life_days') if features.get('historical_learning',{}).get('decay_old_results',False) else None
         stats = load_stats(self.state_root, history_cfg.get("complexity_bucket_width", 2), decay)
 
-        min_samples=int(features.get('historical_learning',{}).get('minimum_samples',history_cfg.get('min_samples_for_empirical_route',DEFAULT_MIN_SAMPLES)))
+        min_samples=configured_min_samples(
+            features, default=history_cfg.get('min_samples_for_empirical_route', DEFAULT_MIN_SAMPLES))
         route = adaptive_route(
             run_id=run_id, task_class=task_class, complexity=complexity, risk=risk,
             quality_floor=qf, cost_aggressiveness=ca, stats=stats, features=features,
@@ -129,7 +134,7 @@ class OrchestrationEngine:
     def record_model_call(self, **metric: Any) -> dict[str, Any]:
         metric.setdefault("event", "model_call")
         rec = self.store.metric(**metric)
-        generate_dashboard(self.state_root, config=self.config)
+        self._on_change()
         return rec
 
     def verify_task(self, *, task_id: str, run_id: str | None = None, evidence: QualityEvidence,
@@ -181,10 +186,10 @@ class OrchestrationEngine:
 
     def record_outcome(self, task_id: str, **payload: Any) -> None:
         self.store.outcome(task_id=task_id, **payload)
-        generate_dashboard(self.state_root, config=self.config)
+        self._on_change()
 
     def _refresh(self) -> None:
         # Normal lifecycle boundaries catch up from the durable event prefix; only an
         # explicit recovery rebuild should discard the exact-ID cache used by the next append.
         refresh_ledger(self.state_root)
-        generate_dashboard(self.state_root, config=self.config)
+        self._on_change()

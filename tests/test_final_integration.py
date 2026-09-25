@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from orchestrator.dashboard import build_data
+from orchestrator.dashboard import build_data, generate_dashboard
 from orchestrator.engine import OrchestrationEngine
 from orchestrator.history import build_route_stats
 from orchestrator.record_batch import write_batch
@@ -26,7 +26,7 @@ def call(run='R', **kw):
 
 
 def test_engine_failed_verification_is_not_a_pass(tmp_path):
-    engine = OrchestrationEngine(tmp_path)
+    engine = OrchestrationEngine(tmp_path, on_change=lambda: generate_dashboard(tmp_path, config=engine.config))
     engine.record_model_call(**call())
     engine.verify_task(run_id='R', task_id='T', evidence=QualityEvidence())
     engine.verify_task(run_id='R', task_id='other', evidence=QualityEvidence(acceptance_pass=True, deterministic_checks_pass=True))
