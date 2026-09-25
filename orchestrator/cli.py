@@ -2,7 +2,7 @@ from __future__ import annotations
 import argparse,json,os,sys
 from pathlib import Path
 from typing import Any, Callable
-from .runtime import EventStore,QualityEvidence,default_state_root,read_json,utc_now,write_json
+from .runtime import EventStore,QualityEvidence,default_state_root,read_json
 from .state import rebuild,refresh_ledger,load_or_rebuild
 from .dashboard import generate_dashboard
 from .record_batch import write_batch,single_record,BatchValidationError,BatchAppendError,STREAMS,RETRY_SAME_IDS
@@ -13,6 +13,8 @@ from .context import ContextRegistry
 from .features import FeaturePolicy, feature_inventory
 from .app.engine import build_engine
 from .ingest import discover_logs, ingest_paths
+from .ingest.service import INGEST_ERROR_LIMIT, _bound_error, _redact_paths, make_ingest_status
+from .ingest.service import process_ingest as _ingest_process_ingest
 from .dynamic_adapter import resolve_adapter
 from .archive import archive_runs, restore_run, DEFAULT_OLDER_THAN_DAYS, RESTORE_COMMAND
 from .contract import (
@@ -20,35 +22,12 @@ from .contract import (
     EXIT_INVALID as CONTRACT_EXIT_INVALID,
     EXIT_OK as CONTRACT_EXIT_OK,
     EXIT_REFRESH_FAILED as CONTRACT_EXIT_REFRESH_FAILED,
-    INGEST_STATUS_FILE,
     PATH_REDACTION_RE,
     STATUS_APPEND_FAILED,
     STATUS_INVALID,
 )
 
 _PATH_RE = PATH_REDACTION_RE
-def _redact_paths(text):
-    return _PATH_RE.sub("<path>", text)
-
-#: Bound for the one-line ingest error kept in `ingest_status.json` and echoed on stderr.
-INGEST_ERROR_LIMIT = 240
-#: Characters of the tail kept when a detail must be shortened. Ingest conflict messages end with the
-#: remedy sentence ("... Switching to --granularity session cannot establish identity ..."), so the
-#: tail carries the actionable part; the head carries what failed.
-_INGEST_ERROR_TAIL = 120
-
-def _bound_error(text: str, limit: int = INGEST_ERROR_LIMIT, tail: int = _INGEST_ERROR_TAIL) -> str:
-    """Return `text` if it fits in `limit`, else its head and tail joined by ` ... ` at exactly `limit`.
-
-    A plain `text[:limit]` dropped the closing guidance of a long conflict message, leaving the hook
-    and launchd logs with the failure but not the fix. Callers redact paths *before* bounding so a
-    cut can never expose a partial path and the bound applies to what is actually printed.
-    """
-    if len(text) <= limit:
-        return text
-    joiner = ' ... '
-    tail = min(tail, (limit - len(joiner)) // 2)
-    return text[:limit - tail - len(joiner)] + joiner + text[-tail:]
 
 #: Override for the state root, set only by tests via `mock.patch.object(cli, 'ROOT', ...)`.
 #: `None` (the default at import time) means "resolve from the environment lazily"; see `_root()`.
@@ -74,65 +53,17 @@ def refresh(state_root: Path | None = None) -> Path:
     return generate_dashboard(root, config=cfg())
 
 
-def make_ingest_status(previous: dict[str, Any], result: dict[str, Any], *,
-                       materialization_error: Exception | None = None) -> dict[str, Any]:
-    failures = result.get('failures') or []
-    status = 'error' if materialization_error is not None else ('partial' if failures else 'ok')
-    error = _bound_error(_redact_paths(str(materialization_error))) if materialization_error is not None else None
-    if error is None and failures:
-        first_detail = str(failures[0].get('error') or 'ingest failed')
-        error = _bound_error(_redact_paths(f"{len(failures)} file(s) failed; first: {first_detail}"))
-
-    interval = os.environ.get('HUMAIN_ORCHESTRATOR_INGEST_INTERVAL')
-    try:
-        sweep_interval_seconds = int(interval) if interval is not None else None
-        if sweep_interval_seconds is not None and sweep_interval_seconds < 0:
-            sweep_interval_seconds = None
-    except (TypeError, ValueError):
-        sweep_interval_seconds = None
-    if sweep_interval_seconds is None:
-        previous_interval = previous.get('sweep_interval_seconds')
-        if isinstance(previous_interval, int) and not isinstance(previous_interval, bool) and previous_interval >= 0:
-            sweep_interval_seconds = previous_interval
-        else:
-            sweep_interval_seconds = 900
-
-    now = utc_now()
-    return {
-        'version': 1,
-        'last_attempt_at': now,
-        'last_success_at': now if status == 'ok' else previous.get('last_success_at'),
-        'status': status,
-        'files_scanned': int(result.get('files_scanned', 0)),
-        'emitted': int(result.get('emitted', 0)),
-        'failure_count': len(failures) + (1 if materialization_error is not None else 0),
-        'error': error,
-        'sweep_interval_seconds': sweep_interval_seconds,
-    }
-
-
 def process_ingest(paths: list[Path], *, state_root: Path, runtime: str | None,
                    repository: str | None, dry_run: bool, granularity: str,
                    on_file: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
-    paths = list(paths)
-    root = Path(state_root)
-    result = ingest_paths(paths, runtime=runtime, repository=repository, state_root=root,
-                          dry_run=dry_run, granularity=granularity, on_file=on_file,
-                          summarize_files=len(paths) <= 25)
-    result['files_scanned'] = len(paths)
-    if not dry_run:
-        previous = read_json(root / INGEST_STATUS_FILE, {})
-        if not isinstance(previous, dict):
-            previous = {}
-        status = make_ingest_status(previous, result)
-        write_json(root / INGEST_STATUS_FILE, status)
-        try:
-            refresh(root)
-        except Exception as error:
-            write_json(root / INGEST_STATUS_FILE,
-                       make_ingest_status(previous, result, materialization_error=error))
-            raise
-    return result
+    """Thin cli.py wrapper around `ingest.service.process_ingest`, injecting `refresh` (ledger
+    catch-up + dashboard publish) as the dependency that module cannot import directly (it stays
+    below `presentation`/`app`/`cli` in the B2 layer order — see `docs/architecture-review.md` B3).
+    `refresh` is looked up by name here, not captured at import time, so
+    `unittest.mock.patch('orchestrator.cli.refresh', ...)` still takes effect on every call.
+    """
+    return _ingest_process_ingest(paths, state_root=state_root, runtime=runtime, repository=repository,
+                                  dry_run=dry_run, granularity=granularity, on_file=on_file, refresh=refresh)
 
 # Exit codes for the durable-write commands (`batch`, `event`, `metric`, `outcome`). The JSON body on
 # stdout always carries `persisted`/`duplicates`/`retry`; `retry == 'same_ids'` (exit 2 or 3) means the

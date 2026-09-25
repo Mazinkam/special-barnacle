@@ -334,7 +334,6 @@ class IncrementalContractTests(unittest.TestCase):
             self.assertEqual((second['emitted'], second['duplicates'], second['usage_rows']), (0, 2, 2))
 
     def test_a_file_is_appended_in_bounded_batches_not_one_write_per_call(self):
-        from orchestrator import ingest as ingest_module
         from orchestrator.record_batch import MAX_BATCH_RECORDS, write_batch
         with tempfile.TemporaryDirectory() as d:
             root = Path(d, 'state')
@@ -351,7 +350,7 @@ class IncrementalContractTests(unittest.TestCase):
                 calls.append(len(args[1]))
                 return write_batch(*args, **kwargs)
 
-            with self._env(root), patch.object(ingest_module, 'write_batch', counting):
+            with self._env(root), patch('orchestrator.ingest.service.write_batch', counting):
                 result = ingest_file(log, state_root=root, runtime=HUMAIN_TERMINAL)
             self.assertEqual(result['emitted'], MAX_BATCH_RECORDS + 10)
             self.assertEqual(calls, [MAX_BATCH_RECORDS, 10])
@@ -392,7 +391,7 @@ class RepositoryDecodingTests(unittest.TestCase):
             sessions = Path(d, 'sessions')
             sessions.mkdir(parents=True)
             project.mkdir(parents=True)
-            with patch('orchestrator.ingest._resolve_encoded_path', return_value=project):
+            with patch('orchestrator.ingest.parsers.humain_terminal._resolve_encoded_path', return_value=project):
                 calls = read_humain_terminal(humain_terminal_log(Path(sessions, 's_abc.jsonl')))
             self.assertEqual({c['repository'] for c in calls}, {str(project)})
 

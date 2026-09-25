@@ -1000,7 +1000,7 @@ class RecoveryTests(CheckpointTestCase):
         def fail(*args, **kwargs):
             raise BatchAppendError('append/fsync of metrics.jsonl failed', {'event': 0, 'metric': 0, 'outcome': 0})
 
-        with patch('orchestrator.ingest.write_batch', fail):
+        with patch('orchestrator.ingest.service.write_batch', fail):
             result = self.ingest(log)
         self.assertEqual(len(result['failures']), 1, result)
         self.assertIn('same record ids', result['failures'][0]['error'])
@@ -1490,6 +1490,7 @@ class RotationDuringReadTests(CheckpointTestCase):
 
     def test_initial_metrics_bind_the_scanned_inode_not_the_replacement_path(self):
         from orchestrator import ingest as ingest_module
+        from orchestrator.ingest import service as ingest_service_module
 
         for granularity in (CALL, SESSION):
             with self.subTest(granularity=granularity):
@@ -1504,7 +1505,7 @@ class RotationDuringReadTests(CheckpointTestCase):
                     os.replace(replacement, log)
                     return real_read(*args, **kwargs)
 
-                with patch.object(ingest_module, 'read_calls', rotate_then_read):
+                with patch.object(ingest_service_module, 'read_calls', rotate_then_read):
                     self.one(log, granularity)
                 self.assertEqual(recorded_input_tokens(self.root, 'sessA'), 1000)
                 self.assertEqual(ingest_rows(self.root)[0].get('source_identity'), identity)
@@ -1516,6 +1517,7 @@ class RotationDuringReadTests(CheckpointTestCase):
 
     def test_rotation_between_verify_and_read_neither_binds_the_wrong_session_nor_duplicates(self):
         from orchestrator import ingest as ingest_module
+        from orchestrator.ingest import service as ingest_service_module
         log = ht_session(self.dir / 'session.jsonl', 3, session='sess-old')
         self.one(log)
         append(log, ht_call(3))  # a genuine last call of the old session
@@ -1528,7 +1530,7 @@ class RotationDuringReadTests(CheckpointTestCase):
                 os.replace(replacement, log)
             return real_read_calls(*args, **kwargs)
 
-        with patch.object(ingest_module, 'read_calls', rotate_then_read):
+        with patch.object(ingest_service_module, 'read_calls', rotate_then_read):
             first = self.one(log)
         self.assertEqual(first['emitted'], 1)
         self.assertEqual(recorded_input_tokens(self.root, 'sess-old'), 4000, 'only the old file was read')
@@ -1542,6 +1544,7 @@ class RotationDuringReadTests(CheckpointTestCase):
 
     def test_in_place_rewrite_while_reading_is_rejected_before_any_write(self):
         from orchestrator import ingest as ingest_module
+        from orchestrator.ingest import service as ingest_service_module
         log = ht_session(self.dir / 'session.jsonl', 3)
         real_read_calls = ingest_module.read_calls
 
@@ -1553,7 +1556,7 @@ class RotationDuringReadTests(CheckpointTestCase):
             os.utime(log, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
             return result
 
-        with patch.object(ingest_module, 'read_calls', rewrite_then_read):
+        with patch.object(ingest_service_module, 'read_calls', rewrite_then_read):
             result = self.ingest(log)
         self.assertEqual(len(result['failures']), 1, result)
         self.assertIn('while it was being read', result['failures'][0]['error'])
@@ -1727,6 +1730,7 @@ class RecoveryRoundTwoTests(CheckpointTestCase):
 
     def test_header_rewrite_with_growth_during_read_cannot_misattribute_calls(self):
         from orchestrator import ingest as ingest_module
+        from orchestrator.ingest import service as ingest_service_module
         log = ht_session(self.dir / 'session.jsonl', 3)
         self.one(log)
         before = snapshot(self.root)
@@ -1738,7 +1742,7 @@ class RecoveryRoundTwoTests(CheckpointTestCase):
             append(log, ht_call(3, tokens=50))
             return real_read(*args, **kwargs)
 
-        with patch.object(ingest_module, 'read_calls', rewrite_and_grow):
+        with patch.object(ingest_service_module, 'read_calls', rewrite_and_grow):
             result = self.ingest(log)
         self.assertEqual(len(result['failures']), 1, result)
         self.assertEqual(snapshot(self.root), before)
@@ -1789,6 +1793,7 @@ class RecoveryRoundTwoTests(CheckpointTestCase):
 
     def test_first_import_rejects_header_rewrite_and_growth_after_parsing(self):
         from orchestrator import ingest as ingest_module
+        from orchestrator.ingest import service as ingest_service_module
         log = ht_session(self.dir / 'session.jsonl', 3)
         real_read = ingest_module.read_calls
 
@@ -1799,7 +1804,7 @@ class RecoveryRoundTwoTests(CheckpointTestCase):
             append(log, ht_call(3, tokens=50))
             return result
 
-        with patch.object(ingest_module, 'read_calls', rewrite_after_read):
+        with patch.object(ingest_service_module, 'read_calls', rewrite_after_read):
             result = self.ingest(log)
         self.assertEqual(len(result['failures']), 1, result)
         self.assertEqual(ingest_rows(self.root), [])

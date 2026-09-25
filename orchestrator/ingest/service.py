@@ -1,508 +1,64 @@
-"""Ingest per-call token usage from coding-agent session logs.
+"""Settle, check, append, checkpoint: the coordinated ingest write path, plus the CLI-facing
+sweep/status helpers.
 
-An agent writing its own telemetry mid-session cannot know its token counts, so records
-emitted by hand arrive unmetered. Every harness already writes usage to disk; this module
-reads those logs and emits `model_call` metrics through the coordinated writer
-(`record_batch.write_batch`), which prices and labels them.
-
-Ingestion is idempotent and incremental. Each call carries a `call_id` derived from the
-harness's own identifiers (also used as the durable `record_id`). Session-level rows aggregate
-only unrecorded call IDs and persist those IDs as `covered_call_ids` alongside the usage. A per-source
-checkpoint (`ingest_checkpoint`) remembers the verified byte offset of the log, every call id the
-log has ever shown, and the `session_ingest` rows already known for its sessions. Unchanged sources
-need only edge checks; growth verifies the whole checkpointed prefix before parsing the suffix.
-The event stream durably binds fallback identities to their explicit logical sessions, even when
-promotion emits no new usage. Initial metrics retain the scanned source's device/inode, so
-checkpoint loss cannot turn a replacement file into a fallback promotion. Metrics remain authoritative for paid coverage; every checkpoint is a
-rebuildable cache, and settle → check → append → checkpoint runs under the one writer lock so
-competing ingesters serialize instead of double counting. Each log is read through one open file
-(identity, prefix check, scan and fingerprints all see the same inode). Totals-only legacy history
-without matching checkpoint evidence, or a file modified under the reader, is rejected before any
-write rather than guessed from numeric usage. Identified calls survive rewrites and checkpoint loss.
+Split out of `orchestrator/ingest.py` and `orchestrator/cli.py` (B3, `docs/architecture-review.md`).
+`make_ingest_status`/`process_ingest` used to live in `cli.py`; they move here because they are
+ingest bookkeeping, not argument parsing, but this module stays below `presentation`/`app`/`cli`
+in the B2 layer order, so `process_ingest` cannot call `cli.refresh` (ledger catch-up + dashboard
+publish) itself — its caller injects that as the `refresh` parameter (ground rule 4). `cli.py`
+keeps a `process_ingest` wrapper that supplies its own `refresh`, so the name (and its
+`unittest.mock.patch('orchestrator.cli.refresh', ...)` seam) stays exactly where tests/scripts
+already look for it.
 """
 from __future__ import annotations
 
-import json
-import time
+import os
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Iterable, Iterator, NamedTuple, Optional
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Optional
 
-from . import ingest_checkpoint as ckpt
-from .ingest_checkpoint import COUNT_FIELDS, IngestLedger, TOKEN_FIELDS, add_totals, empty_totals, totals_equal
-from .record_batch import BatchAppendError, MAX_BATCH_RECORDS, build_record, settle_streams, write_batch
+from ..contract import INGEST_STATUS_FILE, PATH_REDACTION_RE
+from ..record_batch import BatchAppendError, MAX_BATCH_RECORDS, build_record, settle_streams, write_batch
 # CALL/SESSION come from `orchestrator.records`, the one definition of granularity vocabulary
 # ('call' / 'session'), and are re-exported here because callers outside this module (tests,
 # cli.py) import them from `orchestrator.ingest`.
-from .records import CALL, SESSION
-from .runtime import EventStore, default_state_root, iter_jsonl_from, open_binary, stable_hash, tail_fingerprint, writer_lock
+from ..records import CALL, SESSION
+from ..runtime import EventStore, default_state_root, read_json, tail_fingerprint, utc_now, write_json, writer_lock
+from .. import ingest_checkpoint as ckpt
+from ..ingest_checkpoint import COUNT_FIELDS, TOKEN_FIELDS, IngestLedger, add_totals, empty_totals, totals_equal
+from .parsers import HUMAIN_TERMINAL, PARSERS, detect_runtime, read_calls
+from .reconcile import SourceConflict, _reconcile_source_calls, call_id_for
 
-HUMAIN_TERMINAL = 'humain-terminal'
-CODEX = 'codex'
+_PATH_RE = PATH_REDACTION_RE
 
-LOG_GLOBS: dict[str, tuple[str, ...]] = {
-    HUMAIN_TERMINAL: ('.humain-terminal/agent/sessions/*/*.jsonl',),
-    CODEX: ('.codex/sessions/*/*/*/rollout-*.jsonl',),
-}
+
+def _redact_paths(text: str) -> str:
+    return _PATH_RE.sub('<path>', text)
+
+
+#: Bound for the one-line ingest error kept in `ingest_status.json` and echoed on stderr.
+INGEST_ERROR_LIMIT = 240
+#: Characters of the tail kept when a detail must be shortened. Ingest conflict messages end with the
+#: remedy sentence ("... Switching to --granularity session cannot establish identity ..."), so the
+#: tail carries the actionable part; the head carries what failed.
+_INGEST_ERROR_TAIL = 120
+
+
+def _bound_error(text: str, limit: int = INGEST_ERROR_LIMIT, tail: int = _INGEST_ERROR_TAIL) -> str:
+    """Return `text` if it fits in `limit`, else its head and tail joined by ` ... ` at exactly `limit`.
+
+    A plain `text[:limit]` dropped the closing guidance of a long conflict message, leaving the hook
+    and launchd logs with the failure but not the fix. Callers redact paths *before* bounding so a
+    cut can never expose a partial path and the bound applies to what is actually printed.
+    """
+    if len(text) <= limit:
+        return text
+    joiner = ' ... '
+    tail = min(tail, (limit - len(joiner)) // 2)
+    return text[:limit - tail - len(joiner)] + joiner + text[-tail:]
 
 
 class GranularityConflict(ValueError):
     """Legacy aggregate coverage cannot be reconciled safely; the message names the missing evidence."""
-
-
-class SourceConflict(ValueError):
-    """The log and metrics.jsonl disagree in a way no checkpoint can reconstruct; nothing was written."""
-
-
-def _int(value: Any) -> int:
-    try:
-        n = int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-    return n if n > 0 else 0
-
-
-def _is_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _lines(source: Path | BinaryIO) -> Iterator[dict[str, Any]]:
-    """Every parseable JSON object line of a Path or open binary file, including an unterminated last line."""
-    with open_binary(source) as handle:
-        handle.seek(0)
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if isinstance(record, dict):
-                yield record
-
-
-_TEMP_MARKERS = ('var-folders', 'T-pi-', 'pi-runtime-events', '-tmp-', 'T-tmp')
-_PROBE_LIMIT = 4_000
-
-
-def _resolve_encoded_path(name: str, *, root: Path = Path('/')) -> Optional[Path]:
-    """Decode a HUMAIN Terminal project directory name back into a real path.
-
-    The name is an absolute path with separators replaced by `-`, which is ambiguous whenever a
-    directory name itself contains a dash (`humain-terminal`). Resolve it against the filesystem,
-    preferring longer segment merges, so `--Users-a-humain-terminal--` cannot be silently
-    mis-split. Returns None when no existing directory matches; guessing a repository is worse
-    than leaving attribution to the caller.
-    """
-    tokens = [token for token in name.strip('-').split('-') if token]
-    if not tokens:
-        return None
-    probes = 0
-
-    def walk(base: Path, index: int) -> Optional[Path]:
-        nonlocal probes
-        if index >= len(tokens):
-            return base
-        for end in range(len(tokens), index, -1):
-            probes += 1
-            if probes > _PROBE_LIMIT:
-                return None
-            candidate = base / '-'.join(tokens[index:end])
-            if candidate.is_dir():
-                resolved = walk(candidate, end)
-                if resolved is not None:
-                    return resolved
-        return None
-
-    return walk(root, 0)
-
-
-def log_repository(path: Path) -> Optional[str]:
-    """Repository a HUMAIN Terminal session belongs to, decoded from its project directory."""
-    resolved = _resolve_encoded_path(path.parent.name)
-    return str(resolved) if resolved else None
-
-
-def is_scratch_log(path: Path) -> bool:
-    """True for test-harness and temp-directory sessions (faux models, throwaway sandboxes)."""
-    name = path.parent.name
-    if any(marker in name for marker in _TEMP_MARKERS):
-        return True
-    return name.startswith('--var-folders') or '/T/pi-' in str(path)
-
-
-# --- incremental readers ---------------------------------------------------------------------
-# Each reader is a pure step `(record, state) -> call | None` over a small JSON-serializable
-# `state`, so a checkpoint can carry the context (session id, per-turn models, cwd) needed to
-# continue mid-file. `valid_state` says whether a state read back from a checkpoint is one this
-# parser can continue from; anything else costs a full read, never a crash or a mis-attribution.
-# `read_humain_terminal`/`read_codex` remain the whole-file conveniences.
-
-def _optional_str(value: Any) -> bool:
-    return value is None or isinstance(value, str)
-
-
-def _humain_terminal_state(path: Path) -> dict[str, Any]:
-    return {'session_id': path.stem.split('_')[-1], 'session_origin': 'fallback', 'session_provenance': {},
-            'repository': log_repository(path), 'count': 0}
-
-
-def _humain_terminal_state_ok(state: dict[str, Any]) -> bool:
-    return (isinstance(state.get('session_id'), str) and _optional_str(state.get('repository'))
-            and state.get('session_origin') in ('fallback', 'explicit')
-            and ckpt.valid_session_provenance(state.get('session_provenance'))
-            and _is_int(state.get('count')) and state['count'] >= 0)
-
-
-def _parse_humain_terminal(record: dict[str, Any], state: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """HUMAIN Terminal session JSONL: assistant messages carry a `usage` block.
-
-    `usage.input` excludes cached reads here, unlike the OpenAI-style convention used by the
-    telemetry contract, so cached reads are folded back into `input_tokens` to keep
-    `cached_input_tokens` a subset of it.
-    """
-    if record.get('type') == 'session':
-        session_id = record.get('id') or record.get('sessionId')
-        if session_id:
-            state['session_id'] = str(session_id)
-            state['session_origin'] = 'explicit'
-            state['session_provenance'][state['session_id']] = 'explicit'
-    message = record.get('message')
-    if not isinstance(message, dict) or message.get('role') != 'assistant':
-        return None
-    usage = message.get('usage')
-    if not isinstance(usage, dict):
-        return None
-    state['session_provenance'].setdefault(state['session_id'], state['session_origin'])
-    cached = _int(usage.get('cacheRead'))
-    call = {
-        'native_id': str(record.get('id') or state['count']),
-        '_native_id_stable': bool(record.get('id')),
-        'session_id': state['session_id'],
-        'session_origin': state['session_origin'],
-        'ts': record.get('timestamp'),
-        'model': message.get('model'),
-        'provider': message.get('provider'),
-        'repository': state['repository'],
-        'input_tokens': _int(usage.get('input')) + cached,
-        'cached_input_tokens': cached,
-        'cache_write_tokens': _int(usage.get('cacheWrite')) + _int(usage.get('cacheWrite1h')),
-        'output_tokens': _int(usage.get('output')),
-        'reasoning_output_tokens': _int(usage.get('reasoning')),
-        'total_tokens': _int(usage.get('totalTokens')),
-    }
-    state['count'] += 1
-    return call
-
-
-def _codex_state(path: Path) -> dict[str, Any]:
-    return {'models': {}, 'latest_model': None, 'repository': None, 'provider': None, 'stem': path.stem}
-
-
-def _codex_state_ok(state: dict[str, Any]) -> bool:
-    models = state.get('models')
-    return (isinstance(models, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in models.items())
-            and all(_optional_str(state.get(key)) for key in ('latest_model', 'repository', 'provider'))
-            and isinstance(state.get('stem'), str))
-
-
-def _parse_codex(record: dict[str, Any], state: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Codex rollout JSONL: one `token_usage_record` per response.
-
-    `payload.usage` is the per-response delta; `turn_token_usage` and `thread_token_usage` are
-    cumulative and must not be summed. The model lives on `turn_context`, keyed by turn.
-    """
-    kind = record.get('type')
-    payload = record.get('payload')
-    if not isinstance(payload, dict):
-        return None
-    if kind == 'session_meta':
-        state['repository'] = payload.get('cwd') or state['repository']
-        state['provider'] = payload.get('model_provider') or state['provider']
-        return None
-    if kind == 'turn_context':
-        model = payload.get('model')
-        if model:
-            state['latest_model'] = str(model)
-            if payload.get('turn_id'):
-                state['models'][str(payload['turn_id'])] = state['latest_model']
-        state['repository'] = payload.get('cwd') or state['repository']
-        return None
-    if kind != 'token_usage_record':
-        return None
-    usage = payload.get('usage')
-    if not isinstance(usage, dict):
-        return None
-    turn_id = payload.get('turn_id')
-    return {
-        'native_id': str(payload.get('response_id') or f"{turn_id}:{record.get('ordinal')}"),
-        '_native_id_stable': bool(payload.get('response_id') or (turn_id and record.get('ordinal') is not None)),
-        'session_id': str(payload.get('session_id') or state['stem']),
-        'session_origin': 'explicit' if payload.get('session_id') else 'fallback',
-        'turn_id': turn_id,
-        'ts': record.get('timestamp'),
-        'model': state['models'].get(str(turn_id), state['latest_model']),
-        'provider': state['provider'],
-        'repository': state['repository'],
-        'input_tokens': _int(usage.get('input_tokens')),
-        'cached_input_tokens': _int(usage.get('cached_input_tokens')),
-        'cache_write_tokens': _int(usage.get('cache_write_input_tokens')),
-        'output_tokens': _int(usage.get('output_tokens')),
-        'reasoning_output_tokens': _int(usage.get('reasoning_output_tokens')),
-        'total_tokens': _int(usage.get('total_tokens')),
-    }
-
-
-class Parser(NamedTuple):
-    initial: Callable[[Path], dict[str, Any]]
-    step: Callable[[dict[str, Any], dict[str, Any]], Optional[dict[str, Any]]]
-    valid_state: Callable[[dict[str, Any]], bool]
-
-
-PARSERS: dict[str, Parser] = {
-    HUMAIN_TERMINAL: Parser(_humain_terminal_state, _parse_humain_terminal, _humain_terminal_state_ok),
-    CODEX: Parser(_codex_state, _parse_codex, _codex_state_ok),
-}
-
-
-def read_calls(path: Path, runtime: str, *, offset: int = 0, state: dict[str, Any] | None = None,
-               handle: BinaryIO | None = None) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
-    """Calls from the complete lines of `path` at or after `offset`; returns (calls, end offset, reader state).
-
-    A trailing line without its newline is a torn or in-progress write: it is not parsed and the
-    returned offset stops before it, so the next pass reads it whole. `state` is the reader
-    context returned by a previous pass (copied, never mutated) or None to start at byte 0.
-    `handle`, when given, is the already open file to read (so identity checks, this scan and the
-    fingerprints all see one inode); `path` then only names it.
-    """
-    parser = PARSERS[runtime]
-    state = json.loads(json.dumps(state)) if state else parser.initial(path)
-    calls: list[dict[str, Any]] = []
-    end = offset
-    for record, line_end in iter_jsonl_from(handle if handle is not None else path, offset):
-        end = line_end
-        if isinstance(record, dict):
-            call = parser.step(record, state)
-            if call is not None:
-                calls.append(call)
-    return calls, end, state
-
-
-def read_humain_terminal(path: Path) -> list[dict[str, Any]]:
-    return read_calls(path, HUMAIN_TERMINAL)[0]
-
-
-def read_codex(path: Path) -> list[dict[str, Any]]:
-    return read_calls(path, CODEX)[0]
-
-
-READERS: dict[str, Callable[[Path], list[dict[str, Any]]]] = {
-    HUMAIN_TERMINAL: read_humain_terminal,
-    CODEX: read_codex,
-}
-
-
-def detect_runtime(path: Path | BinaryIO) -> Optional[str]:
-    """Identify the harness from the log's own record shapes, not from its file name."""
-    for index, record in enumerate(_lines(path)):
-        if record.get('type') == 'token_usage_record':
-            return CODEX
-        if record.get('type') == 'session_meta' and isinstance(record.get('payload'), dict):
-            return CODEX
-        message = record.get('message')
-        if isinstance(message, dict) and 'usage' in message:
-            return HUMAIN_TERMINAL
-        if record.get('type') in {'session', 'model_change'} and 'payload' not in record:
-            return HUMAIN_TERMINAL
-        if index > 400:
-            break
-    return None
-
-
-def discover_logs(*, since_days: float | None = None, runtimes: Iterable[str] | None = None,
-                  home: str | Path | None = None, include_scratch: bool = False) -> list[Path]:
-    """Find session logs, newest first, optionally limited to those modified recently.
-
-    Test-harness and temp-directory sessions are excluded by default: they run faux models and
-    would enter the ledger as real work.
-    """
-    base = Path(home).expanduser() if home is not None else Path.home()
-    cutoff = time.time() - since_days * 86_400 if since_days else None
-    wanted = set(runtimes) if runtimes else set(LOG_GLOBS)
-    found: list[Path] = []
-    for runtime, globs in LOG_GLOBS.items():
-        if runtime not in wanted:
-            continue
-        for pattern in globs:
-            for path in base.glob(pattern):
-                if not path.is_file():
-                    continue
-                if cutoff is not None and path.stat().st_mtime < cutoff:
-                    continue
-                if not include_scratch and is_scratch_log(path):
-                    continue
-                found.append(path)
-    return sorted(set(found), key=lambda p: p.stat().st_mtime, reverse=True)
-
-
-def call_id_for(runtime: str, session_id: str, native_id: str) -> str:
-    return stable_hash(['model_call', runtime, session_id, native_id])
-
-
-def _reconcile_source_calls(calls: list[dict[str, Any]], *, runtime: str, path: Path,
-                            live: set[str], history: dict[tuple[str, str], dict[str, Any]],
-                            ledger: IngestLedger, resumable: bool, promotions: dict[str, dict[str, Any]],
-                            source_identity: list[int], checkpoint_identity: list[int] | None,
-                            alias_targets: dict[str, set[str]] | None = None
-                            ) -> tuple[set[str], dict[str, set[str]]]:
-    """Resolve orphaned session IDs by exact source call coverage, never by token totals.
-
-    The current native ID can recreate its old session-qualified hash. A matching hash in
-    this source's authoritative coverage (or its observed history) identifies the same call.
-    Preserve that hash in observations, so drift does not invent unpaid historical aliases
-    when metrics are later rolled back. Multiple old identities and positional IDs are not
-    evidence of a unique call and must not silently suppress usage. For a rewrite, require
-    complete matching coverage and per-model usage as well: reused IDs with missing or changed
-    calls are ambiguous. Totals validate an identity match; they never pay for unmatched IDs.
-    """
-    if not calls:
-        return set(), {}  # no identity to reconcile; keep seeded Codex ledgers incremental
-    if not resumable:
-        # Live IDs bypass alias reconciliation below, but their paid hashes are not
-        # proof of continuity across an inode replacement for fallback identities,
-        # whether still headerless or promoted to explicit IDs. Check provenance
-        # BEFORE comparing any paid IDs, including same-session IDs.
-        # Explicit-only sessions still support rotation with call-ID deduplication.
-        source_states = ledger.source_states(runtime, path)
-        current_generation = {tuple(source_identity)}
-        fallback_sessions = {str(call['session_id']) for call in calls if call.get('session_origin') == 'fallback'}
-        for sid in {str(call['session_id']) for call in calls}:
-            state = source_states.get(sid)
-            if not state:
-                continue  # no target coverage to inherit; a rotated target can be billed in full
-            fallback_origin = sid in fallback_sessions or 'fallback' in state.get('session_origins', set())
-            rotated_target = any(bound['to_session_id'] == sid and bound['source_identity'] != source_identity
-                                 for bound in promotions.values())
-            if ((fallback_origin or rotated_target)
-                    and state.get('source_identities', set()) != current_generation):
-                # A binding can predate a fully billed replacement. Only rows wholly
-                # from that replacement permit its retries; mixed/missing generations
-                # cannot establish which same-session calls were actually paid.
-                raise SourceConflict(f'{path}: session {sid}: ambiguous source generation for a live fallback or promoted identity; '
-                                     'reconcile source identities before retrying; nothing was written.')
-    # Missing/old checkpoints are not permission to alias explicit logical sessions.
-    # Rebuild eligibility from source-scoped authoritative rows. Unknown legacy origins
-    # remain candidates only so an overlapping identity is rejected, never guessed paid/new.
-    unknown_origins: set[str] = set()
-    if alias_targets is None:
-        source_states = ledger.source_states(runtime, path)
-        fallback = set()
-        explicit_history = any('explicit' in state.get('session_origins', set()) for state in source_states.values())
-        for sid in (set(source_states) | {sid for sid, _ in history}) - live:
-            origins = source_states.get(sid, {}).get('session_origins', set())
-            if origins == {'fallback'}:
-                fallback.add(sid)
-                if sid not in promotions and (explicit_history or source_states[sid].get('legacy_promotions')):
-                    # An older writer may already have consumed this fallback in a
-                    # promotion, even one with zero new metrics. Without a protocol
-                    # marker or binding, origins cannot name its target; do not guess.
-                    unknown_origins.add(sid)
-            elif origins != {'explicit'}:
-                unknown_origins.add(sid)
-        alias_targets = {sid: set(unknown_origins) for sid in live}
-        for call in calls:
-            if call.get('session_origin') == 'explicit':
-                alias_targets[str(call['session_id'])].update(fallback)
-    # Durable bindings constrain even a stale checkpoint's proposed aliases. A paid
-    # fallback can belong to only one explicit logical session, never its successor.
-    for target, ids in alias_targets.items():
-        ids.difference_update(sid for sid, bound in promotions.items() if bound['to_session_id'] != target)
-        ids.update(sid for sid, bound in promotions.items() if bound['to_session_id'] == target and sid not in live)
-    unknown_origins.difference_update(promotions)
-    eligible = {sid for ids in alias_targets.values() for sid in ids}
-    unknown_generations: set[str] = set()
-    for sid in eligible:
-        binding = promotions.get(sid)
-        if binding is not None and binding['source_identity'] != source_identity:
-            same_generation = False
-        elif checkpoint_identity is not None and any(old_sid == sid for old_sid, _ in history):
-            same_generation = checkpoint_identity == source_identity
-        else:
-            # Native IDs and equal usage can recur at the same path on a new inode.
-            # All source-scoped rows must establish continuity; missing/mixed legacy
-            # generations cannot be filled in from a different row or a binding.
-            generations = ledger.source_states(runtime, path).get(sid, {}).get('source_identities', set())
-            current = tuple(source_identity)
-            same_generation = generations == {current}
-            if not same_generation and (not generations or None in generations or current in generations):
-                unknown_generations.add(sid)
-                continue
-        if not same_generation:
-            for ids in alias_targets.values():
-                ids.discard(sid)
-    eligible = {sid for ids in alias_targets.values() for sid in ids}
-    candidates: dict[str, set[str]] = {}
-    evidence = []
-    if not resumable:
-        for sid, state in ledger.source_states(runtime, path).items():
-            if sid in live or sid not in eligible:
-                continue
-            if state['unidentified']:
-                raise SourceConflict(f'{path}: session {sid}: ambiguous totals-only source history after session ID '
-                                     'drift; reconcile the legacy rows with call IDs before retrying; nothing was written.')
-            candidates[sid] = set(state['covered_call_ids'])
-            evidence.append((sid, set(state['covered_call_ids']), state['models']))
-    for (sid, model), group in history.items():
-        if sid not in live and sid in eligible:
-            candidates.setdefault(sid, set()).update(group['call_ids'])
-            if not resumable:
-                evidence.append((sid, set(group['call_ids']), {model: group}))
-    paid = set()
-    aliases: dict[str, set[str]] = {}
-    matched: dict[str, dict[str, dict[str, Any]]] = {}
-    for call in calls:
-        target = str(call['session_id'])
-        matches = {sid: call_id_for(runtime, sid, call['native_id']) for sid, ids in candidates.items()
-                   if sid in alias_targets.get(target, set())
-                   and call_id_for(runtime, sid, call['native_id']) in ids}
-        if not matches:
-            continue
-        if unknown_origins.intersection(matches):
-            raise SourceConflict(f'{path}: ambiguous session provenance in source history after session ID drift; '
-                                 'restore provenance or reconcile the legacy rows before retrying; nothing was written.')
-        if unknown_generations.intersection(matches):
-            raise SourceConflict(f'{path}: ambiguous source generation after session ID drift; restore a matching '
-                                 'checkpoint or reconcile metric source identities before retrying; nothing was written.')
-        # Historical hashes do not distinguish HT's numeric positional fallback from an
-        # explicit numeric ID. Neither can safely establish cross-session identity.
-        positional = runtime == HUMAIN_TERMINAL and call['native_id'].isdecimal()
-        if len(matches) != 1 or positional or not call.get('_native_id_stable', False):
-            raise SourceConflict(f'{path}: ambiguous source-native call identity after session ID drift; '
-                                 'restore unambiguous source history before retrying; nothing was written.')
-        sid, call_id = next(iter(matches.items()))
-        if any(sid in ids and other != target for other, ids in aliases.items()):
-            raise SourceConflict(f'{path}: ambiguous session promotion to multiple explicit sessions; nothing was written.')
-        # Retain the original session-qualified identity for old calls only. New calls keep
-        # the session the reader found; no tokens move between recorded session buckets.
-        call['session_id'] = sid
-        call['session_origin'] = 'fallback'
-        aliases.setdefault(target, set()).add(sid)
-        matched.setdefault(sid, {})[call_id] = call
-        if call_id in ledger.state(runtime, sid)['covered_call_ids']:
-            paid.add(call_id)
-    for sid, ids, models in evidence:
-        found = matched.get(sid, {})
-        if not ids.intersection(found):
-            continue
-        totals: dict[str, dict[str, int]] = {}
-        for call_id in ids.intersection(found):
-            call = found[call_id]
-            add_totals(totals.setdefault(str(call.get('model') or ''), empty_totals()), call)
-        if not ids.issubset(found) or any(not totals_equal(models.get(model), totals.get(model))
-                                        for model in set(models) | set(totals)):
-            raise SourceConflict(f'{path}: session {sid}: ambiguous source-native coverage after session ID drift; '
-                                 'missing calls or changed usage cannot establish identity; nothing was written.')
-    return paid, aliases
 
 
 def _tally(summary: dict[str, Any], record: dict[str, Any]) -> None:
@@ -511,7 +67,7 @@ def _tally(summary: dict[str, Any], record: dict[str, Any]) -> None:
     if cost is not None:
         summary['estimated_cost_usd'] = round(summary['estimated_cost_usd'] + float(cost), 6)
         return
-    from .pricing import load_pricing, rate_for
+    from ..pricing import load_pricing, rate_for
     model = record.get('model') or 'unknown'
     tokens = sum(int(record.get(field) or 0) for field in TOKEN_FIELDS)
     bucket = 'unpriced_models' if rate_for(model, load_pricing()) is None else 'zero_token_models'
@@ -965,3 +521,73 @@ def ingest_paths(paths: Iterable[str | Path], *, runtime: str | None = None, rep
         'zero_token_models': zero_token,
         'dry_run': bool(dry_run),
     }
+
+
+# --- CLI-facing sweep bookkeeping (moved from cli.py) -------------------------------------------
+
+def make_ingest_status(previous: dict[str, Any], result: dict[str, Any], *,
+                       materialization_error: Exception | None = None) -> dict[str, Any]:
+    failures = result.get('failures') or []
+    status = 'error' if materialization_error is not None else ('partial' if failures else 'ok')
+    error = _bound_error(_redact_paths(str(materialization_error))) if materialization_error is not None else None
+    if error is None and failures:
+        first_detail = str(failures[0].get('error') or 'ingest failed')
+        error = _bound_error(_redact_paths(f"{len(failures)} file(s) failed; first: {first_detail}"))
+
+    interval = os.environ.get('HUMAIN_ORCHESTRATOR_INGEST_INTERVAL')
+    try:
+        sweep_interval_seconds = int(interval) if interval is not None else None
+        if sweep_interval_seconds is not None and sweep_interval_seconds < 0:
+            sweep_interval_seconds = None
+    except (TypeError, ValueError):
+        sweep_interval_seconds = None
+    if sweep_interval_seconds is None:
+        previous_interval = previous.get('sweep_interval_seconds')
+        if isinstance(previous_interval, int) and not isinstance(previous_interval, bool) and previous_interval >= 0:
+            sweep_interval_seconds = previous_interval
+        else:
+            sweep_interval_seconds = 900
+
+    now = utc_now()
+    return {
+        'version': 1,
+        'last_attempt_at': now,
+        'last_success_at': now if status == 'ok' else previous.get('last_success_at'),
+        'status': status,
+        'files_scanned': int(result.get('files_scanned', 0)),
+        'emitted': int(result.get('emitted', 0)),
+        'failure_count': len(failures) + (1 if materialization_error is not None else 0),
+        'error': error,
+        'sweep_interval_seconds': sweep_interval_seconds,
+    }
+
+
+def process_ingest(paths: list[Path], *, state_root: Path, runtime: str | None,
+                   repository: str | None, dry_run: bool, granularity: str,
+                   refresh: Callable[[Path], Any],
+                   on_file: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+    """Ingest `paths`, then (unless `dry_run`) write `ingest_status.json` and call `refresh(root)`.
+
+    `refresh` is the caller's ledger catch-up + dashboard publish (`cli.refresh`); this module
+    stays below `presentation`/`app`/`cli` in the B2 layer order, so it takes that step as a
+    parameter instead of importing it (ground rule 4).
+    """
+    paths = list(paths)
+    root = Path(state_root)
+    result = ingest_paths(paths, runtime=runtime, repository=repository, state_root=root,
+                          dry_run=dry_run, granularity=granularity, on_file=on_file,
+                          summarize_files=len(paths) <= 25)
+    result['files_scanned'] = len(paths)
+    if not dry_run:
+        previous = read_json(root / INGEST_STATUS_FILE, {})
+        if not isinstance(previous, dict):
+            previous = {}
+        status = make_ingest_status(previous, result)
+        write_json(root / INGEST_STATUS_FILE, status)
+        try:
+            refresh(root)
+        except Exception as error:
+            write_json(root / INGEST_STATUS_FILE,
+                       make_ingest_status(previous, result, materialization_error=error))
+            raise
+    return result

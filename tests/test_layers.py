@@ -33,6 +33,18 @@ FORBIDDEN_EDGES: dict[str, set[str]] = {
     'presentation.dashboard_data': {'app', 'engine', 'cli'},
     'presentation.dashboard_html': {'app', 'engine', 'cli'},
     'presentation.publish': {'app', 'engine', 'cli'},
+    # B3: `ingest/` sits below `presentation`/`app`/`cli` in the B2 layer order (it may import
+    # core/contract/vocab/records/store/record_batch/record_index/state/pricing). `cli` -> `ingest`
+    # is fine (and expected: `cli.py` imports `ingest.service.process_ingest` etc.), so only the
+    # reverse direction is forbidden here.
+    'ingest': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'ingest.discovery': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'ingest.reconcile': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'ingest.service': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'ingest.parsers': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'ingest.parsers.humain_terminal': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'ingest.parsers.codex': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
+    'ingest.parsers._shared': {'dashboard', 'presentation', 'app', 'engine', 'cli'},
 }
 
 #: Only these module prefixes may import `orchestrator.app`; every other module must not.
