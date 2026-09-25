@@ -118,6 +118,7 @@ import {
 	type InterruptionReport,
 } from "./dispatch-progress.ts";
 import { RunCancellation } from "./cancellation.ts";
+import { buildChildArgs, buildChildEnv, personaCanMutateFor } from "./dispatch/child-args.ts";
 import { applyObservation, applyWarnings, createProgressView, fmtElapsed, formatNestedWorkerRows, formatProgressLine, formatWarningLine, spinnerFrame } from "./run-ui.ts";
 import type { DispatchProgressView } from "./run-ui.ts";
 import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
@@ -1514,20 +1515,6 @@ export async function runSubagentProcess(opts: {
 		session.startDispatch(taskId, opts.label ?? opts.agentName, opts.model, opts.depth ?? 0);
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-
-	// model is "provider/modelId"; split so the CLI resolver can pick the
-	// right provider binding (mirrors executeSingleSubagent).
-	const slashIndex = opts.model.indexOf("/");
-	if (slashIndex !== -1) {
-		args.push("--provider", opts.model.slice(0, slashIndex));
-		args.push("--model", opts.model.slice(slashIndex + 1));
-	} else {
-		args.push("--model", opts.model);
-	}
-
-	if (opts.effort) args.push("--thinking", opts.effort);
-
 	// Resolve the orchestrator agent persona the same way the subagent tool
 	// does: read the agent markdown from the runtime's agents/ directories and
 	// pass its body via --append-system-prompt. There is NO `--agent` CLI flag;
@@ -1535,6 +1522,7 @@ export async function runSubagentProcess(opts: {
 	// contacts a provider, which is what silently zeroed out every dispatch.
 	let persona: { tools?: string[] } | undefined;
 	let promptDir: string | undefined;
+	let promptPath: string | undefined;
 	if (opts.agentName === NO_PERSONA) {
 		/* probes run on the default system prompt on purpose */
 	} else try {
@@ -1544,9 +1532,8 @@ export async function runSubagentProcess(opts: {
 			persona = { tools: agent.tools };
 			if (agent.systemPrompt.trim()) {
 				promptDir = mkdtempSync(join(tmpdir(), PERSONA_TMP_PREFIX));
-				const promptPath = join(promptDir, `${opts.agentName}.md`);
+				promptPath = join(promptDir, `${opts.agentName}.md`);
 				writeFileSync(promptPath, agent.systemPrompt, { encoding: "utf-8", mode: 0o600 });
-				args.push("--append-system-prompt", promptPath);
 			}
 		} else {
 			console.warn(`[orchestrator] agent persona not found: ${opts.agentName} (using default persona)`);
@@ -1556,33 +1543,19 @@ export async function runSubagentProcess(opts: {
 	}
 
 	const tools = opts.tools && opts.tools.length > 0 ? opts.tools : persona?.tools;
-	if (tools && tools.length > 0) args.push("--tools", tools.join(","));
-	// An allow-list without write/edit means the child physically could not have
-	// touched a file, so anything its prose mentions is a false positive. With no
-	// allow-list at all the child gets the default tool set, which can mutate.
-	const personaCanMutate = !tools || tools.some((t) => t === "write" || t === "edit");
-
-	// Avoid feedback loops: an extension handler inside an interactive
-	// session must not recursively load extensions or the user's skill
-	// commands. Subagent tool does the same.
-	args.push("--no-extensions", "--no-skills", "--no-prompt-templates");
-
-	args.push(renderTaskWithContext(opts.task, undefined));
+	const personaCanMutate = personaCanMutateFor(tools);
+	const args = buildChildArgs({
+		model: opts.model,
+		effort: opts.effort,
+		promptPath,
+		tools,
+		task: renderTaskWithContext(opts.task, undefined),
+	});
 
 	const startedAt = Date.now();
 	return new Promise<SubagentProcessResult>((resolve) => {
 		const invocation = orchCliInvocation(args);
-		const env: NodeJS.ProcessEnv = {
-			...process.env,
-			HUMAIN_TERMINAL_RUNTIME: "orchestrator-dispatch",
-			CODING_AGENT_RUNTIME: "humain-terminal",
-			CODING_AGENT_REPOSITORY: opts.cwd,
-			// Supacode/HT injected a few env vars that a nested Pi run would
-			// pick up and try to attach to the parent's supacode session —
-			// that fails fast with an auth error. Clear them.
-			SUPACODE_SESSION: undefined,
-			SUPACODE_TAB_ID: undefined,
-		};
+		const env: NodeJS.ProcessEnv = buildChildEnv(process.env, { cwd: opts.cwd });
 		let buffer = "";
 		// Raw child events can recursively include full worker histories. Retain
 		// only diagnostics, never the unbounded stream.
