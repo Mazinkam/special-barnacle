@@ -66,8 +66,21 @@ from .store.facade import EventStore
 
 # `_handler` was the `logging.StreamHandler` this module (now `core.fs`) attached to `_LOGGER` at
 # import time, module-global there for the same reason: nothing in this repo re-imports it, but a
-# pre-split `orchestrator.runtime._handler` existed, so it stays importable.
-from .core.fs import _handler  # noqa: F401 - re-export only, see comment above
+# pre-split `orchestrator.runtime._handler` existed, so it stays importable when it exists.
+#
+# `core.fs` only *defines* `_handler` when `_LOGGER` had no handlers yet at `core.fs` import time
+# (see its own `if not _LOGGER.handlers:` guard); if the caller's process had already attached a
+# handler to the `orchestrator` logger before anything imported `orchestrator.core.fs` (directly or
+# transitively, e.g. via this module), `core.fs` never binds `_handler` at all. Importing it
+# unconditionally, as `from .core.fs import _handler`, would then raise `ImportError` and make
+# `import orchestrator.runtime` fail depending on unrelated logging setup in the caller — the same
+# conditional exposure the pre-split module had (see `git show 1a1e439:orchestrator/runtime.py`,
+# which only bound `_handler` inside its own `if not _LOGGER.handlers:` block). Mirror that: only
+# re-export `_handler` when `core.fs` actually defined it.
+from .core import fs as _fs
+
+if hasattr(_fs, '_handler'):
+    _handler = _fs._handler  # noqa: F401 - re-export only, see comment above
 
 __all__ = [
     'default_attribution', 'default_state_root', 'stable_hash', 'utc_now',

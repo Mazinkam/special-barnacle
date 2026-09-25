@@ -150,29 +150,31 @@ def _failure(status:str,error:str,persisted:dict|None=None,retry:str|None=None)-
     empty={s:0 for s in STREAMS}
     return {'ok':False,'status':status,'error':error,'persisted':persisted or empty,'duplicates':empty,'ledger_updated':False,'dashboard_updated':False,'retry':retry}
 
-def _write(records)->tuple[int,dict]:
+def _write(root:Path|None,records)->tuple[int,dict]:
     """Run the coordinated writer; return (exit code, JSON body) without printing.
 
     Every CLI path that appends (`batch`, `event`, `metric`, `outcome`, `init`) reports the writer's
     outcome through this one function, so a rejected batch or an interrupted append is always a
-    structured body with `persisted`/`retry` and never an uncaught traceback.
+    structured body with `persisted`/`retry` and never an uncaught traceback. `root` is the state
+    root already resolved by the caller (`main()` resolves it once per invocation); pass `None` to
+    resolve it here instead, for callers outside `main()`.
     """
-    root=_root()
+    root=root if root is not None else _root()
     try: result=write_batch(root,records)
     except BatchValidationError as exc: return EXIT_INVALID,_failure(STATUS_INVALID,str(exc))
     except BatchAppendError as exc: return EXIT_APPEND_FAILED,_failure(STATUS_APPEND_FAILED,str(exc),exc.persisted,RETRY_SAME_IDS)
     result=refresh_after_write(root,result,config=cfg())
     return (EXIT_OK if result['ok'] else EXIT_REFRESH_FAILED),{k:v for k,v in result.items() if k!='records'}
 
-def write_records(records)->int:
+def write_records(records,root:Path|None=None)->int:
     """Run the coordinated writer for the CLI and print its JSON result; return the exit code."""
-    code,body=_write(records); print(json.dumps(body)); return code
+    code,body=_write(root,records); print(json.dumps(body)); return code
 
-def _single(stream:str,payload_text:str,event:str|None=None)->int:
+def _single(stream:str,payload_text:str,event:str|None=None,root:Path|None=None)->int:
     """One-record form of `write_records`: the command names the stream (and event); the payload cannot override them."""
     try: record=single_record(stream,_parse_json(payload_text,'payload'),event=event)
     except BatchValidationError as exc: print(json.dumps(_failure(STATUS_INVALID,str(exc)))); return EXIT_INVALID
-    return write_records([record])
+    return write_records([record],root)
 
 def _add_policy_override_flags(subparser):
     """Add the shared --quality-floor/--cost-aggressiveness override flags.
@@ -260,46 +262,49 @@ def _format_adapter_table(a: dict) -> str:
 def main():
     ap=build_parser()
     args=ap.parse_args(); C=cfg()
+    # Resolve the state root exactly once per invocation (honouring a test-patched `ROOT`), then
+    # thread it explicitly through every helper below instead of each one calling `_root()` again.
+    root=_root()
     # A dry run must leave the state root untouched (not even created), so the root and its streams are
     # only ensured for commands that write or read them; the engine is built where a command needs it.
     # The archive commands never touch the streams at all, so they do not create them either.
-    if not (args.cmd=='ingest' and args.dry_run) and args.cmd not in ('archive-runs','restore-run'): EventStore(_root())
-    def eng(): return build_engine(_root())
+    if not (args.cmd=='ingest' and args.dry_run) and args.cmd not in ('archive-runs','restore-run'): EventStore(root)
+    def eng(root): return build_engine(root)
     if args.cmd=='init':
         # One coordinated write: durable append -> incremental ledger -> atomic dashboard, instead of
         # an append followed by a full history replay that also discards the record-id cache. A
         # rejected or interrupted write is reported exactly like `batch` (JSON body, exit 1/2/3,
         # `retry == 'same_ids'`), so callers can resubmit `init` safely instead of parsing a traceback.
-        code,body=_write([single_record('event',{'schema_version':3},event='orchestrator_initialized')])
+        code,body=_write(root,[single_record('event',{'schema_version':3},event='orchestrator_initialized')])
         if code!=EXIT_OK: print(json.dumps(body)); raise SystemExit(code)
         print('Initialized V3 state'); return
-    if args.cmd=='status': print(json.dumps(load_or_rebuild(_root()),indent=2)); return
-    if args.cmd=='dashboard': print(generate_dashboard(_root(),config=C)); return
+    if args.cmd=='status': print(json.dumps(load_or_rebuild(root),indent=2)); return
+    if args.cmd=='dashboard': print(generate_dashboard(root,config=C)); return
     if args.cmd=='rebuild':
-        root=_root(); print(json.dumps(rebuild(root),indent=2)); generate_dashboard(root,config=C); return
+        print(json.dumps(rebuild(root),indent=2)); generate_dashboard(root,config=C); return
     if args.cmd=='features':
         f=FeaturePolicy(C.get('features',{})).resolve(); print(json.dumps(feature_inventory(f),indent=2)); return
-    if args.cmd=='recommend-policy': print(json.dumps(eng().recommend_policy(),indent=2)); return
-    if args.cmd=='event': raise SystemExit(_single('event',args.payload,event=args.event))
-    if args.cmd=='metric': raise SystemExit(_single('metric',args.payload))
-    if args.cmd=='outcome': raise SystemExit(_single('outcome',args.payload))
+    if args.cmd=='recommend-policy': print(json.dumps(eng(root).recommend_policy(),indent=2)); return
+    if args.cmd=='event': raise SystemExit(_single('event',args.payload,event=args.event,root=root))
+    if args.cmd=='metric': raise SystemExit(_single('metric',args.payload,root=root))
+    if args.cmd=='outcome': raise SystemExit(_single('outcome',args.payload,root=root))
     if args.cmd=='batch':
         try: records=_batch_payload(args.payload)
         except BatchValidationError as exc: print(json.dumps(_failure(STATUS_INVALID,str(exc)))); raise SystemExit(EXIT_INVALID)
-        raise SystemExit(write_records(records))
+        raise SystemExit(write_records(records,root))
     if args.cmd=='route':
         overrides={}
         if args.quality_floor is not None: overrides['quality_floor']=args.quality_floor
         if args.cost_aggressiveness is not None: overrides['cost_aggressiveness']=args.cost_aggressiveness
-        plan=eng().plan_run(run_id=args.run_id,task_class=args.task_class,complexity=args.complexity,risk=args.risk,user_overrides=overrides)
+        plan=eng(root).plan_run(run_id=args.run_id,task_class=args.task_class,complexity=args.complexity,risk=args.risk,user_overrides=overrides)
         print(json.dumps(plan['route'],indent=2)); return
     if args.cmd=='plan':
         overrides={}
         if args.quality_floor is not None: overrides['quality_floor']=args.quality_floor
         if args.cost_aggressiveness is not None: overrides['cost_aggressiveness']=args.cost_aggressiveness
-        print(json.dumps(eng().plan_run(run_id=args.run_id,task_class=args.task_class,complexity=args.complexity,risk=args.risk,coupling=args.coupling,parallelizable=args.parallelizable,repo_revision=args.repo_revision,user_overrides=overrides),indent=2)); return
+        print(json.dumps(eng(root).plan_run(run_id=args.run_id,task_class=args.task_class,complexity=args.complexity,risk=args.risk,coupling=args.coupling,parallelizable=args.parallelizable,repo_revision=args.repo_revision,user_overrides=overrides),indent=2)); return
     if args.cmd=='simulate-policy':
-        print(json.dumps(eng().simulate_policy(candidate_quality_floor=args.quality_floor,candidate_cost_aggressiveness=args.cost_aggressiveness),indent=2)); return
+        print(json.dumps(eng(root).simulate_policy(candidate_quality_floor=args.quality_floor,candidate_cost_aggressiveness=args.cost_aggressiveness),indent=2)); return
     if args.cmd=='topology': print(json.dumps(topology_for(args.complexity,args.coupling,args.parallelizable,args.risk),indent=2)); return
     if args.cmd=='resolve-adapter':
         a = resolve_adapter(model_family=args.model_family)
@@ -325,7 +330,7 @@ def main():
             done[0]+=1
             runtime_label=str(summary.get('runtime') or '?')
             print(f"[{done[0]}/{len(paths)}] {runtime_label:16} +{summary.get('emitted',0):<5} dup={summary.get('duplicates',0):<4} ${summary.get('estimated_cost_usd',0.0):.4f}  {Path(summary['file']).name}",file=sys.stderr,flush=True)
-        result=process_ingest(paths, state_root=_root(), runtime=args.runtime,
+        result=process_ingest(paths, state_root=root, runtime=args.runtime,
                               repository=args.repository, dry_run=args.dry_run,
                               granularity=args.granularity,
                               on_file=progress if not args.quiet else None)
@@ -342,15 +347,15 @@ def main():
         return
     if args.cmd=='quality':
         ev=QualityEvidence(**json.loads(args.payload)); print(json.dumps({'hard_gate_pass':ev.hard_gate_pass(),'quality_evidence_score':ev.evidence_score()},indent=2)); return
-    if args.cmd=='context-put': print(json.dumps(ContextRegistry(_root()).put(args.id,args.content,source=args.source,status=args.status,repo_revision=args.revision),indent=2)); return
-    if args.cmd=='context-packet': print(json.dumps(ContextRegistry(_root()).packet([x.strip() for x in args.ids.split(',') if x.strip()],args.budget),indent=2)); return
-    if args.cmd=='archive-runs': raise SystemExit(_archive_runs_command(args))
-    if args.cmd=='restore-run': raise SystemExit(_restore_run_command(args))
+    if args.cmd=='context-put': print(json.dumps(ContextRegistry(root).put(args.id,args.content,source=args.source,status=args.status,repo_revision=args.revision),indent=2)); return
+    if args.cmd=='context-packet': print(json.dumps(ContextRegistry(root).packet([x.strip() for x in args.ids.split(',') if x.strip()],args.budget),indent=2)); return
+    if args.cmd=='archive-runs': raise SystemExit(_archive_runs_command(args,root))
+    if args.cmd=='restore-run': raise SystemExit(_restore_run_command(args,root))
 
 def _fmt_bytes(n:int)->str: return f'{n:,}'
 
-def _archive_runs_command(args)->int:
-    root=_root()
+def _archive_runs_command(args,root:Path|None=None)->int:
+    root=root if root is not None else _root()
     try: entries=archive_runs(root,older_than_days=args.older_than_days,execute=args.execute)
     except (ValueError,OSError) as exc: print(f'archive-runs: {exc}',file=sys.stderr); return EXIT_INVALID
     planned=[e for e in entries if e['files']]
@@ -386,8 +391,9 @@ def _archive_runs_command(args)->int:
     if failed: print(f"{summary['not_archived_files']} planned file(s) were not archived; see the notes above. Recovery copies are retained.",file=sys.stderr)
     return EXIT_INVALID if failed else EXIT_OK
 
-def _restore_run_command(args)->int:
-    try: result=restore_run(_root(),args.run_id,execute=not args.dry_run)
+def _restore_run_command(args,root:Path|None=None)->int:
+    root=root if root is not None else _root()
+    try: result=restore_run(root,args.run_id,execute=not args.dry_run)
     except (ValueError,OSError) as exc: print(f'restore-run: {exc}',file=sys.stderr); return EXIT_INVALID
     if args.json: print(json.dumps(result,indent=2,default=str)); return EXIT_OK if not result['errors'] else EXIT_INVALID
     print(result['message'])

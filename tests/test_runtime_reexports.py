@@ -12,9 +12,22 @@ block like `_handler`, and every name bound by an `import`/`from ... import` sta
 Anything previously reachable as `orchestrator.runtime.<name>` (a private helper, a stdlib module
 object reached through this name for `unittest.mock.patch(...)`, a dataclass field default
 factory helper) must stay reachable, per ground rule 2 ("don't change what's importable").
+
+`_handler` is conditional even in the pre-split module: `core.fs` (like the monolithic module
+before it) only binds `_handler` when the `orchestrator` logger had no handlers yet at import
+time (`if not _LOGGER.handlers: ... _handler = ...`). `orchestrator.runtime` mirrors that with
+`if hasattr(core.fs, '_handler'): _handler = core.fs._handler` instead of importing it
+unconditionally, so `import orchestrator.runtime` cannot raise `ImportError` merely because
+something already attached a handler to the `orchestrator` logger before `core.fs` ran (see
+`RuntimeHandlerReexportSubprocessTests` below for the regression this guards against). The
+checks below therefore skip `_handler` whenever this process's `core.fs` did not define it,
+instead of asserting it unconditionally.
 """
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
 import fcntl as _stdlib_fcntl
 import hashlib as _stdlib_hashlib
 import json as _stdlib_json
@@ -125,6 +138,8 @@ STDLIB_IDENTITY: dict[str, object] = {
 class RuntimeReexportTests(unittest.TestCase):
     def test_every_previously_importable_name_is_still_importable(self):
         for name in sorted(EXPECTED_REEXPORTS):
+            if name == '_handler' and not hasattr(core_fs, '_handler'):
+                continue  # core.fs did not define it this run (logger already had a handler)
             self.assertTrue(hasattr(runtime, name),
                              f'orchestrator.runtime no longer has {name!r}, previously importable '
                              f'from it (see docs/architecture-review.md B2.2/B2.3)')
@@ -133,6 +148,8 @@ class RuntimeReexportTests(unittest.TestCase):
         self.assertEqual(set(NEW_HOME_IDENTITY) | set(STDLIB_IDENTITY), EXPECTED_REEXPORTS,
                           'every expected re-export must be covered by exactly one identity map above')
         for name, expected in NEW_HOME_IDENTITY.items():
+            if name == '_handler' and not hasattr(core_fs, '_handler'):
+                continue  # core.fs did not define it this run (logger already had a handler)
             self.assertIs(getattr(runtime, name), expected,
                            f'orchestrator.runtime.{name} is not the same object as its new home')
 
@@ -141,6 +158,43 @@ class RuntimeReexportTests(unittest.TestCase):
             self.assertIs(getattr(runtime, name), expected,
                            f'orchestrator.runtime.{name} is not the same object callers used to get '
                            f'(needed e.g. for patch("orchestrator.runtime.fcntl.flock", ...))')
+
+    def test_handler_is_absent_when_core_fs_did_not_define_it(self):
+        """`_handler` must never be unconditionally imported: if `core.fs` did not bind it (this
+        process's `orchestrator` logger already had a handler when `core.fs` ran), `runtime` must
+        not claim to re-export it either, rather than raising `ImportError` at import time (the
+        BLOCKING finding this module now guards against) or fabricating a value.
+        """
+        if hasattr(core_fs, '_handler'):
+            self.skipTest("this process's core.fs defined _handler; nothing to assert about its absence")
+        self.assertFalse(hasattr(runtime, '_handler'))
+
+
+class RuntimeHandlerReexportSubprocessTests(unittest.TestCase):
+    """Regression test for the BLOCKING finding: `orchestrator.runtime` used to do
+    `from .core.fs import _handler` unconditionally, which raised `ImportError` whenever the
+    `orchestrator` logger already had a handler before `core.fs` ran — e.g. a host application
+    (or a previous import of `orchestrator.core.fs` under a different alias) installing its own
+    handler on `logging.getLogger('orchestrator')` before ever importing `orchestrator.runtime`.
+    A fresh subprocess is required because within one process `core.fs` (and therefore its
+    `_handler` decision) is only ever evaluated once, on its first import.
+    """
+    def test_import_succeeds_when_orchestrator_logger_already_has_a_handler(self):
+        script = textwrap.dedent("""\
+            import logging
+            logging.getLogger('orchestrator').addHandler(logging.NullHandler())
+            import orchestrator.runtime  # must not raise ImportError
+            assert not hasattr(orchestrator.runtime, '_handler'), (
+                'core.fs did not define _handler (logger already had a handler); '
+                'runtime must not re-export it either'
+            )
+            print('ok')
+            """)
+        result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0,
+                          f'import orchestrator.runtime failed with a pre-installed orchestrator '
+                          f'logger handler:\nstdout={result.stdout!r}\nstderr={result.stderr!r}')
+        self.assertEqual(result.stdout.strip(), 'ok')
 
 
 if __name__ == '__main__':
