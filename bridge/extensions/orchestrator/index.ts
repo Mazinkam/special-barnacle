@@ -873,10 +873,7 @@ export function dispatchReconAndLeads(
 // OrchestrateArgs, parseArgs, newOrchestrateArgs, consumeFlag moved to
 // core/args.ts (pure; B4.1); imported below.
 
-/** Goals that ask the agents to come back with questions cannot be honored headlessly. */
-function goalExpectsInteraction(goal: string): boolean {
-	return /\b(ask|raise)\b.*\bquestions?\b|\bclarif(y|ication)|\bcheck (back )?with me\b|\bconfirm with me\b/i.test(goal);
-}
+// goalExpectsInteraction moved into commands/orchestrate.ts (B4.6), its only caller.
 
 /**
  * Live check: one cheap probe per distinct configured model, through the exact
@@ -981,28 +978,7 @@ const USAGE = usageText(PROFILES_PATH);
 // installTelemetryDrain moved to hooks/shutdown.ts (B4.6), alongside the
 // signal-driven dispatch reaper; imported below as installShutdownHooks.
 
-/**
- * Post a run's terminal outcome to the chat as a custom message, so the user sees it
- * even though `/orchestrate` returned long before the run settled. `sendMessage` can
- * throw after the session has moved on (e.g. a later shutdown); that failure is not
- * this run's problem to surface, so it is swallowed and logged instead.
- */
-function postRunMessage(
-	pi: ExtensionAPI,
-	runId: string,
-	outcome: "completed" | "failed" | "cancelled",
-	content: string,
-	costUsd: number,
-): void {
-	try {
-		pi.sendMessage(
-			{ customType: "orchestrator-run", content, display: true, details: { runId, outcome, costUsd } },
-			{ triggerTurn: false },
-		);
-	} catch (err) {
-		console.warn(`[orchestrator] could not post run ${runId} summary to chat: ${(err as Error)?.message ?? err}`);
-	}
-}
+// postRunMessage moved into commands/orchestrate.ts (B4.6), its only caller.
 
 export default function (pi: ExtensionAPI) {
 	reapOrphanedPersonaDirs({ tmpRoot: tmpdir(), prefix: PERSONA_TMP_PREFIX, ttlMs: PERSONA_TMP_TTL_MS });
