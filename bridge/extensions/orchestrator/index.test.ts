@@ -329,6 +329,22 @@ describe("session ingest hook wiring", () => {
 		}
 	});
 
+	test("recordHookFailure's written status has exactly the fields contract.json's ingest_status.fields declares (B4.7)", () => {
+		// Python's make_ingest_status (orchestrator/ingest/service.py) and this TS hook build the
+		// same ingest_status.json shape from the same contract; this proves the TS side's output
+		// keys are exactly that shared field list (see tests/test_contract.py for the Python side).
+		const root = mkdtempSync(join(tmpdir(), "orch-hook-fields-test-"));
+		try {
+			orchestrator.recordHookFailure!(root, "boom");
+			const status = JSON.parse(readFileSync(join(root, "ingest_status.json"), "utf8"));
+			expect(Object.keys(status).sort()).toEqual([...contract.ingest_status.fields].sort());
+			expect(status.status).toBe(contract.ingest_status.status_values.error);
+			expect(status.sweep_interval_seconds).toBe(contract.ingest_status.default_sweep_interval_seconds);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("redactPaths (index.ts) matches contract.json's ts redaction_regex on a sample", () => {
 		// The B1 review asked for a consumer-level parity check, not just the JSON: this
 		// exercises the actual exported function, not a re-typed copy of the pattern.

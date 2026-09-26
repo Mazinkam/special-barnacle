@@ -33,6 +33,16 @@ INGEST_STATUS_FILE: str = _CONTRACT['ingest_status_file']
 #: (see `contract.json`'s `max_leads_note` for why 4, not the TS side's old default of 8).
 MAX_LEADS: int = int(_CONTRACT['max_leads'])
 
+_ingest_status = _CONTRACT['ingest_status']
+#: B4.7: `ingest_status.json`'s field names, shared by `ingest.service.make_ingest_status`
+#: and the TS bridge's `hooks/ingest.ts` `recordHookFailure` (see `contract.json`'s
+#: `ingest_status._note` for why the two keep separate write logic on purpose).
+INGEST_STATUS_FIELDS: frozenset[str] = frozenset(_ingest_status['fields'])
+#: `status` field's literal values, keyed by meaning (`ok`/`partial`/`error`).
+INGEST_STATUS_VALUES: dict[str, str] = dict(_ingest_status['status_values'])
+#: Fallback `sweep_interval_seconds` when neither an env override nor a previous status exists.
+DEFAULT_SWEEP_INTERVAL_SECONDS: int = int(_ingest_status['default_sweep_interval_seconds'])
+
 #: File names archive.py must never touch, regardless of age (`archive.NEVER_ARCHIVE`)
 #: and the matching protected-name set in `run-diagnostics.ts`.
 NEVER_ARCHIVE_FILES: frozenset[str] = frozenset(_CONTRACT['never_archive_files'])

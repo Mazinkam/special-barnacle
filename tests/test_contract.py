@@ -16,6 +16,7 @@ import pytest
 from datetime import datetime, timezone
 
 from orchestrator import archive, contract, record_batch, record_index, cli, runtime, scheduler
+from orchestrator.ingest.service import make_ingest_status
 from orchestrator.outcomes import _dt as outcomes_dt
 from orchestrator.run_evidence import _parse_ts as run_evidence_parse_ts
 
@@ -189,6 +190,26 @@ def test_max_leads_matches_contract_and_scheduler_topology_cap() -> None:
         for parallelizable in (0.0, 0.25, 0.5, 0.75, 1.0):
             topo = scheduler.topology_for(complexity, coupling=0.3, parallelizable=parallelizable)
             assert topo['leads'] <= contract.MAX_LEADS
+
+
+def test_make_ingest_status_fields_match_contract() -> None:
+    """B4.7: `make_ingest_status` (Python) and `recordHookFailure` (TS, `hooks/ingest.ts`)
+    build the same `ingest_status.json` shape from `contract.json`'s `ingest_status.fields`/
+    `status_values`/`default_sweep_interval_seconds`, rather than each re-typing the field
+    names and literal status strings. The TS-side parity test is in `index.test.ts`.
+    """
+    raw = _raw_contract()['ingest_status']
+    status = make_ingest_status({}, {'files_scanned': 1, 'emitted': 0})
+    assert set(status.keys()) == set(raw['fields'])
+    assert status['status'] == raw['status_values']['ok']
+
+    failed = make_ingest_status({}, {'files_scanned': 1, 'emitted': 0, 'failures': [{'error': 'boom'}]})
+    assert set(failed.keys()) == set(raw['fields'])
+    assert failed['status'] == raw['status_values']['partial']
+
+    errored = make_ingest_status({}, {'files_scanned': 1, 'emitted': 0}, materialization_error=RuntimeError('x'))
+    assert errored['status'] == raw['status_values']['error']
+    assert errored['sweep_interval_seconds'] == raw['default_sweep_interval_seconds']
 
 
 def test_runtime_state_root_env_var_matches_contract() -> None:

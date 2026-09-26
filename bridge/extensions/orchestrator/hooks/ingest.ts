@@ -68,16 +68,23 @@ export function recordHookFailure(stateRoot: string, detail: string): void {
 			version: 1,
 			last_attempt_at: new Date().toISOString(),
 			last_success_at: previous.last_success_at ?? null,
-			status: "error",
+			status: contract.ingest_status.status_values.error,
 			files_scanned: typeof previous.files_scanned === "number" ? previous.files_scanned : 1,
 			emitted: typeof previous.emitted === "number" ? previous.emitted : 0,
 			failure_count: typeof failureCount === "number" && Number.isFinite(failureCount) ? failureCount + 1 : 1,
 			error,
 			sweep_interval_seconds:
-				typeof previous.sweep_interval_seconds === "number" ? previous.sweep_interval_seconds : 900,
+				typeof previous.sweep_interval_seconds === "number"
+					? previous.sweep_interval_seconds
+					: contract.ingest_status.default_sweep_interval_seconds,
 		};
+		// Written status is exactly contract.json's ingest_status.fields (B4.7): same field set as
+		// Python's make_ingest_status, so `...previous` cannot leak stale/unknown keys into the file.
+		const orderedStatus = Object.fromEntries(
+			contract.ingest_status.fields.map((field) => [field, (status as Record<string, unknown>)[field] ?? null]),
+		);
 		mkdirSync(root, { recursive: true });
-		writeFileSync(temporaryPath, `${JSON.stringify(status, null, 2)}\n`, { mode: 0o600 });
+		writeFileSync(temporaryPath, `${JSON.stringify(orderedStatus, null, 2)}\n`, { mode: 0o600 });
 		renameSync(temporaryPath, statusPath);
 	} catch {
 		// Status reporting is best-effort and must never interrupt a terminal session.

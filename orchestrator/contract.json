@@ -13,6 +13,13 @@
   "max_leads": 4,
   "max_leads_note": "B4.7: the single source for the orchestration lead-count ceiling, consumed by orchestrator/scheduler.py's topology_for (which never requests more leads than this for any complexity/parallelizable input) and by the TS bridge's config.ts (the default for maxLeads, overridable per-run via HUMAIN_ORCHESTRATOR_MAX_LEADS). 4 was chosen to preserve the pre-B4.7 effective behaviour: the Python plan topology already capped itself at 4 leads, so the TS side's old default of 8 was never the binding constraint (config.ts's maxLeads is `min`'d against the plan's own leads, and the plan never exceeded 4) — no behaviour change for a normal /orchestrate run.",
 
+  "ingest_status": {
+    "fields": ["version", "last_attempt_at", "last_success_at", "status", "files_scanned", "emitted", "failure_count", "error", "sweep_interval_seconds"],
+    "status_values": { "ok": "ok", "partial": "partial", "error": "error" },
+    "default_sweep_interval_seconds": 900,
+    "_note": "B4.7: single source for the ingest_status.json shape, built independently by two different writers on different failure paths — Python's orchestrator/ingest/service.py:make_ingest_status (a completed ingest sweep, which may be ok/partial/error) and the TS bridge's hooks/ingest.ts:recordHookFailure (a hook-level failure before/around a Python spawn, always 'error'). Both read field names and status-string literals from here instead of re-typing them, so the written JSON's keys and status vocabulary can never drift even though the two writers cover different scenarios and are not expected to share write logic."
+  },
+
   "never_archive_files": [
     "events.jsonl",
     "metrics.jsonl",

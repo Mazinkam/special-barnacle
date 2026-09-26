@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Optional
 
-from ..contract import INGEST_STATUS_FILE, PATH_REDACTION_RE
+from ..contract import INGEST_STATUS_FILE, PATH_REDACTION_RE, DEFAULT_SWEEP_INTERVAL_SECONDS, INGEST_STATUS_VALUES
 from ..record_batch import BatchAppendError, MAX_BATCH_RECORDS, build_record, settle_streams, write_batch
 # CALL/SESSION come from `orchestrator.records`, the one definition of granularity vocabulary
 # ('call' / 'session'), and are re-exported here because callers outside this module (tests,
@@ -529,7 +529,10 @@ def ingest_paths(paths: Iterable[str | Path], *, runtime: str | None = None, rep
 def make_ingest_status(previous: dict[str, Any], result: dict[str, Any], *,
                        materialization_error: Exception | None = None) -> dict[str, Any]:
     failures = result.get('failures') or []
-    status = 'error' if materialization_error is not None else ('partial' if failures else 'ok')
+    status = (
+        INGEST_STATUS_VALUES['error'] if materialization_error is not None
+        else (INGEST_STATUS_VALUES['partial'] if failures else INGEST_STATUS_VALUES['ok'])
+    )
     error = _bound_error(_redact_paths(str(materialization_error))) if materialization_error is not None else None
     if error is None and failures:
         first_detail = str(failures[0].get('error') or 'ingest failed')
@@ -547,13 +550,13 @@ def make_ingest_status(previous: dict[str, Any], result: dict[str, Any], *,
         if isinstance(previous_interval, int) and not isinstance(previous_interval, bool) and previous_interval >= 0:
             sweep_interval_seconds = previous_interval
         else:
-            sweep_interval_seconds = 900
+            sweep_interval_seconds = DEFAULT_SWEEP_INTERVAL_SECONDS
 
     now = utc_now()
     return {
         'version': 1,
         'last_attempt_at': now,
-        'last_success_at': now if status == 'ok' else previous.get('last_success_at'),
+        'last_success_at': now if status == INGEST_STATUS_VALUES['ok'] else previous.get('last_success_at'),
         'status': status,
         'files_scanned': int(result.get('files_scanned', 0)),
         'emitted': int(result.get('emitted', 0)),
