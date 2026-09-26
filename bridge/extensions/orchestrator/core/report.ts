@@ -29,6 +29,16 @@ export interface VerificationVerdictInput {
 	filesChangedCount: number;
 	/** QA's pass/fail verdict, meaningful only when verification actually ran. */
 	passedVerification: boolean;
+	/** True when the QA dispatch itself timed out (inactivity or absolute ceiling) rather than
+	 *  completing and reporting failing checks. Distinct from a plain FAIL: a timeout means QA
+	 *  never finished judging the changed files at all. */
+	verificationTimedOut?: boolean;
+	/** Named checks QA's own report identified as failing (`parseFailedChecks`), when verification
+	 *  ran and did not pass. Empty when QA failed (non-zero exit, or an explicit FAIL verdict with
+	 *  no named check) without the parser recognizing any specific check — the old
+	 *  `verification failed: (unparsed)` case, which must be visible in the summary too, not just
+	 *  the run log (docs/architecture-review.md C5). */
+	failedChecks?: string[];
 }
 
 export function verificationVerdictFor(input: VerificationVerdictInput): string {
@@ -39,7 +49,10 @@ export function verificationVerdictFor(input: VerificationVerdictInput): string 
 			? "N/A (no files changed — report-only goal)"
 			: "SKIPPED (no files changed)";
 	}
-	return input.passedVerification ? "PASS" : "FAIL";
+	if (input.verificationTimedOut) return "TIMED OUT (QA dispatch did not complete)";
+	if (input.passedVerification) return "PASS";
+	const checks = input.failedChecks ?? [];
+	return checks.length > 0 ? `FAIL (${checks.join(", ")})` : "FAIL (unparsed)";
 }
 
 /**
@@ -70,6 +83,11 @@ export interface RunReport {
 	reconWorkersLine: string;
 	verificationSkipped: boolean;
 	passedVerification: boolean;
+	/** True when the QA dispatch itself timed out rather than completing (see `VerificationVerdictInput`). */
+	verificationTimedOut: boolean;
+	/** Named checks QA's report identified as failing; empty when it failed without the parser
+	 *  recognizing any specific check (`FAIL (unparsed)`). */
+	failedChecks: string[];
 	totalCostUsd: number;
 	/** Number of billed dispatches (architect/workers/leads/verification/escalation + triage, when triage spent anything). */
 	dispatchCount: number;
@@ -107,6 +125,8 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		verificationSkipped: report.verificationSkipped,
 		filesChangedCount: report.filesChangedCount,
 		passedVerification: report.passedVerification,
+		verificationTimedOut: report.verificationTimedOut,
+		failedChecks: report.failedChecks,
 	});
 	const summary = [
 		`Orchestration ${report.blocked ? "BLOCKED" : report.dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(report.elapsedMs)}.`,

@@ -23,7 +23,34 @@ describe("core/report.ts verificationVerdictFor", () => {
 
 	test("verification ran: PASS/FAIL follow the actual verdict, not dispatch success", () => {
 		expect(verificationVerdictFor({ ...base, passedVerification: true })).toBe("PASS");
-		expect(verificationVerdictFor({ ...base, passedVerification: false })).toBe("FAIL");
+		expect(verificationVerdictFor({ ...base, passedVerification: false })).toBe("FAIL (unparsed)");
+	});
+
+	test("verification failed with named checks: the summary names them instead of reading as unparsed", () => {
+		expect(verificationVerdictFor({ ...base, passedVerification: false, failedChecks: ["typecheck", "lint"] })).toBe("FAIL (typecheck, lint)");
+	});
+
+	test("verification failed with no recognized check: reads as unparsed, not a bare FAIL", () => {
+		expect(verificationVerdictFor({ ...base, passedVerification: false, failedChecks: [] })).toBe("FAIL (unparsed)");
+	});
+
+	test("the QA dispatch timing out reads as TIMED OUT, distinct from a completed FAIL", () => {
+		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true })).toBe("TIMED OUT (QA dispatch did not complete)");
+	});
+
+	test("a timeout still wins over named failed checks (QA never finished judging them)", () => {
+		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true, failedChecks: ["typecheck"] })).toBe("TIMED OUT (QA dispatch did not complete)");
+	});
+
+	test("regression: QA dispatched and failed unparsed must never read as 'NOT RUN (no lead succeeded)' (docs/architecture-review.md C5)", () => {
+		// The exact contradiction this fix removes: the old summary said
+		// `verification: NOT RUN (no lead succeeded)` while QA had actually been
+		// dispatched and the log had `verification failed: (unparsed)`. With
+		// `dispatchOk: true` (a lead succeeded, QA ran), the verdict must reflect
+		// the real QA failure, not the no-lead-succeeded state.
+		const verdict = verificationVerdictFor({ ...base, dispatchOk: true, passedVerification: false, failedChecks: [] });
+		expect(verdict).not.toContain("NOT RUN");
+		expect(verdict).toBe("FAIL (unparsed)");
 	});
 });
 
@@ -47,6 +74,8 @@ function baseReport(): RunReport {
 		reconWorkersLine: "recon: 0 workers dispatched",
 		verificationSkipped: false,
 		passedVerification: true,
+		verificationTimedOut: false,
+		failedChecks: [],
 		totalCostUsd: 1.2345,
 		dispatchCount: 3,
 		nestedCostUsd: 0,
@@ -250,5 +279,31 @@ describe("core/report.ts buildRunSummary", () => {
 			].join("\n"),
 		);
 		expect(succeeded).toBe(false);
+	});
+
+	test("QA dispatch timed out: verification line reads TIMED OUT, distinct from a completed FAIL, and the run is not reported as succeeded", () => {
+		const report = { ...baseReport(), passedVerification: false, verificationTimedOut: true, failedChecks: [] };
+		const { text, succeeded } = buildRunSummary(report);
+		expect(text).toContain("verification: TIMED OUT (QA dispatch did not complete)");
+		expect(succeeded).toBe(false);
+	});
+
+	test("QA failed with named checks: the summary names them instead of reading as unparsed", () => {
+		const report = { ...baseReport(), passedVerification: false, failedChecks: ["typecheck", "lint"] };
+		const { text, succeeded } = buildRunSummary(report);
+		expect(text).toContain("verification: FAIL (typecheck, lint)");
+		expect(succeeded).toBe(false);
+	});
+
+	test("regression: a run where a lead succeeded and QA was dispatched but failed unparsed never reads as NOT RUN (no lead succeeded) (docs/architecture-review.md C5)", () => {
+		// The exact bug this closes: the FAILED summary said
+		// `verification: NOT RUN (no lead succeeded)` while QA had been dispatched
+		// and the log had `verification failed: (unparsed)`. A lead succeeding
+		// (dispatchOk: true) plus a failed, unparsed QA verdict must read as a
+		// real FAIL, never as "no lead succeeded".
+		const report = { ...baseReport(), dispatchOk: true, passedVerification: false, failedChecks: [] };
+		const { text } = buildRunSummary(report);
+		expect(text).toContain("verification: FAIL (unparsed)");
+		expect(text).not.toContain("NOT RUN (no lead succeeded)");
 	});
 });

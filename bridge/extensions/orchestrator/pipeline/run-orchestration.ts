@@ -585,6 +585,11 @@ export async function runOrchestration(
 	// loop) so it can skip QA when no lead succeeded; reused here unchanged.
 	const verificationSkipped = lastVerification?.skipped ?? false;
 	const passedVerification = dispatchOk && (lastVerification?.passed ?? false);
+	// The QA dispatch itself timing out (inactivity/absolute ceiling) is a distinct state from QA
+	// completing and reporting failing checks — the summary must say so instead of folding both
+	// into a plain FAIL (docs/architecture-review.md C5).
+	const verificationTimedOut = lastVerification?.dispatch?.outcome === "timed_out";
+	const failedChecks = lastVerification?.failedChecks ?? [];
 
 	session.cancellation.throwIfCancelled();
 	const telemetry = await deps.completeRun(runId, {
@@ -653,6 +658,8 @@ export async function runOrchestration(
 		reconWorkersLine: summarizeReconWorkers(workerResults),
 		verificationSkipped,
 		passedVerification,
+		verificationTimedOut,
+		failedChecks,
 		totalCostUsd: totalCost,
 		dispatchCount: billedResults.length + (triageCost.usd > 0 ? 1 : 0),
 		nestedCostUsd: nestedCost,
