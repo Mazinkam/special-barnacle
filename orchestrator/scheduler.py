@@ -108,7 +108,6 @@ def recommend_package(*,task_class:str,complexity:float,risk:str,quality_floor:f
         if delayed is not None: quality=max(0.0,quality-delayed*.20)
         small_penalty=max(0,min_samples-samples)/min_samples*.025
         adjusted_quality=quality-small_penalty
-        cost_score=cost*(1.0+max(0,1-cost_aggressiveness)*.15)
         feasible=adjusted_quality>=quality_floor
         candidates.append({'package':asdict(p),'samples':round(samples,3),'estimated_verified_cost_usd':round(cost,6),'estimated_quality_evidence':round(adjusted_quality,4),'feasible':feasible,'historical':bool(hist)})
     feasible=[c for c in candidates if c['feasible']]

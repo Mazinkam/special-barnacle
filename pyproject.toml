@@ -29,3 +29,16 @@ select = ["E9", "F", "B"]
 "orchestrator/ingest/__init__.py" = ["F401"]
 "orchestrator/ingest_checkpoint.py" = ["F401"]
 "orchestrator/runtime.py" = ["F401"]
+# Ground rule 2 (docs/architecture-review.md, B3): every name importable from the old
+# single-file orchestrator/cli.py must stay importable/patchable from this package's
+# __init__.py, enforced by tests/test_cli_reexports.py.
+"orchestrator/cli/__init__.py" = ["F401"]
+# Backward-compatible re-export shim (see module docstring): every name that used to be
+# importable from orchestrator/dashboard.py before the B3 presentation split stays
+# importable here, including private helpers tests reach via dashboard._name.
+"orchestrator/dashboard.py" = ["F401"]
+# EFFORTS/CAPABILITY_TIER_TARGET are resolved lazily via module __getattr__ (B2 review
+# finding: avoid a file read on bare import); __all__ lists them so `import *` still
+# reaches them through __getattr__ (tests/test_star_exports.py).
+"orchestrator/scheduler.py" = ["F822"]
+"orchestrator/dynamic_adapter.py" = ["F822"]

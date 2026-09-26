@@ -13,7 +13,6 @@ top-level key without wiring a reader — fails loudly instead of silently reint
 from __future__ import annotations
 
 import json
-import re
 import unittest
 from pathlib import Path
 

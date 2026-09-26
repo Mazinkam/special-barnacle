@@ -264,7 +264,7 @@ class IngestLedger:
 
         path = self.path.with_name(STREAMS['event'])
         end = 0
-        for row, end in iter_jsonl_from(path):
+        for row, end in iter_jsonl_from(path):  # noqa: B007 -- end is read after the loop, below
             apply(row)
         apply(self._complete_tail(end, path))
         for row in self.staged:

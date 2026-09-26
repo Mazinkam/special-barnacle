@@ -1502,7 +1502,7 @@ class RotationDuringReadTests(CheckpointTestCase):
                 replacement = ht_session(self.dir / 'incoming.jsonl', 2, session='sess-B')
                 real_read = ingest_module.read_calls
 
-                def rotate_then_read(*args, **kwargs):
+                def rotate_then_read(*args, replacement=replacement, log=log, real_read=real_read, **kwargs):
                     os.replace(replacement, log)
                     return real_read(*args, **kwargs)
 

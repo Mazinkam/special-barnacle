@@ -222,7 +222,6 @@ def test_runtime_state_root_env_var_matches_contract() -> None:
 
 def test_install_sh_default_state_root_matches_contract() -> None:
     """The active shell fallback must match `state_root.default` in the contract."""
-    import re
 
     install_sh = (REPO_ROOT / 'install.sh').read_text(encoding='utf-8')
     assignments = [

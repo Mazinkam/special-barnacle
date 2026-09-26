@@ -334,7 +334,7 @@ record_batch.write_batch(sys.argv[1], json.loads(sys.stdin.read()))
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 _fill_streams(root, 4000 * multiplier)
-                def probe(i):
+                def probe(i, root=root):
                     return record_batch.write_batch(root, [{'stream': 'metric', 'record_id': f'probe-{i}'}], refresh=False)
                 probe(0); probe(1)
                 with measure_io() as counts:

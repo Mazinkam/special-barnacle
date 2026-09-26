@@ -254,7 +254,7 @@ class JsonDocumentByteIdenticalTests(unittest.TestCase):
             data = {'schema_version': 3, 'artifacts': {}}
 
             def old_put(artifact_id, content, *, source, token_estimate=None):
-                from orchestrator.runtime import stable_hash, utc_now
+                from orchestrator.runtime import stable_hash
                 obj = {'id': artifact_id, 'hash': stable_hash(content), 'content': content, 'source': source,
                        'status': 'observed', 'repo_revision': None, 'dependencies': [],
                        'token_estimate': token_estimate, 'valid': True, 'updated_at': None}

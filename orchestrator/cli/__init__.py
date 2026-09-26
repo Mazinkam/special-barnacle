@@ -93,7 +93,7 @@ EXIT_OK=CONTRACT_EXIT_OK; EXIT_INVALID=CONTRACT_EXIT_INVALID; EXIT_APPEND_FAILED
 
 def _parse_json(text:str,what:str):
     try: return json.loads(text)
-    except json.JSONDecodeError as exc: raise BatchValidationError(f'{what} is not valid JSON: {exc}')
+    except json.JSONDecodeError as exc: raise BatchValidationError(f'{what} is not valid JSON: {exc}') from exc
 
 def _batch_payload(raw:str|None):
     return _parse_json(raw if raw not in (None,'-') else sys.stdin.read(),'batch payload')

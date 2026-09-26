@@ -19,7 +19,6 @@ import sys
 import time
 from pathlib import Path
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AUDIT_SCRIPT = REPO_ROOT / "scripts" / "audit_and_clean_metrics.py"

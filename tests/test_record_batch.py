@@ -543,7 +543,6 @@ class ReviewRegressionTests(TemporaryRootTestCase):
 
     # (2) Cached membership can never be the reason a new record is silently dropped.
     def test_valid_shaped_corrupt_checkpoint_cannot_discard_a_new_record(self):
-        from orchestrator import record_batch
         self.assertEqual(run_batch(self.root, sample_batch()).returncode, 0)
         def corrupt(record_id: str, *, consistent: bool):
             """Forge membership in a structurally valid cache; receipt stays independent."""

@@ -13,8 +13,6 @@ import json
 
 
 def register(sp) -> None:
-    from orchestrator import cli
-
     sp.add_parser('init', help='append the schema-3 orchestrator_initialized event and refresh the ledger/dashboard')
     sp.add_parser('status', help='print the current ledger (rebuilding it from durable streams first if it is missing/stale)')
     sp.add_parser('dashboard', help='render and print the dashboard HTML for the current state root')
@@ -78,7 +76,7 @@ def handle_batch(args, root, C) -> None:
         records = cli._batch_payload(args.payload)
     except cli.BatchValidationError as exc:
         print(json.dumps(cli._failure(cli.STATUS_INVALID, str(exc))))
-        raise SystemExit(cli.EXIT_INVALID)
+        raise SystemExit(cli.EXIT_INVALID) from exc
     raise SystemExit(cli.write_records(records, root))
 
 

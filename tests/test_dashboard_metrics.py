@@ -11,7 +11,6 @@ fail for the right reason.
 """
 import json
 import math
-import os
 import re
 import tempfile
 import unittest
@@ -841,7 +840,7 @@ class SpendCapBreachTests(StreamCase):
     def _cap(self, run_id, capability='lead_large', cost=10.5, nested=5.0, cap=10, action='warn', model='fable'):
         return {'event': 'spend_cap_exceeded', 'run_id': run_id, 'task_id': f'{run_id}-lead-0',
                 'capability': capability, 'model': model, 'cap_usd': cap, 'cost_usd': cost,
-                'nested_cost_usd': nested, 'action': action, 'ts': f'2026-09-24T10:00:00Z',
+                'nested_cost_usd': nested, 'action': action, 'ts': '2026-09-24T10:00:00Z',
                 'record_id': f'cap-{run_id}-{capability}'}
 
     def test_no_breaches_is_a_real_zero(self):

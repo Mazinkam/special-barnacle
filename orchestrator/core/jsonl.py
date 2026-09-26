@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterator, Optional
 from contextlib import contextmanager
 
 

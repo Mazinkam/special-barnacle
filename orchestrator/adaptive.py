@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
 from typing import Any
 import hashlib
 
 from .history import bucket_complexity
 from . import scheduler
-from .scheduler import DEFAULT_PACKAGES, recommend_package, topology_for, package_history, measured
+from .scheduler import recommend_package, topology_for, package_history, measured
 from .vocab import DEFAULT_MIN_SAMPLES, HIGH_RISK
 
 

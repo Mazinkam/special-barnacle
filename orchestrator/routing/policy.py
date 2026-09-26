@@ -8,7 +8,6 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from ..history import bucket_complexity
 from ..scheduler import recommend_package
 from ..vocab import DEFAULT_MIN_SAMPLES
 
