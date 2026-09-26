@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@humain/terminal";
 
+import type { DispatchTask } from "../core/prompts.ts";
 import { parseFailedChecks, runVerification, type VerifyDeps, hasExplicitFailVerdict } from "./verify-loop.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import type { RunContext } from "../run/context.ts";
@@ -37,6 +38,21 @@ function fakeQaResult(stdout: string, exitCode = 0): DispatchResult {
 function fakeVerifyDeps(qaStdout: string, exitCode = 0): VerifyDeps {
 	return {
 		dispatch: async () => [fakeQaResult(qaStdout, exitCode)],
+		captureDispatchCost: async () => {},
+		recordOutcome: () => {},
+	};
+}
+
+/** Captures the exact `task` string handed to `dispatch`, for asserting the QA prompt's content
+ *  (docs/architecture-review.md C4: the repo root + verification commands). */
+function capturingVerifyDeps(qaStdout: string, exitCode = 0): VerifyDeps & { lastTasks: DispatchTask[] } {
+	const lastTasks: DispatchTask[] = [];
+	return {
+		lastTasks,
+		dispatch: async (tasks) => {
+			lastTasks.push(...tasks);
+			return [fakeQaResult(qaStdout, exitCode)];
+		},
 		captureDispatchCost: async () => {},
 		recordOutcome: () => {},
 	};
@@ -197,30 +213,38 @@ describe("parseFailedChecks fenced code block / blockquote handling", () => {
 });
 
 describe("runVerification", () => {
+	test("grounds the QA prompt in the absolute repo root and its verification commands (docs/architecture-review.md C4)", async () => {
+		const deps = capturingVerifyDeps("## Verdict\nPASS", 0);
+		await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), deps, "/abs/repo/root");
+		expect(deps.lastTasks).toHaveLength(1);
+		expect(deps.lastTasks[0]!.task).toContain("The repo root is /abs/repo/root (your cwd). Never search outside it; never run `find /`.");
+		expect(deps.lastTasks[0]!.task).toContain("Verification commands:");
+	});
+
 	test("an explicit '## Verdict' FAIL heading fails verification even though the QA dispatch exited 0", async () => {
 		const qaOut = ["## Checks", "- `typecheck`: PASS", "", "## Verdict", "FAIL."].join("\n");
-		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0), "/repo");
 		expect(result.passed).toBe(false);
 		expect(result.failedChecks).toContain("verdict");
 	});
 
 	test("a 'Verdict: FAIL' line fails verification even though the QA dispatch exited 0", async () => {
 		const qaOut = "Verdict: FAIL";
-		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0), "/repo");
 		expect(result.passed).toBe(false);
 		expect(result.failedChecks).toContain("verdict");
 	});
 
 	test("a 'STATUS: fail' line fails verification even though the QA dispatch exited 0", async () => {
 		const qaOut = "STATUS: fail";
-		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0), "/repo");
 		expect(result.passed).toBe(false);
 		expect(result.failedChecks).toContain("verdict");
 	});
 
 	test("an explicit '## Verdict' PASS heading does not flag, and does not falsely fail", async () => {
 		const qaOut = ["## Checks", "- `typecheck`: PASS", "", "## Verdict", "PASS."].join("\n");
-		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0), "/repo");
 		expect(result.passed).toBe(true);
 		expect(result.failedChecks).not.toContain("verdict");
 	});
@@ -238,35 +262,35 @@ describe("runVerification", () => {
 			"Verdict: FAIL",
 			"```",
 		].join("\n");
-		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0), "/repo");
 		expect(result.passed).toBe(true);
 		expect(result.failedChecks).not.toContain("verdict");
 	});
 
 	test("a real PASS verdict is not overridden by a FAIL verdict quoted inside a blockquote in the same output", async () => {
 		const qaOut = ["## Checks", "- `typecheck`: PASS", "", "## Verdict", "PASS.", "", "> Verdict: FAIL"].join("\n");
-		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0), "/repo");
 		expect(result.passed).toBe(true);
 		expect(result.failedChecks).not.toContain("verdict");
 	});
 
 	test("an unterminated ``` fence does not hide a real FAIL verdict that follows it", async () => {
 		const qaOut = ["```", "some unterminated code", "## Verdict", "FAIL"].join("\n");
-		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0), "/repo");
 		expect(result.passed).toBe(false);
 		expect(result.failedChecks).toContain("verdict");
 	});
 
 	test("a ``` fence mismatched-closed by ~~~ does not hide a real FAIL verdict that follows it", async () => {
 		const qaOut = ["```", "Verdict: FAIL (example)", "~~~", "## Verdict", "FAIL"].join("\n");
-		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0), "/repo");
 		expect(result.passed).toBe(false);
 		expect(result.failedChecks).toContain("verdict");
 	});
 
 	test("a properly closed fence containing FAIL followed by a real PASS verdict passes", async () => {
 		const qaOut = ["```", "Verdict: FAIL (example)", "```", "## Verdict", "PASS"].join("\n");
-		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0), "/repo");
 		expect(result.passed).toBe(true);
 		expect(result.failedChecks).not.toContain("verdict");
 	});

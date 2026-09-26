@@ -53,6 +53,8 @@ export async function dispatchReconAndLeads(
 		maxLeads: number;
 		/** Sized lead capability (lead_small | lead | lead_large); defaults to "lead". */
 		leadCapability?: string;
+		/** The run's cwd, resolved absolute; forwarded into every lead prompt (docs/architecture-review.md C4). */
+		repoRoot: string;
 	},
 	effects: {
 		dispatch: (tasks: DispatchTask[]) => Promise<DispatchResult[]>;
@@ -61,7 +63,7 @@ export async function dispatchReconAndLeads(
 		throwIfCancelled: () => void;
 	},
 ): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[] }> {
-	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars, maxLeads, leadCapability = "lead" } = input;
+	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars, maxLeads, leadCapability = "lead", repoRoot } = input;
 	const requestedLeadCount = effectiveLeadCount(plan, maxLeads);
 
 	// Rule 2: parent-owned, read-only recon dispatched directly by the bridge
@@ -122,7 +124,7 @@ export async function dispatchReconAndLeads(
 	const waves = assignments ? planLeadWaves(assignments) : [[0]];
 	const leadTaskFor = (i: number): DispatchTask => ({
 		capability: leadCapability,
-		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter, assignments?.[i]),
+		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter, repoRoot, assignments?.[i]),
 		taskId: `${runId}-lead-${i}`,
 	});
 
@@ -187,6 +189,9 @@ export interface HierarchyDeps {
 	maxLeads: number;
 	/** Rule-2 recon evidence packet budget (config.ts's `reconEvidenceMaxChars`). */
 	evidenceMaxChars: number;
+	/** The run's cwd, resolved absolute (docs/architecture-review.md C4): threaded into every lead
+	 *  prompt so the lead is told plainly where it is instead of guessing and running `find /`. */
+	repoRoot: string;
 }
 
 /**
@@ -267,7 +272,7 @@ export async function dispatchHierarchical(
 	}
 
 	const results = await dispatchReconAndLeads(
-		{ runId, goal, plan, adapter, architectResult, leadCapability, evidenceMaxChars: deps.evidenceMaxChars, maxLeads: deps.maxLeads },
+		{ runId, goal, plan, adapter, architectResult, leadCapability, evidenceMaxChars: deps.evidenceMaxChars, maxLeads: deps.maxLeads, repoRoot: deps.repoRoot },
 		{
 			dispatch: deps.dispatch,
 			capture: (result) => deps.captureDispatchCost(captureOpts, result, run),

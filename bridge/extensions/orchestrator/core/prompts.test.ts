@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { effectiveLeadCount, formatTaskPrompt, parsePlanResponse, type PlanResponse } from "./prompts.ts";
+import { effectiveLeadCount, formatTaskPrompt, leadPrompt, parsePlanResponse, repoRootGuardrail, VERIFICATION_COMMANDS, type PlanResponse } from "./prompts.ts";
 import planFixture from "../fixtures/orchestrator-cli-plan-response.json";
 
 function plan(leads: number): PlanResponse {
@@ -45,6 +45,26 @@ describe("core/prompts.ts formatTaskPrompt", () => {
 		const withMsg = formatTaskPrompt({ taskId: "t1", capability: "worker", task: "do it" }, "run-1", ["stop early"]);
 		expect(withMsg).toContain("stop early");
 		expect(withMsg).toContain("User messages while this run was in progress");
+	});
+});
+
+describe("core/prompts.ts repoRootGuardrail", () => {
+	test("names the absolute repo root as the agent's cwd and forbids searching outside it", () => {
+		const lines = repoRootGuardrail("/abs/repo/root");
+		expect(lines.join("\n")).toContain("The repo root is /abs/repo/root (your cwd). Never search outside it; never run `find /`.");
+	});
+
+	test("names the repo's verification commands", () => {
+		const lines = repoRootGuardrail("/abs/repo/root");
+		for (const cmd of VERIFICATION_COMMANDS) expect(lines.join("\n")).toContain(cmd);
+	});
+});
+
+describe("core/prompts.ts leadPrompt", () => {
+	test("grounds the lead in the absolute repo root and forbids find / (docs/architecture-review.md C4)", () => {
+		const prompt = leadPrompt("goal", plan(1), undefined, "", 0, 1, { lead: { model: "provider/model" } }, "/abs/repo/root");
+		expect(prompt).toContain("The repo root is /abs/repo/root (your cwd). Never search outside it; never run `find /`.");
+		expect(prompt).toContain("Verification commands:");
 	});
 });
 

@@ -13,6 +13,7 @@
  */
 
 import { homedir, tmpdir } from "node:os";
+import { resolve } from "node:path";
 
 import { type ExtensionAPI, type ExtensionContext } from "@humain/terminal";
 
@@ -316,9 +317,12 @@ export function dispatchParallel(
  * required `maxLeads`/`evidenceMaxChars`.
  */
 export function dispatchReconAndLeads(
-	input: Omit<Parameters<typeof dispatchReconAndLeadsCore>[0], "maxLeads" | "evidenceMaxChars"> & {
+	input: Omit<Parameters<typeof dispatchReconAndLeadsCore>[0], "maxLeads" | "evidenceMaxChars" | "repoRoot"> & {
 		maxLeads?: number;
 		evidenceMaxChars?: number;
+		/** The run's cwd, resolved absolute; defaults to the process's own cwd here — this wrapper is
+		 *  index.ts's impure edge, unlike the pure `pipeline/hierarchy.ts` core it defaults for. */
+		repoRoot?: string;
 	},
 	effects: Parameters<typeof dispatchReconAndLeadsCore>[1],
 ): ReturnType<typeof dispatchReconAndLeadsCore> {
@@ -327,6 +331,7 @@ export function dispatchReconAndLeads(
 			...input,
 			maxLeads: input.maxLeads ?? MAX_LEADS,
 			evidenceMaxChars: input.evidenceMaxChars ?? RECON_EVIDENCE_MAX_CHARS,
+			repoRoot: input.repoRoot ?? resolve(process.cwd()),
 		},
 		effects,
 	);

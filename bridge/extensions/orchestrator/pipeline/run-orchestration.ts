@@ -23,6 +23,7 @@
  * `deps` instead, same as `pipeline/hierarchy.ts` and `pipeline/verify-loop.ts`.
  */
 import type { ExtensionContext } from "@humain/terminal";
+import { resolve } from "node:path";
 
 import type { OrchestrateArgs } from "../core/args.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
@@ -329,6 +330,7 @@ export async function runOrchestration(
 	const headBefore = gitHead(cwd);
 	// `workerResults` carries the parent-owned recon dispatches; they must stay
 	// destructured here or the run stops billing them (plan Task 3).
+	const repoRoot = resolve(cwd);
 	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks } = await dispatchHierarchical(
 		runId,
 		plan.plan_id,
@@ -343,6 +345,7 @@ export async function runOrchestration(
 			captureDispatchCost: deps.captureDispatchCost,
 			maxLeads: deps.maxLeads,
 			evidenceMaxChars: deps.reconEvidenceMaxChars,
+			repoRoot,
 		},
 	);
 	// dispatchHierarchical no longer hands back a mutable `escalationResults`
@@ -403,9 +406,17 @@ export async function runOrchestration(
 	// lead reports "Files Changed: None" belong to someone else (a
 	// concurrent session) and are excluded from this run's QA scope.
 	const leadStatuses = leadResults.map((r) => parseLeadStatus(r.stdout));
+	// Computed here (not only in Step 4's finalize) so the retry loop below can
+	// skip QA entirely when no lead succeeded, instead of sending it to verify
+	// a failed lead's partial, unreported changes (docs/architecture-review.md
+	// C4: the old QA ran on 29 files a failed lead had left behind, decided it
+	// was in the wrong directory, ran `find / -iname ...`, and hung until the
+	// 20-minute timeout).
+	const succeededLeads = leadResults.filter((r) => r.exitCode === 0).length;
+	const dispatchOk = leadResults.length > 0 && succeededLeads > 0;
 	const runOutcome = classifyRunOutcome({
 		leadStatuses,
-		succeededLeads: leadResults.filter((r) => r.exitCode === 0).length,
+		succeededLeads,
 		leads: leadResults.length,
 	});
 	// Only when EVERY lead exited 0 and says it changed nothing: a lead that
@@ -422,12 +433,15 @@ export async function runOrchestration(
 	if (runOutcome === "blocked") {
 		session.log(`all ${leadResults.length} lead(s) reported STATUS: blocked; skipping QA`);
 		deps.recordEvent("run_blocked", { run_id: runId, leads: leadResults.length });
+	} else if (!dispatchOk) {
+		session.log(`no lead succeeded (0/${leadResults.length}); skipping QA on the failed lead(s)' partial work`);
+		deps.recordEvent("qa_skipped_no_lead_succeeded", { run_id: runId, leads: leadResults.length });
 	}
 
 	let retries = 0;
 	let lastVerification: VerificationResult | null = null;
 	const verificationResults: DispatchResult[] = [];
-	while (runOutcome !== "blocked" && retries <= parsed.maxRetries) {
+	while (runOutcome !== "blocked" && dispatchOk && retries <= parsed.maxRetries) {
 		if (allFiles.length > 0) {
 			session.setPhase(
 				retries === 0
@@ -447,6 +461,7 @@ export async function runOrchestration(
 				captureDispatchCost: deps.captureDispatchCost,
 				recordOutcome: deps.recordOutcome,
 			},
+			repoRoot,
 		);
 		session.cancellation.throwIfCancelled();
 		if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
@@ -566,11 +581,8 @@ export async function runOrchestration(
 	const nestedCost = billedResults.reduce((s, r) => s + (r.nestedCostUsd ?? 0), 0);
 	const totalCost =
 		triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0) + nestedCost;
-	const succeededLeads = leadResults.filter((r) => r.exitCode === 0).length;
-	// A run that dispatched nothing, or whose every lead failed, has not
-	// verified anything — reporting the empty verification suite as PASS is
-	// how phantom runs looked green.
-	const dispatchOk = leadResults.length > 0 && succeededLeads > 0;
+	// `succeededLeads`/`dispatchOk` are computed earlier (before the QA retry
+	// loop) so it can skip QA when no lead succeeded; reused here unchanged.
 	const verificationSkipped = lastVerification?.skipped ?? false;
 	const passedVerification = dispatchOk && (lastVerification?.passed ?? false);
 

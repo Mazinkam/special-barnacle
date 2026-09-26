@@ -18,7 +18,7 @@ import type { ExtensionContext } from "@humain/terminal";
 
 import type { Adapter } from "../adapters/adapter-resolver.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
-import { QA_SCOPE_RULES, type DispatchTask } from "../core/prompts.ts";
+import { QA_SCOPE_RULES, repoRootGuardrail, type DispatchTask } from "../core/prompts.ts";
 import type { RunContext } from "../run/context.ts";
 import type { RunSession } from "../run/session.ts";
 
@@ -248,6 +248,9 @@ export async function runVerification(
 	run: RunContext<RunSession> | null,
 	captureOpts: CaptureOpts,
 	deps: VerifyDeps,
+	/** The run's cwd, resolved absolute (docs/architecture-review.md C4): grounds the QA prompt in
+	 *  the repo it is actually running against, instead of letting it guess and run `find /`. */
+	repoRoot: string,
 ): Promise<VerificationResult> {
 	if (filesChanged.length === 0) {
 		return {
@@ -262,6 +265,8 @@ export async function runVerification(
 		`Run the project verification suite for these changed files:`,
 		"",
 		...filesChanged.map((f) => `- \`${f}\``),
+		"",
+		...repoRootGuardrail(repoRoot),
 		"",
 		"Run typecheck, unit tests, integration tests, lint as applicable.",
 		...QA_SCOPE_RULES,

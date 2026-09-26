@@ -205,6 +205,27 @@ export const QA_SCOPE_RULES = [
 	"Environment: use the project's documented test commands. If they cannot run after 2 attempts (missing interpreter, dependency, or service), stop and report FAIL with check name `environment` and the exact error; do not try alternative interpreters or install anything.",
 ];
 
+/** The repo's own canonical verification commands (README.md "Verify" section). */
+export const VERIFICATION_COMMANDS = [
+	"python3 -B -m pytest -p no:cacheprovider -q",
+	"bun test ./bridge",
+	"./scripts/typecheck-bridge.sh --all",
+];
+
+/**
+ * Grounds a QA/lead prompt in the repo it is actually running against (docs/architecture-review.md
+ * C4): the old QA prompt didn't name the repo root, so the agent decided it was in the wrong
+ * directory, ran `find / -iname ...`, and hung until the 20-minute timeout. `repoRoot` must be the
+ * run's cwd, resolved absolute, and threaded in explicitly by the caller — this stays a pure
+ * string formatter, never reading `process.cwd()` itself.
+ */
+export function repoRootGuardrail(repoRoot: string): string[] {
+	return [
+		`The repo root is ${repoRoot} (your cwd). Never search outside it; never run \`find /\`.`,
+		`Verification commands: ${VERIFICATION_COMMANDS.join(" · ")}`,
+	];
+}
+
 /**
  * The model table the lead must forward to HT's `subagent` tool. The subagent
  * tool ignores the `model:` frontmatter in the orch-* persona files and runs
@@ -236,6 +257,8 @@ export function leadPrompt(
 	leadIndex: number,
 	leadCount: number,
 	adapter: Adapter,
+	/** The run's cwd, resolved absolute (docs/architecture-review.md C4). */
+	repoRoot: string,
 	assignment?: LeadAssignment,
 ): string {
 	// Only forward a plan the architect actually produced. A failed architect
@@ -270,6 +293,8 @@ export function leadPrompt(
 	].join("\n");
 	return [
 		`You are the orchestrator lead for the following goal. Drive it to completion.`,
+		"",
+		...repoRootGuardrail(repoRoot),
 		"",
 		`Goal: ${goal}`,
 		`Task class: ${plan.task_class} | Complexity: ${plan.complexity} | Risk: ${plan.risk}`,

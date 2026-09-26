@@ -643,6 +643,7 @@ const planFixture: Parameters<typeof orchestrator.leadPrompt>[1] = {
 const adapterFixture: Parameters<typeof orchestrator.leadPrompt>[6] = {
 	lead: { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
 };
+const repoRootFixture = "/repo";
 
 describe("leadPrompt recon evidence handoff", () => {
 
@@ -655,6 +656,7 @@ describe("leadPrompt recon evidence handoff", () => {
 			0,
 			1,
 			adapterFixture,
+			repoRootFixture,
 		);
 		expect(prompt).toContain("Recon evidence");
 		expect(prompt).toContain("affected: src/a.ts");
@@ -671,6 +673,7 @@ describe("leadPrompt recon evidence handoff", () => {
 			0,
 			1,
 			adapterFixture,
+			repoRootFixture,
 		);
 		expect(prompt).toContain("Recon evidence");
 		expect(prompt).toContain("none");
@@ -685,6 +688,7 @@ describe("leadPrompt recon evidence handoff", () => {
 			0,
 			1,
 			adapterFixture,
+			repoRootFixture,
 		);
 		expect(prompt).not.toContain("workers fan out inside each lead");
 		expect(prompt).toContain("not authoritative worker accounting");
@@ -692,7 +696,7 @@ describe("leadPrompt recon evidence handoff", () => {
 
 	test("leaves final QA to the orchestrator instead of asking the lead to run orch-qa-agent", () => {
 		// Regression: ht-orch-1790256789245-1a3fms ran QA twice (lead's orch-qa-agent, then the bridge's).
-		const prompt = orchestrator.leadPrompt("repair flow", planFixture, undefined, "", 0, 1, adapterFixture);
+		const prompt = orchestrator.leadPrompt("repair flow", planFixture, undefined, "", 0, 1, adapterFixture, repoRootFixture);
 		expect(prompt).not.toContain("run QA via orch-qa-agent");
 		expect(prompt).toContain("Do not dispatch orch-qa-agent");
 		expect(prompt).not.toContain("does not see, log, or bill");
@@ -4077,7 +4081,7 @@ describe("lead sizing wiring (Phase A)", () => {
 	});
 
 	test("lead prompt states the delegation rule and the STATUS contract", () => {
-		const p = orchestrator.leadPrompt("goal", planFixture, undefined, "", 0, 1, adapterFixture);
+		const p = orchestrator.leadPrompt("goal", planFixture, undefined, "", 0, 1, adapterFixture, repoRootFixture);
 		expect(p).toContain(orchestrator.LEAD_DELEGATION_RULE);
 		expect(p).toContain(orchestrator.LEAD_STATUS_CONTRACT);
 	});
@@ -4205,7 +4209,7 @@ describe("orchestrator fixes from run ht-orch-1790237987755-lyjkn8 (A8)", () => 
 	});
 
 	test("lead prompt carries the assigned scope and its dependencies", () => {
-		const p = orchestrator.leadPrompt("g", threeLeadPlan, undefined, "", 1, 3, adapterFixture, { index: 1, scope: "A1-A3", dependsOn: [0] });
+		const p = orchestrator.leadPrompt("g", threeLeadPlan, undefined, "", 1, 3, adapterFixture, repoRootFixture, { index: 1, scope: "A1-A3", dependsOn: [0] });
 		expect(p).toContain("Your scope (from the architect's Lead assignments): A1-A3");
 		expect(p).toContain("Leads 1 ran before you");
 	});

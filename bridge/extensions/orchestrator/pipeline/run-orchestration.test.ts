@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@humain/terminal";
 
 import { runOrchestration, writeLeadReportsDiagnostic, type RunOrchestrationDeps } from "./run-orchestration.ts";
+import { buildRunSummary } from "../core/report.ts";
 import { RunCancellation } from "../cancellation.ts";
 import type { RunSession } from "../run/session.ts";
 import type { RunContext } from "../run/context.ts";
@@ -194,6 +195,80 @@ describe("pipeline/run-orchestration.ts runOrchestration", () => {
 		expect(dispatchCalls).toBe(0);
 		expect(failRunCalls).toBe(1);
 		expect(notifications.some((n) => n.text === "Cancelled." && n.level === "info")).toBe(true);
+	});
+});
+
+describe("pipeline/run-orchestration.ts runOrchestration QA skip when no lead succeeded (C4)", () => {
+	test("every lead failing dispatches no QA agent, and the summary says verification was skipped because no lead succeeded", async () => {
+		const runId = "ht-orch-1700000000000-allfailed";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan: PlanResponse = {
+			plan_id: "plan-123456789012",
+			run_id: runId,
+			task_class: "bugfix",
+			complexity: 3,
+			risk: "medium",
+			topology: { depth: 1, leads: 1, workers: 0, shape: "flat" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto",
+				history_sufficient: true,
+				explanation: {},
+			},
+			effective_quality_floor: 0.5,
+			cost_aggressiveness: 0.5,
+		};
+		const dispatchedCapabilities: string[] = [];
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			// The lead itself fails (exit 1) but reports files changed — the exact
+			// shape of the incident this regression guards: a failed lead's partial,
+			// unreported work must never reach QA.
+			dispatchParallel: async (_cwd, _runId2, tasks) => {
+				dispatchedCapabilities.push(...tasks.map((t) => t.capability));
+				return tasks.map((t) => ({
+					taskId: t.taskId,
+					capability: t.capability,
+					model: "p/lead",
+					exitCode: 1,
+					stdout: "boom mid-way through",
+					stderr: "lead crashed",
+					usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+					durationMs: 1,
+					costUsd: 0,
+					nestedCostUsd: 0,
+					costReported: true,
+					outcome: "failed" as const,
+					filesChanged: ["src/a.ts"],
+				}));
+			},
+		});
+
+		const result = await runOrchestration(
+			runId,
+			"/tmp/cwd-not-a-git-repo",
+			fakeArgs(),
+			adapter,
+			resolved,
+			ctx,
+			session,
+			{ ...claimed, session },
+			deps,
+		);
+
+		expect(result.kind).toBe("completed");
+		expect(dispatchedCapabilities).not.toContain("qa_agent");
+		if (result.kind === "completed") {
+			expect(result.report.dispatchOk).toBe(false);
+			expect(result.report.verificationSkipped).toBe(false);
+			expect(result.report.passedVerification).toBe(false);
+			const { text } = buildRunSummary(result.report);
+			expect(text).toContain("verification: NOT RUN (no lead succeeded)");
+		}
 	});
 });
 
