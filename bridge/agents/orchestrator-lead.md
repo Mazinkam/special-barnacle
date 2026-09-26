@@ -68,7 +68,7 @@ STATUS: completed | partial | blocked
 The last line of your report MUST be exactly one `STATUS:` line. `completed` = your scope is done and verified; `partial` = some of your scope is done; `blocked` = you stopped before changing anything because a stop condition or precondition failed.
 
 ## Constraints
-- Stay within the orchestrator's retry budget (`stop_loss_multiplier` in config).
+- Stay within the orchestrator's retry budget: escalate per Rule 1 (`method.json` `rules.review_after_fix`) only while retries remain (see `--max-retries`), and stay under the run's spend cap.
 - Do NOT make architectural decisions — surface them via "Open items."
 - Each subagent call should carry a clear, narrowly-scoped task — no open-ended "figure it out" instructions.
 - Workers do not dispatch further workers unless they're themselves a lead. Default workers are leaf nodes.
