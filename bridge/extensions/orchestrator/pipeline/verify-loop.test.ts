@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@humain/terminal";
 
 import type { DispatchTask } from "../core/prompts.ts";
-import { parseFailedChecks, runVerification, type VerifyDeps, hasExplicitFailVerdict } from "./verify-loop.ts";
+import { parseFailedChecks, runVerification, type VerifyDeps, hasExplicitFailVerdict, qaVerificationOutcomeFor } from "./verify-loop.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import type { RunContext } from "../run/context.ts";
 import type { RunSession } from "../run/session.ts";
@@ -293,5 +293,16 @@ describe("runVerification", () => {
 		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0), "/repo");
 		expect(result.passed).toBe(true);
 		expect(result.failedChecks).not.toContain("verdict");
+	});
+});
+
+describe("verification outcome records (qaVerificationOutcomeFor)", () => {
+	test("QA gate outcomes are marked run-scoped, not task attestations", () => {
+		expect(qaVerificationOutcomeFor("run-1", true, 0.95, "ok")).toMatchObject({
+			run_id: "run-1",
+			task_id: "run-1-qa",
+			outcome: "verified",
+			verification_scope: "run",
+		});
 	});
 });
