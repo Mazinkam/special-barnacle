@@ -91,17 +91,10 @@ export function createOrchestratorCli(config: OrchestratorCliConfig): Orchestrat
 	}
 
 	async function planRun(runId: string, opts: PlanOptions): Promise<PlanResponse> {
-		const args = [
-			"plan",
-			runId,
-			opts.taskClass,
-			String(opts.complexity),
-			opts.risk,
-			"--coupling",
-			"0.5",
-			"--parallelizable",
-			"0.5",
-		];
+		// `--coupling`/`--parallelizable` are omitted: the Python CLI's `plan` subparser already
+		// defaults both to 0.5 (`orchestrator/cli/routing_cmds.py`), so sending them was a no-op
+		// that just duplicated the default in two places (B4.7).
+		const args = ["plan", runId, opts.taskClass, String(opts.complexity), opts.risk];
 		if (opts.qualityFloor !== undefined) args.push("--quality-floor", String(opts.qualityFloor));
 		if (opts.costAggressiveness !== undefined)
 			args.push("--cost-aggressiveness", String(opts.costAggressiveness));

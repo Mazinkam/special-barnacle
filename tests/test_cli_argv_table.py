@@ -39,7 +39,8 @@ CASES: list[tuple[list[str], dict]] = [
      {'cmd': 'route', 'task_class': 'coding', 'complexity': 0.6, 'risk': 'medium',
       'run_id': 'cli-route', 'quality_floor': None, 'cost_aggressiveness': None}),
     # `bridge/extensions/orchestrator/index.ts` `planRun`: exact literal argv shape (positionals +
-    # `--coupling`/`--parallelizable` always, `--quality-floor`/`--cost-aggressiveness` when set).
+    # `--quality-floor`/`--cost-aggressiveness` when set; `--coupling`/`--parallelizable` are
+    # omitted since the `plan` subparser already defaults both to 0.5, see test_cli_args.py).
     (['plan', 'run-1', 'coding', '0.6', 'medium', '--coupling', '0.5', '--parallelizable', '0.5',
       '--quality-floor', '0.9', '--cost-aggressiveness', '0.5'],
      {'cmd': 'plan', 'run_id': 'run-1', 'task_class': 'coding', 'complexity': 0.6, 'risk': 'medium',

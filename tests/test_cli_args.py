@@ -53,19 +53,25 @@ def _extract_function(source: str, name: str, path: Path = BRIDGE_TS) -> str:
 
 def test_plan_run_argv_from_bridge_is_accepted_by_the_real_parser():
     """Extract the literal argv `planRun` builds (including the conditional policy flags) and
-    feed a representative instance through the real argparse parser; it must not raise."""
+    feed a representative instance through the real argparse parser; it must not raise.
+
+    `--coupling`/`--parallelizable` are deliberately absent (B4.7): the `plan` subparser already
+    defaults both to 0.5 (`orchestrator/cli/routing_cmds.py`), so the bridge omits them instead of
+    re-stating the default.
+    """
     body = _extract_function(_orchestrator_cli_source(), 'planRun', ORCHESTRATOR_CLI_TS)
     literals = re.findall(r'"(--[a-z-]+)"', body)
     assert '--quality-floor' in literals
     assert '--cost-aggressiveness' in literals
-    assert '--coupling' in literals
-    assert '--parallelizable' in literals
+    assert '--coupling' not in literals
+    assert '--parallelizable' not in literals
 
     argv = ['plan', 'run-1', 'coding', '0.6', 'medium',
-            '--coupling', '0.5', '--parallelizable', '0.5',
             '--quality-floor', '0.9', '--cost-aggressiveness', '0.5']
     args = build_parser().parse_args(argv)
     assert args.cmd == 'plan'
+    assert args.coupling == pytest.approx(0.5)
+    assert args.parallelizable == pytest.approx(0.5)
     assert args.quality_floor == pytest.approx(0.9)
     assert args.cost_aggressiveness == pytest.approx(0.5)
 
