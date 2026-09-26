@@ -1,5 +1,18 @@
 ## Unreleased
 
+### B4.7 fixes
+
+- Fixed `parseFailedChecks` treating `0 errors`/`0 failed` rows as QA failures (B4.7).
+- `orchestrator.cli plan` JSON is validated before being used as a PlanResponse (B4.7).
+- `planRun` no longer sends `--coupling 0.5 --parallelizable 0.5`; Python defaults are already 0.5, no behaviour change (B4.7).
+- Persona prompt-file write/discovery failures are logged to the session and written as a per-dispatch diagnostic instead of silently falling back (B4.7).
+- The run summary no longer links `lead-report.md` when writing it failed (B4.7).
+- Run duration comes from the session's recorded start time, not the run id (B4.7).
+- `max_leads` (4) is defined once in contract.json and read by scheduler.py and the bridge config; the bridge default was 8 but was never binding because the plan never exceeds 4 leads. HUMAIN_ORCHESTRATOR env override (if any) unchanged (B4.7).
+- ingest_status.json field names/status values defined once in contract.json for `make_ingest_status` and `recordHookFailure`; no behaviour change (B4.7).
+- `models.ts` `reconWorkers` returns 0 for a missing complexity band, matching `recon.ts` (the production path) (B4.7).
+- Dashboard spend-cap breaches panel ported to presentation/dashboard_data.py and the template (merge of main).
+
 ### dashboard: spend-cap breaches
 
 - `spend_cap_exceeded` events were recorded but only visible in the 500-row
