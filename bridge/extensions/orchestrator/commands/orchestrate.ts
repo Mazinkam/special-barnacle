@@ -21,7 +21,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { parseArgs, usageText, type ModelOverrides } from "../core/args.ts";
-import { assembleProvidedContextBlock, contextFileLabel, CONTEXT_SOURCE_MAX_CHARS, formatContextSource, lastAssistantReplyText, LAST_REPLY_LABEL, type ContextSource } from "../core/context.ts";
+import { assembleProvidedContextBlock, contextFileLabel, CONTEXT_SOURCE_MAX_CHARS, formatContextSource, lastAssistantReplyText, LAST_REPLY_LABEL, providedContextAssemblyOverhead, providedContextSeparatorLength, type ContextSource } from "../core/context.ts";
 import { goalRefersToMissingContext } from "../core/context-detector.ts";
 import { redactPaths } from "../hooks/ingest.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
@@ -114,7 +114,13 @@ export const CONTEXT_FILE_PREFIX_BYTES = 4 * CONTEXT_SOURCE_MAX_CHARS;
  * (no later `--context` file is even opened) and every source from that
  * point on, including the one that did not fit, is counted into ONE
  * collapsed omission notice appended at the end — not a truncation/omission
- * message per source.
+ * message per source. `loadProvidedContext` reserves `core/context.ts`'s
+ * `providedContextAssemblyOverhead` (the header, per-section separators, and
+ * the collapsed omission notice itself) OUT OF this budget before
+ * accumulating any source, so the final ASSEMBLED block
+ * (`assembleProvidedContextBlock`'s output) never exceeds this many
+ * characters either — not just the sum of the sources' own rendered lengths
+ * (docs/architecture-review.md C6).
  */
 export const CONTEXT_AGGREGATE_MAX_CHARS = 160_000;
 
@@ -429,7 +435,14 @@ export function loadProvidedContext(
 	}
 
 	const renderedSources: string[] = [];
-	let budgetLeft = CONTEXT_AGGREGATE_MAX_CHARS;
+	// The largest number of attachments a single call could ever report omitted: every --context
+	// file (bounded by MAX_CONTEXT_FILES) plus, at most, --with-last-reply itself
+	// (docs/architecture-review.md C6). Reserving budget for this now guarantees the FINAL
+	// assembled block (header, per-section separators, and the collapsed omission notice all
+	// included) never exceeds CONTEXT_AGGREGATE_MAX_CHARS, regardless of how many sources end up
+	// included vs. omitted.
+	const maxOmittedCount = MAX_CONTEXT_FILES + 1;
+	let budgetLeft = CONTEXT_AGGREGATE_MAX_CHARS - providedContextAssemblyOverhead(maxOmittedCount);
 	let omittedCount = 0;
 
 	for (const raw of contextFiles) {
@@ -454,13 +467,14 @@ export function loadProvidedContext(
 				: undefined,
 		};
 		const rendered = formatContextSource(source);
-		if (rendered.length > budgetLeft) {
+		const cost = rendered.length + providedContextSeparatorLength(renderedSources.length);
+		if (cost > budgetLeft) {
 			omittedCount++;
 			budgetLeft = 0;
 			continue;
 		}
 		renderedSources.push(rendered);
-		budgetLeft -= rendered.length;
+		budgetLeft -= cost;
 	}
 
 	if (withLastReply) {
@@ -472,11 +486,12 @@ export function loadProvidedContext(
 			omittedCount++;
 		} else {
 			const rendered = formatContextSource({ label: LAST_REPLY_LABEL, content: text });
-			if (rendered.length > budgetLeft) {
+			const cost = rendered.length + providedContextSeparatorLength(renderedSources.length);
+			if (cost > budgetLeft) {
 				omittedCount++;
 			} else {
 				renderedSources.push(rendered);
-				budgetLeft -= rendered.length;
+				budgetLeft -= cost;
 			}
 		}
 	}

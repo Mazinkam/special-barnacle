@@ -116,7 +116,7 @@ export function buildProvidedContextBlock(sources: ContextSource[]): string {
 		"",
 		PROVIDED_CONTEXT_HEADER_LINES[1],
 		"",
-		sources.map(formatContextSource).join("\n\n---\n\n"),
+		sources.map(formatContextSource).join(PROVIDED_CONTEXT_SECTION_SEPARATOR),
 	].join("\n");
 }
 
@@ -144,15 +144,60 @@ export function assembleProvidedContextBlock(renderedSources: string[], omittedC
 	if (renderedSources.length === 0 && omittedCount === 0) return "";
 	const sections = [...renderedSources];
 	if (omittedCount > 0) {
-		sections.push(
-			[
-				"### (further attachments omitted)",
-				"",
-				`${omittedCount} further attachment(s) were not read: the aggregate --context/--with-last-reply budget was already used up by earlier sources.`,
-			].join("\n"),
-		);
+		sections.push(omissionNoticeSection(omittedCount));
 	}
-	return [PROVIDED_CONTEXT_HEADER_LINES[0], "", PROVIDED_CONTEXT_HEADER_LINES[1], "", sections.join("\n\n---\n\n")].join("\n");
+	return [PROVIDED_CONTEXT_HEADER_LINES[0], "", PROVIDED_CONTEXT_HEADER_LINES[1], "", sections.join(PROVIDED_CONTEXT_SECTION_SEPARATOR)].join("\n");
+}
+
+/** Separator `assembleProvidedContextBlock`/`buildProvidedContextBlock` join sections with — a
+ *  shared constant so `providedContextAssemblyOverhead`/`providedContextSeparatorLength`
+ *  (used by `commands/orchestrate.ts` to reserve budget for it) can never drift out of sync
+ *  with the actual join. */
+export const PROVIDED_CONTEXT_SECTION_SEPARATOR = "\n\n---\n\n";
+
+/**
+ * The single collapsed "further attachments omitted" section `assembleProvidedContextBlock`
+ * appends when `omittedCount > 0` (docs/architecture-review.md C6). Worded as "omitted", not
+ * "were not read": the FIRST omitted attachment in `commands/orchestrate.ts`'s `loadProvidedContext`
+ * loop is always read off disk before its rendered size is found not to fit the remaining
+ * aggregate budget — only the attachments AFTER that one are genuinely never opened. "omitted"
+ * is true of all of them; "not read" was not.
+ */
+function omissionNoticeSection(omittedCount: number): string {
+	return [
+		"### (further attachments omitted)",
+		"",
+		`${omittedCount} further attachment(s) omitted: aggregate --context/--with-last-reply budget exhausted by earlier sources.`,
+	].join("\n");
+}
+
+/**
+ * How many characters `assembleProvidedContextBlock`'s output spends on everything that is NOT a
+ * rendered source's own text: the fixed `## Provided context` header, plus — reserved
+ * unconditionally, whether or not an omission actually happens — the collapsed omission notice
+ * (sized for the largest `omittedCount` the caller could ever report, so the reservation never
+ * comes up short just because the real count turned out to need one more digit) and the
+ * separator joining it to the sources before it. Callers (`commands/orchestrate.ts`'s
+ * `loadProvidedContext`) subtract this from `CONTEXT_AGGREGATE_MAX_CHARS` BEFORE accumulating
+ * rendered sources, so the final assembled block — header, per-section separators, and omission
+ * notice all included — can never exceed the aggregate budget (docs/architecture-review.md C6).
+ */
+export function providedContextAssemblyOverhead(maxOmittedCount: number): number {
+	const headerPrefixLen = [PROVIDED_CONTEXT_HEADER_LINES[0], "", PROVIDED_CONTEXT_HEADER_LINES[1], "", ""].join("\n").length;
+	const noticeReserve = omissionNoticeSection(maxOmittedCount).length + PROVIDED_CONTEXT_SECTION_SEPARATOR.length;
+	return headerPrefixLen + noticeReserve;
+}
+
+/**
+ * The extra characters a section costs beyond its own rendered length, given it would become
+ * the `sectionsSoFar + 1`-th section appended to the block: the separator in front of it, or
+ * none when it would be the very first section (`assembleProvidedContextBlock` never puts a
+ * separator before the first section). Used by `commands/orchestrate.ts`'s `loadProvidedContext`
+ * to charge each candidate source's TRUE cost against the aggregate budget, not just its own
+ * rendered length (docs/architecture-review.md C6).
+ */
+export function providedContextSeparatorLength(sectionsSoFar: number): number {
+	return sectionsSoFar === 0 ? 0 : PROVIDED_CONTEXT_SECTION_SEPARATOR.length;
 }
 
 /** Label for the `--with-last-reply` source (docs/architecture-review.md C6). */

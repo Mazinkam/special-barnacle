@@ -386,7 +386,7 @@ describe("commands/orchestrate.ts readContextFileSafely / loadProvidedContext (d
 		const result = loadProvidedContext(dir, files, false, fakeCtxNoLastReply());
 		expect("block" in result).toBe(true);
 		if (!("block" in result)) return;
-		expect(result.block.length).toBeLessThanOrEqual(CONTEXT_AGGREGATE_MAX_CHARS + 500);
+		expect(result.block.length).toBeLessThanOrEqual(CONTEXT_AGGREGATE_MAX_CHARS);
 		const sections = result.block.split("\n\n---\n\n");
 		expect(sections).toHaveLength(includedCount + 1);
 		for (const section of sections.slice(0, includedCount)) {
@@ -407,7 +407,7 @@ describe("commands/orchestrate.ts readContextFileSafely / loadProvidedContext (d
 		const result = loadProvidedContext(dir, files, false, fakeCtxNoLastReply());
 		expect("block" in result).toBe(true);
 		if (!("block" in result)) return;
-		expect(result.block.length).toBeLessThanOrEqual(CONTEXT_AGGREGATE_MAX_CHARS + 1000);
+		expect(result.block.length).toBeLessThanOrEqual(CONTEXT_AGGREGATE_MAX_CHARS);
 		const omittedMatch = result.block.match(/(\d+) further attachment/);
 		expect(omittedMatch).not.toBeNull();
 		const omittedCount = Number(omittedMatch![1]);
@@ -415,6 +415,26 @@ describe("commands/orchestrate.ts readContextFileSafely / loadProvidedContext (d
 		const includedHeadings = result.block.match(/^### file: f\d+\.md$/gm) ?? [];
 		expect(includedHeadings.length + omittedCount).toBe(16);
 		expect(result.block.match(/\d+ further attachment/g)?.length).toBe(1);
+	});
+
+	test("boundary: four sources sized to nearly fill the aggregate budget still produce a final block <= CONTEXT_AGGREGATE_MAX_CHARS", () => {
+		// Four files, each just under 1/4 of the aggregate budget once rendered, so all four fit the
+		// per-source sum of raw rendered lengths (<= CONTEXT_AGGREGATE_MAX_CHARS) while the header,
+		// three separators, and the omission-notice reservation still have to be squeezed inside the
+		// same 160_000-character ceiling — the case most likely to overshoot if assembly overhead is
+		// not reserved inside the budget (docs/architecture-review.md C6).
+		const perFileContentChars = 39_900;
+		const names = ["a.md", "b.md", "c.md", "d.md"];
+		const files = names.map((name) => {
+			const p = join(dir, name);
+			writeFileSync(p, "x".repeat(perFileContentChars));
+			return p;
+		});
+
+		const result = loadProvidedContext(dir, files, false, fakeCtxNoLastReply());
+		expect("block" in result).toBe(true);
+		if (!("block" in result)) return;
+		expect(result.block.length).toBeLessThanOrEqual(CONTEXT_AGGREGATE_MAX_CHARS);
 	});
 
 	test("more than MAX_CONTEXT_FILES attachments is a clear error before any file is opened (a count cap, independent of the aggregate character budget)", () => {
