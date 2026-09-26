@@ -1,16 +1,19 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI, ExtensionContext } from "@humain/terminal";
 
 import {
 	CONTEXT_AGGREGATE_MAX_CHARS,
+	CONTEXT_FILE_PREFIX_BYTES,
 	loadProvidedContext,
+	MAX_CONTEXT_FILES,
 	readContextFileSafely,
 	registerOrchestrateCommand,
 	type OrchestrateDeps,
 } from "./orchestrate.ts";
+import { contextFileLabel, CONTEXT_SOURCE_MAX_CHARS, formatContextSource } from "../core/context.ts";
 import { RunRegistry } from "../run/context.ts";
 import type { RunSession } from "../run/session.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
@@ -212,7 +215,7 @@ describe("commands/orchestrate.ts readContextFileSafely / loadProvidedContext (d
 		const link = join(dir, "link.md");
 		symlinkSync(real, link);
 
-		expect(() => readContextFileSafely(link)).toThrow(/is a symlink/);
+		expect(() => readContextFileSafely(link, dir)).toThrow(/is a symlink/);
 	});
 
 	test("a file reached through a symlinked parent directory is rejected", () => {
@@ -223,7 +226,80 @@ describe("commands/orchestrate.ts readContextFileSafely / loadProvidedContext (d
 		const linkedDir = join(dir, "linked-dir");
 		symlinkSync(realDir, linkedDir);
 
-		expect(() => readContextFileSafely(join(linkedDir, "notes.md"))).toThrow(/containing directory is a symlink/);
+		expect(() => readContextFileSafely(join(linkedDir, "notes.md"), dir)).toThrow(/containing directory is a symlink/);
+	});
+
+	test("a symlinked GRANDPARENT directory (two levels above the file) is rejected, not just the immediate parent", () => {
+		// dir/real/b/file.txt is real; dir/link-a -> dir/real is a symlink. Reached as
+		// dir/link-a/b/file.txt, the file's immediate parent ("b") is an ordinary directory --
+		// only the grandparent ("link-a") is a symlink. The old immediate-parent-only lstat would
+		// have missed this entirely.
+		const real = join(dir, "real");
+		mkdirSync(join(real, "b"), { recursive: true });
+		writeFileSync(join(real, "b", "file.txt"), "content");
+		const linkA = join(dir, "link-a");
+		symlinkSync(real, linkA);
+
+		expect(() => readContextFileSafely(join(linkA, "b", "file.txt"), dir)).toThrow(/symlink/);
+	});
+
+	test("a symlinked GREAT-GRANDPARENT directory (three levels above the file) is rejected", () => {
+		const real = join(dir, "real2");
+		mkdirSync(join(real, "b", "c"), { recursive: true });
+		writeFileSync(join(real, "b", "c", "file.txt"), "content");
+		const linkA = join(dir, "link-a2");
+		symlinkSync(real, linkA);
+
+		expect(() => readContextFileSafely(join(linkA, "b", "c", "file.txt"), dir)).toThrow(/symlink/);
+	});
+
+	test("both a symlinked parent AND a symlinked leaf in the same path are still rejected (not just the first one checked)", () => {
+		const mid = join(dir, "mid");
+		mkdirSync(mid);
+		const realLeafTarget = join(dir, "real-leaf-target.txt");
+		writeFileSync(realLeafTarget, "leaf content");
+		const leafLink = join(mid, "leaf-link.txt");
+		symlinkSync(realLeafTarget, leafLink);
+		const linkToMid = join(dir, "link-to-mid");
+		symlinkSync(mid, linkToMid);
+
+		expect(() => readContextFileSafely(join(linkToMid, "leaf-link.txt"), dir)).toThrow(/symlink/);
+	});
+
+	test("an ordinary file nested several directories deep under a /tmp-based cwd is accepted (macOS /tmp -> /private/tmp must not be mistaken for a symlink attack)", () => {
+		const nested = join(dir, "sub", "deep", "path");
+		mkdirSync(nested, { recursive: true });
+		const file = join(nested, "notes.md");
+		writeFileSync(file, "nested notes");
+
+		const { content } = readContextFileSafely(file, dir);
+		expect(content).toBe("nested notes");
+	});
+
+	test("a file outside cwd, under its own real (non-symlinked) directory, is accepted via the top-level-component anchor", () => {
+		const otherDir = mkdtempSync(join(tmpdir(), "orch-c6-outside-"));
+		try {
+			const file = join(otherDir, "notes.md");
+			writeFileSync(file, "outside content");
+
+			const { content } = readContextFileSafely(file, dir);
+			expect(content).toBe("outside content");
+		} finally {
+			rmSync(otherDir, { recursive: true, force: true });
+		}
+	});
+
+	test("a file under the real home directory is accepted (the cwd-outside, home-inside anchor branch)", () => {
+		const homeTmp = mkdtempSync(join(homedir(), ".orch-c6-home-"));
+		try {
+			const file = join(homeTmp, "notes.md");
+			writeFileSync(file, "home content");
+
+			const { content } = readContextFileSafely(file, dir);
+			expect(content).toBe("home content");
+		} finally {
+			rmSync(homeTmp, { recursive: true, force: true });
+		}
 	});
 
 	test("a FIFO is rejected instead of hanging", () => {
@@ -234,21 +310,21 @@ describe("commands/orchestrate.ts readContextFileSafely / loadProvidedContext (d
 			return;
 		}
 
-		expect(() => readContextFileSafely(fifo)).toThrow(/is a FIFO/);
+		expect(() => readContextFileSafely(fifo, dir)).toThrow(/is a FIFO/);
 	});
 
 	test("a directory is rejected", () => {
 		const sub = join(dir, "a-directory");
 		mkdirSync(sub);
 
-		expect(() => readContextFileSafely(sub)).toThrow(/is a directory/);
+		expect(() => readContextFileSafely(sub, dir)).toThrow(/is a directory/);
 	});
 
 	test("binary content (a NUL byte) is rejected", () => {
 		const bin = join(dir, "binary.dat");
 		writeFileSync(bin, Buffer.from([0x48, 0x49, 0x00, 0x42, 0x59, 0x45]));
 
-		expect(() => readContextFileSafely(bin)).toThrow(/binary content/);
+		expect(() => readContextFileSafely(bin, dir)).toThrow(/binary content/);
 	});
 
 	test("content that is not valid UTF-8 is rejected", () => {
@@ -256,46 +332,26 @@ describe("commands/orchestrate.ts readContextFileSafely / loadProvidedContext (d
 		// 0xC3 alone (no continuation byte) is not valid UTF-8, and contains no NUL byte.
 		writeFileSync(bad, Buffer.from([0x41, 0x42, 0xc3]));
 
-		expect(() => readContextFileSafely(bad)).toThrow(/not valid UTF-8/);
+		expect(() => readContextFileSafely(bad, dir)).toThrow(/not valid UTF-8/);
 	});
 
 	test("a huge file (over the per-file prefix cap) is only read up to the prefix, with a truncation note", () => {
 		const huge = join(dir, "huge.txt");
 		writeFileSync(huge, "x".repeat(1024 * 1024)); // 1 MB, well over CONTEXT_FILE_PREFIX_BYTES (160,000 bytes)
 
-		const { content, truncatedOnDisk } = readContextFileSafely(huge);
+		const { content, truncatedOnDisk } = readContextFileSafely(huge, dir);
 		expect(truncatedOnDisk).toBe(true);
 		expect(content.length).toBe(4 * 40_000);
 	});
 
-	test("aggregate budget: several --context files that individually fit under the per-file cap still get truncated once their combined size exceeds CONTEXT_AGGREGATE_MAX_CHARS", () => {
-		// Each file is comfortably under both the per-file prefix cap (160,000 bytes) and the
-		// per-source formatting cap (CONTEXT_SOURCE_MAX_CHARS = 40,000 characters), but five of
-		// them together (175,000) exceed the 160,000-character aggregate budget.
-		// A non-ASCII filler that cannot collide with anything else in the block (random
-		// tmpdir path components, note wording, labels): unambiguous to count.
-		const perFile = 35_000;
-		const files = ["a.md", "b.md", "c.md", "d.md", "e.md"].map((name) => {
-			const p = join(dir, name);
-			writeFileSync(p, "\u2022".repeat(perFile));
-			return p;
-		});
+	test("the disk-truncation note for a file over the per-file read limit is visible in the final rendered block, not swallowed by the per-source cap (docs/architecture-review.md C6)", () => {
+		const huge = join(dir, "huge2.txt");
+		writeFileSync(huge, "y".repeat(CONTEXT_FILE_PREFIX_BYTES + 50_000)); // > 160,000 bytes on disk
 
-		const result = loadProvidedContext(dir, files, false, fakeCtxNoLastReply());
+		const result = loadProvidedContext(dir, [huge], false, fakeCtxNoLastReply());
 		expect("block" in result).toBe(true);
 		if (!("block" in result)) return;
-		expect(result.block).toContain("aggregate --context/--with-last-reply budget");
-		const sections = result.block.split("\n\n---\n\n");
-		expect(sections).toHaveLength(5);
-		// The first four sources are unaffected; the fifth's filler run is shorter than what was
-		// written to disk \u2014 the aggregate budget, not just the (much larger) per-file cap, is
-		// what cut it short.
-		for (const section of sections.slice(0, 4)) {
-			expect(section.match(/\u2022+/)?.[0].length).toBe(perFile);
-		}
-		const lastRun = sections[4].match(/\u2022+/)?.[0] ?? "";
-		expect(lastRun.length).toBeLessThan(perFile);
-		expect(lastRun.length).toBe(CONTEXT_AGGREGATE_MAX_CHARS - 4 * perFile);
+		expect(result.block).toContain(`${CONTEXT_FILE_PREFIX_BYTES}-byte read limit`);
 	});
 
 	test("a single source under both the per-file and aggregate caps is included verbatim, with no truncation note", () => {
@@ -308,5 +364,66 @@ describe("commands/orchestrate.ts readContextFileSafely / loadProvidedContext (d
 		expect(result.block).toContain("small content");
 		expect(result.block).not.toContain("truncated");
 		expect(result.block).not.toContain("omitted");
+	});
+
+	test("aggregate budget: several --context files that individually fit under the per-file cap still get bounded once their combined RENDERED size exceeds CONTEXT_AGGREGATE_MAX_CHARS, with exactly one collapsed omission notice", () => {
+		const perFile = 35_000;
+		const names = ["a.md", "b.md", "c.md", "d.md", "e.md"];
+		const files = names.map((name) => {
+			const p = join(dir, name);
+			writeFileSync(p, "\u2022".repeat(perFile));
+			return p;
+		});
+
+		const perSourceRendered = formatContextSource({
+			label: contextFileLabel(dir, files[0]),
+			content: "\u2022".repeat(perFile),
+		}).length;
+		const includedCount = Math.floor(CONTEXT_AGGREGATE_MAX_CHARS / perSourceRendered);
+		expect(includedCount).toBeGreaterThan(0);
+		expect(includedCount).toBeLessThan(names.length);
+
+		const result = loadProvidedContext(dir, files, false, fakeCtxNoLastReply());
+		expect("block" in result).toBe(true);
+		if (!("block" in result)) return;
+		expect(result.block.length).toBeLessThanOrEqual(CONTEXT_AGGREGATE_MAX_CHARS + 500);
+		const sections = result.block.split("\n\n---\n\n");
+		expect(sections).toHaveLength(includedCount + 1);
+		for (const section of sections.slice(0, includedCount)) {
+			expect(section.match(/\u2022+/)?.[0].length).toBe(perFile);
+		}
+		expect(sections[includedCount]).toContain(`${names.length - includedCount} further attachment`);
+		expect(result.block).not.toContain("truncated");
+	});
+
+	test("16 large attachments: the rendered block never balloons past the aggregate budget plus one collapsed notice", () => {
+		const names = Array.from({ length: 16 }, (_, i) => `f${i}.md`);
+		const files = names.map((name) => {
+			const p = join(dir, name);
+			writeFileSync(p, "z".repeat(CONTEXT_SOURCE_MAX_CHARS));
+			return p;
+		});
+
+		const result = loadProvidedContext(dir, files, false, fakeCtxNoLastReply());
+		expect("block" in result).toBe(true);
+		if (!("block" in result)) return;
+		expect(result.block.length).toBeLessThanOrEqual(CONTEXT_AGGREGATE_MAX_CHARS + 1000);
+		const omittedMatch = result.block.match(/(\d+) further attachment/);
+		expect(omittedMatch).not.toBeNull();
+		const omittedCount = Number(omittedMatch![1]);
+		expect(omittedCount).toBeGreaterThan(0);
+		const includedHeadings = result.block.match(/^### file: f\d+\.md$/gm) ?? [];
+		expect(includedHeadings.length + omittedCount).toBe(16);
+		expect(result.block.match(/\d+ further attachment/g)?.length).toBe(1);
+	});
+
+	test("more than MAX_CONTEXT_FILES attachments is a clear error before any file is opened (a count cap, independent of the aggregate character budget)", () => {
+		const files = Array.from({ length: 1000 }, (_, i) => join(dir, `does-not-exist-${i}.md`));
+
+		const result = loadProvidedContext(dir, files, false, fakeCtxNoLastReply());
+		expect("error" in result).toBe(true);
+		if (!("error" in result)) return;
+		expect(result.error).toContain(String(MAX_CONTEXT_FILES));
+		expect(result.error).not.toContain("could not read");
 	});
 });

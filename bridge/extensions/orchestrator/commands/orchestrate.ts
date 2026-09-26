@@ -16,11 +16,12 @@
  * directly from its own module, same as any other caller.
  */
 import type { ExtensionAPI, ExtensionContext } from "@humain/terminal";
-import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { parseArgs, usageText, type ModelOverrides } from "../core/args.ts";
-import { buildProvidedContextBlock, contextFileLabel, CONTEXT_SOURCE_MAX_CHARS, lastAssistantReplyText, LAST_REPLY_LABEL, type ContextSource } from "../core/context.ts";
+import { assembleProvidedContextBlock, contextFileLabel, CONTEXT_SOURCE_MAX_CHARS, formatContextSource, lastAssistantReplyText, LAST_REPLY_LABEL, type ContextSource } from "../core/context.ts";
 import { goalRefersToMissingContext } from "../core/context-detector.ts";
 import { redactPaths } from "../hooks/ingest.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
@@ -97,18 +98,38 @@ function goalExpectsInteraction(goal: string): boolean {
  * read in full: only this bounded prefix ever touches memory
  * (docs/architecture-review.md C6).
  */
-const CONTEXT_FILE_PREFIX_BYTES = 4 * CONTEXT_SOURCE_MAX_CHARS;
+export const CONTEXT_FILE_PREFIX_BYTES = 4 * CONTEXT_SOURCE_MAX_CHARS;
 
 /**
  * Aggregate cap across every `--context` file plus `--with-last-reply`
  * combined (docs/architecture-review.md C6): a single huge attachment is
  * already capped per-source (`CONTEXT_SOURCE_MAX_CHARS`), but several
  * attachments each near that cap could otherwise blow the prompt budget out
- * together. Sources are consumed in order; once the budget is exhausted,
- * later content is truncated (with a note) rather than the run being
- * rejected outright.
+ * together. This bounds the final RENDERED `## Provided context` block —
+ * labels, `<provided-context>` wrappers, and per-source notes all count,
+ * not just raw file content — because that rendered text, not the raw
+ * bytes on disk, is what actually reaches the model. Sources are consumed
+ * IN ORDER and the budget is tracked incrementally: as soon as a source's
+ * own rendered size would not fit in what is left, reading stops entirely
+ * (no later `--context` file is even opened) and every source from that
+ * point on, including the one that did not fit, is counted into ONE
+ * collapsed omission notice appended at the end — not a truncation/omission
+ * message per source.
  */
 export const CONTEXT_AGGREGATE_MAX_CHARS = 160_000;
+
+/**
+ * Ceiling on the number of `--context <file>` flags a single run will accept
+ * (docs/architecture-review.md C6), enforced BEFORE any file is opened — a
+ * separate, independent guard from `CONTEXT_AGGREGATE_MAX_CHARS`: that caps
+ * total rendered characters once files are read; this caps the number of
+ * disk reads/open file descriptors a single `/orchestrate` invocation will
+ * attempt at all; a typo'd shell glob (`--context *`) expanding into
+ * hundreds or thousands of arguments fails fast here, with a clear error,
+ * rather than the aggregate budget silently eating the run into it one file
+ * at a time.
+ */
+export const MAX_CONTEXT_FILES = 16;
 
 /**
  * Trims the trailing bytes of `buf` that would otherwise split a multi-byte
@@ -136,15 +157,19 @@ function trimTrailingIncompleteUtf8(buf: Buffer): Buffer {
  * Reads a `--context <file>` off disk, hardened against everything a hostile
  * or merely surprising path can do (docs/architecture-review.md C6):
  *
- * - Symlinks are rejected outright, at two points: the immediate containing
- *   directory is `lstat`'d first (a symlinked parent is rejected before any
- *   open() call reaches it), and the open itself uses `O_NOFOLLOW` (the
- *   file's own path is refused if it is a symlink, kernel-enforced, no
- *   TOCTOU window). Deliberately does not walk the whole ancestor chain with
- *   `realpath` — on macOS `/tmp` (and therefore every `os.tmpdir()`-based
- *   path) already resolves through `/private/tmp`, so a full-chain
- *   comparison would reject ordinary temp files as "symlinked" for reasons
- *   that have nothing to do with the operator's path.
+ * - Every path component strictly below a trusted anchor is `lstat`'d and
+ *   rejected if it is a symlink — not just the immediate containing
+ *   directory. A symlink anywhere in the chain (`docs/link/sso/x.json` with
+ *   `docs/link -> ~/.aws`, however many levels up) is caught, not only a
+ *   symlinked immediate parent. The anchor itself (`chooseTrustAnchor`
+ *   below) is `realpath`'d but never itself `lstat`'d, which is what lets a
+ *   symlinked top-level directory — macOS's `/tmp` -> `/private/tmp`,
+ *   `/var` -> `/private/var`, and therefore every `os.tmpdir()`-based path
+ *   — sit "above" the anchor without every ordinary temp file being
+ *   rejected as symlinked for reasons that have nothing to do with the
+ *   operator's path. The open itself also uses `O_NOFOLLOW` (the file's own
+ *   path is refused if it is a symlink, kernel-enforced) as a second,
+ *   independent check on the leaf.
  * - Only a regular file is accepted (`fstat(fd).isFile()`); FIFOs, device
  *   files, and directories are rejected with a clear message instead of
  *   hanging (`O_NONBLOCK`, where the platform has it, keeps an `open()` on a
@@ -158,6 +183,16 @@ function trimTrailingIncompleteUtf8(buf: Buffer): Buffer {
  *   rejected: this is a prompt-text attachment mechanism, not a general file
  *   upload.
  *
+ * RESIDUAL RACE: Node has no `openat`, so every check above (the lstat walk,
+ * the `realpath` equality check, and their post-open repeat below) is
+ * necessarily a separate syscall from the `open()` that follows it — a
+ * directory component could in principle be swapped for a symlink in the
+ * instant between the LAST check and `open()` itself. The post-open
+ * dev+ino re-verification narrows this window (it catches a swap that
+ * happened before the open completed) but cannot close it entirely; this is
+ * accepted as a residual risk for a single-operator CLI reading files it
+ * already trusted enough to name on its own command line, not eliminated.
+ *
  * Throws a plain `Error` with an operator-facing message on any rejection;
  * the caller (`loadProvidedContext`) turns that into `{ error }`.
  */
@@ -170,20 +205,134 @@ function safeRealpath(path: string): string | null {
 	}
 }
 
-export function readContextFileSafely(abs: string): { content: string; truncatedOnDisk: boolean } {
-	const parent = dirname(abs);
-	let parentStat: ReturnType<typeof lstatSync>;
+/** `realpath`, but a failure becomes the same operator-facing rejection every other unreadable-path
+ *  case in this module throws — used for the trust anchor itself, which must resolve for any of
+ *  the checks below to mean anything. */
+function realpathOrThrow(path: string): string {
 	try {
-		parentStat = lstatSync(parent);
+		return realpathSync(path);
 	} catch (err) {
 		throw new Error(`could not read the file (${(err as Error).message}). Fix the path or drop the flag.`);
 	}
-	if (parentStat.isSymbolicLink()) {
-		const target = safeRealpath(parent);
+}
+
+/** True when `child` is strictly inside (a descendant of, never equal to) directory `parent` —
+ *  both given as normalized absolute paths, neither `realpath`'d. Used by `chooseTrustAnchor` to
+ *  decide which lexical directory to walk from; matching on the LEXICAL (not `realpath`'d) form is
+ *  what lets the walk below actually detect a symlinked component — resolving first would already
+ *  have thrown away the very thing being checked for. */
+function isStrictlyInside(child: string, parent: string): boolean {
+	const rel = relative(parent, child);
+	return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+/** The first path segment after the root, e.g. `/var/folders/xx/T/foo` -> `/var`. Used as the
+ *  trust anchor's lexical directory when `absLexical` is neither inside `cwd` nor the home
+ *  directory (`chooseTrustAnchor`'s fallback branch): `realpath`'d, this tolerates a symlinked
+ *  top-level directory (macOS's `/tmp` -> `/private/tmp`, `/var` -> `/private/var`) without
+ *  walking — or having to trust — the whole ancestor chain down from `/`. */
+function firstTopLevelComponent(absLexical: string): string {
+	const withoutRoot = absLexical.slice(1);
+	const firstSep = withoutRoot.indexOf(sep);
+	const first = firstSep === -1 ? withoutRoot : withoutRoot.slice(0, firstSep);
+	return sep + first;
+}
+
+/** The directory the ancestor-symlink walk starts from (docs/architecture-review.md C6). */
+interface TrustAnchor {
+	/** The anchor directory in its ORIGINAL (lexical, not `realpath`'d) spelling — the walk below
+	 *  starts here, not from `real`: `realpath`-ing first would already have resolved away the very
+	 *  symlink the walk exists to catch. */
+	lexical: string;
+	/** `realpath(lexical)` — trusted without itself being `lstat`'d; see `firstTopLevelComponent`'s
+	 *  doc for why a symlinked top-level directory is deliberately tolerated here. */
+	real: string;
+}
+
+/**
+ * Picks the directory the ancestor-symlink walk in `walkAncestorsForSymlinks` starts from
+ * (docs/architecture-review.md C6): `realpath(cwd)` when `absLexical` is lexically inside `cwd`
+ * (the common case — an operator's `--context docs/plan.md`); otherwise `realpath(homedir())`
+ * when it is inside the home directory, checked against BOTH the lexical and the already-resolved
+ * home path (a home directory that is itself reached through a symlink, e.g. an NFS mount, must
+ * not make every file under it look "outside" the anchor); otherwise `realpath` of the path's own
+ * first top-level component (`/tmp`, `/var`, ...), which sits `realpath`-equivalent to but
+ * lexically above the anchor so a symlinked top-level directory is tolerated without being trusted
+ * blindly — everything BELOW it is still walked and `lstat`'d.
+ */
+function chooseTrustAnchor(absLexical: string, cwd: string): TrustAnchor {
+	const cwdLexical = resolve(cwd);
+	if (isStrictlyInside(absLexical, cwdLexical)) {
+		return { lexical: cwdLexical, real: realpathOrThrow(cwdLexical) };
+	}
+	const homeLexical = resolve(homedir());
+	const homeReal = safeRealpath(homeLexical);
+	if (isStrictlyInside(absLexical, homeLexical)) {
+		return { lexical: homeLexical, real: homeReal ?? realpathOrThrow(homeLexical) };
+	}
+	if (homeReal && isStrictlyInside(absLexical, homeReal)) {
+		return { lexical: homeReal, real: homeReal };
+	}
+	const top = firstTopLevelComponent(absLexical);
+	return { lexical: top, real: realpathOrThrow(top) };
+}
+
+/**
+ * `lstat`'s every path component strictly below `anchor.lexical` on the way to `absLexical`
+ * (docs/architecture-review.md C6) — including the file itself — and rejects if any of them is a
+ * symlink, since the kernel would otherwise silently follow it while resolving the rest of the
+ * path (the original bug this closes: only the immediate parent was ever checked, so a symlink
+ * anywhere higher up — `docs/link/sso/x.json` with `docs/link -> ~/.aws` — was never caught).
+ * `anchor.lexical` itself is never `lstat`'d (see `chooseTrustAnchor`'s doc). Returns the path
+ * segments below the anchor, so the caller can reconstruct `join(anchor.real, ...segments)`.
+ */
+function walkAncestorsForSymlinks(anchor: TrustAnchor, absLexical: string): string[] {
+	const relPart = relative(anchor.lexical, absLexical);
+	const segments = relPart.split(sep).filter(Boolean);
+	let cur = anchor.lexical;
+	for (const [i, seg] of segments.entries()) {
+		cur = join(cur, seg);
+		let st: ReturnType<typeof lstatSync>;
+		try {
+			st = lstatSync(cur);
+		} catch (err) {
+			throw new Error(`could not read the file (${(err as Error).message}). Fix the path or drop the flag.`);
+		}
+		if (st.isSymbolicLink()) {
+			const target = safeRealpath(cur);
+			const targetNote = target ? ` (resolves to ${redactPaths(target)})` : "";
+			const refusal = "pass the target path directly instead (this refusal is deliberate — see docs/architecture-review.md C6).";
+			if (i === segments.length - 1) {
+				throw new Error(`is a symlink${targetNote}; ${refusal}`);
+			}
+			if (i === segments.length - 2) {
+				throw new Error(`its containing directory is a symlink${targetNote}; ${refusal}`);
+			}
+			throw new Error(`an ancestor directory ("${redactPaths(cur)}")${targetNote} is a symlink; ${refusal}`);
+		}
+	}
+	return segments;
+}
+
+export function readContextFileSafely(abs: string, cwd: string): { content: string; truncatedOnDisk: boolean } {
+	const anchor = chooseTrustAnchor(abs, cwd);
+	const segments = walkAncestorsForSymlinks(anchor, abs);
+	const expectedPath = join(anchor.real, ...segments);
+	// Additionally require realpath(abs) === the anchor-reconstructed path: a mismatch means
+	// something in the chain resolves somewhere the lstat walk above did not see
+	// (docs/architecture-review.md C6).
+	let realAbs: string;
+	try {
+		realAbs = realpathSync(abs);
+	} catch (err) {
+		throw new Error(`could not read the file (${(err as Error).message}). Fix the path or drop the flag.`);
+	}
+	if (realAbs !== expectedPath) {
 		throw new Error(
-			`its containing directory is a symlink${target ? ` (resolves to ${redactPaths(target)})` : ""}; pass the target path directly instead (this refusal is deliberate — see docs/architecture-review.md C6).`,
+			`resolves outside its expected location; pass the target path directly instead (this refusal is deliberate — see docs/architecture-review.md C6).`,
 		);
 	}
+
 	const nonBlock = fsConstants.O_NONBLOCK ?? 0;
 	let fd: number;
 	try {
@@ -204,6 +353,23 @@ export function readContextFileSafely(abs: string): { content: string; truncated
 			const kind = stat.isDirectory() ? "a directory" : stat.isFIFO() ? "a FIFO" : "not a regular file";
 			throw new Error(`is ${kind}; only regular files can be attached with --context.`);
 		}
+		// Re-verify after opening (docs/architecture-review.md C6): narrows — does not close, see this
+		// function's doc — the TOCTOU window between the checks above and this `open()` by re-stat'ing
+		// via the anchor's own trusted real path and re-walking the component lstat chain. A mismatch
+		// on either means a directory component was swapped out from under us in between.
+		let expectedStat: ReturnType<typeof statSync>;
+		try {
+			expectedStat = statSync(expectedPath);
+		} catch (err) {
+			throw new Error(`could not read the file (${(err as Error).message}). Fix the path or drop the flag.`);
+		}
+		if (stat.dev !== expectedStat.dev || stat.ino !== expectedStat.ino) {
+			throw new Error(
+				`changed underneath the safety check (possible symlink race); pass the target path directly instead (this refusal is deliberate — see docs/architecture-review.md C6).`,
+			);
+		}
+		walkAncestorsForSymlinks(anchor, abs);
+
 		const cap = Math.min(CONTEXT_FILE_PREFIX_BYTES, stat.size);
 		const buffer = Buffer.alloc(cap);
 		let readTotal = 0;
@@ -236,10 +402,19 @@ export function readContextFileSafely(abs: string): { content: string; truncated
  * (docs/architecture-review.md C6). A missing/unreadable/symlinked/binary/non-regular file or an
  * absent last reply is a user error: returned as `{ error }` instead of thrown, so the caller can
  * stop the run before a session/run dir is ever created. File reading and session access live
- * here (not in `core/context.ts`) so that module stays a pure string formatter. Every source is
- * bounded per-file (`readContextFileSafely`'s `CONTEXT_FILE_PREFIX_BYTES`) and, once collected,
- * bounded again in aggregate (`CONTEXT_AGGREGATE_MAX_CHARS`) so several near-cap attachments
- * together cannot blow the prompt budget out.
+ * here (not in `core/context.ts`) so that module stays a pure string formatter.
+ *
+ * Three independent bounds apply, checked in this order:
+ * 1. `MAX_CONTEXT_FILES` — a hard cap on the NUMBER of `--context` flags, enforced before any
+ *    file is opened.
+ * 2. `readContextFileSafely`'s `CONTEXT_FILE_PREFIX_BYTES` — a per-file cap on how much of any
+ *    one file is ever read off disk.
+ * 3. `CONTEXT_AGGREGATE_MAX_CHARS` — a cap on the total RENDERED size of the `## Provided
+ *    context` block (labels, `<provided-context>` wrappers, and notes all counted, not just raw
+ *    content). Sources are read and rendered ONE AT A TIME, in order; as soon as one does not fit
+ *    in what is left, reading stops — no later `--context` file is even opened — and everything
+ *    from that point on is folded into ONE collapsed omission notice naming how many attachments
+ *    were skipped, rather than a truncation/omission message per source.
  */
 export function loadProvidedContext(
 	cwd: string,
@@ -247,42 +422,66 @@ export function loadProvidedContext(
 	withLastReply: boolean,
 	ctx: ExtensionContext,
 ): { block: string } | { error: string } {
-	const sources: ContextSource[] = [];
+	if (contextFiles.length > MAX_CONTEXT_FILES) {
+		return {
+			error: `--context: ${contextFiles.length} files attached; at most ${MAX_CONTEXT_FILES} are allowed per run. Combine them into fewer files or drop some.`,
+		};
+	}
+
+	const renderedSources: string[] = [];
+	let budgetLeft = CONTEXT_AGGREGATE_MAX_CHARS;
+	let omittedCount = 0;
+
 	for (const raw of contextFiles) {
+		// Once the aggregate budget is exhausted, stop reading entirely — this file is never opened,
+		// only counted (docs/architecture-review.md C6).
+		if (budgetLeft <= 0) {
+			omittedCount++;
+			continue;
+		}
 		const abs = resolve(cwd, raw);
 		let read: { content: string; truncatedOnDisk: boolean };
 		try {
-			read = readContextFileSafely(abs);
+			read = readContextFileSafely(abs, cwd);
 		} catch (err) {
 			return { error: `--context ${raw}: ${(err as Error).message}` };
 		}
-		const content = read.truncatedOnDisk
-			? `${read.content}\n\n[... this file is larger than the ${CONTEXT_FILE_PREFIX_BYTES}-byte read limit; only the beginning was read ...]`
-			: read.content;
-		sources.push({ label: contextFileLabel(cwd, abs), content });
+		const source: ContextSource = {
+			label: contextFileLabel(cwd, abs),
+			content: read.content,
+			diskTruncationNote: read.truncatedOnDisk
+				? `\n\n[... this file is larger than the ${CONTEXT_FILE_PREFIX_BYTES}-byte read limit; only the beginning was read ...]`
+				: undefined,
+		};
+		const rendered = formatContextSource(source);
+		if (rendered.length > budgetLeft) {
+			omittedCount++;
+			budgetLeft = 0;
+			continue;
+		}
+		renderedSources.push(rendered);
+		budgetLeft -= rendered.length;
 	}
+
 	if (withLastReply) {
 		const text = lastAssistantReplyText(ctx.sessionManager.getEntries());
 		if (text === null) {
 			return { error: "--with-last-reply: no assistant message found in the current session." };
 		}
-		sources.push({ label: LAST_REPLY_LABEL, content: text });
-	}
-	let budgetLeft = CONTEXT_AGGREGATE_MAX_CHARS;
-	for (const source of sources) {
 		if (budgetLeft <= 0) {
-			source.content = `[... omitted: the aggregate --context/--with-last-reply budget (${CONTEXT_AGGREGATE_MAX_CHARS} characters total) was already used up by earlier sources ...]`;
-			continue;
-		}
-		if (source.content.length > budgetLeft) {
-			const over = source.content.length - budgetLeft;
-			source.content = `${source.content.slice(0, budgetLeft)}\n\n[... truncated: the aggregate --context/--with-last-reply budget (${CONTEXT_AGGREGATE_MAX_CHARS} characters total) was exceeded; ${over} more character(s) of this source omitted ...]`;
-			budgetLeft = 0;
+			omittedCount++;
 		} else {
-			budgetLeft -= source.content.length;
+			const rendered = formatContextSource({ label: LAST_REPLY_LABEL, content: text });
+			if (rendered.length > budgetLeft) {
+				omittedCount++;
+			} else {
+				renderedSources.push(rendered);
+				budgetLeft -= rendered.length;
+			}
 		}
 	}
-	return { block: buildProvidedContextBlock(sources) };
+
+	return { block: assembleProvidedContextBlock(renderedSources, omittedCount) };
 }
 
 /**

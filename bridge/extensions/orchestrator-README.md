@@ -76,19 +76,33 @@ material it refers to:
 /orchestrate "implement option 2 from the above" --with-last-reply
 ```
 
-- `--context <file>` (repeatable): reads the file (path resolved against the run's cwd) and
-  inserts it into the architect and lead prompts under `## Provided context`, one sub-block per
-  file, each capped at 40,000 characters with an explicit truncation note if it is cut. A
-  missing or unreadable file stops the command with a clear error — no run is started.
-  Symlinks are rejected outright (whether the file itself or its containing directory is a
-  symlink) — pass the target path directly. Only regular files are accepted; a FIFO, device
-  file, or directory is rejected with a clear message instead. Binary content (a NUL byte, or
-  bytes that are not valid UTF-8) is rejected: this is a text-attachment mechanism, not a
-  general file upload. At most 160,000 bytes of any single file is ever read off disk
-  (truncated with a note beyond that, on top of the 40,000-character cap above), and the
-  combined content of every `--context` file plus `--with-last-reply` is capped at 160,000
-  characters in aggregate — several attachments that each fit individually can still be
-  truncated (with a note) once their total exceeds that budget.
+- `--context <file>` (repeatable, at most 16 per run — a hard count cap enforced before any
+  file is opened; more fails fast with a clear error) reads the file (path resolved against the
+  run's cwd) and inserts it into the architect and lead prompts under `## Provided context`, one
+  sub-block per file, each capped at 40,000 characters with an explicit truncation note if it is
+  cut. A missing or unreadable file stops the command with a clear error — no run is started.
+  Every path component on the way to the file — not just its immediate containing directory — is
+  checked and rejected if it is a symlink, so a symlink several directories up
+  (`docs/link/sso/x.json` with `docs/link -> ~/.aws`) is caught the same as a symlinked immediate
+  parent or the file itself; pass the target path directly instead. The trust anchor for that
+  walk is the run's cwd (when the file is inside it), else the real home directory (when it is
+  inside that), else the file's own top-level directory (`/tmp`, `/var`, ...) — resolved once via
+  `realpath` so a symlinked top-level directory (macOS's `/tmp` → `/private/tmp`, `/var` →
+  `/private/var`) is tolerated without weakening the check on everything below it. Only regular
+  files are accepted; a FIFO, device file, or directory is rejected with a clear message instead.
+  Binary content (a NUL byte, or bytes that are not valid UTF-8) is rejected: this is a
+  text-attachment mechanism, not a general file upload. At most 160,000 bytes of any single file
+  is ever read off disk (truncated with a note reserved inside the 40,000-character cap above, so
+  the note itself is never the thing that gets cut off), and the aggregate **rendered** size of
+  the whole `## Provided context` block — labels, `<provided-context>` wrappers, and notes
+  included, not just raw file content — is capped at 160,000 characters: sources are read and
+  rendered one at a time, in order, and as soon as one would not fit in what is left, reading
+  stops entirely (no later `--context` file is even opened) and everything from that point on is
+  folded into one collapsed notice naming how many attachments were skipped. *Residual race*: Node
+  has no `openat`, so the symlink checks above and the `open()` that follows them are necessarily
+  separate syscalls — a directory component could in principle be swapped for a symlink in the
+  narrow instant between the last check and the open; a post-open re-verification narrows this
+  window but cannot close it entirely.
 - `--with-last-reply`: attaches the current session's last assistant message the same way,
   labelled `last assistant reply`. Stops with an error if the session has no assistant message
   yet.
