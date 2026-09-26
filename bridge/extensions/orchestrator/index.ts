@@ -50,7 +50,7 @@ import {
 } from "./adapters/adapter-resolver.ts";
 import { createProfilesStore } from "./adapters/profiles-store.ts";
 import { type SpawnFn } from "./adapters/python-cli.ts";
-import { emptyOverrides, type ModelOverrides, usageText } from "./core/args.ts";
+import { emptyOverrides, type ModelOverrides } from "./core/args.ts";
 import { loadBridgeConfig, liveEnv, runsDir, shippedProfilesPath } from "./config.ts";
 import { type TriageResult } from "./core/triage.ts";
 import { type DispatchTask } from "./core/prompts.ts";
@@ -102,10 +102,6 @@ const profilesStore = createProfilesStore({
 });
 const loadProfiles = profilesStore.loadProfiles;
 const writeProfilesFile = profilesStore.writeProfilesFile;
-
-// Kept alive for parity with usageText's prior module-level use (registerOrchestrateCommand
-// reads its own copy via commands/orchestrate.ts; this call has no side effects beyond that).
-usageText(PROFILES_PATH);
 
 // -----------------------------------------------------------------------------
 // Extension instance factory (B5: the injected-spawn test seam)
