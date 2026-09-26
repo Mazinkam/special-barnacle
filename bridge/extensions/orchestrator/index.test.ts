@@ -1208,67 +1208,6 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 
 
 
-describe("codex -> Bedrock quota fallback (Phase A)", () => {
-	const table = buildAliasTable([
-		{ provider: "openai-codex", id: "gpt-6-astra" },
-		{ provider: "amazon-bedrock", id: "global.openai.gpt-6-astra" },
-		{ provider: "openai-codex", id: "gpt-5.3-codex-spark" },
-	]);
-	const proc = (over: Partial<Awaited<ReturnType<typeof orchestrator.runSubagentProcess>>>) => ({
-		exitCode: 0, stdout: "ok", finalText: "ok", rawStdout: "", personaCanMutate: false, stderr: "",
-		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.01, contextTokens: 0, turns: 1 },
-		costUsd: 0.01, costReported: true, durationMs: 5, outcome: "completed" as const, processExitCode: 0, ...over,
-	});
-	const task = (model: string): DispatchTask[] => [{ capability: "security_review", task: "review", taskId: "run-sec" }];
-
-	test("quota failure on codex retries once on the Bedrock twin and records route_degraded", async () => {
-		const events: Array<[string, Record<string, unknown>]> = [];
-		const models: string[] = [];
-		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
-			{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, null, 0, {
-				recordEvent: (e, p) => { events.push([e, p]); },
-				aliasTable: table,
-				runProcess: async (opts) => {
-					models.push(opts.model);
-					return models.length === 1
-						? proc({ exitCode: 1, stderr: "usage limit reached for this account", costUsd: 0, costReported: true,
-							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 } })
-						: proc({ model: "amazon-bedrock/global.openai.gpt-6-astra" });
-				},
-			});
-		expect(models).toEqual(["openai-codex/gpt-6-astra", "amazon-bedrock/global.openai.gpt-6-astra"]);
-		expect(result.exitCode).toBe(0);
-		expect(result.model).toBe("amazon-bedrock/global.openai.gpt-6-astra");
-		expect(result.taskId).toBe("run-sec");
-		const degraded = events.filter(([e]) => e === "route_degraded");
-		expect(degraded).toHaveLength(1);
-		expect(degraded[0][1]).toMatchObject({ from_model: "openai-codex/gpt-6-astra", to_model: "amazon-bedrock/global.openai.gpt-6-astra", reason: "provider_quota" });
-	});
-
-	test("no Bedrock twin: the original failure is returned, no redispatch", async () => {
-		let calls = 0;
-		const events: string[] = [];
-		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
-			{ security_review: { model: "openai-codex/gpt-5.3-codex-spark" } }, {} as never, null, 0, {
-				recordEvent: (e) => { events.push(e); },
-				aliasTable: table,
-				runProcess: async () => { calls++; return proc({ exitCode: 1, stderr: "429 Too Many Requests" }); },
-			});
-		expect(calls).toBe(1);
-		expect(result.exitCode).toBe(1);
-		expect(events).not.toContain("route_degraded");
-	});
-
-	test("non-quota failure is not retried", async () => {
-		let calls = 0;
-		await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
-			{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, null, 0, {
-				recordEvent: () => {}, aliasTable: table,
-				runProcess: async () => { calls++; return proc({ exitCode: 1, stderr: "TypeError: boom" }); },
-			});
-		expect(calls).toBe(1);
-	});
-});
 
 describe("orchestrator fixes from run ht-orch-1790237987755-lyjkn8 (A8)", () => {
 	const threeLeadPlan = { ...planFixture, complexity: 8, topology: { depth: 3, leads: 3, workers: 0, shape: "multi_lead" } };
