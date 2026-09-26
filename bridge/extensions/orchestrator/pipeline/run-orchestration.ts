@@ -89,6 +89,9 @@ export interface RunOrchestrationDeps {
 	reconEvidenceMaxChars: number;
 	/** `<STATE_ROOT>`, threaded through onto the returned `RunReport`'s ledger line. */
 	stateRoot: string;
+	/** The `## Provided context` block from `--context`/`--with-last-reply` (docs/architecture-review.md C6), built
+	 *  by `commands/orchestrate.ts` from files it already read; `""` when neither flag was given. */
+	providedContext: string;
 }
 
 /**
@@ -346,6 +349,7 @@ export async function runOrchestration(
 			maxLeads: deps.maxLeads,
 			evidenceMaxChars: deps.reconEvidenceMaxChars,
 			repoRoot,
+			providedContext: deps.providedContext,
 			// C3: a lead's resume prompt needs "files changed since it started", using
 			// the same git dirty-snapshot machinery `changedSince` below uses for QA
 			// scope — a snapshot taken right before the lead's (wave's) dispatch,

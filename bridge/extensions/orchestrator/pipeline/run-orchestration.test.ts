@@ -79,6 +79,9 @@ function fakeArgs(overrides: Partial<OrchestrateArgs> = {}): OrchestrateArgs {
 		interactive: false,
 		check: false,
 		models: { tiers: {}, capabilities: {} },
+		contextFiles: [],
+		withLastReply: false,
+		force: false,
 		unknownFlags: [],
 		...overrides,
 	};
@@ -101,6 +104,7 @@ function fakeDeps(overrides: Partial<RunOrchestrationDeps> = {}): RunOrchestrati
 		maxLeads: 4,
 		reconEvidenceMaxChars: 4000,
 		stateRoot: "/tmp/state",
+		providedContext: "",
 		...overrides,
 	};
 }

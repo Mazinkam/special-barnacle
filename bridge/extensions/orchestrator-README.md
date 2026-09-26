@@ -17,7 +17,7 @@ After install, restart HT (or `/reload`):
 
 ```
 /reload
-/orchestrate [flags] <goal> [flags]   # e.g. <goal> [--task-class T] [--complexity N] [--risk R] [--cheap P/M] [--mid P/M] [--premium P/M] [--model cap=P/M] [--max-retries N] [--interactive]
+/orchestrate [flags] <goal> [flags]   # e.g. <goal> [--task-class T] [--complexity N] [--risk R] [--cheap P/M] [--mid P/M] [--premium P/M] [--model cap=P/M] [--max-retries N] [--interactive] [--context FILE] [--with-last-reply] [--force]
 /orchestrator-models [list|set|use|pick|validate --live]
 /orchestrator-roi
 ```
@@ -63,6 +63,31 @@ Show ROI anytime:
 ```
 /orchestrator-roi
 ```
+
+## Providing context
+
+Dispatched agents run headless, on the goal string plus whatever the plan/architect/lead
+prompts add — they have no access to the rest of your chat. A goal like `"do A then C then
+B"` or `"implement option 2 from the above"` means nothing to them unless you attach the
+material it refers to:
+
+```
+/orchestrate "do A then C then B" --context docs/plan.md --context notes.txt
+/orchestrate "implement option 2 from the above" --with-last-reply
+```
+
+- `--context <file>` (repeatable): reads the file (path resolved against the run's cwd) and
+  inserts it into the architect and lead prompts under `## Provided context`, one sub-block per
+  file, each capped at 40,000 characters with an explicit truncation note if it is cut. A
+  missing or unreadable file stops the command with a clear error — no run is started.
+- `--with-last-reply`: attaches the current session's last assistant message the same way,
+  labelled `last assistant reply`. Stops with an error if the session has no assistant message
+  yet.
+- Before triage, a short goal (under ~200 characters) that looks like it refers to something
+  outside itself — a standalone letter (`do A then C`), `option N`, `the above`, `as discussed`,
+  `that plan` — is refused with a message pointing at `--context`/`--with-last-reply`/`--force`,
+  instead of dispatching a run that will just block on missing context. Pass `--force` to skip
+  this check (e.g. for a goal that only looks like a reference but genuinely is not one).
 
 ## How it works
 

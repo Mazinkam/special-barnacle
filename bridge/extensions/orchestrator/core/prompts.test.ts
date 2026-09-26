@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { effectiveLeadCount, formatTaskPrompt, leadPrompt, parsePlanResponse, repoRootGuardrail, resumeLeadPrompt, RESUME_REPORT_MAX_CHARS, VERIFICATION_COMMANDS, type PlanResponse } from "./prompts.ts";
+import { architectPrompt, effectiveLeadCount, formatTaskPrompt, leadPrompt, parsePlanResponse, repoRootGuardrail, resumeLeadPrompt, RESUME_REPORT_MAX_CHARS, VERIFICATION_COMMANDS, type PlanResponse } from "./prompts.ts";
 import planFixture from "../fixtures/orchestrator-cli-plan-response.json";
 
 function plan(leads: number): PlanResponse {
@@ -65,6 +65,34 @@ describe("core/prompts.ts leadPrompt", () => {
 		const prompt = leadPrompt("goal", plan(1), undefined, "", 0, 1, { lead: { model: "provider/model" } }, "/abs/repo/root");
 		expect(prompt).toContain("The repo root is /abs/repo/root (your cwd). Never search outside it; never run `find /`.");
 		expect(prompt).toContain("Verification commands:");
+	});
+
+	test("omits the Provided context section when none was given, byte-identical to the pre-C6 prompt", () => {
+		const withDefault = leadPrompt("goal", plan(1), undefined, "", 0, 1, { lead: { model: "provider/model" } }, "/abs/repo/root");
+		const withEmptyContext = leadPrompt("goal", plan(1), undefined, "", 0, 1, { lead: { model: "provider/model" } }, "/abs/repo/root", undefined, "");
+		expect(withEmptyContext).toBe(withDefault);
+		expect(withDefault).not.toContain("## Provided context");
+	});
+
+	test("inserts the Provided context block when one is given (docs/architecture-review.md C6)", () => {
+		const block = "## Provided context\n\n### file: docs/plan.md\n\nplan body";
+		const prompt = leadPrompt("goal", plan(1), undefined, "", 0, 1, { lead: { model: "provider/model" } }, "/abs/repo/root", undefined, block);
+		expect(prompt).toContain("## Provided context");
+		expect(prompt).toContain("plan body");
+	});
+});
+
+describe("core/prompts.ts architectPrompt", () => {
+	test("omits the Provided context section when none was given", () => {
+		expect(architectPrompt("g", plan(1))).not.toContain("## Provided context");
+		expect(architectPrompt("g", plan(1))).toBe(architectPrompt("g", plan(1), 8, ""));
+	});
+
+	test("inserts the Provided context block when one is given (docs/architecture-review.md C6)", () => {
+		const block = "## Provided context\n\n### last assistant reply\n\nprevious answer";
+		const prompt = architectPrompt("g", plan(1), 8, block);
+		expect(prompt).toContain("## Provided context");
+		expect(prompt).toContain("previous answer");
 	});
 });
 

@@ -48,6 +48,16 @@ export interface OrchestrateArgs {
 	models: ModelOverrides;
 	/** `--lead-size small|standard|large`: overrides triage sizing and the risk floor. */
 	leadSize?: LeadSize;
+	/**
+	 * `--context <file>` (repeatable), raw as given on the command line — resolved against the
+	 * run's cwd and read by `commands/orchestrate.ts` (docs/architecture-review.md C6). This module
+	 * stays pure: it never touches `node:fs`, so a bad path is not an error here, only downstream.
+	 */
+	contextFiles: string[];
+	/** `--with-last-reply`: attach the current session's last assistant message as context (C6). */
+	withLastReply: boolean;
+	/** `--force`: skip the C7 "goal refers to missing context" pre-triage check. */
+	force: boolean;
 	/** Flags we did not recognize — reported instead of silently swallowed. */
 	unknownFlags: string[];
 }
@@ -99,6 +109,9 @@ function newOrchestrateArgs(): OrchestrateArgs {
 		interactive: false,
 		check: false,
 		models: emptyOverrides(),
+		contextFiles: [],
+		withLastReply: false,
+		force: false,
 		unknownFlags: [],
 	};
 }
@@ -121,6 +134,13 @@ function consumeFlag(tokens: string[], start: number, out: OrchestrateArgs): num
 			case "--fan-out": out.fanOut = true; break;
 			case "--max-retries": if (next) { const n = Number(next); out.maxRetries = Number.isFinite(n) && n >= 0 ? n : 2; i++; } break;
 			case "--interactive": out.interactive = true; break;
+			case "--context": {
+				if (next) { out.contextFiles.push(next); i++; }
+				else out.unknownFlags.push("--context (missing value)");
+				break;
+			}
+			case "--with-last-reply": out.withLastReply = true; break;
+			case "--force": out.force = true; break;
 			// Kept as a no-op for existing scripts: auto-approval is now the default.
 			case "--yes": case "-y": break;
 			case "--check": case "--live": out.check = true; break;
@@ -173,6 +193,8 @@ export function usageText(profilesPath: string): string {
 		"Usage: /orchestrate <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical]\n" +
 		"       [--profile NAME] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--frontier ALIAS] [--model <capability>=ALIAS] [--effort LEVEL]\n" +
 		"       [--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--interactive]\n" +
-		"ALIAS is a short name (fable-5-1, opus-5-5, sonnet-5, gpt-6-sol, gpt-6-luna, astra) or provider/model. Profiles: " + profilesPath + "  (see /orchestrator-models)"
+		"       [--context FILE ...] [--with-last-reply] [--force]\n" +
+		"ALIAS is a short name (fable-5-1, opus-5-5, sonnet-5, gpt-6-sol, gpt-6-luna, astra) or provider/model. Profiles: " + profilesPath + "  (see /orchestrator-models)\n" +
+		"--context FILE (repeatable) and --with-last-reply attach material the goal refers to; goals that look like they refer to outside context without either are stopped before triage unless --force is given."
 	);
 }

@@ -16,8 +16,12 @@
  * directly from its own module, same as any other caller.
  */
 import type { ExtensionAPI, ExtensionContext } from "@humain/terminal";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 import { parseArgs, usageText, type ModelOverrides } from "../core/args.ts";
+import { buildProvidedContextBlock, contextFileLabel, lastAssistantReplyText, LAST_REPLY_LABEL, type ContextSource } from "../core/context.ts";
+import { goalRefersToMissingContext } from "../core/context-detector.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import type { DispatchTask, PlanResponse } from "../core/prompts.ts";
 import { buildRunSummary } from "../core/report.ts";
@@ -86,6 +90,41 @@ function goalExpectsInteraction(goal: string): boolean {
 }
 
 /**
+ * Reads every `--context <file>` and, when asked, the current session's last assistant message,
+ * building the `## Provided context` block the architect/lead prompts insert
+ * (docs/architecture-review.md C6). A missing/unreadable file or an absent last reply is a user
+ * error: returned as `{ error }` instead of thrown, so the caller can stop the run before a
+ * session/run dir is ever created. File reading and session access live here (not in
+ * `core/context.ts`) so that module stays a pure string formatter.
+ */
+function loadProvidedContext(
+	cwd: string,
+	contextFiles: string[],
+	withLastReply: boolean,
+	ctx: ExtensionContext,
+): { block: string } | { error: string } {
+	const sources: ContextSource[] = [];
+	for (const raw of contextFiles) {
+		const abs = resolve(cwd, raw);
+		let content: string;
+		try {
+			content = readFileSync(abs, "utf8");
+		} catch (err) {
+			return { error: `--context ${raw}: could not read the file (${(err as Error).message}). Fix the path or drop the flag.` };
+		}
+		sources.push({ label: contextFileLabel(cwd, abs), content });
+	}
+	if (withLastReply) {
+		const text = lastAssistantReplyText(ctx.sessionManager.getEntries());
+		if (text === null) {
+			return { error: "--with-last-reply: no assistant message found in the current session." };
+		}
+		sources.push({ label: LAST_REPLY_LABEL, content: text });
+	}
+	return { block: buildProvidedContextBlock(sources) };
+}
+
+/**
  * Post a run's terminal outcome to the chat as a custom message, so the user sees it
  * even though `/orchestrate` returned long before the run settled. `sendMessage` can
  * throw after the session has moved on (e.g. a later shutdown); that failure is not
@@ -115,7 +154,8 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 			"Plan and dispatch a hierarchical agent run. " +
 			"Args: <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical] " +
 			"[--profile NAME] [--lead-size small|standard|large] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--frontier ALIAS] [--model <capability>=ALIAS] [--effort LEVEL] " +
-			"[--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--interactive]\n\n" +
+			"[--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--interactive] " +
+			"[--context FILE ...] [--with-last-reply] [--force]\n\n" +
 			"With no triage flags, an LLM triage call (cheapest configured model) " +
 			"auto-fills task_class, complexity, and risk from the goal text. " +
 			"Models: flags > profile (orchestrator-profiles.json) > cost-tier resolver. See /orchestrator-models.",
@@ -137,6 +177,34 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 				);
 				return;
 			}
+
+			// -----------------------------------------------------------------
+			// C7 (docs/architecture-review.md): a short goal that refers to something outside
+			// itself ("do A then C then B", "implement option 2", "the above") blocks the
+			// dispatched agents, who have nothing to attach the reference to. Stop before
+			// triage/planning/dispatch — no run dir is created — unless the operator already
+			// attached context or explicitly asked to skip this check.
+			// -----------------------------------------------------------------
+			const hasContext = parsed.contextFiles.length > 0 || parsed.withLastReply;
+			if (!hasContext && !parsed.force && goalRefersToMissingContext(parsed.goal)) {
+				ctx.ui.notify(
+					"This goal looks short and refers to something outside itself (a lettered/numbered item, " +
+						'"the above", "as discussed", or similar) that the dispatched agents will not have. ' +
+						"Attach it with --context <file> (repeatable) or --with-last-reply, or skip this check with --force.",
+					"warning",
+				);
+				return;
+			}
+
+			// C6 (docs/architecture-review.md): read every --context file and, when asked, the
+			// session's last assistant reply, before anything else is spent. A missing file or an
+			// absent last reply stops the run here — no session/run dir is created.
+			const providedContextResult = loadProvidedContext(process.cwd(), parsed.contextFiles, parsed.withLastReply, ctx);
+			if ("error" in providedContextResult) {
+				ctx.ui.notify(providedContextResult.error, "error");
+				return;
+			}
+			const providedContext = providedContextResult.block;
 
 			// -----------------------------------------------------------------
 			// Step 0: resolve models. Done before anything is spent so a typo in
@@ -211,6 +279,7 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 					maxLeads: deps.maxLeads,
 					reconEvidenceMaxChars: deps.reconEvidenceMaxChars,
 					stateRoot: deps.stateRoot,
+					providedContext,
 				};
 				const result = await runOrchestration(runId, cwd, parsed, adapter, resolved, ctx, session, claimed, orchestrationDeps);
 				if (result.kind === "completed") {

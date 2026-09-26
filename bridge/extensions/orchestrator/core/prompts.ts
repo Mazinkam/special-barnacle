@@ -174,7 +174,7 @@ function leadAssignmentInstructions(plan: PlanResponse, maxLeads: number): strin
 	];
 }
 
-export function architectPrompt(goal: string, plan: PlanResponse, maxLeads = 8): string {
+export function architectPrompt(goal: string, plan: PlanResponse, maxLeads = 8, providedContext = ""): string {
 	return [
 		`You are the architect for this orchestration. Produce a concrete task plan.`,
 		"",
@@ -185,6 +185,7 @@ export function architectPrompt(goal: string, plan: PlanResponse, maxLeads = 8):
 		`Topology: ${plan.topology.shape} (depth=${plan.topology.depth}, leads=${plan.topology.leads}, workers=${plan.topology.workers})`,
 		`Recommended capability: ${plan.route.recommended.capability} @ ${plan.route.recommended.effort}`,
 		`Quality floor: ${plan.effective_quality_floor}`,
+		...(providedContext ? ["", providedContext] : []),
 		"",
 		"Output:",
 		"## Tasks",
@@ -260,6 +261,10 @@ export function leadPrompt(
 	/** The run's cwd, resolved absolute (docs/architecture-review.md C4). */
 	repoRoot: string,
 	assignment?: LeadAssignment,
+	/** The `## Provided context` block built by `commands/orchestrate.ts` from `--context`/`--with-last-reply`
+	 *  (docs/architecture-review.md C6); `""` (default) when neither flag was given — in that case the
+	 *  prompt is byte-identical to its pre-C6 output. */
+	providedContext = "",
 ): string {
 	// Only forward a plan the architect actually produced. A failed architect
 	// dispatch used to be pasted in as an empty "Architect's plan:" section,
@@ -302,6 +307,7 @@ export function leadPrompt(
 		`Recommended capability: ${plan.route.recommended.capability} @ ${plan.route.recommended.effort}`,
 		`Topology: ${plan.topology.shape} (depth=${plan.topology.depth}, leads=${plan.topology.leads}, workers=${plan.topology.workers})`,
 		"",
+		...(providedContext ? [providedContext, ""] : []),
 		scopeNote,
 		architectOutput,
 		"",

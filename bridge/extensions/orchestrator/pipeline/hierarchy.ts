@@ -78,6 +78,8 @@ export async function dispatchReconAndLeads(
 		leadCapability?: string;
 		/** The run's cwd, resolved absolute; forwarded into every lead prompt (docs/architecture-review.md C4). */
 		repoRoot: string;
+		/** The `## Provided context` block from `--context`/`--with-last-reply` (docs/architecture-review.md C6); `""`/undefined when neither was given. */
+		providedContext?: string;
 	},
 	effects: {
 		dispatch: (tasks: DispatchTask[]) => Promise<DispatchResult[]>;
@@ -90,7 +92,7 @@ export async function dispatchReconAndLeads(
 		filesChangedSince?: (mark: unknown, claimed: string[]) => string[];
 	},
 ): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[]; resumedLeadTaskIds: string[]; resumedAttemptResults: DispatchResult[] }> {
-	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars, maxLeads, leadCapability = "lead", repoRoot } = input;
+	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars, maxLeads, leadCapability = "lead", repoRoot, providedContext = "" } = input;
 	const requestedLeadCount = effectiveLeadCount(plan, maxLeads);
 
 	// Rule 2: parent-owned, read-only recon dispatched directly by the bridge
@@ -151,7 +153,7 @@ export async function dispatchReconAndLeads(
 	const waves = assignments ? planLeadWaves(assignments) : [[0]];
 	const leadTaskFor = (i: number): DispatchTask => ({
 		capability: leadCapability,
-		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter, repoRoot, assignments?.[i]),
+		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter, repoRoot, assignments?.[i], providedContext),
 		taskId: `${runId}-lead-${i}`,
 	});
 
@@ -252,6 +254,8 @@ export interface HierarchyDeps {
 	/** The run's cwd, resolved absolute (docs/architecture-review.md C4): threaded into every lead
 	 *  prompt so the lead is told plainly where it is instead of guessing and running `find /`. */
 	repoRoot: string;
+	/** The `## Provided context` block from `--context`/`--with-last-reply` (docs/architecture-review.md C6); `""`/undefined when neither was given. */
+	providedContext?: string;
 	/** Opaque snapshot of the current file state, for `filesChangedSince` (C3 resume prompts). Optional. */
 	markFiles?: () => unknown;
 	/** Files changed since `mark` was taken, unioned with `claimed` (files the lead's own report named). Optional. */
@@ -317,7 +321,7 @@ export async function dispatchHierarchical(
 		[architectResult] = await deps.dispatch([
 			{
 				capability: "architect",
-				task: architectPrompt(goal, plan, deps.maxLeads),
+				task: architectPrompt(goal, plan, deps.maxLeads, deps.providedContext ?? ""),
 				taskId: `${runId}-architect`,
 			},
 		]);
@@ -340,7 +344,7 @@ export async function dispatchHierarchical(
 	}
 
 	const results = await dispatchReconAndLeads(
-		{ runId, goal, plan, adapter, architectResult, leadCapability, evidenceMaxChars: deps.evidenceMaxChars, maxLeads: deps.maxLeads, repoRoot: deps.repoRoot },
+		{ runId, goal, plan, adapter, architectResult, leadCapability, evidenceMaxChars: deps.evidenceMaxChars, maxLeads: deps.maxLeads, repoRoot: deps.repoRoot, providedContext: deps.providedContext },
 		{
 			dispatch: deps.dispatch,
 			capture: (result) => deps.captureDispatchCost(captureOpts, result, run),
