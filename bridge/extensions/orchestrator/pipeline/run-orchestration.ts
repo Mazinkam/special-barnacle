@@ -331,7 +331,7 @@ export async function runOrchestration(
 	// `workerResults` carries the parent-owned recon dispatches; they must stay
 	// destructured here or the run stops billing them (plan Task 3).
 	const repoRoot = resolve(cwd);
-	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks } = await dispatchHierarchical(
+	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks, resumedLeadTaskIds, resumedAttemptResults } = await dispatchHierarchical(
 		runId,
 		plan.plan_id,
 		parsed.goal,
@@ -346,6 +346,15 @@ export async function runOrchestration(
 			maxLeads: deps.maxLeads,
 			evidenceMaxChars: deps.reconEvidenceMaxChars,
 			repoRoot,
+			// C3: a lead's resume prompt needs "files changed since it started", using
+			// the same git dirty-snapshot machinery `changedSince` below uses for QA
+			// scope — a snapshot taken right before the lead's (wave's) dispatch,
+			// diffed against the tree at resume-decision time.
+			markFiles: () => ({ head: gitHead(cwd), dirty: gitDirtySnapshot(cwd) }),
+			filesChangedSince: (mark, claimedFiles) => {
+				const { head, dirty } = mark as { head: string | null; dirty: Map<string, string> | null };
+				return changedFilesSinceRunStart(cwd, head, dirty, claimedFiles).changed;
+			},
 		},
 	);
 	// dispatchHierarchical no longer hands back a mutable `escalationResults`
@@ -573,6 +582,7 @@ export async function runOrchestration(
 		architectResult,
 		workerResults,
 		leadResults,
+		resumedAttemptResults,
 		verificationResults,
 		escalationResults,
 	});
@@ -653,6 +663,7 @@ export async function runOrchestration(
 		totalLeads: leadResults.length,
 		skippedLeads,
 		retries,
+		resumedLeadIds: resumedLeadTaskIds.map((id) => id.replace(`${runId}-`, "")),
 		filesChangedCount: allFiles.length,
 		externalFilesCount: externalFiles.length,
 		reconWorkersLine: summarizeReconWorkers(workerResults),

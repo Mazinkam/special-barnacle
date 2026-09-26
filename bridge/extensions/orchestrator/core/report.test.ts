@@ -69,6 +69,7 @@ function baseReport(): RunReport {
 		totalLeads: 2,
 		skippedLeads: 0,
 		retries: 0,
+		resumedLeadIds: [],
 		filesChangedCount: 3,
 		externalFilesCount: 0,
 		reconWorkersLine: "recon: 0 workers dispatched",
@@ -172,6 +173,21 @@ describe("core/report.ts buildRunSummary", () => {
 	test("nested cost: appended to the total cost line", () => {
 		const { text } = buildRunSummary({ ...baseReport(), nestedCostUsd: 0.5 });
 		expect(text).toContain("total cost: $1.2345 (3 dispatches; $0.5000 of it in lead subagents)");
+	});
+
+	test("resumes (C3): a resumed lead adds a 'resumes: N (...)' line right after the recon line", () => {
+		const { text } = buildRunSummary({ ...baseReport(), resumedLeadIds: ["lead-2"] });
+		expect(text).toContain("recon: 0 workers dispatched\nresumes: 1 (lead-2)\nverification: PASS");
+	});
+
+	test("resumes (C3): multiple resumed leads are joined and counted", () => {
+		const { text } = buildRunSummary({ ...baseReport(), resumedLeadIds: ["lead-0", "lead-2"] });
+		expect(text).toContain("resumes: 2 (lead-0, lead-2)");
+	});
+
+	test("no resumes: the summary is byte-identical to a run with the field omitted (no resumes line at all)", () => {
+		const { text } = buildRunSummary(baseReport());
+		expect(text).not.toContain("resumes:");
 	});
 
 	test("full report: shown inline (no files changed) with a 'lead report:' header, no truncation notice", () => {

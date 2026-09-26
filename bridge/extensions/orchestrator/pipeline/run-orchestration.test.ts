@@ -272,6 +272,113 @@ describe("pipeline/run-orchestration.ts runOrchestration QA skip when no lead su
 	});
 });
 
+describe("pipeline/run-orchestration.ts runOrchestration lead resume after a transient provider failure (C3)", () => {
+	function resumePlan(runId: string): PlanResponse {
+		return {
+			plan_id: "plan-123456789012",
+			run_id: runId,
+			task_class: "bugfix",
+			complexity: 3,
+			risk: "medium",
+			topology: { depth: 1, leads: 1, workers: 0, shape: "flat" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto",
+				history_sufficient: true,
+				explanation: {},
+			},
+			effective_quality_floor: 0.5,
+			cost_aggressiveness: 0.5,
+		};
+	}
+
+	test("a lead that fails once with a transient (503) error then succeeds on resume: run completes, resumedLeadIds populated, both attempts billed, and the summary shows a resumes line", async () => {
+		const runId = "ht-orch-1700000000000-resume-a";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		let leadCalls = 0;
+		const deps = fakeDeps({
+			planRun: async () => resumePlan(runId),
+			dispatchParallel: async (_cwd, _runId2, tasks) => {
+				if (tasks[0].capability !== "lead") return tasks.map((t) => ({
+					taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0,
+					stdout: "PASS", stderr: "", usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+					durationMs: 1, costUsd: 0, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+				}));
+				leadCalls++;
+				if (leadCalls === 1) {
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 1,
+						stdout: "", stderr: "Service unavailable: Bedrock is unable to process your request.",
+						usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+						durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "failed" as const, filesChanged: [],
+					}));
+				}
+				return tasks.map((t) => ({
+					taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+					stdout: "STATUS: completed\n\nFiles Changed: None", stderr: "",
+					usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+					durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+				}));
+			},
+		});
+
+		const result = await runOrchestration(
+			runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+
+		expect(leadCalls).toBe(2);
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(result.report.dispatchOk).toBe(true);
+		expect(result.report.resumedLeadIds).toEqual(["lead-0"]);
+		// (e) A resume is not a verification retry: the QA retry counter is untouched.
+		expect(result.report.retries).toBe(0);
+		// (f) Both lead attempts billed exactly once each: 2 model_call-equivalent
+		// dispatch results (no QA dispatch happens: both leads report no files changed).
+		expect(result.report.dispatchCount).toBe(2);
+		const { text } = buildRunSummary(result.report);
+		expect(text).toContain("resumes: 1 (lead-0)");
+	});
+
+	test("a lead that fails transiently twice: exactly 2 lead dispatches, run FAILED, no resumes line", async () => {
+		const runId = "ht-orch-1700000000000-resume-b";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		let leadCalls = 0;
+		const deps = fakeDeps({
+			planRun: async () => resumePlan(runId),
+			dispatchParallel: async (_cwd, _runId2, tasks) => {
+				if (tasks[0].capability !== "lead") return [];
+				leadCalls++;
+				return tasks.map((t) => ({
+					taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 1,
+					stdout: "", stderr: "Service unavailable: Bedrock is unable to process your request.",
+					usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+					durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "failed" as const, filesChanged: [],
+				}));
+			},
+		});
+
+		const result = await runOrchestration(
+			runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+
+		expect(leadCalls).toBe(2);
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(result.report.dispatchOk).toBe(false);
+		expect(result.report.resumedLeadIds).toEqual(["lead-0"]);
+		const { text } = buildRunSummary(result.report);
+		expect(text.startsWith("Orchestration FAILED")).toBe(true);
+	});
+});
+
 describe("pipeline/run-orchestration.ts writeLeadReportsDiagnostic", () => {
 	test("no lead reports: does not write, is not logged, and hasLeadReports is false", () => {
 		const logs: string[] = [];

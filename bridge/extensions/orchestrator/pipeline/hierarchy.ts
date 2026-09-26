@@ -23,11 +23,13 @@ import type { ExtensionContext } from "@humain/terminal";
 import type { Adapter } from "../adapters/adapter-resolver.ts";
 import { summarizeStderr } from "../dispatch/stderr-sink.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
+import { isTransientProviderError } from "../core/transient-error.ts";
 import {
 	architectPrompt,
 	complexityNeedsArchitect,
 	effectiveLeadCount,
 	leadPrompt,
+	resumeLeadPrompt,
 	type DispatchTask,
 	type PlanResponse,
 } from "../core/prompts.ts";
@@ -38,6 +40,27 @@ import { METHOD, shortName } from "../models.ts";
 import { fmtElapsed } from "../run-ui.ts";
 import type { RunContext } from "../run/context.ts";
 import type { RunSession } from "../run/session.ts";
+
+/**
+ * True when a lead's `DispatchResult` ended because of a transient provider
+ * error (docs/architecture-review.md C3) rather than a bad result, a blocked
+ * status, or cancellation — the single decision point both the wave loop
+ * below and its tests use, so "should this lead be resumed" is judged
+ * exactly once, from exactly this text. A cancelled dispatch is never
+ * resumed; a lead that exited 0 needs no resuming; a lead whose own report
+ * says `STATUS: blocked` stopped at a precondition, not a transient failure.
+ * Deliberately does not look at `stdout`: a lead's own prose can legitimately
+ * mention words like "overloaded" while describing something else, and the
+ * result's error/stderr/stopReason/exit text is what actually reflects why
+ * the dispatch itself ended.
+ */
+export function isTransientLeadFailure(r: DispatchResult): boolean {
+	if (r.exitCode === 0) return false;
+	if (r.outcome === "cancelled") return false;
+	if (parseLeadStatus(r.stdout) === "blocked") return false;
+	const text = [r.stderr, r.stopReason, r.timeoutReason].filter(Boolean).join("\n");
+	return isTransientProviderError(text);
+}
 
 /** Parent-owned recon/lead sequencing; effects are supplied by the bridge. */
 export async function dispatchReconAndLeads(
@@ -61,8 +84,12 @@ export async function dispatchReconAndLeads(
 		capture: (result: DispatchResult) => Promise<void>;
 		setPhase: (phase: string) => void;
 		throwIfCancelled: () => void;
+		/** Opaque snapshot of the current file state, for `filesChangedSince` (C3 resume prompts). Optional: only real dispatch callers need to supply it. */
+		markFiles?: () => unknown;
+		/** Files changed since `mark` was taken, unioned with `claimed` (files the lead's own report named). Optional: falls back to `claimed` when absent. */
+		filesChangedSince?: (mark: unknown, claimed: string[]) => string[];
 	},
-): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[] }> {
+): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[]; resumedLeadTaskIds: string[]; resumedAttemptResults: DispatchResult[] }> {
 	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars, maxLeads, leadCapability = "lead", repoRoot } = input;
 	const requestedLeadCount = effectiveLeadCount(plan, maxLeads);
 
@@ -145,6 +172,12 @@ export async function dispatchReconAndLeads(
 	// to recover the lead's original goal/scope/model-routing prompt on retry.
 	const leadTasks: DispatchTask[] = [];
 	const stopped = new Set<number>();
+	const resumedLeadTaskIds: string[] = [];
+	// The discarded (failed) attempt of every resumed lead, kept separately from
+	// `leadResults` (which only ever holds the ONE result used to classify that
+	// lead's status) so its cost is still counted toward the run's total spend
+	// — both attempts are billed, but only the final attempt speaks for the lead.
+	const resumedAttemptResults: DispatchResult[] = [];
 	for (const [w, wave] of waves.entries()) {
 		// A lead whose dependency failed or reported STATUS: blocked is not started.
 		const runnable = wave.filter((i) => !(assignments?.[i]?.dependsOn ?? []).some((d) => stopped.has(d)));
@@ -156,14 +189,41 @@ export async function dispatchReconAndLeads(
 		if (runnable.length === 0) continue;
 		if (waves.length > 1) effects.setPhase(`wave ${w + 1}/${waves.length}: lead(s) ${runnable.map((i) => i + 1).join(", ")}`);
 		const tasks = runnable.map(leadTaskFor);
+		const waveStartMark = effects.markFiles ? effects.markFiles() : undefined;
 		const results = await effects.dispatch(tasks);
 		for (const r of results) await effects.capture(r);
 		// Same contract as recon: bill every finished lead, then honour cancellation.
 		effects.throwIfCancelled();
+		// C3: a lead that exited because of a transient provider error (not a bad
+		// result, blocked status, or cancellation) is re-dispatched once, with the
+		// original lead prompt plus a `## Resume` section built from its own last
+		// report and the files changed since it started — instead of discarding
+		// the work a lead's subagents already left on disk. Never more than once
+		// per lead: the replaced result below is not re-examined for resume.
+		const finalResults = [...results];
 		for (const [k, r] of results.entries()) {
+			if (!isTransientLeadFailure(r)) continue;
+			const leadIndex = runnable[k];
+			const originalTask = tasks[k];
+			const filesChangedSinceStart = effects.filesChangedSince
+				? effects.filesChangedSince(waveStartMark, r.filesChanged)
+				: r.filesChanged;
+			effects.setPhase(`lead ${leadIndex + 1}: transient provider error, resuming once`);
+			const [resumed] = await effects.dispatch([
+				{ ...originalTask, task: resumeLeadPrompt(originalTask.task, r.stdout, filesChangedSinceStart) },
+			]);
+			if (resumed) {
+				await effects.capture(resumed);
+				resumedAttemptResults.push(r);
+				finalResults[k] = resumed;
+				resumedLeadTaskIds.push(originalTask.taskId);
+			}
+			effects.throwIfCancelled();
+		}
+		for (const [k, r] of finalResults.entries()) {
 			if (r.exitCode !== 0 || parseLeadStatus(r.stdout) === "blocked") stopped.add(runnable[k]);
 		}
-		leadResults.push(...results);
+		leadResults.push(...finalResults);
 		leadTasks.push(...tasks);
 	}
 
@@ -173,7 +233,7 @@ export async function dispatchReconAndLeads(
 	// not count it as part of this run's authoritative worker accounting.
 	// Leads never started because a lead they depend on failed or was blocked.
 	const skippedLeads = [...stopped].filter((i) => !leadResults.some((r) => r.taskId === `${runId}-lead-${i}`)).length;
-	return { leadResults, workerResults, skippedLeads, leadTasks };
+	return { leadResults, workerResults, skippedLeads, leadTasks, resumedLeadTaskIds, resumedAttemptResults };
 }
 
 /** Dispatch + billing seams `dispatchHierarchical` needs; index.ts's caller supplies the real ones. */
@@ -192,6 +252,10 @@ export interface HierarchyDeps {
 	/** The run's cwd, resolved absolute (docs/architecture-review.md C4): threaded into every lead
 	 *  prompt so the lead is told plainly where it is instead of guessing and running `find /`. */
 	repoRoot: string;
+	/** Opaque snapshot of the current file state, for `filesChangedSince` (C3 resume prompts). Optional. */
+	markFiles?: () => unknown;
+	/** Files changed since `mark` was taken, unioned with `claimed` (files the lead's own report named). Optional. */
+	filesChangedSince?: (mark: unknown, claimed: string[]) => string[];
 }
 
 /**
@@ -230,6 +294,10 @@ export async function dispatchHierarchical(
 	architectResult?: DispatchResult;
 	/** Original DispatchTask objects dispatched for each lead, paired with leadResults by taskId — needed to build faithful retry prompts (BUG 2). */
 	leadTasks: DispatchTask[];
+	/** taskIds of leads re-dispatched once after a transient provider error (C3). */
+	resumedLeadTaskIds: string[];
+	/** The discarded (failed) attempt of every resumed lead, for billing alongside `leadResults` (C3). */
+	resumedAttemptResults: DispatchResult[];
 }> {
 	const { depth } = plan.topology;
 	const captureOpts: CaptureOpts = {
@@ -278,6 +346,8 @@ export async function dispatchHierarchical(
 			capture: (result) => deps.captureDispatchCost(captureOpts, result, run),
 			setPhase: (phase) => run?.session.setPhase(phase),
 			throwIfCancelled: () => run?.session.cancellation.throwIfCancelled(),
+			markFiles: deps.markFiles,
+			filesChangedSince: deps.filesChangedSince,
 		},
 	);
 	return { ...results, architectResult };
@@ -296,11 +366,16 @@ export function collectBilledResults(input: {
 	leadResults: DispatchResult[];
 	verificationResults: DispatchResult[];
 	escalationResults: DispatchResult[];
+	/** The discarded (failed) attempt of every lead resumed once after a transient provider error
+	 *  (C3): billed alongside `leadResults`' kept (final) attempt, so both dispatches' cost counts
+	 *  toward the run's total spend even though only the final attempt speaks for the lead's status. */
+	resumedAttemptResults?: DispatchResult[];
 }): DispatchResult[] {
 	return [
 		...(input.architectResult ? [input.architectResult] : []),
 		...input.workerResults,
 		...input.leadResults,
+		...(input.resumedAttemptResults ?? []),
 		...input.verificationResults,
 		...input.escalationResults,
 	];

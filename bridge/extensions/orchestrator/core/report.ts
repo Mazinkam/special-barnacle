@@ -74,6 +74,10 @@ export interface RunReport {
 	/** Leads never started because a dependency failed or was blocked. */
 	skippedLeads: number;
 	retries: number;
+	/** taskIds (stripped of the `<runId>-` prefix) of leads re-dispatched once after a transient
+	 *  provider error (docs/architecture-review.md C3); empty on every run with no resume, so
+	 *  existing summary output is byte-identical when this feature never fires. */
+	resumedLeadIds: string[];
 	/** Files verified this run (after excluding files changed by someone else). */
 	filesChangedCount: number;
 	/** Files changed during the run that no lead reported changing (excluded from QA). */
@@ -133,6 +137,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		`run_id: ${report.runId}`,
 		`leads: ${report.succeededLeads}/${report.totalLeads} ${report.blocked ? "blocked" : "succeeded"}${report.skippedLeads > 0 ? ` (+${report.skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${report.retries} · files: ${report.filesChangedCount} changed${report.externalFilesCount > 0 ? ` (+${report.externalFilesCount} changed by someone else, not verified)` : ""}`,
 		report.reconWorkersLine,
+		...(report.resumedLeadIds.length > 0 ? [`resumes: ${report.resumedLeadIds.length} (${report.resumedLeadIds.join(", ")})`] : []),
 		`verification: ${verdict}`,
 		`total cost: $${report.totalCostUsd.toFixed(4)} (${report.dispatchCount} dispatches${report.nestedCostUsd > 0 ? `; $${report.nestedCostUsd.toFixed(4)} of it in lead subagents` : ""})`,
 		...(report.dispatchOk ? [] : [`first failure: ${report.firstFailureLine}`]),
