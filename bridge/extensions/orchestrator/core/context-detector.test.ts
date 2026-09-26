@@ -9,6 +9,9 @@ describe("core/context-detector.ts goalRefersToMissingContext", () => {
 		["as discussed, ship the fix", "as discussed phrase"],
 		["run that plan now", "that plan phrase"],
 		["add a README for part B", "conservative: standalone letter B is still a reference"],
+		["Do A then B", "\"A\" is the second word, not sentence-initial: still a reference"],
+		["A new plan: do B then C", "sentence-initial \"A\" is excluded, but B and C still flag it"],
+		["Fine. A go with option 2", "\"A\" is sentence-initial and excluded, but the option-N phrase still flags it"],
 	];
 	for (const [goal, why] of positives) {
 		test(`flags: "${goal}" (${why})`, () => {
@@ -21,6 +24,9 @@ describe("core/context-detector.ts goalRefersToMissingContext", () => {
 		["fix the API error handling for the checkout flow", "API is not a standalone letter"],
 		["I think the retry logic has a bug, please fix it", "lone I is the pronoun, not a reference"],
 		["add a health check endpoint", "lone lowercase a is an article, not a reference"],
+		["A new endpoint for users", "sentence-initial \"A\" followed by a lowercase word is the indefinite article, not a reference"],
+		["A cat sat on the mat", "sentence-initial \"A\" (start of string) followed by a lowercase word"],
+		["Ship it now. A quick fix for the bug", "\"A\" sentence-initial after \". \", followed by a lowercase word"],
 		[
 			`do A then C then B.${"z".repeat(SHORT_GOAL_MAX_CHARS - "do A then C then B.".length)}`,
 			"long goal is exempt regardless of content",
