@@ -376,7 +376,7 @@ Before release:
   the product.)
   The three TS2683 implicit-`this` errors formerly at `orchestrator/index.test.ts:722,723,733`
   were **introduced on this branch**, not pre-program debt; typed mocks now fix them.
-- [ ] Installed-HT reload/shutdown smoke, supported Python (>=3.10), and Linux checks remain
+- [ ] Installed-HT reload/shutdown smoke, supported Python (>=3.9), and Linux checks remain
   **unverified** here. Synthetic child tests do not replace those release gates.
 - [ ] Same-input hashes, billing/duration/verification coverage, retry byte equality, and
   ledger/dashboard totals agree. Compare latency, RSS, subprocesses and I/O together.
