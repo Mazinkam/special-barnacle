@@ -59,17 +59,27 @@ Exit 3; one finding:
 orchestrator/adaptive.py:225: unused variable 'reproducible' (100% confidence)
 ```
 
-### `bunx knip --production`
+### `bunx knip` baseline
 
-Exit 2. No root `package.json` exists; no package manifest or dependencies were added. Exact output:
+The repo has no `package.json` so knip can't run in place. Baseline run in a temp copy (`bridge/` + `knip.json` + stub `{"name":"probe","private":true,"type":"module"}` `package.json`) on this branch at commit c93d85c: `bunx knip --production` → 0 findings, exit 0; non-production `bunx knip` reports unused exports/types (test-only exports and re-exports) and configuration hints (the @humain/*, @sinclair/typebox, bun:test ignore entries are reported as unnecessary).
 
-```text
-Resolving dependencies
-Resolved, downloaded and extracted [132]
-Saved lockfile
-ERROR: Unable to find package.json
-
-Run `knip --help` or visit https://knip.dev for help
-```
+Note: `scripts/lint.sh` (end of run) must supply a `package.json` (temp or committed private stub with no dependencies).
 
 The Python packaging regression check `python3 -m pytest -q tests/test_packaging.py` passed: **3 passed**. The Ruff invocation above confirms it loads the new project config, but returns the baseline diagnostics listed above.
+
+## Fixed-now status updates
+
+| Finding | Status | Commit |
+|---|---|---|
+| B4.6 `index.ts` wiring | fixed-now | 9fb00f9, 6e411f7, 3900c01, c93d85c |
+| B4.7 `parseFailedChecks` zero rows | fixed-now | 8fb3c57 |
+| B4.7 PlanResponse validation | fixed-now | ef683bf |
+| B4.7 coupling/parallelizable defaults | fixed-now | e3b4a0c |
+| B4.7 prompt-write/discovery failures | fixed-now | 87fb1ee |
+| B4.7 failed `lead-report.md` link | fixed-now | 6f6da8b |
+| B4.7 run duration | fixed-now | 90bce8d |
+| B4.7 MAX_LEADS contract source | fixed-now | 6f2636d |
+| B4.7 `recordHookFailure`/`make_ingest_status` contract fields | fixed-now | 48c411a |
+| B4.7 `reconWorkers` missing complexity band | fixed-now | 5214332 |
+| Dashboard spend-cap panel merge from main | fixed-now | 3b7bf5d |
+| `models.ts` reconWorkers has no production caller | open — Phase 2 dead-code candidate | — |
