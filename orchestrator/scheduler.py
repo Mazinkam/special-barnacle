@@ -5,6 +5,7 @@ from .history import bucket_complexity
 from .method import effort_levels
 from .records import is_no_data
 from .vocab import SCHEDULER_MIN_SAMPLES
+from .contract import MAX_LEADS
 
 #: `EFFORTS` used to be computed at import time (`effort_levels()` reads `method.json`). Kept as a
 #: module attribute (some tests do `from orchestrator.scheduler import EFFORTS`), but resolved lazily
@@ -28,7 +29,7 @@ def __getattr__(name: str):
 #: `__all__`, `import *` only takes names already in the module's `__dict__`, and `EFFORTS` is
 #: deliberately not one of those (see `efforts()`/`__getattr__` above) — B2 review finding.
 __all__ = [
-    'Any', 'ComputePackage', 'DEFAULT_PACKAGES', 'EFFORTS', 'SCHEDULER_MIN_SAMPLES',
+    'Any', 'ComputePackage', 'DEFAULT_PACKAGES', 'EFFORTS', 'MAX_LEADS', 'SCHEDULER_MIN_SAMPLES',
     'asdict', 'bucket_complexity', 'dataclass', 'effort_levels', 'efforts', 'is_no_data',
     'measured', 'package_history', 'recommend_package', 'topology_for',
 ]
@@ -67,7 +68,9 @@ def topology_for(complexity:float,coupling:float=.5,parallelizable:float=.5,risk
     if c<=3 or coupling>=.8: return {'depth':1,'leads':0,'workers':1,'shape':'direct'}
     if c<=6:
         workers=max(1,min(4,round(1+3*parallelizable))); return {'depth':2,'leads':1,'workers':workers,'shape':'single_lead'}
-    leads=max(2,min(4,round(2+2*parallelizable))); workers=max(leads,min(10,round(c*parallelizable+leads)))
+    # B4.7: MAX_LEADS (contract.json, currently 4) is the single source for this ceiling,
+    # shared with the TS bridge's config.ts maxLeads default.
+    leads=max(2,min(MAX_LEADS,round(2+2*parallelizable))); workers=max(leads,min(10,round(c*parallelizable+leads)))
     return {'depth':3 if c<9 else 4,'leads':leads,'workers':workers,'shape':'multi_lead'}
 
 def package_history(stats:list[dict], *, task_class:str, complexity:float, risk:str, package:dict)->dict|None:

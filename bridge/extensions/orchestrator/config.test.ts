@@ -38,7 +38,7 @@ describe("config.ts loadBridgeConfig defaults", () => {
 		const cfg = loadBridgeConfig({}, HOME);
 		expect(cfg.pythonTimeoutMs).toBe(60_000);
 		expect(cfg.maxConcurrentDispatches).toBe(4);
-		expect(cfg.maxLeads).toBe(8);
+		expect(cfg.maxLeads).toBe(contract.max_leads);
 		expect(cfg.dispatchTimeoutMs).toBe(20 * 60 * 1000);
 		expect(cfg.telemetryFlushMs).toBe(500);
 		expect(cfg.telemetryMaxBatch).toBe(100);
@@ -107,7 +107,7 @@ describe("config.ts loadBridgeConfig env overrides", () => {
 			{ HUMAIN_ORCHESTRATOR_MAX_LEADS: "not-a-number", HUMAIN_ORCHESTRATOR_MAX_CONCURRENCY: "-1" },
 			HOME,
 		);
-		expect(cfg.maxLeads).toBe(8);
+		expect(cfg.maxLeads).toBe(contract.max_leads);
 		expect(cfg.maxConcurrentDispatches).toBe(4);
 	});
 });

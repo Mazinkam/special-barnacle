@@ -82,4 +82,11 @@ describe("contract.json parity", () => {
 	test("run-diagnostics' protected file set equals contract.never_archive_files", () => {
 		expect([...protectedNames].sort()).toEqual([...contract.never_archive_files].sort());
 	});
+
+	test("max_leads is the single source for the lead-count ceiling (B4.7)", () => {
+		// The Python plan topology (orchestrator/scheduler.py's topology_for) never requests more
+		// than this many leads, so it is the effective ceiling for a normal /orchestrate run;
+		// config.ts's maxLeads default must be exactly this value, not an independently chosen one.
+		expect(contract.max_leads).toBe(4);
+	});
 });

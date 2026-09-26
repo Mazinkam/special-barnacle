@@ -10,6 +10,9 @@
 
   "ingest_status_file": "ingest_status.json",
 
+  "max_leads": 4,
+  "max_leads_note": "B4.7: the single source for the orchestration lead-count ceiling, consumed by orchestrator/scheduler.py's topology_for (which never requests more leads than this for any complexity/parallelizable input) and by the TS bridge's config.ts (the default for maxLeads, overridable per-run via HUMAIN_ORCHESTRATOR_MAX_LEADS). 4 was chosen to preserve the pre-B4.7 effective behaviour: the Python plan topology already capped itself at 4 leads, so the TS side's old default of 8 was never the binding constraint (config.ts's maxLeads is `min`'d against the plan's own leads, and the plan never exceeded 4) — no behaviour change for a normal /orchestrate run.",
+
   "never_archive_files": [
     "events.jsonl",
     "metrics.jsonl",

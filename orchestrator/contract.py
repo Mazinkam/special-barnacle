@@ -28,6 +28,11 @@ STREAMS: dict[str, str] = dict(_CONTRACT['streams'])
 #: Receipt file for the last ingest attempt (`cli.py`, `dashboard.py`, `archive.py`).
 INGEST_STATUS_FILE: str = _CONTRACT['ingest_status_file']
 
+#: B4.7: single source for the lead-count ceiling. `scheduler.topology_for` never requests
+#: more leads than this; the TS bridge's `config.ts` `maxLeads` default is this same value
+#: (see `contract.json`'s `max_leads_note` for why 4, not the TS side's old default of 8).
+MAX_LEADS: int = int(_CONTRACT['max_leads'])
+
 #: File names archive.py must never touch, regardless of age (`archive.NEVER_ARCHIVE`)
 #: and the matching protected-name set in `run-diagnostics.ts`.
 NEVER_ARCHIVE_FILES: frozenset[str] = frozenset(_CONTRACT['never_archive_files'])

@@ -41,7 +41,12 @@ export interface BridgeConfig {
 	pythonTimeoutMs: number;
 	/** Hard ceiling on concurrent child processes, independent of what a plan asks for. */
 	maxConcurrentDispatches: number;
-	/** Hard ceiling on lead fan-out, so a malformed topology can't spawn unbounded leads. */
+	/**
+	 * Hard ceiling on lead fan-out, so a malformed topology can't spawn unbounded leads.
+	 * Defaults to `contract.max_leads` (B4.7: the single source shared with
+	 * `orchestrator/scheduler.py`'s plan-topology ceiling — see `contract.json`'s
+	 * `max_leads_note`), overridable per-run via `HUMAIN_ORCHESTRATOR_MAX_LEADS`.
+	 */
 	maxLeads: number;
 	/** Per-dispatch wall clock for a LEAF dispatch that does its own work directly. */
 	dispatchTimeoutMs: number;
@@ -131,7 +136,7 @@ export function loadBridgeConfig(env: BridgeEnv, home: string): BridgeConfig {
 		legacyAdapterPath,
 		pythonTimeoutMs: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_PYTHON_TIMEOUT_MS", 60_000),
 		maxConcurrentDispatches: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_MAX_CONCURRENCY", 4),
-		maxLeads: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_MAX_LEADS", 8),
+		maxLeads: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_MAX_LEADS", contract.max_leads),
 		dispatchTimeoutMs,
 		telemetryFlushMs: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_TELEMETRY_FLUSH_MS", 500),
 		telemetryMaxBatch: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_TELEMETRY_BATCH", 100),

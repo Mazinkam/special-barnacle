@@ -15,7 +15,7 @@ import pytest
 
 from datetime import datetime, timezone
 
-from orchestrator import archive, contract, record_batch, record_index, cli, runtime
+from orchestrator import archive, contract, record_batch, record_index, cli, runtime, scheduler
 from orchestrator.outcomes import _dt as outcomes_dt
 from orchestrator.run_evidence import _parse_ts as run_evidence_parse_ts
 
@@ -171,6 +171,24 @@ def test_record_batch_limits_exit_and_status_constants_match_contract() -> None:
 def test_cli_redaction_constant_matches_contract() -> None:
     assert cli._PATH_RE is contract.PATH_REDACTION_RE
     assert cli._PATH_RE.pattern == contract.PATH_REDACTION_RE.pattern
+
+
+def test_max_leads_matches_contract_and_scheduler_topology_cap() -> None:
+    """B4.7: `contract.json`'s `max_leads` is the one source for the lead-count ceiling.
+
+    Python's `scheduler.topology_for` never requests more leads than this (it is the plan
+    topology's own ceiling), and the TS bridge's `config.ts` `maxLeads` default (absent an
+    env override) must be the same number, so a normal `/orchestrate` run's effective lead
+    ceiling is one value, not two independently-maintained ones.
+    """
+    raw = _raw_contract()
+    assert contract.MAX_LEADS == raw['max_leads'] == 4
+    # scheduler never asks for more leads than the contract ceiling, across the whole
+    # parallelizable/complexity range that can produce a multi_lead topology.
+    for complexity in (7, 8, 9, 10, 12):
+        for parallelizable in (0.0, 0.25, 0.5, 0.75, 1.0):
+            topo = scheduler.topology_for(complexity, coupling=0.3, parallelizable=parallelizable)
+            assert topo['leads'] <= contract.MAX_LEADS
 
 
 def test_runtime_state_root_env_var_matches_contract() -> None:
