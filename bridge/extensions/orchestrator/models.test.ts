@@ -236,6 +236,16 @@ describe("method.json (canonical orchestration method)", () => {
 		expect(reconWorkers(10)).toBe(5);
 		expect(reconWorkers(9, "investigation")).toBe(0);
 	});
+
+	test("Rule 2: a complexity above every band's max (missing band) skips recon, matching planReconTasks (B4.7)", () => {
+		// method.json's workers_by_complexity currently tops out at max 10; a complexity above
+		// that has no matching band. recon.ts's planReconTasks() treats a missing band as 0
+		// workers (skip recon) — the actual production behaviour, since it is the function
+		// dispatchHierarchical/pipeline/hierarchy.ts calls. reconWorkers must agree, not fall
+		// back to the highest band's count.
+		const maxBand = Math.max(...METHOD.rules.pre_implementation_recon.workers_by_complexity.map((b: { max: number }) => b.max));
+		expect(reconWorkers(maxBand + 1)).toBe(0);
+	});
 });
 
 describe("tiers", () => {

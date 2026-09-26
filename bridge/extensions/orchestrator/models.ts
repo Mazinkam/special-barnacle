@@ -100,12 +100,18 @@ export function rereviewFloor(risk: string): ReReviewFloor {
 	return table[risk as RiskLevel] ?? table.medium;
 }
 
-/** Rule 2: how many pre-implementation recon workers a task warrants; 0 = skip recon. */
+/**
+ * Rule 2: how many pre-implementation recon workers a task warrants; 0 = skip recon.
+ *
+ * A missing band (complexity above every `workers_by_complexity` entry's `max`) is 0
+ * workers, not the highest band's count — matching the actual production call path,
+ * `recon.ts`'s `planReconTasks` (B4.7: the two disagreed on this before).
+ */
 export function reconWorkers(complexity: number, taskClass?: string): number {
 	const r = METHOD.rules.pre_implementation_recon;
 	if ((taskClass && r.skip_for_task_classes.includes(taskClass)) || complexity < r.min_complexity) return 0;
 	const band = r.workers_by_complexity.find((b) => complexity >= b.min && complexity <= b.max);
-	return band?.workers ?? r.workers_by_complexity[r.workers_by_complexity.length - 1]?.workers ?? 0;
+	return band?.workers ?? 0;
 }
 
 export function tierIndex(tier: Tier): number {

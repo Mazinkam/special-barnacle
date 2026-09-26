@@ -90,6 +90,9 @@ export function planReconTasks(input: ReconPlanInput): ReconTaskPlan[] {
 	const { method, complexity, taskClass, goal, runId } = input;
 	if (complexity < method.min_complexity) return [];
 	if (method.skip_for_task_classes.includes(taskClass)) return [];
+	// A missing band (complexity above every workers_by_complexity entry's max) is 0 workers
+	// (skip recon), not a fallback to the highest band's count — this is the production
+	// behaviour models.ts's reconWorkers must match (B4.7: the two disagreed before).
 	const band = method.workers_by_complexity.find(({ min, max }) => complexity >= min && complexity <= max);
 	const count = Math.max(0, band?.workers ?? 0);
 	return RECON_QUESTIONS.slice(0, count).map((question, index) => ({
