@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { architectPrompt, effectiveLeadCount, formatTaskPrompt, leadPrompt, parsePlanResponse, repoRootGuardrail, resumeLeadPrompt, RESUME_REPORT_MAX_CHARS, VERIFICATION_COMMANDS, type PlanResponse } from "./prompts.ts";
 import planFixture from "../fixtures/orchestrator-cli-plan-response.json";
 
@@ -225,5 +228,108 @@ describe("core/prompts.ts parsePlanResponse", () => {
 			cost_aggressiveness: 0.7,
 		});
 		expect(effectiveLeadCount(result)).toBe(1);
+	});
+});
+
+describe("lead persona recon contract", () => {
+	// The Rule-2 fan-out is parent-owned and billed. If the lead persona also told
+	// leads to dispatch their own `orch-scout` recon, every qualifying run would pay
+	// for recon twice and the second round would be invisible to the bridge's worker
+	// accounting. Guard the instruction, not just the code.
+	const raw = readFileSync(
+		join(import.meta.dir, "..", "..", "..", "agents", "orchestrator-lead.md"),
+		"utf-8",
+	);
+	// Match on prose, not formatting: `**not**` must not be able to slip a
+	// prohibition past these assertions.
+	const leadPersona = raw.replace(/\*/g, "");
+
+	test("does not instruct leads to dispatch their own recon scouts", () => {
+		expect(leadPersona).not.toMatch(/dispatch\s+3[–-]5\s+`?orch-scout/i);
+		expect(leadPersona).toMatch(/do not dispatch your own `orch-scout`/i);
+	});
+
+	test("tells leads recon evidence arrives from the parent", () => {
+		expect(leadPersona).toMatch(/parent-owned/i);
+		expect(leadPersona).toMatch(/Recon evidence/);
+	});
+});
+
+const leadPromptFixture: Parameters<typeof leadPrompt>[1] = {
+	plan_id: "plan-1",
+	run_id: "run-1",
+	task_class: "implementation",
+	complexity: 6,
+	risk: "medium",
+	topology: { depth: 2, leads: 1, workers: 3, shape: "lead-workers" },
+	route: {
+		selected: { capability: "lead", effort: "standard", verification_depth: "targeted" },
+		recommended: { capability: "lead", effort: "standard", verification_depth: "targeted" },
+		mode: "adaptive",
+		history_sufficient: true,
+		explanation: {},
+	},
+	effective_quality_floor: 0.8,
+	cost_aggressiveness: 0.5,
+};
+const leadPromptAdapterFixture: Parameters<typeof leadPrompt>[6] = {
+	lead: { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
+};
+const leadPromptRepoRootFixture = "/repo";
+
+describe("leadPrompt recon evidence handoff", () => {
+	test("adds completed recon evidence to the lead prompt", () => {
+		const prompt = leadPrompt(
+			"repair flow",
+			leadPromptFixture,
+			undefined,
+			"### run-recon-0\naffected: src/a.ts",
+			0,
+			1,
+			leadPromptAdapterFixture,
+			leadPromptRepoRootFixture,
+		);
+		expect(prompt).toContain("Recon evidence");
+		expect(prompt).toContain("affected: src/a.ts");
+		expect(prompt).toContain("Do not repeat broad repository discovery");
+	});
+
+	test("states no parent-owned recon was required when evidence is empty", () => {
+		const prompt = leadPrompt(
+			"repair flow",
+			leadPromptFixture,
+			undefined,
+			"",
+			0,
+			1,
+			leadPromptAdapterFixture,
+			leadPromptRepoRootFixture,
+		);
+		expect(prompt).toContain("Recon evidence");
+		expect(prompt).toContain("none");
+	});
+
+	test("tells the lead nested subagent fan-out is not authoritative worker accounting", () => {
+		const prompt = leadPrompt(
+			"repair flow",
+			leadPromptFixture,
+			undefined,
+			"### run-recon-0\naffected: src/a.ts",
+			0,
+			1,
+			leadPromptAdapterFixture,
+			leadPromptRepoRootFixture,
+		);
+		expect(prompt).not.toContain("workers fan out inside each lead");
+		expect(prompt).toContain("not authoritative worker accounting");
+	});
+
+	test("leaves final QA to the orchestrator instead of asking the lead to run orch-qa-agent", () => {
+		// Regression: ht-orch-1790256789245-1a3fms ran QA twice (lead's orch-qa-agent, then the bridge's).
+		const prompt = leadPrompt("repair flow", leadPromptFixture, undefined, "", 0, 1, leadPromptAdapterFixture, leadPromptRepoRootFixture);
+		expect(prompt).not.toContain("run QA via orch-qa-agent");
+		expect(prompt).toContain("Do not dispatch orch-qa-agent");
+		expect(prompt).not.toContain("does not see, log, or bill");
+		expect(prompt).not.toMatch(/- orch-qa-agent: model/);
 	});
 });

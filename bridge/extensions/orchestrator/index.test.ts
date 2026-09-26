@@ -215,31 +215,6 @@ describe("session ingest hook wiring (index.ts wiring)", () => {
 
 
 
-
-// The Rule-2 fan-out is parent-owned and billed. If the lead persona also told
-// leads to dispatch their own `orch-scout` recon, every qualifying run would pay
-// for recon twice and the second round would be invisible to the bridge's worker
-// accounting. Guard the instruction, not just the code.
-describe("lead persona recon contract", () => {
-	const raw = readFileSync(
-		join(import.meta.dir, "..", "..", "agents", "orchestrator-lead.md"),
-		"utf-8",
-	);
-	// Match on prose, not formatting: `**not**` must not be able to slip a
-	// prohibition past these assertions.
-	const leadPersona = raw.replace(/\*/g, "");
-
-	test("does not instruct leads to dispatch their own recon scouts", () => {
-		expect(leadPersona).not.toMatch(/dispatch\s+3[–-]5\s+`?orch-scout/i);
-		expect(leadPersona).toMatch(/do not dispatch your own `orch-scout`/i);
-	});
-
-	test("tells leads recon evidence arrives from the parent", () => {
-		expect(leadPersona).toMatch(/parent-owned/i);
-		expect(leadPersona).toMatch(/Recon evidence/);
-	});
-});
-
 const planFixture: Parameters<typeof orchestrator.leadPrompt>[1] = {
 		plan_id: "plan-1",
 		run_id: "run-1",
@@ -262,64 +237,6 @@ const adapterFixture: Parameters<typeof orchestrator.leadPrompt>[6] = {
 };
 const repoRootFixture = "/repo";
 
-describe("leadPrompt recon evidence handoff", () => {
-
-	test("adds completed recon evidence to the lead prompt", () => {
-		const prompt = orchestrator.leadPrompt(
-			"repair flow",
-			planFixture,
-			undefined,
-			"### run-recon-0\naffected: src/a.ts",
-			0,
-			1,
-			adapterFixture,
-			repoRootFixture,
-		);
-		expect(prompt).toContain("Recon evidence");
-		expect(prompt).toContain("affected: src/a.ts");
-		expect(prompt).toContain("Do not repeat broad repository discovery");
-	});
-
-	test("states no parent-owned recon was required when evidence is empty", () => {
-		expect(orchestrator.leadPrompt).toBeFunction();
-		const prompt = orchestrator.leadPrompt!(
-			"repair flow",
-			planFixture,
-			undefined,
-			"",
-			0,
-			1,
-			adapterFixture,
-			repoRootFixture,
-		);
-		expect(prompt).toContain("Recon evidence");
-		expect(prompt).toContain("none");
-	});
-
-	test("tells the lead nested subagent fan-out is not authoritative worker accounting", () => {
-		const prompt = orchestrator.leadPrompt(
-			"repair flow",
-			planFixture,
-			undefined,
-			"### run-recon-0\naffected: src/a.ts",
-			0,
-			1,
-			adapterFixture,
-			repoRootFixture,
-		);
-		expect(prompt).not.toContain("workers fan out inside each lead");
-		expect(prompt).toContain("not authoritative worker accounting");
-	});
-
-	test("leaves final QA to the orchestrator instead of asking the lead to run orch-qa-agent", () => {
-		// Regression: ht-orch-1790256789245-1a3fms ran QA twice (lead's orch-qa-agent, then the bridge's).
-		const prompt = orchestrator.leadPrompt("repair flow", planFixture, undefined, "", 0, 1, adapterFixture, repoRootFixture);
-		expect(prompt).not.toContain("run QA via orch-qa-agent");
-		expect(prompt).toContain("Do not dispatch orch-qa-agent");
-		expect(prompt).not.toContain("does not see, log, or bill");
-		expect(prompt).not.toMatch(/- orch-qa-agent: model/);
-	});
-});
 
 function dispatchResult(task: DispatchTask, exitCode = 0): DispatchResult {
 	return {
