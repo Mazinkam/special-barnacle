@@ -83,15 +83,4 @@ export class RunRegistry<TSession> {
 	release(context: RunContext<TSession>): void {
 		if (this.current === context) this.current = null;
 	}
-
-	/**
-	 * Test-only escape hatch: force the registry into an arbitrary state,
-	 * bypassing `claim()`'s guard entirely. Used to simulate a race where a
-	 * newer run has already replaced the active one out from under a stale
-	 * run's cleanup — production code has no other way to reach that state; it
-	 * only ever calls `claim()`/`release()`.
-	 */
-	setForTest(context: RunContext<TSession> | null): void {
-		this.current = context;
-	}
 }

@@ -94,11 +94,6 @@ export function installDispatchReaper(deps: DispatchReaperDeps): void {
 	}
 }
 
-/** Reset the install-once guard. Test-only: production installs exactly once per process. */
-export function resetDispatchReaperForTest(): void {
-	dispatchReaperInstalled = false;
-}
-
 export interface PersonaReapOptions {
 	/** Directory persona temp dirs are created in (`os.tmpdir()` in production). */
 	tmpRoot: string;

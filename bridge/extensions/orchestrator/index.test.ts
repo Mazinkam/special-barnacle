@@ -85,12 +85,16 @@ afterAll(() => {
 // B4.4: activeRunForTest()/setActiveRunForTest() were free functions reading/
 // writing the (now-deleted) ACTIVE_RUN global. `orchestrator.runRegistry` is
 // the module's one allowed piece of state now; these helpers give tests the
-// same two operations directly against it.
+// same two operations, built only from the registry's real claim()/release()
+// API — release() always succeeds here because it is handed back exactly the
+// context active() just returned, so identity trivially matches.
 function activeSession(): InstanceType<typeof orchestrator.RunSession> | null {
 	return orchestrator.runRegistry.active()?.session ?? null;
 }
 function forceActiveSession(session: InstanceType<typeof orchestrator.RunSession> | null): void {
-	orchestrator.runRegistry.setForTest(session ? { session, tags: {}, aliasTable: null } : null);
+	const current = orchestrator.runRegistry.active();
+	if (current) orchestrator.runRegistry.release(current);
+	if (session) orchestrator.runRegistry.claim(session, {}, null);
 }
 
 describe("session ingest hook wiring", () => {

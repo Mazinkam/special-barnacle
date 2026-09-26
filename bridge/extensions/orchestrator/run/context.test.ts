@@ -59,30 +59,29 @@ describe("RunRegistry", () => {
 
 	test("release() is a no-op when the context is not the current owner (stale-run check)", () => {
 		// Reproduces the scenario a stale run's own `finally` must survive: run A
-		// claims the registry, then — simulating a race the guard is supposed to
-		// prevent in production, but which a test can still force — run B's
-		// context replaces it directly. A's own `release(contextA)` must not undo
-		// that: it is not releasing the context that is actually still active.
+		// claims the registry, cleanly releases, then run B claims it. A's own
+		// `release(contextA)` — called again, e.g. from a stale/duplicate cleanup
+		// path — must not undo that: it is not releasing the context that is
+		// actually still active.
 		const registry = new RunRegistry<ReturnType<typeof fakeSession>>();
 		const contextA = registry.claim(fakeSession("a"))!;
-		const contextB = registry.claim(fakeSession("b")); // fails: A still holds it
-		expect(contextB).toBeNull();
-		const forcedB = { session: fakeSession("b"), tags: {}, aliasTable: null };
-		registry.setForTest(forcedB);
-		expect(registry.active()).toBe(forcedB);
+		registry.release(contextA);
+		const contextB = registry.claim(fakeSession("b"));
+		expect(contextB).not.toBeNull();
+		expect(registry.active()).toBe(contextB);
 
 		registry.release(contextA);
 
-		expect(registry.active()).toBe(forcedB);
+		expect(registry.active()).toBe(contextB);
 	});
 
 	test("after a stale release() no-ops, the real owner can still release cleanly", () => {
 		const registry = new RunRegistry<ReturnType<typeof fakeSession>>();
 		const contextA = registry.claim(fakeSession("a"))!;
-		const forcedB = { session: fakeSession("b"), tags: {}, aliasTable: null };
-		registry.setForTest(forcedB);
+		registry.release(contextA);
+		const contextB = registry.claim(fakeSession("b"))!;
 		registry.release(contextA); // no-op: A no longer owns the registry
-		registry.release(forcedB); // the real owner releases cleanly
+		registry.release(contextB); // the real owner releases cleanly
 		expect(registry.active()).toBeNull();
 	});
 
@@ -93,12 +92,5 @@ describe("RunRegistry", () => {
 		const second = registry.claim(fakeSession("b"));
 		expect(second).not.toBeNull();
 		expect(registry.active()!.session).toEqual(fakeSession("b"));
-	});
-
-	test("setForTest(null) clears the registry directly, bypassing release()'s identity check", () => {
-		const registry = new RunRegistry<ReturnType<typeof fakeSession>>();
-		registry.claim(fakeSession("a"));
-		registry.setForTest(null);
-		expect(registry.active()).toBeNull();
 	});
 });
