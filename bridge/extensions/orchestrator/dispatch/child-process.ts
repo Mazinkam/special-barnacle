@@ -36,7 +36,7 @@ import { basename, join } from "node:path";
 import { discoverAgents, type ExtensionContext, renderTaskWithContext, type SubagentUsageStats } from "@humain/terminal";
 
 import { RunCancellation } from "../cancellation.ts";
-import { RunDiagnostics, appendDiagnosticPath, type DiagnosticWriter } from "../run-diagnostics.ts";
+import { RunDiagnostics, type DiagnosticWriter } from "../run-diagnostics.ts";
 import { SpendCapTracker, capFor, type SpendCapVerdict } from "../spend-cap.ts";
 import { NestedCostTracker } from "../nested-cost.ts";
 import { killProcessTree } from "../adapters/process-reaper.ts";
@@ -113,16 +113,6 @@ export function guardChildStreamHandler(
 		} catch {
 			/* the stream listener must never throw */
 		}
-	}
-}
-
-/** Write a JSONL event while omitting recursively repeated worker histories. */
-export function appendTrimmedEventLog(eventsLog: string | undefined, event: unknown): void {
-	if (!eventsLog) return;
-	try {
-		appendDiagnosticPath(eventsLog, `${JSON.stringify(trimEventForLog(event))}\n`);
-	} catch {
-		/* per-dispatch diagnostics must not disrupt the child stream */
 	}
 }
 

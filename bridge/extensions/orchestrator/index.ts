@@ -21,7 +21,6 @@ import {
 	PERSONA_TMP_PREFIX,
 	liveDispatchPids,
 	guardChildStreamHandler,
-	appendTrimmedEventLog,
 } from "./dispatch/child-process.ts";
 import { dispatchParallel as dispatchParallelCore, agentNameFor } from "./dispatch/parallel.ts";
 import { telemetryHealthy, telemetryWarning } from "./record-queue.ts";
@@ -104,7 +103,6 @@ import { formatOrchestratorStatus } from "./run/board.ts";
 // -----------------------------------------------------------------------------
 export {
 	guardChildStreamHandler,
-	appendTrimmedEventLog,
 	agentNameFor,
 	telemetryHealthy,
 	telemetryWarning,

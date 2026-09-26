@@ -479,38 +479,6 @@ describe("child stream handler safety", () => {
 	});
 });
 
-describe("dispatch event logging", () => {
-	test("writes tool updates without nested worker histories", () => {
-		expect(orchestrator.appendTrimmedEventLog).toBeFunction();
-		const dir = mkdtempSync(join(tmpdir(), "orch-event-log-test-"));
-		const eventsLog = join(dir, "worker.events.jsonl");
-		try {
-			orchestrator.appendTrimmedEventLog!(eventsLog, {
-				type: "tool_execution_update",
-				partialResult: {
-					details: {
-						results: [{
-							taskId: "worker-1",
-							agent: "worker",
-							usage: { input: 1, output: 2 },
-							messages: [{ role: "assistant", content: "x".repeat(1024 * 1024) }],
-						}],
-					},
-				},
-			});
-
-			const logged = JSON.parse(readFileSync(eventsLog, "utf8"));
-			expect(logged.partialResult.details.results[0]).toEqual({
-				taskId: "worker-1",
-				agent: "worker",
-				usage: { input: 1, output: 2 },
-			});
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
-	});
-});
-
 describe("RunSession cancellation presentation", () => {
 	test("clears the widget and status after cancellation cleanup, keeping the trace in run.log", () => {
 		const widgets: unknown[] = [];
@@ -3142,7 +3110,6 @@ describe("diagnostic writer ownership and sealing", () => {
 		expect(readFileSync(session.file("task.stderr.log"), "utf8")).toBe("error\n");
 		expect(writer.append("task.events.jsonl", "too late")).toBe(false);
 		expect(session.writeDiagnostic("lead-report.md", "overwrite")).toBe(false);
-		orchestrator.appendTrimmedEventLog(session.file("task.events.jsonl"), { type: "late" });
 		expect(readFileSync(session.file("task.events.jsonl"), "utf8")).toBe("first\nlate\n");
 		expect(() => session.diagnostics.writer()).toThrow();
 		expect(() => new orchestrator.RunSession("seal-writers", ctx as never, "reopen")).toThrow();
@@ -3217,7 +3184,6 @@ print(json.dumps({'removed':result['raw_bytes_removed'],'ownership':result['owne
 				}
 				for (let i = 0; i < 20; i++) await Promise.resolve();
 				expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(false);
-				orchestrator.appendTrimmedEventLog(session.file("task.events.jsonl"), { type: "bypass" });
 				expect(readFileSync(session.file("task.events.jsonl"), "utf8")).toBe("before\nlate\n");
 				expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
 				// Exercise the Python archive gate with the real timed-out owner marker.

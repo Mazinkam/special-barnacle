@@ -5,7 +5,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import {
-	appendFileSync, closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, linkSync, lstatSync,
+	closeSync, constants, fstatSync, fsyncSync, ftruncateSync, linkSync, lstatSync,
 	mkdirSync, openSync, readSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -267,12 +267,3 @@ export class RunDiagnostics {
 	}
 }
 
-// This legacy exported path helper cannot bypass an owning session, even after reload/sealing.
-export function appendDiagnosticPath(path: string, text: string): boolean {
-	const dir = resolve(dirname(path));
-	const owner = owners.get(dir);
-	if (owner) return owner.write(basename(path), text, true);
-	if (existsSync(join(dir, OWNER_FILE)) || existsSync(join(dir, SEAL_FILE))) return false;
-	appendFileSync(path, text);
-	return true;
-}
