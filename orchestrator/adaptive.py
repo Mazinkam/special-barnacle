@@ -222,6 +222,6 @@ def adaptive_route(*, run_id: str, task_class: str, complexity: float, risk: str
     }
 
 
-def should_canary(run_id: str, percentage: float, reproducible: bool = True) -> bool:
+def should_canary(run_id: str, percentage: float) -> bool:
     # Always deterministic by run id: reproducibility is desirable for canary assignment even when normal exploration is not.
     return deterministic_coin(f'canary:{run_id}', float(percentage)/100.0)
