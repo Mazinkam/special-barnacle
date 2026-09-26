@@ -227,7 +227,7 @@ def test_bounded_ingest_error_keeps_head_and_actionable_tail():
 
 def test_ingest_conflict_stderr_is_bounded_and_keeps_granularity_hint(tmp_path):
     from orchestrator.runtime import EventStore
-    from tests.test_ingest_checkpoint import aggregate_row, ht_session
+    from tests.ingest_checkpoint.helpers import aggregate_row, ht_session
     root = tmp_path/'state'; root.mkdir()
     # A long directory name guarantees the redacted message exceeds the stderr bound.
     logs = tmp_path/('very-long-session-directory-name-'*4); logs.mkdir()
