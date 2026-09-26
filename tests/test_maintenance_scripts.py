@@ -27,6 +27,7 @@ STAMP_SCRIPT = REPO_ROOT / "scripts" / "stamp_granularity.py"
 sys.path.insert(0, str(REPO_ROOT))
 from orchestrator.records import NON_COST_EVENTS  # noqa: E402
 from orchestrator.runtime import writer_lock  # noqa: E402
+from scripts.stamp_granularity import _default_state_dir, _parse_args  # noqa: E402
 
 
 def _complete_model_call(**overrides) -> dict:
@@ -85,6 +86,16 @@ def _quarantine_rows(state_dir: Path) -> list[dict]:
     for path in state_dir.glob("metrics.quarantine-*.jsonl"):
         rows.extend(_read_jsonl(path))
     return rows
+
+
+def test_stamp_granularity_resolves_state_root_alias(monkeypatch, tmp_path):
+    alias_root = tmp_path / "alias-state"
+    monkeypatch.delenv("CODING_AGENT_ORCHESTRATOR_HOME", raising=False)
+    monkeypatch.setenv("HUMAIN_ORCHESTRATOR_STATE_ROOT", str(alias_root))
+
+    assert _default_state_dir() == alias_root
+    assert _parse_args([])[0] == alias_root
+    assert _parse_args([str(tmp_path / "cli-root")])[0] == tmp_path / "cli-root"
 
 
 def test_audit_keeps_every_package_row_type(tmp_path):
