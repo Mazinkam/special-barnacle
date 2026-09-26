@@ -21,10 +21,8 @@ import {
 	runSubagentProcess as runSubagentProcessCore,
 	PERSONA_TMP_PREFIX,
 	liveDispatchPids,
-	guardChildStreamHandler,
 } from "./dispatch/child-process.ts";
-import { dispatchParallel as dispatchParallelCore, agentNameFor } from "./dispatch/parallel.ts";
-import { telemetryHealthy, telemetryWarning } from "./record-queue.ts";
+import { dispatchParallel as dispatchParallelCore } from "./dispatch/parallel.ts";
 import { createOrchestratorCli } from "./adapters/orchestrator-cli.ts";
 import { reapOrphanedPersonaDirs } from "./adapters/process-reaper.ts";
 import { createTelemetry } from "./adapters/telemetry.ts";
@@ -34,106 +32,28 @@ import { createCheckModels } from "./commands/check-models.ts";
 import {
 	type Adapter,
 	type FullResolution,
-	policyIdFor,
 	resolveAdapter as resolveAdapterAdapter,
 } from "./adapters/adapter-resolver.ts";
 import { createProfilesStore } from "./adapters/profiles-store.ts";
-import {
-	changedFilesSinceRunStart,
-	diffDirtySnapshots,
-	gitDirtySnapshot,
-	gitHead,
-} from "./adapters/git-changes.ts";
-import { emptyOverrides, type ModelOverrides, parseArgs, usageText } from "./core/args.ts";
+import { emptyOverrides, type ModelOverrides, usageText } from "./core/args.ts";
 import { loadBridgeConfig, liveEnv, runsDir, shippedProfilesPath } from "./config.ts";
-import { clampComplexity, type TriageResult } from "./core/triage.ts";
-import {
-	type DispatchResult,
-	dispatchRecordsFor,
-	leadSelfImplemented,
-	methodEffortFor,
-	runCompletionOutcomeFor,
-} from "./core/records.ts";
-import {
-	architectPrompt,
-	type DispatchTask,
-	LEAD_DELEGATION_RULE,
-	LEAD_STATUS_CONTRACT,
-	leadPrompt,
-	QA_SCOPE_RULES,
-} from "./core/prompts.ts";
+import { type TriageResult } from "./core/triage.ts";
+import { type DispatchTask } from "./core/prompts.ts";
 import { RunRegistry, type RunContext } from "./run/context.ts";
-import { confirmStep } from "./run/ui-sink.ts";
 import {
-	describeRunArtifact,
 	RunSession as RunSessionCore,
 	type RunSessionDeps,
-	type RunTiming,
 } from "./run/session.ts";
 import { triageTask as triageTaskCore } from "./pipeline/triage-step.ts";
-import {
-	collectBilledResults,
-	dispatchReconAndLeads as dispatchReconAndLeadsCore,
-	summarizeReconWorkers,
-} from "./pipeline/hierarchy.ts";
-import { qaVerificationOutcomeFor, type VerificationResult } from "./pipeline/verify-loop.ts";
+import { dispatchReconAndLeads as dispatchReconAndLeadsCore } from "./pipeline/hierarchy.ts";
 import { registerOrchestratorStatusTool } from "./tools/status.ts";
-import {
-	installSessionIngest,
-	recordHookFailure,
-	redactPaths,
-	registerSessionIngestHooks,
-} from "./hooks/ingest.ts";
+import { installSessionIngest } from "./hooks/ingest.ts";
 import { installShutdownHooks } from "./hooks/shutdown.ts";
 import { registerOrchestrateCancelCommand } from "./commands/cancel.ts";
 import { registerOmsgCommand } from "./commands/omsg.ts";
 import { registerOrchestratorRoiCommand } from "./commands/roi.ts";
 import { registerOrchestratorModelsCommand } from "./commands/orchestrator-models.ts";
 import { registerOrchestrateCommand } from "./commands/orchestrate.ts";
-import type { OrchestratorStatus, WorktreeInfo } from "./run/board.ts";
-import { formatOrchestratorStatus } from "./run/board.ts";
-
-// -----------------------------------------------------------------------------
-// Re-exports for existing importers/tests; removed in B5.
-//
-// index.test.ts (and fixtures/run-subagent-under-node.ts) import these by
-// name off `import * as orchestrator from "./index.ts"`. B5 splits
-// index.test.ts across the modules that now own each implementation; until
-// then, every name a test or external caller reaches through this module
-// must keep resolving here.
-// -----------------------------------------------------------------------------
-export {
-	guardChildStreamHandler,
-	agentNameFor,
-	telemetryHealthy,
-	telemetryWarning,
-	confirmStep,
-	describeRunArtifact,
-	recordHookFailure,
-	redactPaths,
-	registerSessionIngestHooks,
-	qaVerificationOutcomeFor,
-	collectBilledResults,
-	summarizeReconWorkers,
-	formatOrchestratorStatus,
-	architectPrompt,
-	changedFilesSinceRunStart,
-	clampComplexity,
-	diffDirtySnapshots,
-	dispatchRecordsFor,
-	gitDirtySnapshot,
-	gitHead,
-	LEAD_DELEGATION_RULE,
-	LEAD_STATUS_CONTRACT,
-	leadPrompt,
-	leadSelfImplemented,
-	methodEffortFor,
-	parseArgs,
-	policyIdFor,
-	QA_SCOPE_RULES,
-	runCompletionOutcomeFor,
-};
-export type { VerificationResult, OrchestratorStatus, RunTiming, WorktreeInfo, DispatchResult, DispatchTask };
 
 // -----------------------------------------------------------------------------
 // Configuration + the one Python CLI spawner

@@ -10,7 +10,10 @@ import { fileURLToPath } from "node:url";
 import { SessionIngestScheduler } from "./ingest.ts";
 import { planReconTasks } from "./recon.ts";
 import { METHOD, TIER_CAPABILITIES, buildAliasTable } from "./models.ts";
-import type { DispatchResult, DispatchTask } from "./index.ts";
+import type { DispatchResult } from "./core/records.ts";
+import type { DispatchTask } from "./core/prompts.ts";
+import { leadPrompt } from "./core/prompts.ts";
+import { telemetryHealthy, telemetryWarning } from "./record-queue.ts";
 import { RunCancellation } from "./cancellation.ts";
 import { MAX_CHILD_STDERR_DISK_BYTES } from "./dispatch/stderr-sink.ts";
 import contract from "./contract.json";
@@ -18,10 +21,6 @@ import { planEscalation } from "./escalation.ts";
 import { pickModel } from "./core/routing.ts";
 
 mock.module("@humain/terminal", () => ({
-	BorderedLoader: class {
-		onAbort?: () => void;
-		constructor(..._args: unknown[]) {}
-	},
 	// Mirrors the real bridge/agents/ personas the dispatcher resolves by name:
 	// a write-capable implementer, and the read-only scout Rule-2 recon binds to.
 	// orch-scout carries a non-empty body so the --append-system-prompt path (and
@@ -205,7 +204,7 @@ describe("session ingest hook wiring (index.ts wiring)", () => {
 
 
 
-const planFixture: Parameters<typeof orchestrator.leadPrompt>[1] = {
+const planFixture: Parameters<typeof leadPrompt>[1] = {
 		plan_id: "plan-1",
 		run_id: "run-1",
 		task_class: "implementation",
@@ -222,7 +221,7 @@ const planFixture: Parameters<typeof orchestrator.leadPrompt>[1] = {
 		effective_quality_floor: 0.8,
 		cost_aggressiveness: 0.5,
 	};
-const adapterFixture: Parameters<typeof orchestrator.leadPrompt>[6] = {
+const adapterFixture: Parameters<typeof leadPrompt>[6] = {
 	lead: { model: "amazon-bedrock/anthropic.claude-sonnet-5" },
 };
 const repoRootFixture = "/repo";
@@ -350,7 +349,7 @@ describe("batched telemetry through the Python batch CLI (index.ts wiring)", () 
 			expect(report.failed).toBe(1);
 			expect(report.acknowledged).toBe(3);
 			expect(report.error).toContain("task_id");
-			expect(orchestrator.telemetryWarning!(report).join("\n")).toMatch(/1 record\(s\) could not be written/);
+			expect(telemetryWarning(report).join("\n")).toMatch(/1 record\(s\) could not be written/);
 			// Without a baseline the report covers the final drain only, which is what the old code showed.
 			orchestrator.recordEvent!("dispatch_started", { run_id: runId, task_id: 13 as unknown as string });
 			await orchestrator.recordQueue!.flush();
@@ -362,22 +361,22 @@ describe("batched telemetry through the Python batch CLI (index.ts wiring)", () 
 	}, 30_000);
 
 	test("the run summary distinguishes lost records from durable records whose ledger/dashboard refresh failed", () => {
-		const lost = orchestrator.telemetryWarning!({ ok: false, batches: 1, acknowledged: 0, failed: 2, derivedStale: 0, error: "exit -1: python3: not found" });
+		const lost = telemetryWarning({ ok: false, batches: 1, acknowledged: 0, failed: 2, derivedStale: 0, error: "exit -1: python3: not found" });
 		expect(lost).toHaveLength(1);
 		expect(lost[0]).toMatch(/2 record\(s\) could not be written/);
 		expect(lost[0]).toContain("python3: not found");
 
-		const stale = orchestrator.telemetryWarning!({ ok: true, batches: 3, acknowledged: 5, failed: 0, derivedStale: 5, staleReason: "dashboard refresh failed: disk full" });
+		const stale = telemetryWarning({ ok: true, batches: 3, acknowledged: 5, failed: 0, derivedStale: 5, staleReason: "dashboard refresh failed: disk full" });
 		expect(stale).toHaveLength(1);
 		expect(stale[0]).not.toMatch(/could not be written|lost/);
 		expect(stale[0]).toMatch(/5 record\(s\).*durable/);
 		expect(stale[0]).toMatch(/ledger|dashboard/);
 		expect(stale[0]).toContain("disk full");
 
-		expect(orchestrator.telemetryWarning!({ ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 0 })).toEqual([]);
-		expect(orchestrator.telemetryHealthy!({ ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 0 })).toBe(true);
-		expect(orchestrator.telemetryHealthy!({ ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 1 })).toBe(false);
-		expect(orchestrator.telemetryHealthy!({ ok: false, batches: 1, acknowledged: 0, failed: 1, derivedStale: 0 })).toBe(false);
+		expect(telemetryWarning({ ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 0 })).toEqual([]);
+		expect(telemetryHealthy({ ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 0 })).toBe(true);
+		expect(telemetryHealthy({ ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 1 })).toBe(false);
+		expect(telemetryHealthy({ ok: false, batches: 1, acknowledged: 0, failed: 1, derivedStale: 0 })).toBe(false);
 	});
 
 	test("a Python executable that does not exist fails the batch promptly with the spawn error, instead of hanging the terminal flush", async () => {

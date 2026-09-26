@@ -57,7 +57,7 @@ describe("runSubagentProcess persona resolution failure (B4.7)", () => {
 			agentName: "orch-scout",
 			task: "do it",
 			model: "provider/model",
-			ctx: {} as never, env: () => process.env,
+			ctx: {} as never,
 			taskId: "t1",
 			session,
 			env: () => ({}),
@@ -82,7 +82,7 @@ describe("runSubagentProcess persona resolution failure (B4.7)", () => {
 			agentName: NO_PERSONA,
 			task: "do it",
 			model: "provider/model",
-			ctx: {} as never, env: () => process.env,
+			ctx: {} as never,
 			taskId: "t2",
 			session,
 			env: () => ({}),
@@ -714,8 +714,8 @@ describe("runSubagentProcess process/event handling", () => {
 			// bun:test runtime feature and does not apply to a plain `Bun.build`
 			// bundle later run under real `node`. Stub it at build time instead —
 			// this test's code path (`agentName: "__no_persona__"`) never calls
-			// `discoverAgents`/`BorderedLoader`, so the stubs only need to satisfy
-			// the module's top-level named imports.
+			// `discoverAgents`, so the stub only needs to satisfy the module's
+			// top-level named imports.
 			const build = await Bun.build({
 				entrypoints: [join(fixturesDir, "run-subagent-under-node.ts")],
 				outdir: buildDir,
@@ -748,8 +748,7 @@ describe("runSubagentProcess process/event handling", () => {
 							b.onLoad({ filter: /.*/, namespace: "stub-humain-terminal" }, () => ({
 								contents: `
 									export const discoverAgents = () => ({ agents: [] });
-									export class BorderedLoader { constructor() {} }
-									export const renderTaskWithContext = (task) => task;
+																		export const renderTaskWithContext = (task) => task;
 								`,
 								loader: "js",
 							}));
