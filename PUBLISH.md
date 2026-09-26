@@ -40,17 +40,19 @@ git log --oneline -1
 
 | Path | What goes in the repo |
 |---|---|
-| `SKILL.md` | V3 spec — hierarchical orchestration, adaptive routing, routing policy overlay |
+| `SKILL.md` | V3 spec — hierarchical orchestration, adaptive routing, routing policy (`orchestrator/method.json`) |
 | `README.md` | Quick-start / orientation |
-| `pyproject.toml` | Python package metadata (`name = "hierarchical-agent-orchestrator"`, `v0.3.0`) |
-| `orchestrator/` | Reference runtime: engine, scheduler, adaptive, dashboard, ingest, CLI |
+| `pyproject.toml` | Python package metadata (`name = "hierarchical-agent-orchestrator"`) |
+| `orchestrator/` | Reference runtime: `core/`, `config/` (loaded from `config.json`/`method.json`/`contract.json`), `records/`, `store/`, `ingest/`, `analytics/`, `routing/`, `presentation/` (dashboard data), `app/`, `cli/`, `archive/` — plus top-level modules (`engine.py`, `scheduler.py`, `history.py`, `outcomes.py`, `run_evidence.py`, `verification.py`, `vocab.py`, ...) |
 | `bridge/` | HUMAIN Terminal integration: extension TS + agent definitions + `install.sh` |
 | `bridge/extensions/` | `orchestrator/`, `orchestrator-README.md` |
+| `bridge/extensions/orchestrator/` | `adapters/`, `core/`, `dispatch/`, `pipeline/`, `run/`, `commands/`, `hooks/`, `tools/` — plus top-level wiring (`index.ts`, `config.ts`, `models.ts`, `record-queue.ts`, ...) and each module's co-located `*.test.ts` |
 | `bridge/agents/` | `orch-*.md` agent definitions (one per capability) + the hierarchical `orchestrator-lead.md` |
 | `install.sh` | Symlinks `bridge/` into `~/.humain-terminal/agent/` for runtime loading |
 | `adapters/` | Example adapter configs (claude-code, codex, generic) |
-| `docs/` | V3 features, adaptive routing, integration, telemetry |
-| `scripts/` | Init, rebuild-ledger, regenerate-dashboard, dynamic-adapter entry points |
+| `docs/` | Architecture review, adaptive routing, integration, telemetry, plans |
+| `knip.json` | Unused-export config for the bridge TS project (`bunx knip --production`, run via `scripts/lint.sh`) |
+| `scripts/` | Init, rebuild-ledger, regenerate-dashboard, dynamic-adapter entry points, `typecheck-bridge.sh`, `lint.sh` (ruff/vulture/knip) |
 | `tests/` | Python tests for the reference runtime |
 
 ## Excluded from the repo (already in `.gitignore`)
@@ -66,3 +68,17 @@ The runtime state for any machine using this skill belongs in the
 shared canonical state root `~/.local/state/coding-agent-orchestrator/`,
 not inside the skill directory. The skill ships the *code*, the
 machine produces the *events*.
+
+## Pre-publish verification
+
+Before pushing, run the three verification gates from a clean tree:
+
+```bash
+python3 -m pytest -q
+bash scripts/typecheck-bridge.sh
+bash scripts/lint.sh
+```
+
+`scripts/lint.sh` runs `ruff check`, `vulture` (dead-code, Python) and `knip --production`
+(unused exports, bridge TS) and exits non-zero on any finding or tool failure.
+
