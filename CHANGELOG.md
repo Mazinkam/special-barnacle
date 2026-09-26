@@ -1,5 +1,16 @@
 ## Unreleased
 
+### scheduler: min_samples default
+
+- `orchestrator.vocab.SCHEDULER_MIN_SAMPLES` (the sample-count threshold below which
+  `scheduler.recommend_package` discounts a package's estimated quality for a small sample) was
+  its own unrelated literal, `8`, distinct from the general adaptive-routing default of `12`
+  (`orchestrator.vocab.DEFAULT_MIN_SAMPLES`, sourced from `config.json`'s
+  `history.min_samples_for_empirical_route`). It now aliases `DEFAULT_MIN_SAMPLES`, so a scheduler
+  recommendation needs 12 samples, not 8, before it stops discounting a package on small-sample
+  grounds (behaviour change; no test asserted the old default, per
+  `tests/test_history_scheduler.py`).
+
 ### B4.7 fixes
 
 - Fixed `parseFailedChecks` treating `0 errors`/`0 failed` rows as QA failures (B4.7).

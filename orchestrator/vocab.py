@@ -100,9 +100,10 @@ def parse_iso_ts(value: Any, *, coerce_str: bool = True) -> Optional[datetime]:
 # --- min_samples ------------------------------------------------------------------
 # 12 in engine.py, adaptive.py, policy_simulation.py, policy_recommendations.py.
 DEFAULT_MIN_SAMPLES = 12
-# 8 in scheduler.py, kept as its own named constant — intentionally NOT unified
-# with DEFAULT_MIN_SAMPLES; that unification is B2's job, not B1's.
-SCHEDULER_MIN_SAMPLES = 8
+# Same threshold as DEFAULT_MIN_SAMPLES: a scheduler recommendation should not start trusting a
+# package's history with less evidence than the rest of adaptive routing requires (single source;
+# see CHANGELOG.md "Unreleased" for the behaviour change from the old, unrelated literal 8).
+SCHEDULER_MIN_SAMPLES = DEFAULT_MIN_SAMPLES
 
 # --- High-risk set ------------------------------------------------------------------
 # `{'high','critical'}`, used identically in adaptive.py (lines with risk checks)
