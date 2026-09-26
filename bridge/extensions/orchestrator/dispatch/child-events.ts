@@ -50,6 +50,43 @@ export interface ChildTurnDelta {
 	text?: string;
 }
 
+/** One `--mode json` content block of an assistant message. Untyped over the wire; only `type`/`text` are read. */
+interface ChildContentBlock {
+	type?: string;
+	text?: string;
+}
+
+/** One assistant `message_end` event's `message` field, as received over `--mode json`. */
+interface ChildAssistantMessage {
+	role?: string;
+	model?: string;
+	responseModel?: string;
+	usage?: {
+		input?: number;
+		output?: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+		cost?: { total?: unknown };
+		totalTokens?: number;
+	};
+	stopReason?: string;
+	errorMessage?: string;
+	content?: unknown;
+}
+
+/** One raw `--mode json` protocol event. Untyped over the wire (see child-process.ts); only the fields every
+ * absorb() call reads, plus the tool/message-lifecycle fields `RunSession.onChildEvent` (run/session.ts) reads
+ * for the live status board, are declared here. */
+export interface ChildStreamEvent {
+	type?: string;
+	stopReason?: string;
+	message?: ChildAssistantMessage;
+	/** `tool_execution_start`/`tool_execution_end` fields. */
+	toolName?: string;
+	args?: unknown;
+	isError?: boolean;
+}
+
 function reportedCost(total: unknown): number | undefined {
 	return typeof total === "number" && Number.isFinite(total) && total >= 0 ? total : undefined;
 }
@@ -66,7 +103,7 @@ export class ChildEventAccumulator {
 	sawAgentEnd = false;
 
 	/** Absorb one parsed `--mode json` event. Returns what changed. */
-	absorb(event: any): ChildEventDelta {
+	absorb(event: ChildStreamEvent): ChildEventDelta {
 		const delta: ChildEventDelta = {};
 		if (event?.type === "agent_settled") {
 			this.sawAgentSettled = true;
@@ -89,7 +126,7 @@ export class ChildEventAccumulator {
 		return delta;
 	}
 
-	private absorbAssistantMessage(msg: any): ChildTurnDelta {
+	private absorbAssistantMessage(msg: ChildAssistantMessage): ChildTurnDelta {
 		if (msg.model) this.model = msg.responseModel ?? msg.model;
 		let costDelta = 0;
 		const hadUsage = Boolean(msg.usage);
@@ -116,9 +153,9 @@ export class ChildEventAccumulator {
 		}
 		let text: string | undefined;
 		if (Array.isArray(msg.content)) {
-			const joined = msg.content
-				.filter((b: any) => b?.type === "text" && typeof b.text === "string")
-				.map((b: any) => b.text)
+			const joined = (msg.content as ChildContentBlock[])
+				.filter((b) => b?.type === "text" && typeof b.text === "string")
+				.map((b) => b.text as string)
 				.join("\n")
 				.trim();
 			if (joined) text = joined;

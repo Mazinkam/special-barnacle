@@ -101,12 +101,13 @@ export async function loadDynamicAdapter(cli: DynamicAdapterCli): Promise<{ adap
 				warning: `resolve-adapter failed (exit ${result.code ?? "n/a"}): ${(result.error ?? result.stderr).trim().slice(0, 300)}`,
 			};
 		}
-		const resolved = JSON.parse(result.stdout.trim()) as Record<string, any>;
+		const resolved = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
 		const out: Adapter = {};
 		for (const [cap, info] of Object.entries(resolved)) {
 			if (!info || typeof info !== "object" || cap.startsWith("_")) continue;
-			if (!info.provider || !info.model) continue;
-			out[cap] = { model: `${info.provider}/${info.model}` };
+			const { provider, model } = info as { provider?: unknown; model?: unknown };
+			if (!provider || !model) continue;
+			out[cap] = { model: `${provider}/${model}` };
 		}
 		return { adapter: out, warning: Object.keys(out).length === 0 ? "resolve-adapter returned no bindings" : undefined };
 	} catch (err) {

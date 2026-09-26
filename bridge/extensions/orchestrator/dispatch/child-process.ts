@@ -63,7 +63,7 @@ import {
 } from "./stderr-sink.ts";
 import { buildChildArgs, buildChildEnv, personaCanMutateFor } from "./child-args.ts";
 import { resolvePersona } from "./persona.ts";
-import { ChildEventAccumulator, type ChildEventDelta } from "./child-events.ts";
+import { ChildEventAccumulator, type ChildEventDelta, type ChildStreamEvent } from "./child-events.ts";
 
 /** Sentinel agent name: spawn with HT's default system prompt, no persona file. */
 export const NO_PERSONA = "__no_persona__";
@@ -134,7 +134,7 @@ export interface DispatchSession {
 	drainMessages(recipient: string): string[];
 	startDispatch(taskId: string, label: string, model: string, depth?: number): void;
 	endDispatch(taskId: string, exitCode: number, costUsd: number, note?: string): void;
-	onChildEvent(taskId: string, event: any, delta: ChildEventDelta): void;
+	onChildEvent(taskId: string, event: ChildStreamEvent, delta: ChildEventDelta): void;
 	setNestedCost(taskId: string, costUsd: number): void;
 	recordProgress(taskId: string, observation: ProgressObservation, check: TimeoutCheck, now?: number): void;
 }
@@ -657,9 +657,9 @@ export async function runSubagentProcess(opts: {
 		const processLine = (line: string) => {
 			const trimmed = line.trim();
 			if (!trimmed) return;
-			let event: any;
+			let event: ChildStreamEvent;
 			try {
-				event = JSON.parse(trimmed);
+				event = JSON.parse(trimmed) as ChildStreamEvent;
 			} catch {
 				// Unparseable protocol lines are dropped: they cannot safely be JSONL.
 				return;

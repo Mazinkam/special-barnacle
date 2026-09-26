@@ -32,7 +32,7 @@ import { RunDiagnostics } from "../run-diagnostics.ts";
 import { RunCancellation } from "../cancellation.ts";
 import { SpendCapTracker } from "../spend-cap.ts";
 import type { QueueStats } from "../record-queue.ts";
-import type { ChildEventDelta } from "../dispatch/child-events.ts";
+import type { ChildEventDelta, ChildStreamEvent } from "../dispatch/child-events.ts";
 import type { ProgressObservation, TimeoutCheck } from "../dispatch-progress.ts";
 import { applyObservation, applyWarnings, createProgressView, fmtElapsed } from "../run-ui.ts";
 import { safeUi } from "./ui-sink.ts";
@@ -349,7 +349,7 @@ export class RunSession {
 	 * `dispatch/child-events.ts`'s accumulator already computed for it (B4.5
 	 * step 3: this is UI/board bookkeeping only now — turns/cost come from the
 	 * delta, not from re-deriving them off `event` a second time). */
-	onChildEvent(taskId: string, event: any, delta: ChildEventDelta): void {
+	onChildEvent(taskId: string, event: ChildStreamEvent, delta: ChildEventDelta): void {
 		const d = this.dispatches.get(taskId);
 		if (!d) return;
 		// Nested worker counts/turns are derived by render() from the single
@@ -358,9 +358,10 @@ export class RunSession {
 		switch (event?.type) {
 			case "tool_execution_start": {
 				d.toolCalls += 1;
-				d.lastTool = event.toolName;
-				const detail = shortArgs(event.toolName, event.args);
-				changed = `${event.toolName}${detail ? ` ${detail}` : ""}`;
+				const toolName = event.toolName ?? "";
+				d.lastTool = toolName;
+				const detail = shortArgs(toolName, event.args);
+				changed = `${toolName}${detail ? ` ${detail}` : ""}`;
 				this.log(`  ${taskId} tool#${d.toolCalls} ${changed}`);
 				break;
 			}
