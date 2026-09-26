@@ -1,9 +1,16 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { RunSession } from "./session.ts";
+
+// The diagnostic-sealing tests below shell out to python3's orchestrator.archive to check the
+// TS/Python archive contract against the real seal marker; PYTHONPATH must resolve THIS
+// worktree's package, never an installed skill checkout.
+process.env.HUMAIN_ORCHESTRATOR_SKILL_ROOT ??= fileURLToPath(new URL("../../../../", import.meta.url));
 
 const repoDir = mkdtempSync(join(tmpdir(), "orch-session-test-repo-"));
 const runsDir = mkdtempSync(join(tmpdir(), "orch-session-test-runs-"));
@@ -240,5 +247,158 @@ describe("RunSession terminal timing", () => {
 		const calls = handler.match(/await deps\.(?:completeRun|failRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThanOrEqual(6);
 		for (const call of calls) expect(call).toContain("session.terminalTiming()");
+	});
+});
+
+describe("diagnostic writer ownership and sealing", () => {
+	const ctx = { ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} } };
+	test("terminal drain and all producer closes precede seal; late callbacks cannot reopen diagnostics", async () => {
+		const session = createSession("seal-writers", ctx as never, "test");
+		const writer = session.diagnostics.writer();
+		writer.write("task.prompt.md", "prompt");
+		writer.append("task.events.jsonl", "first\n");
+		session.writeDiagnostic("lead-report.md", "report");
+		// A real pipe delivers data after the run's UI has closed, as on timeout/error.
+		const { spawn } = await import("node:child_process");
+		const child = spawn(process.execPath, ["-e", 'setTimeout(() => { process.stdout.write("late\\n"); process.stderr.write("error\\n"); }, 50)']);
+		child.stdout.on("data", data => writer.append("task.events.jsonl", data.toString()));
+		child.stderr.on("data", data => writer.append("task.stderr.log", data.toString()));
+		const drained = new Promise<void>(resolve => child.on("close", () => { writer.close(); resolve(); }));
+		let terminal!: () => void;
+		const terminalDrain = new Promise<boolean>(resolve => { terminal = () => resolve(true); });
+		session.close();
+		const sealing = session.sealDiagnostics(terminalDrain);
+		await drained;
+		expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+		terminal();
+		expect(await sealing).toBe(true);
+		const seal = JSON.parse(readFileSync(session.file(".diagnostics-sealed.json"), "utf8"));
+		expect(seal.files["task.events.jsonl"].raw_bytes).toBe(11);
+		expect(readFileSync(session.file("task.stderr.log"), "utf8")).toBe("error\n");
+		expect(writer.append("task.events.jsonl", "too late")).toBe(false);
+		expect(session.writeDiagnostic("lead-report.md", "overwrite")).toBe(false);
+		expect(readFileSync(session.file("task.events.jsonl"), "utf8")).toBe("first\nlate\n");
+		expect(() => session.diagnostics.writer()).toThrow();
+		expect(() => createSession("seal-writers", ctx as never, "reopen")).toThrow();
+		// Consume the actual HT seal with Python, not a hand-built Python-only marker.
+		const recovered = JSON.parse(execFileSync("python3", ["-B", "-c", `
+import json, sys
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from orchestrator.archive import archive_runs, restore_run
+from tempfile import TemporaryDirectory
+from shutil import copytree
+# Archive fixtures must not overwrite the shared bridge/Python telemetry ledger.
+fixture = TemporaryDirectory(); root = Path(fixture.name)
+source = Path(sys.argv[1]); run = root/'runs'/source.name
+copytree(source, run)
+originals = {p.name:p.read_bytes() for p in run.iterdir() if not p.name.startswith('.')}
+now = datetime.now(timezone.utc)
+(root/'outcomes.jsonl').write_text(json.dumps({'run_id':run.name,'task_id':'run-complete','ts':now.isoformat()})+'\\n')
+result = next(e for e in archive_runs(root, execute=True, now=now+timedelta(days=40)) if e['run_id']==run.name)
+assert result['status']=='archived', result
+assert not (run/'task.events.jsonl').exists()
+assert (run/'run.log').read_bytes()==originals['run.log']
+assert restore_run(root,run.name)['status']=='restored'
+assert all((run/n).read_bytes()==data for n,data in originals.items())
+print(json.dumps({'removed':result['raw_bytes_removed'],'ownership':result['ownership']}))
+`, session.dir], { env: { ...process.env, PYTHONPATH: process.env.HUMAIN_ORCHESTRATOR_SKILL_ROOT }, encoding: "utf8" }));
+		expect(recovered.ownership).toBe("sealed");
+		expect(recovered.removed).toBe(29); // prompt 6 + events 11 + stderr 6 + report 6
+	});
+
+	// Removing the cleanup deadline must fail promptly rather than hang this test.
+	for (const lateClose of [false, true]) {
+		test(`seal deadline leaves managed diagnostics archive-ineligible (${lateClose ? "late close" : "lease never closes"})`, async () => {
+			const notices: Array<{ message: string; level: string }> = [];
+			const session = createSession(`seal-timeout-${lateClose}`, {
+				ui: { ...ctx.ui, notify: (message: string, level: string) => notices.push({ message, level }) },
+			} as never, "test");
+			const writer = session.diagnostics.writer();
+			writer.append("task.events.jsonl", "before\n");
+			session.close();
+			let expire: (() => void) | undefined;
+			let deadlineMs: number | undefined;
+			const timer = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms: number) => {
+				expire = callback;
+				deadlineMs = ms;
+				return 123;
+			}) as typeof setTimeout);
+			const cleared: unknown[] = [];
+			const clear = spyOn(globalThis, "clearTimeout").mockImplementation(id => { cleared.push(id); });
+			try {
+				let settled: boolean | undefined;
+				const sealing = session.sealDiagnostics(Promise.resolve(true));
+				void sealing.then(result => { settled = result; });
+				expire?.();
+				// Flush promise continuations without relying on a real timeout.
+				for (let i = 0; i < 20; i++) await Promise.resolve();
+				expect(settled).toBe(false);
+				expect(deadlineMs).toBeGreaterThan(0);
+				expect(deadlineMs).toBeLessThanOrEqual(2000);
+				expect(cleared).toContain(123);
+				expect(notices.some(n => n.level === "warning" && /UNSEALED/.test(n.message) && /archive-ineligible/.test(n.message))).toBe(true);
+				expect(existsSync(session.file(".diagnostics-owner.json"))).toBe(true);
+				expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+				expect(() => session.diagnostics.writer()).toThrow();
+				expect(session.writeDiagnostic("task.events.jsonl", "overwrite")).toBe(false);
+				// Deadline does not revoke a producer's lease or lose its trailing bytes.
+				expect(writer.append("task.events.jsonl", "late\n")).toBe(true);
+				if (lateClose) {
+					writer.close();
+					writer.close(); // idempotent close after the abandoned seal attempt
+					expect(writer.append("task.events.jsonl", "after close")).toBe(false);
+				}
+				for (let i = 0; i < 20; i++) await Promise.resolve();
+				expect(await session.sealDiagnostics(Promise.resolve(true))).toBe(false);
+				expect(readFileSync(session.file("task.events.jsonl"), "utf8")).toBe("before\nlate\n");
+				expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+				// Exercise the Python archive gate with the real timed-out owner marker.
+				const result = JSON.parse(execFileSync("python3", ["-B", "-c", `
+import json, sys
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from orchestrator.archive import archive_runs
+from tempfile import TemporaryDirectory
+from shutil import copytree
+fixture = TemporaryDirectory(); root = Path(fixture.name)
+source = Path(sys.argv[1]); run = root/'runs'/source.name
+copytree(source, run)
+now = datetime.now(timezone.utc)
+(root/'outcomes.jsonl').write_text(json.dumps({'run_id':run.name,'task_id':'run-complete','ts':now.isoformat()})+'\\n')
+before = {p.name:p.read_bytes() for p in run.iterdir()}
+result = next(e for e in archive_runs(root, execute=True, now=now+timedelta(days=40)) if e['run_id']==run.name)
+assert {p.name:p.read_bytes() for p in run.iterdir()} == before
+print(json.dumps(result))
+`, session.dir], { env: { ...process.env, PYTHONPATH: process.env.HUMAIN_ORCHESTRATOR_SKILL_ROOT }, encoding: "utf8" }));
+				expect(result.status).toBe("skipped");
+				expect(result.reason).toBe("writers_unsealed");
+			} finally {
+				timer.mockRestore();
+				clear.mockRestore();
+			}
+		});
+	}
+
+	test("a shutdown failure vetoes an in-flight diagnostic seal before the last producer closes", async () => {
+		const session = createSession("seal-shutdown-veto", ctx as never, "test");
+		const writer = session.diagnostics.writer();
+		writer.append("late.events.jsonl", "before\n");
+		session.close();
+		const sealing = session.sealDiagnostics(Promise.resolve(true));
+		const abandoned = session.sealDiagnostics(Promise.resolve(false));
+		writer.append("late.events.jsonl", "after\n");
+		writer.close();
+		expect(await sealing).toBe(false);
+		expect(await abandoned).toBe(false);
+		expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+		expect(readFileSync(session.file("late.events.jsonl"), "utf8")).toBe("before\nafter\n");
+	});
+
+	test("failed terminal drain never seals, even with all writers closed", async () => {
+		const session = createSession("seal-failed-drain", ctx as never, "test");
+		session.close();
+		expect(await session.sealDiagnostics(Promise.resolve(false))).toBe(false);
+		expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
 	});
 });
