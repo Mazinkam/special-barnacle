@@ -1,0 +1,198 @@
+import { describe, expect, test } from "bun:test";
+import type { ExtensionContext } from "@humain/terminal";
+
+import { runOrchestration, type RunOrchestrationDeps } from "./run-orchestration.ts";
+import { RunCancellation } from "../cancellation.ts";
+import type { RunSession } from "../run/session.ts";
+import type { RunContext } from "../run/context.ts";
+import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
+import type { OrchestrateArgs } from "../core/args.ts";
+import type { FlushReport } from "../record-queue.ts";
+import type { PlanResponse } from "../core/prompts.ts";
+
+/** A `RunSession` fake with only the surface `runOrchestration` touches on the
+ *  paths under test: no timers, no disk I/O. Cast past the real class's
+ *  private fields (nominal typing) the same way any hand-rolled test double
+ *  for a class with private state has to. */
+function fakeSession(): RunSession {
+	const cancellation = new RunCancellation();
+	const logs: string[] = [];
+	return {
+		cancellation,
+		log: (line: string) => { logs.push(line); },
+		setPhase: () => {},
+		file: (name: string) => `/tmp/run/${name}`,
+		dir: "/tmp/run",
+		telemetryBaseline: { enqueued: 0, acknowledged: 0 },
+		terminalTiming: () => ({ started_at: "2024-01-01T00:00:00.000Z", finished_at: "2024-01-01T00:00:01.000Z", elapsed_ms: 1000, elapsed_source: "monotonic" as const }),
+		writeDiagnostic: () => true,
+		// Exposed for assertions in a couple of tests below.
+		_logs: logs,
+	} as unknown as RunSession;
+}
+
+function fakeCtx(overrides: Partial<{ hasUI: boolean; confirm: (title: string, message: string) => Promise<boolean> | boolean }> = {}): { ctx: ExtensionContext; notifications: Array<{ text: string; level: string }> } {
+	const notifications: Array<{ text: string; level: string }> = [];
+	const ctx = {
+		hasUI: overrides.hasUI ?? true,
+		ui: {
+			notify: (text: string, level: string) => { notifications.push({ text, level }); },
+			confirm: overrides.confirm ?? (() => Promise.resolve(true)),
+		},
+	} as unknown as ExtensionContext;
+	return { ctx, notifications };
+}
+
+function fakeAdapter(): Adapter {
+	return {
+		implementation_fast: { model: "p/fast" },
+		architect: { model: "p/architect" },
+		lead: { model: "p/lead" },
+		worker: { model: "p/worker" },
+		qa_agent: { model: "p/qa" },
+	};
+}
+
+function fakeResolution(adapter: Adapter): FullResolution {
+	return {
+		adapter,
+		sources: Object.fromEntries(Object.keys(adapter).map((k) => [k, "fallback"])) as FullResolution["sources"],
+		specs: {},
+		warnings: [],
+		notes: [],
+		profileName: "test-profile",
+		profiles: { active_profile: "test-profile", profiles: {}, problems: [], notes: [] } as unknown as FullResolution["profiles"],
+		table: null as unknown as FullResolution["table"],
+		preference: [],
+	};
+}
+
+function fakeArgs(overrides: Partial<OrchestrateArgs> = {}): OrchestrateArgs {
+	return {
+		goal: "do the thing",
+		taskClass: "bugfix", // deliberately not the "implementation"/5/"medium" defaults: skip triage
+		complexity: 5,
+		risk: "medium",
+		fanOut: false,
+		maxRetries: 1,
+		interactive: false,
+		check: false,
+		models: { tiers: {}, capabilities: {} },
+		unknownFlags: [],
+		...overrides,
+	};
+}
+
+const healthyTelemetry: FlushReport = { ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 0 };
+
+function fakeDeps(overrides: Partial<RunOrchestrationDeps> = {}): RunOrchestrationDeps {
+	return {
+		triageTask: async () => null,
+		planRun: async () => {
+			throw new Error("planRun not stubbed for this test");
+		},
+		recordEvent: () => {},
+		recordOutcome: () => {},
+		captureDispatchCost: async () => {},
+		dispatchParallel: async () => [],
+		completeRun: async () => healthyTelemetry,
+		failRun: async () => healthyTelemetry,
+		maxLeads: 4,
+		reconEvidenceMaxChars: 4000,
+		stateRoot: "/tmp/state",
+		...overrides,
+	};
+}
+
+const claimed: RunContext<RunSession> = { session: undefined as unknown as RunSession, tags: {}, aliasTable: null };
+
+describe("pipeline/run-orchestration.ts runOrchestration", () => {
+	test("plan failing outright aborts the run: failRun'd, notified, no RunReport", async () => {
+		const session = fakeSession();
+		const { ctx, notifications } = fakeCtx();
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		let failRunCalls = 0;
+		const deps = fakeDeps({
+			planRun: async () => {
+				throw new Error("boom");
+			},
+			failRun: async (runId, error) => {
+				failRunCalls++;
+				expect(error).toBe("plan failed: boom");
+				return healthyTelemetry;
+			},
+		});
+
+		const result = await runOrchestration(
+			"ht-orch-1700000000000-abcdef",
+			"/tmp/cwd",
+			fakeArgs(),
+			adapter,
+			resolved,
+			ctx,
+			session,
+			{ ...claimed, session },
+			deps,
+		);
+
+		expect(result).toEqual({ kind: "aborted" });
+		expect(failRunCalls).toBe(1);
+		expect(notifications.some((n) => n.text === "Plan failed: boom" && n.level === "error")).toBe(true);
+	});
+
+	test("declining the dispatch confirmation aborts the run without dispatching anything", async () => {
+		const session = fakeSession();
+		const { ctx, notifications } = fakeCtx({ confirm: () => Promise.resolve(false) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan: PlanResponse = {
+			plan_id: "plan-123456789012",
+			run_id: "ht-orch-1700000000000-abcdef",
+			task_class: "bugfix",
+			complexity: 5,
+			risk: "medium",
+			topology: { depth: 1, leads: 1, workers: 1, shape: "flat" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto",
+				history_sufficient: true,
+				explanation: {},
+			},
+			effective_quality_floor: 0.5,
+			cost_aggressiveness: 0.5,
+		};
+		let dispatchCalls = 0;
+		let failRunCalls = 0;
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async () => {
+				dispatchCalls++;
+				return [];
+			},
+			failRun: async (runId, error) => {
+				failRunCalls++;
+				expect(error).toBe("cancelled by user at plan confirmation");
+				return healthyTelemetry;
+			},
+		});
+
+		const result = await runOrchestration(
+			"ht-orch-1700000000000-abcdef",
+			"/tmp/cwd",
+			fakeArgs({ interactive: true }),
+			adapter,
+			resolved,
+			ctx,
+			session,
+			{ ...claimed, session },
+			deps,
+		);
+
+		expect(result).toEqual({ kind: "aborted" });
+		expect(dispatchCalls).toBe(0);
+		expect(failRunCalls).toBe(1);
+		expect(notifications.some((n) => n.text === "Cancelled." && n.level === "info")).toBe(true);
+	});
+});

@@ -1135,7 +1135,8 @@ describe("RunSession terminal timing", () => {
 		}
 		// Every terminal call inside the /orchestrate handler must pass the session timing.
 		const orchestrateSource = readFileSync(new URL("./commands/orchestrate.ts", import.meta.url), "utf8");
-		const handler = orchestrateSource.slice(orchestrateSource.indexOf('pi.registerCommand("orchestrate"'));
+		const pipelineSource = readFileSync(new URL("./pipeline/run-orchestration.ts", import.meta.url), "utf8");
+		const handler = orchestrateSource.slice(orchestrateSource.indexOf('pi.registerCommand("orchestrate"')) + pipelineSource;
 		const calls = handler.match(/await deps\.(?:completeRun|failRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThanOrEqual(6);
 		for (const call of calls) expect(call).toContain("session.terminalTiming()");
@@ -1323,12 +1324,13 @@ describe("batched telemetry through the Python batch CLI", () => {
 		for (const fn of [complete, fail]) expect(fn).toContain("flush()");
 		// Every terminal call reports telemetry cumulatively since the run started, not just the final drain.
 		const orchestrateSource = readFileSync(new URL("./commands/orchestrate.ts", import.meta.url), "utf8");
-		const handler = orchestrateSource.slice(orchestrateSource.indexOf('pi.registerCommand("orchestrate"'));
+		const pipelineSource = readFileSync(new URL("./pipeline/run-orchestration.ts", import.meta.url), "utf8");
+		const handler = orchestrateSource.slice(orchestrateSource.indexOf('pi.registerCommand("orchestrate"')) + pipelineSource;
 		const calls = handler.match(/await deps\.(?:completeRun|failRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThanOrEqual(6);
 		for (const call of calls) expect(call).toContain("session.telemetryBaseline");
 		// Non-terminal records must not block dispatch: no awaited single-record spawns remain.
-		for (const combined of [source, orchestrateSource]) {
+		for (const combined of [source, orchestrateSource, pipelineSource]) {
 			expect(combined).not.toMatch(/await (?:deps\.)?recordEvent\(/);
 			expect(combined).not.toMatch(/await (?:deps\.)?recordModelCall\(/);
 			expect(combined).not.toMatch(/await (?:deps\.)?recordOutcome\(/);
@@ -1346,8 +1348,9 @@ describe("confirmation gates", () => {
 	// "up to N min per dispatch" wrong).
 	test.each([false, true])("dispatch call passes separate confirmation arguments (interactive=%s)", async (interactive) => {
 		// Execute the actual call expression after the plan summary, not a copy of it.
-		// This isolates argument construction without planning or dispatching agents.
-		const source = readFileSync(new URL("./commands/orchestrate.ts", import.meta.url), "utf8");
+		// This isolates argument construction without planning or dispatching agents. The plan
+		// summary and its confirmation gate live in pipeline/run-orchestration.ts (B4.6).
+		const source = readFileSync(new URL("./pipeline/run-orchestration.ts", import.meta.url), "utf8");
 		const afterSummary = source.slice(source.indexOf("session.log(planSummary.join"));
 		const call = afterSummary.match(/confirmStep\([\s\S]*?\n\s*\)/)?.[0];
 		if (!call) throw new Error("Dispatch confirmation call not found after plan summary");
