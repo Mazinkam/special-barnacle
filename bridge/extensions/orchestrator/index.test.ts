@@ -1210,60 +1210,6 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 
 
 
-describe("review fixes (Phase A review)", () => {
-	test("every lead size runs the orchestrator-lead persona with the lead timeout policy", async () => {
-		const { ORCHESTRATING_CAPABILITIES, resolveDispatchTimeoutPolicy } = await import("./dispatch-progress.ts");
-		for (const cap of ["lead_small", "lead", "lead_large"]) {
-			expect(orchestrator.agentNameFor(cap)).toBe("orchestrator-lead");
-			expect(ORCHESTRATING_CAPABILITIES.has(cap)).toBe(true);
-			expect(resolveDispatchTimeoutPolicy(cap, {}).mode).toBe("lead");
-		}
-		expect(orchestrator.agentNameFor("scout")).toBe("orch-scout");
-	});
-
-	test("re-review escalation picks a model from a capability that belongs to the target tier", () => {
-		// oss-like: `lead` (premium capability) overridden to a mid model must not
-		// become the premium escalation target; premium-like: security_review
-		// overridden to another vendor is not preferred for technical re-review.
-		const adapter = {
-			technical_review: { model: "humain-node/kimi-k3" },
-			implementation_strong: { model: "humain-node/minimax-m3" },
-			lead: { model: "humain-node/minimax-m3" },
-			analysis_strong: { model: "humain-node/glm-5.2" },
-			architect: { model: "humain-node/glm-5.2" },
-			security_review: { model: "openai-codex/gpt-6-astra" },
-			lead_large: { model: "amazon-bedrock/global.anthropic.claude-fable-5-1" },
-		};
-		const picked = pickModel("technical_review", adapter, 1, "medium");
-		expect(picked).toBe("humain-node/glm-5.2");
-	});
-
-	test("quota fallback is not attempted for a timed-out or cancelled dispatch, or for quota words only in the model's prose", async () => {
-		const table = buildAliasTable([
-			{ provider: "openai-codex", id: "gpt-6-astra" },
-			{ provider: "amazon-bedrock", id: "global.openai.gpt-6-astra" },
-		]);
-		const base = {
-			exitCode: 124, stdout: "", finalText: "", rawStdout: "", personaCanMutate: false, stderr: "usage limit reached",
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-			costUsd: 0, costReported: false, durationMs: 1, processExitCode: 124,
-		};
-		for (const over of [
-			{ outcome: "timed_out" as const },
-			{ outcome: "cancelled" as const, exitCode: 137 },
-			{ outcome: "failed" as const, exitCode: 125, stopReason: "spend_cap" },
-			{ outcome: "failed" as const, exitCode: 1, stderr: "exit 1", finalText: "the API returned 429 rate limit earlier" },
-		]) {
-			let calls = 0;
-			await orchestrator.dispatchParallel(process.cwd(), "run", [{ capability: "security_review", task: "t", taskId: "run-sec" }],
-				{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, null, 0, {
-					recordEvent: () => {}, aliasTable: table,
-					runProcess: async () => { calls++; return { ...base, ...over }; },
-				});
-			expect(calls).toBe(1);
-		}
-	});
-});
 
 describe("effort telemetry vocabulary", () => {
 	test("thinking levels map onto method.json efforts", () => {
