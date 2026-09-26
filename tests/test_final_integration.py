@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from orchestrator.dashboard import build_data
+from orchestrator.dashboard import build_data, generate_dashboard
 from orchestrator.engine import OrchestrationEngine
 from orchestrator.history import build_route_stats
 from orchestrator.record_batch import write_batch
@@ -26,7 +26,7 @@ def call(run='R', **kw):
 
 
 def test_engine_failed_verification_is_not_a_pass(tmp_path):
-    engine = OrchestrationEngine(tmp_path)
+    engine = OrchestrationEngine(tmp_path, on_change=lambda: generate_dashboard(tmp_path, config=engine.config))
     engine.record_model_call(**call())
     engine.verify_task(run_id='R', task_id='T', evidence=QualityEvidence())
     engine.verify_task(run_id='R', task_id='other', evidence=QualityEvidence(acceptance_pass=True, deterministic_checks_pass=True))
@@ -109,10 +109,13 @@ def test_run_evidence_dedups_each_stream_but_not_idless_rows():
 
 @pytest.mark.parametrize('model,priced', [('claude-sonnet-4-5', True), ('unknown-model', False)])
 def test_old_ht_zero_estimate_is_repriced_or_unmetered(tmp_path, model, priced):
+    from orchestrator.app.refresh import refresh_after_write
     row = call()
     row.update(stream='metric', record_id='old-ht', model=model, input_tokens=1000,
                cost_usd=0, cost_source='estimated-from-reported-tokens')
-    assert write_batch(tmp_path, [row])['ok']
+    result = write_batch(tmp_path, [row])
+    assert result['ok']
+    assert refresh_after_write(tmp_path, result)['ok']
     evidence = page(tmp_path)['runs'][0]
     assert evidence['metered_calls'] == int(priced)
     assert (evidence['cost_known_usd'] or 0) > 0 if priced else evidence['cost_known_usd'] is None
@@ -224,7 +227,7 @@ def test_bounded_ingest_error_keeps_head_and_actionable_tail():
 
 def test_ingest_conflict_stderr_is_bounded_and_keeps_granularity_hint(tmp_path):
     from orchestrator.runtime import EventStore
-    from tests.test_ingest_checkpoint import aggregate_row, ht_session
+    from tests.ingest_checkpoint.helpers import aggregate_row, ht_session
     root = tmp_path/'state'; root.mkdir()
     # A long directory name guarantees the redacted message exceeds the stderr bound.
     logs = tmp_path/('very-long-session-directory-name-'*4); logs.mkdir()

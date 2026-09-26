@@ -5,21 +5,21 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import {
-	appendFileSync, closeSync, constants, existsSync, fstatSync, fsyncSync, ftruncateSync, linkSync, lstatSync,
+	closeSync, constants, fstatSync, fsyncSync, ftruncateSync, linkSync, lstatSync,
 	mkdirSync, openSync, readSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import contract from "./contract.json";
 
 export const OWNER_FILE = ".diagnostics-owner.json";
 export const SEAL_FILE = ".diagnostics-sealed.json";
 const PROTOCOL = "ht-run-diagnostics-v1";
 const SEAL_DRAIN_TIMEOUT_MS = 2000;
 const owners = new Map<string, RunDiagnostics>();
-const protectedNames = new Set([
-	"events.jsonl", "metrics.jsonl", "outcomes.jsonl", "discoveries.jsonl", "ledger.json",
-	"ledger.lock", "records.checkpoint.json", "records.index.sqlite3", "ingest_status.json",
-	"archive.manifest.json", "archive.lock",
-]);
+// Mirrors orchestrator/contract.json's never_archive_files (the authoritative streams and their
+// integrity/recovery metadata), which archive.py's NEVER_ARCHIVE also derives from. Exported so
+// the contract parity test can assert equality without duplicating the list.
+export const protectedNames = new Set<string>(contract.never_archive_files);
 
 function syncDirectory(dir: string): void {
 	const fd = openSync(dir, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -265,14 +265,4 @@ export class RunDiagnostics {
 		}).finally(() => { owners.delete(resolve(this.dir)); });
 		return this.sealing;
 	}
-}
-
-// This legacy exported path helper cannot bypass an owning session, even after reload/sealing.
-export function appendDiagnosticPath(path: string, text: string): boolean {
-	const dir = resolve(dirname(path));
-	const owner = owners.get(dir);
-	if (owner) return owner.write(basename(path), text, true);
-	if (existsSync(join(dir, OWNER_FILE)) || existsSync(join(dir, SEAL_FILE))) return false;
-	appendFileSync(path, text);
-	return true;
 }

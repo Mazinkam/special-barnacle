@@ -9,8 +9,7 @@ waste and the old percentiles averaged in as a single "call".
 import unittest
 
 from orchestrator import economics, method, records
-from orchestrator.economics import (COORDINATION, ESTIMATED, REPORTED, UNMETERED, VERIFICATION,
-                                    coordination_roles, cost_attribution, cost_distribution,
+from orchestrator.economics import (ESTIMATED, REPORTED, UNMETERED, coordination_roles, cost_attribution, cost_distribution,
                                     fanout_rework, is_call_row, is_unsuccessful_attempt,
                                     orchestration_overhead, per_call_costs, quantile, row_cost,
                                     verification_roles, verified_cost, waste_cost)

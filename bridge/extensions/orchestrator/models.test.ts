@@ -14,6 +14,7 @@ import {
 	userLayerWarnings,
 	METHOD,
 	TIERS,
+	TIER_LITERALS,
 	isTier,
 	tierOf,
 	type AvailableModel,
@@ -210,7 +211,10 @@ describe("mergeLayers", () => {
 });
 
 describe("method.json (canonical orchestration method)", () => {
-	const { METHOD, TIER_CAPABILITIES, ALL_CAPABILITIES, rereviewFloor, reconWorkers, tierOf } = require("./models.ts");
+	const { METHOD, TIER_CAPABILITIES, ALL_CAPABILITIES, rereviewFloor, tierOf } = require("./models.ts");
+	const { reconWorkerCount } = require("./recon.ts");
+	const reconWorkers = (complexity: number, taskClass?: string) =>
+		reconWorkerCount(METHOD.rules.pre_implementation_recon, complexity, taskClass);
 
 	test("tier table is derived from method.json, not hand-written", () => {
 		for (const [cap, spec] of Object.entries(METHOD.capabilities) as [string, { tier: string }][]) {
@@ -235,6 +239,15 @@ describe("method.json (canonical orchestration method)", () => {
 		expect(reconWorkers(10)).toBe(5);
 		expect(reconWorkers(9, "investigation")).toBe(0);
 	});
+
+	test("Rule 2: a complexity above every band's max (missing band) skips recon, matching planReconTasks (B4.7)", () => {
+		// method.json's workers_by_complexity currently tops out at max 10; a complexity above
+		// that has no matching band. recon.ts's reconWorkerCount (used by both planReconTasks and
+		// this reconWorkers wrapper) treats a missing band as 0 workers (skip recon) — the actual
+		// production behaviour, not a fallback to the highest band's count.
+		const maxBand = Math.max(...METHOD.rules.pre_implementation_recon.workers_by_complexity.map((b: { max: number }) => b.max));
+		expect(reconWorkers(maxBand + 1)).toBe(0);
+	});
 });
 
 describe("tiers", () => {
@@ -243,6 +256,15 @@ describe("tiers", () => {
 		expect(TIERS[0]).toBe("frontier");
 		expect(isTier("frontier")).toBe(true);
 		expect(isTier("ultra")).toBe(false);
+	});
+	test("the Tier literal union matches method.json's tiers list, in both directions", () => {
+		// TIER_LITERALS is the hand-written source of truth the `Tier` type is checked
+		// against at compile time (see the comment above `Tier` in models.ts). This test
+		// is the runtime half of that guarantee: it must equal METHOD.tiers as a set.
+		expect([...TIER_LITERALS].sort()).toEqual([...METHOD.tiers].sort());
+		expect(TIER_LITERALS.length as number).toBe(METHOD.tiers.length);
+		expect(TIERS.length).toBe(METHOD.tiers.length);
+		expect([...TIERS].sort()).toEqual([...METHOD.tiers].sort());
 	});
 	test("lead sizes sit on mid/premium/frontier", () => {
 		expect(tierOf("lead_small")).toBe("mid");

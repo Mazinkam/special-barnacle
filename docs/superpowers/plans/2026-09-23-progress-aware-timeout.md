@@ -1,5 +1,7 @@
 # Progress-Aware Orchestration Timeout — Contract
 
+**Status: completed.** Merged into `main` via `4ab0fba` (`feat/progress-aware-timeout`, `cb9f51e`).
+
 **Goal:** Replace the lead's fixed 90-minute cancellation (`LEAD_DISPATCH_TIMEOUT_MS` in
 `bridge/extensions/orchestrator/index.ts`) with (a) a meaningful-progress inactivity timeout and
 (b) a separate, configurable absolute safety ceiling. Report active worker progress and

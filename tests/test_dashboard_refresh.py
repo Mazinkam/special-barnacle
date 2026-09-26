@@ -17,7 +17,6 @@ import io
 import json
 import os
 import random
-import re
 import signal
 import statistics
 import subprocess

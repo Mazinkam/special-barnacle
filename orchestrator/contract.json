@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "description": "Values shared verbatim between the Python engine (orchestrator/contract.py) and the HT bridge (bridge/extensions/orchestrator/*.ts, via the symlinked copy of this file). This is the on-disk layout and CLI wire contract: stream file names, protected file names, the durable-write CLI's exit codes and body statuses, batch/id limits, the path-redaction regexes and the state-root environment variables/default. It does NOT hold orchestration method vocabulary (capabilities, tiers, effort, roles) — that lives in method.json. Editing this file edits the on-disk contract for both runtimes at once; keep both sides' behaviour identical except where a field is explicitly documented as intentionally different (see redaction_regex).",
+
+  "streams": {
+    "event": "events.jsonl",
+    "metric": "metrics.jsonl",
+    "outcome": "outcomes.jsonl"
+  },
+
+  "ingest_status_file": "ingest_status.json",
+
+  "max_leads": 4,
+  "max_leads_note": "B4.7: the single source for the orchestration lead-count ceiling, consumed by orchestrator/scheduler.py's topology_for (which never requests more leads than this for any complexity/parallelizable input) and by the TS bridge's config.ts (the default for maxLeads, overridable per-run via HUMAIN_ORCHESTRATOR_MAX_LEADS). 4 was chosen to preserve the pre-B4.7 effective behaviour: the Python plan topology already capped itself at 4 leads, so the TS side's old default of 8 was never the binding constraint (config.ts's maxLeads is `min`'d against the plan's own leads, and the plan never exceeded 4) — no behaviour change for a normal /orchestrate run.",
+
+  "ingest_status": {
+    "fields": ["version", "last_attempt_at", "last_success_at", "status", "files_scanned", "emitted", "failure_count", "error", "sweep_interval_seconds"],
+    "status_values": { "ok": "ok", "partial": "partial", "error": "error" },
+    "default_sweep_interval_seconds": 900,
+    "_note": "B4.7: single source for the ingest_status.json shape, built independently by two different writers on different failure paths — Python's orchestrator/ingest/service.py:make_ingest_status (a completed ingest sweep, which may be ok/partial/error) and the TS bridge's hooks/ingest.ts:recordHookFailure (a hook-level failure before/around a Python spawn, always 'error'). Both read field names and status-string literals from here instead of re-typing them, so the written JSON's keys and status vocabulary can never drift even though the two writers cover different scenarios and are not expected to share write logic."
+  },
+
+  "never_archive_files": [
+    "events.jsonl",
+    "metrics.jsonl",
+    "outcomes.jsonl",
+    "discoveries.jsonl",
+    "ledger.json",
+    "ledger.lock",
+    "records.checkpoint.json",
+    "records.index.sqlite3",
+    "ingest_status.json",
+    "archive.manifest.json",
+    "archive.lock"
+  ],
+
+  "batch": {
+    "max_records": 500,
+    "max_record_id_length": 200,
+    "exit_codes": {
+      "ok": 0,
+      "invalid": 1,
+      "append_failed": 2,
+      "refresh_failed": 3
+    },
+    "statuses": {
+      "ok": "ok",
+      "invalid": "invalid",
+      "append_failed": "append_failed",
+      "refresh_failed": "refresh_failed",
+      "checkpoint_failed": "checkpoint_failed"
+    },
+    "retry_same_ids": "same_ids"
+  },
+
+  "redaction_regex": {
+    "python": "(/Users/[^ \\t\\n|]+|/home/[^ \\t\\n|]+|~/[^ \\t\\n|]+)",
+    "ts": "(/Users/[^\\s|]+|/home/[^\\s|]+|~/[^\\s|]+)",
+    "_todo": "these already differ in behaviour (python's character class excludes only space/tab/newline/pipe; ts's excludes any whitespace plus pipe) and are stored separately on purpose. DO NOT harmonize them here — that is a deliberate follow-up decision, not part of this refactor. Each side must keep importing exactly its own key."
+  },
+
+  "state_root": {
+    "env_vars": {
+      "canonical": "CODING_AGENT_ORCHESTRATOR_HOME",
+      "aliases": ["HUMAIN_ORCHESTRATOR_STATE_ROOT"],
+      "_note": "2.3: both runtimes resolve the canonical name first, then each alias in order, then default. HUMAIN_ORCHESTRATOR_STATE_ROOT is a deprecated fallback alias, kept for existing callers; do not add new readers of it."
+    },
+    "default": "~/.local/state/coding-agent-orchestrator"
+  }
+}

@@ -57,13 +57,13 @@ from pathlib import Path
 # `PYTHONPATH=.` invocation would resolve it.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from orchestrator.core.env import default_state_root  # noqa: E402
 from orchestrator.records import CALL, EVENT, SESSION, classify  # noqa: E402
 from orchestrator.runtime import writer_lock  # noqa: E402
 
 
 def _default_state_dir() -> Path:
-    return Path(os.path.expanduser(os.environ.get(
-        'CODING_AGENT_ORCHESTRATOR_HOME', '~/.local/state/coding-agent-orchestrator')))
+    return default_state_root()
 
 
 def _parse_args(argv: list[str]) -> tuple[Path, bool]:

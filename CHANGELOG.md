@@ -1,5 +1,82 @@
 ## Unreleased
 
+### tests: split large test files (B5)
+
+- `bridge/extensions/orchestrator/index.test.ts` split alongside each new module, with the
+  global `node:child_process` mock replaced by an injected `spawn` and the stale `BorderedLoader`
+  mock dropped.
+- `tests/test_ingest_checkpoint.py` reorganized as a `tests/ingest_checkpoint/` package with
+  shared helpers in `helpers.py`, grouped by behaviour instead of by review round.
+- Direct tests added for `orchestrator/policy_recommendations.py` and
+  `bridge/extensions/orchestrator/run-diagnostics.ts` (previously exercised only indirectly).
+- `record_batch.write_batch` gained an `append_stream=` fault-injection parameter, replacing the in-process `_append_stream` patches in `tests/test_record_batch.py`. The remaining private patches (`archive.execute._compress_to_temp`, subprocess/CLI-level `_append_stream`, the ingest-pipeline `_append_stream` site) are deferred; `cli.ROOT` is a documented test seam and stays.
+- The `index.ts` composition is built by `createOrchestratorExtension({ spawn })`; integration tests inject `spawn` instead of spying on `node:child_process`.
+
+### docs, packaging and lint (B6)
+
+- `SKILL.md` no longer claims a `policy_overlay.json` runtime-state file, `re_review_violations`/
+  `recon_coverage`/`enforcement_readiness` dashboard metrics, or an enforced "$0.50 recon
+  ceiling": none of these exist in the code (`policy_overlay.json` is written by no module;
+  `orchestrator/presentation/dashboard_data.py` has no such metrics; `method.json`'s
+  `max_recon_cost_usd` is never read). Replaced with descriptions of what actually exists today
+  (the durable event/metric streams, the dashboard's spend-cap/adaptive panels, and the advisory,
+  unenforced recon cost field).
+- `bridge/extensions/orchestrator-README.md` no longer says telemetry writes go via
+  `python3 -m orchestrator.cli metric`; it now documents the real path — `recordEvent`/
+  `recordModelCall`/`recordOutcome` enqueue onto `RecordQueue`, which batches and flushes via a
+  single `orchestrator.cli batch -` call (`flushDelayMs`/`maxBatch` from `config.ts`), with
+  failures surfaced through `onError` as a console warning and a session-log line.
+- `PUBLISH.md`'s file-layout table was stale (missing `orchestrator/{core,config,records,store,
+  ingest,analytics,routing,presentation,app,cli,archive}`, `bridge/extensions/orchestrator/
+  {adapters,core,dispatch,pipeline,run,commands,hooks,tools}`, `knip.json`, `scripts/lint.sh`);
+  rebuilt against `git ls-files`, and `scripts/lint.sh` added to the pre-publish checklist.
+- `docs/superpowers/plans/` entries each got a short status line (completed / superseded /
+  in-progress / pending on another branch) based on plan content and `git log`.
+- `requires-python` in `pyproject.toml` changed from `>=3.10` to `>=3.9` to match the interpreter
+  the suite actually runs and is tested on (3.9.6), and `ruff`'s `py39` target.
+- Added `scripts/lint.sh`: runs `ruff check`, `vulture` (Python dead-code) and `knip --production`
+  (unused bridge TS exports, via a temporary probe package.json) from the repo root, printing a
+  summary and exiting non-zero on any finding or tool failure. Added to the verification gate
+  lists in `README.md`, `bridge/README.md`, and `PUBLISH.md`.
+
+### state-root env var (2.3)
+
+- `contract.json`'s `state_root.env_vars` now records a single canonical name,
+  `CODING_AGENT_ORCHESTRATOR_HOME`, plus an `aliases` list containing the deprecated
+  `HUMAIN_ORCHESTRATOR_STATE_ROOT` (previously the two were unrelated per-runtime literals, one
+  named `python`, one `ts`). Both `orchestrator/contract.py`/`core/env.py`'s
+  `default_state_root()` and the bridge's `config.ts` `loadBridgeConfig` now resolve the state
+  root the same way: the canonical name if set and non-empty, else the first non-empty alias,
+  else the contract's default. `install.sh` checks `CODING_AGENT_ORCHESTRATOR_HOME` before
+  falling back to `HUMAIN_ORCHESTRATOR_STATE_ROOT`. No behaviour change for callers that already
+  set only one of the two names; when both are set, `CODING_AGENT_ORCHESTRATOR_HOME` now wins on
+  both sides (previously each runtime read only its own name and ignored the other).
+
+### scheduler: min_samples default
+
+- `orchestrator.vocab.SCHEDULER_MIN_SAMPLES` (the sample-count threshold below which
+  `scheduler.recommend_package` discounts a package's estimated quality for a small sample) was
+  its own unrelated literal, `8`, distinct from the general adaptive-routing default of `12`
+  (`orchestrator.vocab.DEFAULT_MIN_SAMPLES`, sourced from `config.json`'s
+  `history.min_samples_for_empirical_route`). It now aliases `DEFAULT_MIN_SAMPLES`, so a scheduler
+  recommendation needs 12 samples, not 8, before it stops discounting a package on small-sample
+  grounds (behaviour change; no test asserted the old default, per
+  `tests/test_history_scheduler.py`).
+
+### B4.7 fixes
+
+- Fixed `parseFailedChecks` treating `0 errors`/`0 failed` rows as QA failures (B4.7).
+- QA verification now checks every status/count column of a QA table (header-aware; Notes/Description columns ignored), treats an explicit `## Verdict` FAIL as a failure even when the QA process exits 0, and ignores quoted/fenced content (unterminated fences are parsed, fail-safe) (B4.7).
+- `orchestrator.cli plan` JSON is validated before being used as a PlanResponse (B4.7).
+- `planRun` no longer sends `--coupling 0.5 --parallelizable 0.5`; Python defaults are already 0.5, no behaviour change (B4.7).
+- Persona prompt-file write/discovery failures are logged to the session and written as a per-dispatch diagnostic instead of silently falling back (B4.7).
+- The run summary no longer links `lead-report.md` when writing it failed (B4.7).
+- Run duration comes from the session's recorded start time, not the run id (B4.7).
+- `max_leads` (4) is defined once in contract.json and read by scheduler.py and the bridge config; the bridge default was 8 but was never binding because the plan never exceeds 4 leads. HUMAIN_ORCHESTRATOR env override (if any) unchanged (B4.7).
+- ingest_status.json field names/status values defined once in contract.json for `make_ingest_status` and `recordHookFailure`; no behaviour change (B4.7).
+- `models.ts` `reconWorkers` returns 0 for a missing complexity band, matching `recon.ts` (the production path) (B4.7).
+- Dashboard spend-cap breaches panel ported to presentation/dashboard_data.py and the template (merge of main).
+
 ### dashboard: spend-cap breaches
 
 - `spend_cap_exceeded` events were recorded but only visible in the 500-row
@@ -87,9 +164,30 @@
   lead is instructed to record them under `## Open items`, which the summary
   shows. `--yes` flag; one live run per session.
 
-# Changelog
+### architecture-review fixes (C3–C7)
 
-## [Unreleased]
+- **C3.** A lead that exits because of a transient provider error (5xx/529/overloaded/rate-limit/
+  common socket errors, not a quota/billing error) is re-dispatched once with a `## Resume`
+  section — its own last report plus the files changed since it started — instead of the run
+  discarding whatever the lead's subagents already left on disk. Never resumes a cancelled
+  dispatch or a lead that reported `STATUS: blocked`; both attempts are billed, only the final one
+  speaks for the lead's status. (`core/transient-error.ts`, `pipeline/hierarchy.ts`,
+  `resumeLeadPrompt` in `core/prompts.ts`.)
+- **C4.** QA and lead prompts now name the run's absolute repo root and the repo's own
+  verification commands (`repoRootGuardrail` in `core/prompts.ts`), and QA is skipped entirely
+  when no lead succeeded instead of being sent to verify a failed lead's unreported partial work.
+- **C5.** The run summary's verification line is now built from the actual verification state
+  (not run / skipped — no lead succeeded / timed out / failed with these checks / passed) instead
+  of a summary that could say `NOT RUN` while QA had in fact failed.
+- **C6.** `--context <file>` (repeatable) and `--with-last-reply` attach material the goal refers
+  to — file contents or the current session's last assistant message — into the architect and
+  lead prompts under `## Provided context`, capped at 40,000 characters per source with an
+  explicit truncation note, paths redacted. A missing file or an absent last reply stops the
+  command with a clear error before any run starts.
+- **C7.** Before triage, a short goal (under ~200 characters) that refers to something outside
+  itself — a standalone letter, `option N`, `the above`, `as discussed`, `that plan` — is refused
+  with a message pointing at `--context`/`--with-last-reply`/`--force` instead of dispatching a
+  run that will just block waiting for context it was never given. `--force` skips the check.
 
 ### Fixed
 

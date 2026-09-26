@@ -14,9 +14,25 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 // the two runtimes. Edit the root file, never this one.
 import method from "./method.json";
 
+/**
+ * `Tier` is a hand-written literal union, not derived via `(typeof METHOD.tiers)[number]`:
+ * `method.json` is imported as plain JSON, so TS widens its `tiers` array to `string[]` at the
+ * import boundary — there is no way to recover a literal union from a JSON module import. The
+ * `MethodFile` is applied via an unchecked `as unknown as MethodFile` cast, so changes to
+ * `method.json` do not make `tsc` fail. `TIER_LITERALS` and the exhaustiveness check below ensure
+ * the literal union and its list agree at compile time. Drift between `method.json` and those
+ * literals is caught by the runtime parity test in `models.test.ts`.
+ */
 export type Tier = "cheap" | "mid" | "premium" | "frontier";
-/** Display order, most expensive first. `METHOD.tiers` is the ascending cost order. */
-export const TIERS: Tier[] = ["frontier", "premium", "mid", "cheap"];
+
+/** The `Tier` union's members, spelled out once for the compile-time and runtime checks below. */
+export const TIER_LITERALS = ["cheap", "mid", "premium", "frontier"] as const satisfies readonly Tier[];
+// `satisfies readonly Tier[]` above checks TIER_LITERALS ⊆ Tier (every listed literal is a valid
+// Tier). This checks the other direction, Tier ⊆ TIER_LITERALS (every Tier member is listed):
+// if `Tier` ever grows a member missing from TIER_LITERALS, this line fails to compile.
+type AssertTierExhaustive = Tier extends (typeof TIER_LITERALS)[number] ? true : ["Tier has a member missing from TIER_LITERALS", Tier];
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _assertTierExhaustive: AssertTierExhaustive = true;
 
 export type LeadSize = "small" | "standard" | "large";
 export type SpendCapMode = "off" | "warn" | "enforce";
@@ -35,6 +51,10 @@ interface MethodFile {
 	tiers: Tier[];
 	capabilities: Record<string, { tier: Tier; default_effort: string }>;
 	effort_levels: string[];
+	/** Capability -> persona overrides for capabilities whose persona file is not simply `orch-<capability>`. */
+	capability_personas: Record<string, string>;
+	/** HT thinking level -> method.json effort vocabulary (minimal|low|standard|high|maximum). */
+	effort_aliases: Record<string, string>;
 	roles: Record<string, string>;
 	rules: {
 		review_after_fix: {
@@ -66,6 +86,9 @@ interface MethodFile {
 
 export const METHOD = method as unknown as MethodFile;
 
+/** Display order, most expensive first, derived from METHOD.tiers (the ascending cost order). */
+export const TIERS: Tier[] = [...(METHOD.tiers as readonly Tier[])].reverse();
+
 /** Which cost tier each abstract capability sits at. Derived from method.json. */
 export const TIER_CAPABILITIES: Record<Tier, string[]> = { cheap: [], mid: [], premium: [], frontier: [] };
 for (const [cap, spec] of Object.entries(METHOD.capabilities)) TIER_CAPABILITIES[spec.tier].push(cap);
@@ -77,13 +100,14 @@ export function rereviewFloor(risk: string): ReReviewFloor {
 	return table[risk as RiskLevel] ?? table.medium;
 }
 
-/** Rule 2: how many pre-implementation recon workers a task warrants; 0 = skip recon. */
-export function reconWorkers(complexity: number, taskClass?: string): number {
-	const r = METHOD.rules.pre_implementation_recon;
-	if ((taskClass && r.skip_for_task_classes.includes(taskClass)) || complexity < r.min_complexity) return 0;
-	const band = r.workers_by_complexity.find((b) => complexity >= b.min && complexity <= b.max);
-	return band?.workers ?? r.workers_by_complexity[r.workers_by_complexity.length - 1]?.workers ?? 0;
-}
+/**
+ * Rule 2: how many pre-implementation recon workers a task warrants; 0 = skip recon.
+ *
+ * The actual policy application lives in `recon.ts`'s `reconWorkerCount`
+ * (used by `planReconTasks`, the function `dispatchHierarchical` actually
+ * calls); this module only exposes `METHOD.rules.pre_implementation_recon`
+ * for callers/tests that need the raw policy data.
+ */
 
 export function tierIndex(tier: Tier): number {
 	return METHOD.tiers.indexOf(tier);
@@ -123,7 +147,7 @@ export function tierOfModel(model: string, adapter: Record<string, { model: stri
 }
 
 export function isTier(s: string): s is Tier {
-	return s === "cheap" || s === "mid" || s === "premium" || s === "frontier";
+	return (METHOD.tiers as readonly string[]).includes(s);
 }
 
 export function isThinkingLevel(s: string): s is ThinkingLevel {

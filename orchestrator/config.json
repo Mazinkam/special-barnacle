@@ -1,14 +1,5 @@
 {
   "schema_version": 3,
-  "orchestration": {
-    "strategy": "hierarchical",
-    "max_depth": 4,
-    "max_parallel_workers": 8,
-    "max_workers_per_lead": 5,
-    "worker_retry_limit": 2,
-    "stop_loss_multiplier": 3.0,
-    "review_queue_soft_limit": 8
-  },
   "optimization": {
     "quality_floor": 0.95,
     "cost_aggressiveness": 0.7,
@@ -19,25 +10,7 @@
       "medium": 0.02,
       "high": 0.04,
       "critical": 0.045
-    },
-    "hard_gates": {
-      "acceptance_criteria_must_pass": true,
-      "tests_must_pass_when_applicable": true,
-      "no_unresolved_high_risk_findings": true
     }
-  },
-  "context": {
-    "default_worker_budget_tokens": 18000,
-    "lead_budget_tokens": 36000,
-    "architect_budget_tokens": 50000,
-    "packet_refetch_threshold": 0.12,
-    "invalidate_on_revision_change": true
-  },
-  "verification": {
-    "default_depth": "targeted",
-    "cache_enabled": true,
-    "flaky_window": 30,
-    "flaky_threshold": 0.2
   },
   "history": {
     "min_samples_for_empirical_route": 12,
@@ -205,11 +178,6 @@
       }
     },
     "unrated_note": "Models with no locally verifiable rate stay unmetered by design: minimax-m3 and humain-m3-research-preview and gpt-5-mini are absent from the local catalogs. Add rates from the provider of record to meter them."
-  },
-  "budgets": {
-    "default_task_usd": 0.5,
-    "high_risk_task_usd": 3.0,
-    "critical_task_usd": null
   },
   "features": {
     "adaptive_system": {
@@ -412,17 +380,5 @@
     "reproducible_routing": {
       "enabled": false
     }
-  },
-  "persistence": {
-    "directory": "~/.local/state/coding-agent-orchestrator",
-    "events": "events.jsonl",
-    "metrics": "metrics.jsonl",
-    "discoveries": "discoveries.jsonl",
-    "outcomes": "outcomes.jsonl",
-    "ledger": "ledger.json",
-    "context_registry": "context_registry.json",
-    "verification_cache": "verification_cache.json",
-    "locks": "locks.json",
-    "dashboard": "dashboard.html"
   }
 }

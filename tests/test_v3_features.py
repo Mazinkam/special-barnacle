@@ -1,4 +1,4 @@
-import json, tempfile, unittest
+import json, unittest
 from pathlib import Path
 from orchestrator.features import FeaturePolicy, validate_features
 from orchestrator.adaptive import adaptive_route, deterministic_coin, should_canary

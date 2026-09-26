@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
 from typing import Any
 import hashlib
 
 from .history import bucket_complexity
-from .scheduler import DEFAULT_PACKAGES, EFFORTS, recommend_package, topology_for, package_history, measured
+from . import scheduler
+from .scheduler import recommend_package, topology_for, package_history, measured
+from .vocab import DEFAULT_MIN_SAMPLES, HIGH_RISK
 
 
 def _unit_interval(seed: str) -> float:
@@ -18,7 +19,7 @@ def deterministic_coin(seed: str, probability: float) -> bool:
 
 
 def default_package_for(complexity: float, risk: str, features: dict[str, Any], default_efforts: dict[str, str]) -> dict[str, Any]:
-    strong = risk in {'high','critical'} or float(complexity) >= 8
+    strong = risk in HIGH_RISK or float(complexity) >= 8
     capability = 'implementation_strong' if strong else 'implementation_fast'
     effort = default_efforts.get(capability, 'standard')
     effort_cfg=features.get('effort_adaptation', {})
@@ -28,7 +29,8 @@ def default_package_for(complexity: float, risk: str, features: dict[str, Any], 
         elif float(complexity) <= 3 and risk == 'low':
             effort = 'low'
         max_effort=effort_cfg.get('max_effort','maximum')
-        if max_effort in EFFORTS and effort in EFFORTS and EFFORTS.index(effort) > EFFORTS.index(max_effort):
+        efforts = scheduler.efforts()
+        if max_effort in efforts and effort in efforts and efforts.index(effort) > efforts.index(max_effort):
             effort=max_effort
     verification = 'full' if risk == 'critical' else ('broad' if risk == 'high' or float(complexity) >= 7 else 'targeted')
     context_budget = 26000 if capability == 'implementation_strong' else 18000
@@ -39,7 +41,7 @@ def default_package_for(complexity: float, risk: str, features: dict[str, Any], 
         'effort': effort,
         'context_budget_tokens': context_budget,
         'verification_depth': verification,
-        'reviewer_independence': 'independent' if risk in {'high','critical'} else 'normal',
+        'reviewer_independence': 'independent' if risk in HIGH_RISK else 'normal',
     }
 
 
@@ -51,12 +53,13 @@ def _apply_switch_guards(empirical: dict[str, Any], default: dict[str, Any], fea
     effort_cfg=features.get('effort_adaptation', {})
     if not routing.get('allow_effort_switching', True) or not effort_cfg.get('enabled', True):
         out['effort'] = default['effort']
-    elif out.get('effort') in EFFORTS and default.get('effort') in EFFORTS:
-        oi=EFFORTS.index(out['effort']); di=EFFORTS.index(default['effort'])
+    elif out.get('effort') in scheduler.efforts() and default.get('effort') in scheduler.efforts():
+        efforts = scheduler.efforts()
+        oi=efforts.index(out['effort']); di=efforts.index(default['effort'])
         if oi > di and not effort_cfg.get('allow_increase',True): out['effort']=default['effort']
         if oi < di and not effort_cfg.get('allow_decrease',True): out['effort']=default['effort']
         mx=effort_cfg.get('max_effort','maximum')
-        if mx in EFFORTS and out.get('effort') in EFFORTS and EFFORTS.index(out['effort']) > EFFORTS.index(mx): out['effort']=mx
+        if mx in efforts and out.get('effort') in efforts and efforts.index(out['effort']) > efforts.index(mx): out['effort']=mx
     if not routing.get('allow_context_budget_changes', True) or not features.get('context_optimization', {}).get('enabled', True):
         out['context_budget_tokens'] = default['context_budget_tokens']
     if not routing.get('allow_verification_changes', True):
@@ -76,7 +79,7 @@ def route_evidence(stats: list[dict[str, Any]], *, task_class: str, complexity: 
     return {key: int(measured(hist.get(key)) or 0) for key in ('verified_tasks', 'run_samples', 'call_samples')}
 
 
-def configured_min_samples(features: dict[str, Any], default: int = 12) -> int:
+def configured_min_samples(features: dict[str, Any], default: int = DEFAULT_MIN_SAMPLES) -> int:
     return int(features.get('historical_learning', {}).get('minimum_samples', default))
 
 
@@ -135,7 +138,7 @@ def recommend_topology(*, task_class: str, complexity: float, risk: str, couplin
 
 def adaptive_route(*, run_id: str, task_class: str, complexity: float, risk: str, quality_floor: float,
                    cost_aggressiveness: float, stats: list[dict[str, Any]], features: dict[str, Any],
-                   default_efforts: dict[str, str], min_samples: int = 12) -> dict[str, Any]:
+                   default_efforts: dict[str, str], min_samples: int = DEFAULT_MIN_SAMPLES) -> dict[str, Any]:
     default = default_package_for(complexity, risk, features, default_efforts)
     mode = features.get('adaptive_routing', {}).get('mode', 'off')
     if not features.get('adaptive_system', {}).get('enabled', True):
@@ -167,7 +170,7 @@ def adaptive_route(*, run_id: str, task_class: str, complexity: float, risk: str
     exploration = features.get('exploration', {})
     explored = False
     exploration_candidate = None
-    if mode == 'enforce' and exploration.get('enabled', False) and (risk not in {'high','critical'} or not exploration.get('exclude_high_risk_tasks', True)):
+    if mode == 'enforce' and exploration.get('enabled', False) and (risk not in HIGH_RISK or not exploration.get('exclude_high_risk_tasks', True)):
         rate=float(exploration.get('rate',0))
         if deterministic_coin(f'explore:{run_id}:{task_class}:{complexity}:{risk}', rate):
             feasible=[c for c in empirical['candidates'] if c.get('feasible')]
@@ -218,6 +221,6 @@ def adaptive_route(*, run_id: str, task_class: str, complexity: float, risk: str
     }
 
 
-def should_canary(run_id: str, percentage: float, reproducible: bool = True) -> bool:
+def should_canary(run_id: str, percentage: float) -> bool:
     # Always deterministic by run id: reproducibility is desirable for canary assignment even when normal exploration is not.
     return deterministic_coin(f'canary:{run_id}', float(percentage)/100.0)

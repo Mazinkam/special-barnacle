@@ -60,6 +60,20 @@ class T(unittest.TestCase):
         r = recommend_package(task_class='crud', complexity=3, risk='low', quality_floor=.90, cost_aggressiveness=.8, stats=[], min_samples=8)
         self.assertIn('choice', r)
 
+    def test_scheduler_min_samples_matches_the_adaptive_routing_default(self):
+        # Historically SCHEDULER_MIN_SAMPLES was its own, unrelated literal (8) rather than the
+        # general adaptive-routing default (12, `orchestrator.vocab.DEFAULT_MIN_SAMPLES`, sourced
+        # from `config.json`'s `history.min_samples_for_empirical_route`). A scheduler needs at
+        # least as much evidence as the rest of adaptive routing trusts before it stops discounting
+        # a package's estimated quality for a small sample.
+        from orchestrator.vocab import DEFAULT_MIN_SAMPLES, SCHEDULER_MIN_SAMPLES
+        self.assertEqual(SCHEDULER_MIN_SAMPLES, DEFAULT_MIN_SAMPLES)
+        self.assertEqual(SCHEDULER_MIN_SAMPLES, 12)
+
+        import inspect
+        from orchestrator.scheduler import recommend_package as _recommend_package
+        self.assertEqual(inspect.signature(_recommend_package).parameters['min_samples'].default, 12)
+
     def _row(self, **kw):
         base = {'task_class': 'crud', 'complexity': 3, 'risk': 'low', 'capability_class': 'implementation_fast', 'effort': 'low', 'verification_depth': 'targeted', 'cost_usd': .02, 'task_id': 'T1'}
         base.update(kw)

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Canonical orchestration method: capability vocabulary, cost tiers, effort levels, role aliases, and the three routing rules. Read by both the Python engine (orchestrator/method.py) and the HT bridge (bridge/extensions/orchestrator/models.ts via a symlink). Editing this file edits the method; SKILL.md summarises it for humans and must not contradict it. Runtime config (pricing, features, persistence) stays in config.json; per-dispatch spend caps are method policy (rules.dispatch_spend_cap); runtime state (history, measured ROI) stays in ~/.local/state/coding-agent-orchestrator/.",
+  "description": "Canonical orchestration method: capability vocabulary, cost tiers, effort levels, role aliases, capability-to-persona overrides, HT-thinking-level-to-effort aliases, and the three routing rules. Read by both the Python engine (orchestrator/method.py) and the HT bridge (bridge/extensions/orchestrator/models.ts and index.ts via a symlink). Editing this file edits the method; SKILL.md summarises it for humans and must not contradict it. Runtime config (pricing, features, persistence) stays in config.json; per-dispatch spend caps are method policy (rules.dispatch_spend_cap); runtime state (history, measured ROI) stays in ~/.local/state/coding-agent-orchestrator/.",
 
   "tiers": ["cheap", "mid", "premium", "frontier"],
 
@@ -26,6 +26,25 @@
   },
 
   "effort_levels": ["minimal", "low", "standard", "high", "maximum"],
+
+  "capability_personas": {
+    "analysis_mid": "orch-technical-lead",
+    "analysis_strong": "orch-architect",
+    "integration_review": "orch-technical-review",
+    "migration_review": "orch-technical-review",
+    "performance_review": "orch-technical-review",
+    "api_contract_review": "orch-technical-review"
+  },
+
+  "effort_aliases": {
+    "off": "minimal",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "standard",
+    "high": "high",
+    "xhigh": "maximum",
+    "max": "maximum"
+  },
 
   "roles": {
     "architect": "architect",

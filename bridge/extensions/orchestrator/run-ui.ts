@@ -96,7 +96,7 @@ export function applyWarnings(
 	}
 }
 
-function fmtElapsed(ms: number): string {
+export function fmtElapsed(ms: number): string {
 	const seconds = Math.max(0, Math.round(ms / 1000));
 	return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
 }

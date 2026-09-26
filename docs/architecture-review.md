@@ -342,5 +342,37 @@ Also: archive or mark the status of the completed plans in `docs/superpowers/pla
 actually runs the code (or make the bridge check the version).
 
 Done when: B1–B6 are committed, all verification is green, the layer check passes in CI,
-`index.ts` does only wiring, and `refactor/modular` is pushed. Open a PR to `main`; **do not merge
-it without the user's approval.**
+`index.ts` does only wiring, and the modular work is integrated directly into `main`. No PR is
+required per the user's direction.
+
+---
+
+## Direct-main recovery status
+
+The user chose to land the existing `refactor/modular` work directly on `main`; do not open a PR.
+The local `main` checkout had advanced beyond `origin/main` before integration, so preserve the
+committed work already present there while merging the modular branch.
+
+During conflict resolution, the `main` bridge entrypoint and its integration tests were retained to
+avoid dropping the Phase 1–3 functionality already on local `main`. The Python modular packages,
+bridge modules/tests, docs, and lint tooling from `refactor/modular` are being integrated alongside
+that code. Consequently, do not claim B4/B5 are complete merely because the modular files exist:
+verify that the active bridge entrypoint actually uses them, split the remaining monolithic bridge
+tests, and port any still-needed behavior into the modular runtime before closing Part B.
+
+Decisions/status for follow-up:
+- `SCHEDULER_MIN_SAMPLES` is **12** (Phase 2 decision, documented in `CHANGELOG.md`); update older
+  text that still says to defer the 8-vs-12 choice.
+- Keep `.data` as a snapshot for `ContextRegistry` / `VerificationCache`; direct edits require an
+  explicit save/update before later mutations.
+- Keep the Python and TypeScript redaction expressions distinct, `load_jsonl` distinct from
+  `iter_jsonl`, and `plan_run`'s four writes separate unless a separate compatibility decision
+  authorizes changing behavior.
+- C2 provider-outage fallback remains a separate follow-up; C3–C7 must be checked against and wired
+  into the active `main` bridge runtime, not counted complete from unreferenced modules/tests.
+- Add a CI workflow that runs the Python suite (including the layer test), Bun tests, and
+  `scripts/lint.sh`. Bridge typecheck still needs the private HUMAIN Terminal workspace; keep that
+  gate in local verification until CI has an authorized workspace checkout.
+
+After resolving the merge, run all verification gates on `main`, commit the merge only with a clean
+conflict-free tree, and continue remaining modular/runtime integration work directly on `main`.

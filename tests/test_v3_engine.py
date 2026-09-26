@@ -2,7 +2,6 @@ import json, re, tempfile, unittest
 from pathlib import Path
 from orchestrator.engine import OrchestrationEngine
 from orchestrator.dashboard import MIN_TAIL_SAMPLES, generate_dashboard
-from orchestrator.records import is_no_data
 
 
 def embedded_payload(html: str) -> dict:

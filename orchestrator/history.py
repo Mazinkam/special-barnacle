@@ -1,13 +1,13 @@
 from __future__ import annotations
 from pathlib import Path
 from collections import defaultdict
-from typing import Any
 from datetime import datetime, timezone
-import math
 from .runtime import default_state_root, load_jsonl
 from . import records
 from .outcomes import bad_signal
 from .economics import is_call_row, is_session_ingest, cost_class, UNMETERED, unique_records
+from .contract import STREAMS
+from .vocab import TERMINAL_TASK_IDS
 
 
 def bucket_complexity(x:float,width:int=2)->str:
@@ -110,7 +110,7 @@ def build_route_stats(metrics:list[dict], outcomes:list[dict]|None=None, width:i
     # does on the dashboard.
     for task_outcomes in out_by_task.values():
         for o in task_outcomes:
-            if o.get('task_id') in {'run-complete','run-failed','run-cancelled'}: continue
+            if o.get('task_id') in TERMINAL_TASK_IDS: continue
             verdict=_verdict(o)
             if verdict is None and isinstance(o.get('verification'), bool):
                 verdict=records.VERIFIED if o['verification'] else records.FAILED
@@ -213,4 +213,4 @@ def build_route_stats(metrics:list[dict], outcomes:list[dict]|None=None, width:i
 
 
 def load_stats(root=None,width=2,decay_half_life_days:float|None=None):
-    root=Path(root) if root is not None else default_state_root(); return build_route_stats(load_jsonl(root/'metrics.jsonl'),load_jsonl(root/'outcomes.jsonl'),width,decay_half_life_days)
+    root=Path(root) if root is not None else default_state_root(); return build_route_stats(load_jsonl(root/STREAMS['metric']),load_jsonl(root/STREAMS['outcome']),width,decay_half_life_days)

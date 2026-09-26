@@ -1,0 +1,799 @@
+{
+  "run_id": "ht-orch-1700000000000-fixture001",
+  "task_class": "bugfix",
+  "complexity": 5.0,
+  "risk": "medium",
+  "repo_revision": null,
+  "topology": {
+    "depth": 2,
+    "leads": 1,
+    "workers": 2,
+    "shape": "single_lead",
+    "source": "heuristic"
+  },
+  "topology_recommendation": {
+    "heuristic": {
+      "depth": 2,
+      "leads": 1,
+      "workers": 2,
+      "shape": "single_lead",
+      "source": "heuristic"
+    },
+    "empirical": null,
+    "candidates": [],
+    "min_samples": 12,
+    "fallback_reason": "no_comparable_history",
+    "comparable_groups": 0,
+    "skipped_missing_quality_or_cost": 0
+  },
+  "route": {
+    "mode": "recommend",
+    "default": {
+      "capability": "implementation_fast",
+      "effort": "low",
+      "context_budget_tokens": 18000,
+      "verification_depth": "targeted",
+      "reviewer_independence": "normal"
+    },
+    "recommended": {
+      "capability": "implementation_strong",
+      "effort": "high",
+      "context_budget_tokens": 36000,
+      "verification_depth": "full",
+      "reviewer_independence": "independent"
+    },
+    "selected": {
+      "capability": "implementation_fast",
+      "effort": "low",
+      "context_budget_tokens": 18000,
+      "verification_depth": "targeted",
+      "reviewer_independence": "normal"
+    },
+    "empirical": {
+      "task_class": "bugfix",
+      "complexity_bucket": "5-6",
+      "risk": "medium",
+      "quality_floor": 0.97,
+      "cost_aggressiveness": 0.7,
+      "choice": {
+        "package": {
+          "capability": "implementation_strong",
+          "effort": "high",
+          "context_budget_tokens": 36000,
+          "verification_depth": "full",
+          "reviewer_independence": "independent"
+        },
+        "samples": 0,
+        "estimated_verified_cost_usd": 0.1848,
+        "estimated_quality_evidence": 0.962,
+        "feasible": false,
+        "historical": false
+      },
+      "candidates": [
+        {
+          "package": {
+            "capability": "implementation_fast",
+            "effort": "low",
+            "context_budget_tokens": 14000,
+            "verification_depth": "targeted",
+            "reviewer_independence": "normal"
+          },
+          "samples": 0,
+          "estimated_verified_cost_usd": 0.059,
+          "estimated_quality_evidence": 0.92,
+          "feasible": false,
+          "historical": false
+        },
+        {
+          "package": {
+            "capability": "implementation_fast",
+            "effort": "standard",
+            "context_budget_tokens": 20000,
+            "verification_depth": "targeted",
+            "reviewer_independence": "normal"
+          },
+          "samples": 0,
+          "estimated_verified_cost_usd": 0.068,
+          "estimated_quality_evidence": 0.926,
+          "feasible": false,
+          "historical": false
+        },
+        {
+          "package": {
+            "capability": "implementation_fast",
+            "effort": "high",
+            "context_budget_tokens": 26000,
+            "verification_depth": "broad",
+            "reviewer_independence": "normal"
+          },
+          "samples": 0,
+          "estimated_verified_cost_usd": 0.077,
+          "estimated_quality_evidence": 0.932,
+          "feasible": false,
+          "historical": false
+        },
+        {
+          "package": {
+            "capability": "implementation_strong",
+            "effort": "standard",
+            "context_budget_tokens": 26000,
+            "verification_depth": "broad",
+            "reviewer_independence": "normal"
+          },
+          "samples": 0,
+          "estimated_verified_cost_usd": 0.1632,
+          "estimated_quality_evidence": 0.956,
+          "feasible": false,
+          "historical": false
+        },
+        {
+          "package": {
+            "capability": "implementation_strong",
+            "effort": "high",
+            "context_budget_tokens": 36000,
+            "verification_depth": "full",
+            "reviewer_independence": "independent"
+          },
+          "samples": 0,
+          "estimated_verified_cost_usd": 0.1848,
+          "estimated_quality_evidence": 0.962,
+          "feasible": false,
+          "historical": false
+        }
+      ],
+      "explanation": "Selected lowest estimated verified cost among packages meeting the effective quality floor; if none met it, selected highest estimated assurance."
+    },
+    "history_sufficient": false,
+    "exploration_candidate": null,
+    "shadow_selected": false,
+    "shadow_execute_alternative": false,
+    "explanation": {
+      "mode": "recommend",
+      "action": "recommended_only",
+      "history_sufficient": false,
+      "historical_samples": 0,
+      "verified_task_samples": 0,
+      "run_samples": 0,
+      "call_samples": 0,
+      "min_samples": 12,
+      "quality_floor": 0.97,
+      "cost_aggressiveness": 0.7,
+      "default": {
+        "capability": "implementation_fast",
+        "effort": "low",
+        "context_budget_tokens": 18000,
+        "verification_depth": "targeted",
+        "reviewer_independence": "normal"
+      },
+      "recommended": {
+        "capability": "implementation_strong",
+        "effort": "high",
+        "context_budget_tokens": 36000,
+        "verification_depth": "full",
+        "reviewer_independence": "independent"
+      },
+      "selected": {
+        "capability": "implementation_fast",
+        "effort": "low",
+        "context_budget_tokens": 18000,
+        "verification_depth": "targeted",
+        "reviewer_independence": "normal"
+      },
+      "explored": false,
+      "shadow_selected": false
+    }
+  },
+  "selected_compute_package": {
+    "capability": "implementation_fast",
+    "effort": "low",
+    "context_budget_tokens": 18000,
+    "verification_depth": "targeted",
+    "reviewer_independence": "normal"
+  },
+  "policy": {
+    "quality_floor": 0.95,
+    "cost_aggressiveness": 0.7,
+    "latency_weight": 0.1,
+    "human_hour_value_usd": 0.0,
+    "shadow_review_rate": 0.03,
+    "risk_quality_floor_delta": {
+      "low": 0.0,
+      "medium": 0.02,
+      "high": 0.04,
+      "critical": 0.045
+    },
+    "policy_id": "8ae7b99435e24efa"
+  },
+  "features": {
+    "adaptive_system": {
+      "enabled": true
+    },
+    "adaptive_routing": {
+      "mode": "recommend",
+      "allow_model_switching": true,
+      "allow_effort_switching": true,
+      "allow_topology_changes": true,
+      "allow_context_budget_changes": true,
+      "allow_verification_changes": true
+    },
+    "historical_learning": {
+      "enabled": true,
+      "minimum_samples": 12,
+      "decay_old_results": true,
+      "decay_half_life_days": 60,
+      "use_cross_repo_history": false
+    },
+    "exploration": {
+      "enabled": true,
+      "rate": 0.02,
+      "max_extra_cost_percent": 10.0,
+      "exclude_high_risk_tasks": true
+    },
+    "shadow_routing": {
+      "enabled": true,
+      "estimate_only": true,
+      "execute_alternative": false,
+      "sampling_rate": 0.05
+    },
+    "model_promotion": {
+      "enabled": true,
+      "after_conceptual_failures": 1,
+      "after_mechanical_failures": 2
+    },
+    "model_demotion": {
+      "enabled": true
+    },
+    "effort_adaptation": {
+      "enabled": true,
+      "allow_increase": true,
+      "allow_decrease": true,
+      "max_effort": "high"
+    },
+    "dynamic_depth": {
+      "enabled": true,
+      "max_depth": 4
+    },
+    "dynamic_parallelism": {
+      "enabled": true,
+      "min_workers": 1,
+      "max_workers": 8,
+      "use_backpressure": true
+    },
+    "subleads": {
+      "enabled": true,
+      "minimum_complexity": 8.0
+    },
+    "task_fusion": {
+      "enabled": true
+    },
+    "task_splitting": {
+      "enabled": true
+    },
+    "context_optimization": {
+      "enabled": true,
+      "adaptive_budget": true,
+      "deduplicate_context": true,
+      "lazy_load_context": true
+    },
+    "repo_map": {
+      "enabled": true,
+      "reuse": true,
+      "auto_invalidate": true
+    },
+    "shared_discoveries": {
+      "enabled": true
+    },
+    "persistent_leads": {
+      "enabled": true,
+      "reuse_across_runs": true
+    },
+    "deterministic_verification": {
+      "formatter": "on",
+      "lint": "on",
+      "typecheck": "on",
+      "unit_tests": "on",
+      "integration_tests": "adaptive",
+      "full_test_suite": "adaptive"
+    },
+    "verification_cache": {
+      "enabled": true,
+      "require_exact_revision": true
+    },
+    "flaky_test_detection": {
+      "enabled": true,
+      "auto_retry_known_flakes": true,
+      "auto_ignore_known_flakes": false
+    },
+    "semantic_review": {
+      "enabled": true,
+      "adaptive_depth": true
+    },
+    "independent_review": {
+      "mode": "risk_based"
+    },
+    "shadow_review": {
+      "enabled": true,
+      "sample_rate": 0.03
+    },
+    "specialized_reviews": {
+      "security": "adaptive",
+      "performance": "adaptive",
+      "migration": "adaptive",
+      "api_contract": "adaptive"
+    },
+    "cost_optimization": {
+      "enabled": true
+    },
+    "human_cost": {
+      "enabled": false,
+      "hourly_rate_usd": 100.0
+    },
+    "compute_cost": {
+      "enabled": true
+    },
+    "stop_loss": {
+      "enabled": true,
+      "max_cost_multiplier": 3.0,
+      "max_retry_count": 3,
+      "max_wall_time_minutes": null
+    },
+    "budget_enforcement": {
+      "mode": "warn"
+    },
+    "risk_adjustment": {
+      "enabled": true
+    },
+    "delayed_outcomes": {
+      "enabled": true,
+      "windows_days": [
+        7,
+        30,
+        90
+      ]
+    },
+    "maintainability": {
+      "enabled": true,
+      "track_rewrite_rate": true,
+      "track_complexity_delta": true,
+      "track_duplication": true
+    },
+    "production_feedback": {
+      "enabled": false,
+      "ingest_incidents": true,
+      "ingest_rollbacks": true,
+      "ingest_error_rates": true
+    },
+    "replanning": {
+      "enabled": true
+    },
+    "branch_cancellation": {
+      "enabled": true
+    },
+    "dependencies": {
+      "auto_add": "ask",
+      "auto_upgrade": "ask"
+    },
+    "auto_merge": {
+      "enabled": false
+    },
+    "auto_deploy": {
+      "enabled": false
+    },
+    "destructive_operations": {
+      "mode": "deny"
+    },
+    "policy_recommendations": {
+      "enabled": true
+    },
+    "auto_policy_tuning": {
+      "enabled": false
+    },
+    "policy_simulation": {
+      "enabled": true
+    },
+    "policy_canary": {
+      "enabled": true,
+      "percentage": 5.0
+    },
+    "auto_policy_promotion": {
+      "enabled": false
+    },
+    "decision_explanations": {
+      "enabled": true,
+      "level": "concise"
+    },
+    "reproducible_routing": {
+      "enabled": false
+    }
+  },
+  "feature_inventory": [
+    {
+      "feature": "adaptive_routing",
+      "state": "recommend",
+      "config": {
+        "mode": "recommend",
+        "allow_model_switching": true,
+        "allow_effort_switching": true,
+        "allow_topology_changes": true,
+        "allow_context_budget_changes": true,
+        "allow_verification_changes": true
+      }
+    },
+    {
+      "feature": "adaptive_system",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "auto_deploy",
+      "state": "off",
+      "config": {
+        "enabled": false
+      }
+    },
+    {
+      "feature": "auto_merge",
+      "state": "off",
+      "config": {
+        "enabled": false
+      }
+    },
+    {
+      "feature": "auto_policy_promotion",
+      "state": "off",
+      "config": {
+        "enabled": false
+      }
+    },
+    {
+      "feature": "auto_policy_tuning",
+      "state": "off",
+      "config": {
+        "enabled": false
+      }
+    },
+    {
+      "feature": "branch_cancellation",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "budget_enforcement",
+      "state": "warn",
+      "config": {
+        "mode": "warn"
+      }
+    },
+    {
+      "feature": "compute_cost",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "context_optimization",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "adaptive_budget": true,
+        "deduplicate_context": true,
+        "lazy_load_context": true
+      }
+    },
+    {
+      "feature": "cost_optimization",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "decision_explanations",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "level": "concise"
+      }
+    },
+    {
+      "feature": "delayed_outcomes",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "windows_days": [
+          7,
+          30,
+          90
+        ]
+      }
+    },
+    {
+      "feature": "dependencies",
+      "state": "configured",
+      "config": {
+        "auto_add": "ask",
+        "auto_upgrade": "ask"
+      }
+    },
+    {
+      "feature": "destructive_operations",
+      "state": "deny",
+      "config": {
+        "mode": "deny"
+      }
+    },
+    {
+      "feature": "deterministic_verification",
+      "state": "configured",
+      "config": {
+        "formatter": "on",
+        "lint": "on",
+        "typecheck": "on",
+        "unit_tests": "on",
+        "integration_tests": "adaptive",
+        "full_test_suite": "adaptive"
+      }
+    },
+    {
+      "feature": "dynamic_depth",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "max_depth": 4
+      }
+    },
+    {
+      "feature": "dynamic_parallelism",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "min_workers": 1,
+        "max_workers": 8,
+        "use_backpressure": true
+      }
+    },
+    {
+      "feature": "effort_adaptation",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "allow_increase": true,
+        "allow_decrease": true,
+        "max_effort": "high"
+      }
+    },
+    {
+      "feature": "exploration",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "rate": 0.02,
+        "max_extra_cost_percent": 10.0,
+        "exclude_high_risk_tasks": true
+      }
+    },
+    {
+      "feature": "flaky_test_detection",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "auto_retry_known_flakes": true,
+        "auto_ignore_known_flakes": false
+      }
+    },
+    {
+      "feature": "historical_learning",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "minimum_samples": 12,
+        "decay_old_results": true,
+        "decay_half_life_days": 60,
+        "use_cross_repo_history": false
+      }
+    },
+    {
+      "feature": "human_cost",
+      "state": "off",
+      "config": {
+        "enabled": false,
+        "hourly_rate_usd": 100.0
+      }
+    },
+    {
+      "feature": "independent_review",
+      "state": "risk_based",
+      "config": {
+        "mode": "risk_based"
+      }
+    },
+    {
+      "feature": "maintainability",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "track_rewrite_rate": true,
+        "track_complexity_delta": true,
+        "track_duplication": true
+      }
+    },
+    {
+      "feature": "model_demotion",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "model_promotion",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "after_conceptual_failures": 1,
+        "after_mechanical_failures": 2
+      }
+    },
+    {
+      "feature": "persistent_leads",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "reuse_across_runs": true
+      }
+    },
+    {
+      "feature": "policy_canary",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "percentage": 5.0
+      }
+    },
+    {
+      "feature": "policy_recommendations",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "policy_simulation",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "production_feedback",
+      "state": "off",
+      "config": {
+        "enabled": false,
+        "ingest_incidents": true,
+        "ingest_rollbacks": true,
+        "ingest_error_rates": true
+      }
+    },
+    {
+      "feature": "replanning",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "repo_map",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "reuse": true,
+        "auto_invalidate": true
+      }
+    },
+    {
+      "feature": "reproducible_routing",
+      "state": "off",
+      "config": {
+        "enabled": false
+      }
+    },
+    {
+      "feature": "risk_adjustment",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "semantic_review",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "adaptive_depth": true
+      }
+    },
+    {
+      "feature": "shadow_review",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "sample_rate": 0.03
+      }
+    },
+    {
+      "feature": "shadow_routing",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "estimate_only": true,
+        "execute_alternative": false,
+        "sampling_rate": 0.05
+      }
+    },
+    {
+      "feature": "shared_discoveries",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "specialized_reviews",
+      "state": "configured",
+      "config": {
+        "security": "adaptive",
+        "performance": "adaptive",
+        "migration": "adaptive",
+        "api_contract": "adaptive"
+      }
+    },
+    {
+      "feature": "stop_loss",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "max_cost_multiplier": 3.0,
+        "max_retry_count": 3,
+        "max_wall_time_minutes": null
+      }
+    },
+    {
+      "feature": "subleads",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "minimum_complexity": 8.0
+      }
+    },
+    {
+      "feature": "task_fusion",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "task_splitting",
+      "state": "on",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "feature": "verification_cache",
+      "state": "on",
+      "config": {
+        "enabled": true,
+        "require_exact_revision": true
+      }
+    }
+  ],
+  "effective_quality_floor": 0.97,
+  "cost_aggressiveness": 0.7,
+  "canary": false,
+  "plan_id": "448e996857a25649"
+}

@@ -525,7 +525,6 @@ class RestartReconciliationTests(unittest.TestCase):
 
     def test_different_host_is_unknown_never_reclassified(self):
         events=[_ownership(pid=4242,hostname='some-other-host')]
-        from orchestrator.run_evidence import default_liveness_check
         r=by_run(summarize_runs([],events,[]))['r']  # default_liveness_check: different host -> None
         self.assertEqual(r['status'],'incomplete')
 

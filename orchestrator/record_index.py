@@ -44,11 +44,16 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .runtime import RECORD_INDEX_FILE, read_json, tail_fingerprint
+from .contract import STREAMS
+# core.fs/core.jsonl, not runtime: record_batch (which uses this module) is imported by
+# store.facade.EventStore, which orchestrator.runtime re-exports; importing runtime here would
+# cycle (see docs/architecture-review.md B2.2/B2.3).
+from .core.fs import RECORD_INDEX_FILE, read_json
+from .core.jsonl import tail_fingerprint
 
 DATABASE_FILE = 'records.index.sqlite3'
 INDEX_VERSION = 2  # 2: BLOB keys (surrogatepass); receipts of version 1 (TEXT keys) are discarded
-STREAMS = {'event': 'events.jsonl', 'metric': 'metrics.jsonl', 'outcome': 'outcomes.jsonl'}
+# STREAMS is re-exported from contract.py (its canonical home); it used to be defined here.
 
 
 def encode_key(record_id: str) -> bytes:

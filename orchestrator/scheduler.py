@@ -4,8 +4,35 @@ from typing import Any
 from .history import bucket_complexity
 from .method import effort_levels
 from .records import is_no_data
+from .vocab import SCHEDULER_MIN_SAMPLES
+from .contract import MAX_LEADS
 
-EFFORTS=effort_levels()
+#: `EFFORTS` used to be computed at import time (`effort_levels()` reads `method.json`). Kept as a
+#: module attribute (some tests do `from orchestrator.scheduler import EFFORTS`), but resolved lazily
+#: on first access via `efforts()`/module `__getattr__` so `import orchestrator.scheduler` alone
+#: performs no file read.
+_EFFORTS: list[str] | None = None
+
+def efforts() -> list[str]:
+    global _EFFORTS
+    if _EFFORTS is None:
+        _EFFORTS = effort_levels()
+    return _EFFORTS
+
+def __getattr__(name: str):
+    if name == 'EFFORTS':
+        return efforts()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+#: Explicit so `from orchestrator.scheduler import *` (which uses `__all__` when present) still
+#: resolves `EFFORTS` through `__getattr__` above instead of silently dropping it: without an
+#: `__all__`, `import *` only takes names already in the module's `__dict__`, and `EFFORTS` is
+#: deliberately not one of those (see `efforts()`/`__getattr__` above) — B2 review finding.
+__all__ = [
+    'Any', 'ComputePackage', 'DEFAULT_PACKAGES', 'EFFORTS', 'MAX_LEADS', 'SCHEDULER_MIN_SAMPLES',
+    'asdict', 'bucket_complexity', 'dataclass', 'effort_levels', 'efforts', 'is_no_data',
+    'measured', 'package_history', 'recommend_package', 'topology_for',
+]
 
 
 def measured(value:Any)->Any:
@@ -41,7 +68,9 @@ def topology_for(complexity:float,coupling:float=.5,parallelizable:float=.5,risk
     if c<=3 or coupling>=.8: return {'depth':1,'leads':0,'workers':1,'shape':'direct'}
     if c<=6:
         workers=max(1,min(4,round(1+3*parallelizable))); return {'depth':2,'leads':1,'workers':workers,'shape':'single_lead'}
-    leads=max(2,min(4,round(2+2*parallelizable))); workers=max(leads,min(10,round(c*parallelizable+leads)))
+    # B4.7: MAX_LEADS (contract.json, currently 4) is the single source for this ceiling,
+    # shared with the TS bridge's config.ts maxLeads default.
+    leads=max(2,min(MAX_LEADS,round(2+2*parallelizable))); workers=max(leads,min(10,round(c*parallelizable+leads)))
     return {'depth':3 if c<9 else 4,'leads':leads,'workers':workers,'shape':'multi_lead'}
 
 def package_history(stats:list[dict], *, task_class:str, complexity:float, risk:str, package:dict)->dict|None:
@@ -60,7 +89,7 @@ def package_history(stats:list[dict], *, task_class:str, complexity:float, risk:
     return max(matches,key=lambda s:(measured(s.get('verified_tasks')) or 0,measured(s.get('samples')) or 0),default=None)
 
 
-def recommend_package(*,task_class:str,complexity:float,risk:str,quality_floor:float,cost_aggressiveness:float,stats:list[dict],min_samples:int=8)->dict[str,Any]:
+def recommend_package(*,task_class:str,complexity:float,risk:str,quality_floor:float,cost_aggressiveness:float,stats:list[dict],min_samples:int=SCHEDULER_MIN_SAMPLES)->dict[str,Any]:
     cb=bucket_complexity(complexity)
     candidates=[]
     for p in DEFAULT_PACKAGES:
@@ -72,14 +101,13 @@ def recommend_package(*,task_class:str,complexity:float,risk:str,quality_floor:f
         quality=(measured(hist.get('avg_quality_evidence')) if hist else None)
         delayed=(measured(hist.get('delayed_failure_rate')) if hist else None)
         # conservative priors; stronger packages get higher assurance prior, cheap packages lower cost prior
-        if cost is None: cost={'implementation_fast':.05,'implementation_strong':.12}[p.capability]*(1+EFFORTS.index(p.effort)*.18)
+        if cost is None: cost={'implementation_fast':.05,'implementation_strong':.12}[p.capability]*(1+efforts().index(p.effort)*.18)
         prior_q=.945 if p.capability=='implementation_fast' else .975
-        prior_q += max(0,EFFORTS.index(p.effort)-1)*.006
+        prior_q += max(0,efforts().index(p.effort)-1)*.006
         if quality is None: quality=prior_q
         if delayed is not None: quality=max(0.0,quality-delayed*.20)
         small_penalty=max(0,min_samples-samples)/min_samples*.025
         adjusted_quality=quality-small_penalty
-        cost_score=cost*(1.0+max(0,1-cost_aggressiveness)*.15)
         feasible=adjusted_quality>=quality_floor
         candidates.append({'package':asdict(p),'samples':round(samples,3),'estimated_verified_cost_usd':round(cost,6),'estimated_quality_evidence':round(adjusted_quality,4),'feasible':feasible,'historical':bool(hist)})
     feasible=[c for c in candidates if c['feasible']]

@@ -6,7 +6,8 @@
 the package's own runtime data files (`method.json`, `config.json`,
 `feature_schema.json`) read via `Path(__file__).with_name(...)` in
 `orchestrator/method.py`, `orchestrator/cli.py`, `orchestrator/dashboard.py`,
-`orchestrator/engine.py` and `orchestrator/pricing.py`. An installed wheel would
+`orchestrator/engine.py` and `orchestrator/pricing.py` — and `contract.json`, read the
+same way by `orchestrator/contract.py`. An installed wheel would
 therefore fail on import. These tests build a real wheel, inspect its contents,
 and install+import it from an isolated target directory.
 """
@@ -26,12 +27,16 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 #: Data files every currently-shipped module reads at import/run time via
 #: `Path(__file__).with_name(...)` (method.py, cli.py, dashboard.py, engine.py,
-#: pricing.py), plus feature_schema.json (the only other non-.py file in the
-#: package). If a new data file is added under `orchestrator/`, add it here too.
+#: pricing.py, contract.py), plus feature_schema.json (the only other non-.py file in the
+#: package) and presentation/dashboard_template.html (read lazily by
+#: `orchestrator.presentation.dashboard_html`, B3). If a new data file is added under
+#: `orchestrator/`, add it here too.
 REQUIRED_DATA_FILES = (
     "orchestrator/method.json",
     "orchestrator/config.json",
     "orchestrator/feature_schema.json",
+    "orchestrator/contract.json",
+    "orchestrator/presentation/dashboard_template.html",
 )
 
 
@@ -53,10 +58,10 @@ def _build_wheel(dest_dir: Path) -> Path:
     """Build a wheel for the repo into dest_dir, returning its path.
 
     Uses --no-build-isolation (no `build` module / network-isolated build env
-    available) and --ignore-requires-python, since the repo's
-    `requires-python = ">=3.10"` is unmet by the Python 3.9.6 interpreter this
-    suite runs under; that is a test-environment accommodation only, not a
-    metadata change.
+    available) and --ignore-requires-python for robustness across whichever
+    interpreter this suite runs under; `requires-python` matches the 3.9.6
+    interpreter this repo is developed and tested on, so the flag is normally a
+    no-op here.
     """
     result = subprocess.run(
         [

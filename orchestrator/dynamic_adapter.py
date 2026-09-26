@@ -38,7 +38,34 @@ from .method import adapter_tier_targets
 # Capability -> cost tier (cheapest|mid|expensive). Derived from the canonical
 # method file (orchestrator/method.json) so the Python resolver and the HT
 # bridge (models.ts) can never disagree on which tier a capability sits at.
-CAPABILITY_TIER_TARGET = adapter_tier_targets()
+#
+# Resolved lazily on first access (`_capability_tier_target()`, or the module attribute via
+# `__getattr__` below) so `import orchestrator.dynamic_adapter` alone performs no file read.
+_CAPABILITY_TIER_TARGET: dict[str, str] | None = None
+
+def _capability_tier_target() -> dict[str, str]:
+    global _CAPABILITY_TIER_TARGET
+    if _CAPABILITY_TIER_TARGET is None:
+        _CAPABILITY_TIER_TARGET = adapter_tier_targets()
+    return _CAPABILITY_TIER_TARGET
+
+def __getattr__(name: str):
+    if name == 'CAPABILITY_TIER_TARGET':
+        return _capability_tier_target()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+#: Explicit so `from orchestrator.dynamic_adapter import *` (which uses `__all__` when present)
+#: still resolves `CAPABILITY_TIER_TARGET` through `__getattr__` above instead of silently
+#: dropping it: without an `__all__`, `import *` only takes names already in the module's
+#: `__dict__`, and `CAPABILITY_TIER_TARGET` is deliberately not one of those (see
+#: `_capability_tier_target()`/`__getattr__` above) — B2 review finding.
+__all__ = [
+    'Any', 'CAPABILITY_TIER_TARGET', 'DISABLE_VALUES', 'EXCLUDED_MODEL_PREFIXES',
+    'MODEL_FAMILY_DEFAULT', 'MODEL_FAMILY_ENV_VAR', 'MODEL_FAMILY_PRESETS', 'Path',
+    'TIER_BOUNDARIES', 'adapter_tier_targets', 'argparse', 'defaultdict', 'is_excluded_model',
+    'json', 'load_catalog', 'load_ht_store', 'main', 'os', 'provider_for_model',
+    'resolve_adapter', 'resolve_model_family', 'resolve_models', 'sys', 'tier_for',
+]
 
 # Cost-tier thresholds (USD per million output tokens). Models below fall in
 # the cheapest bucket, above into expensive, the rest into mid. Calibrated to
@@ -355,7 +382,7 @@ def resolve_adapter(model_family: str | None = None) -> dict[str, dict[str, Any]
     chosen: dict[str, dict[str, Any]] = {}
     explanations: dict[str, list[str]] = {}
 
-    for cap, target_tier in CAPABILITY_TIER_TARGET.items():
+    for cap, target_tier in _capability_tier_target().items():
         m: dict[str, Any] | None = None
         effective_tier = target_tier
         notes: list[str] = []

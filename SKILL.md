@@ -52,7 +52,7 @@ Do not equate model strength with quality; evaluate the whole implementation + v
 
 The routing method — capability vocabulary, cost tiers, default efforts, role aliases and the three routing rules below — is defined **once** in `orchestrator/method.json`. The Python engine (`orchestrator/method.py`) and the HT bridge (`bridge/extensions/orchestrator/models.ts`, via a symlink to the same file) both read it, so the two runtimes cannot drift. **Edit `method.json` to change the method; the tables below are a human summary and must match it** (`tests/test_method.py` checks the thresholds quoted here). Lead agents follow these rules when dispatching review or exploration work; the dashboard tracks compliance. The rules were calibrated against the orchestrator's first 13 runs and validated against the metric stream.
 
-Runtime state — measured ROI, enforcement readiness, history — lives in `~/.local/state/coding-agent-orchestrator/policy_overlay.json` and is not part of the method.
+Runtime state — measured ROI, enforcement readiness, history — is derived on demand from the durable event/metric streams under `~/.local/state/coding-agent-orchestrator/` (see State, below); there is no separate rules/state overlay file, and none of this is part of the method.
 
 ### Rule 1: Review after a fix uses at least the original reviewer's tier
 
@@ -89,7 +89,7 @@ Rationale: `implementation_strong`-class tasks with 150K–400K input tokens cos
 
 ### Rule 3: Exploration uses the cheapest sufficient model
 
-Investigation, recon, and digest tasks go to the cheapest capability that can produce the needed evidence. The topology is one capable lead plus 3–5 parallel cheap recon workers. The lead synthesizes; the workers gather. Cost ceiling per recon: $0.50; the orchestrator flags any single exploration run that exceeds this.
+Investigation, recon, and digest tasks go to the cheapest capability that can produce the needed evidence. The topology is one capable lead plus 3–5 parallel cheap recon workers. The lead synthesizes; the workers gather. `method.json`'s `max_recon_cost_usd` ($0.50) documents an intended cost ceiling per recon, but nothing in `orchestrator/` or the bridge currently reads that field — it is advisory only, not enforced, and no run is flagged or stopped for exceeding it.
 
 | Task class | Worker capability | Lead capability |
 |---|---|---|
@@ -129,7 +129,7 @@ A dispatch on an `openai-codex/*` model that fails with a usage-limit, quota or 
 
 ### Compliance tracking
 
-The dashboard surfaces violations of these rules. `re_review_violations` lists every re-review call whose model tier falls below the policy floor. `recon_coverage` reports the fraction of high-complexity runs that used pre-implementation recon. `enforcement_readiness` tracks whether the orchestrator has gathered enough empirical data to flip `adaptive_routing` from `recommend` to `enforce`. Until enforcement is ready, the dashboard is the audit; after enforcement, the same policies gate every dispatch.
+The dashboard is the audit trail for these rules, though it does not yet report per-rule violation counts. `orchestrator/presentation/dashboard_data.py` currently surfaces: per-dispatch spend-cap breaches grouped by capability and model (`spend_caps`, with run verdicts); adaptive-routing health (`adaptive_decisions`, `adaptive_actions`, `exploration_rate_observed`, `history_sufficient_rate`); and lead cost/verification grouped by `lead_size`. There is no dedicated `re_review_violations`, `recon_coverage`, or `enforcement_readiness` metric — checking Rule 1/2 compliance today means reading the relevant rows out of the streams by hand. Until such per-rule metrics exist, the dashboard's adaptive and spend-cap panels are the closest thing to an audit; after they exist, the same policies can gate every dispatch.
 
 
 
@@ -211,7 +211,7 @@ Regenerate `~/.local/state/coding-agent-orchestrator/dashboard.html` after use. 
 
 To evaluate whether the orchestrator is earning its keep, run `scripts/skill_vs_baseline.py`. It reads `metrics.jsonl`, partitions orchestrated work from session-log ingests, reprices orchestrated records at flat single-model baselines, and reports cost, success rate, cost-per-success, retry rate, and waste — for the orchestrator and each bracket. The script is observational: it writes nothing to the stream and does not change the dashboard.
 
-The most recent calibrated numbers live in `policy_overlay.json` under `history.measured_performance` and are refreshed as new orchestrated runs are sampled. The durable finding as of the first measurement: the orchestrator's routing savings came from reviews routed to cheaper tiers paying for stronger implementers. That measurement predates the 2026-09-24 finding that a frontier lead doing its own implementation was 49% of orchestrated spend; treat `policy_overlay.json` `enforcement.measured_roi` as historical until it is re-measured on matched cohorts (plan Phase E).
+The most recent calibrated numbers come from re-running `scripts/skill_vs_baseline.py` against the current `metrics.jsonl`; there is no separate calibrated-numbers file to refresh. The durable finding as of the first measurement: the orchestrator's routing savings came from reviews routed to cheaper tiers paying for stronger implementers. That measurement predates the 2026-09-24 finding that a frontier lead doing its own implementation was 49% of orchestrated spend; treat any prior ROI figure as historical until it is re-measured on matched cohorts (plan Phase E).
 
 ## Safe defaults
 

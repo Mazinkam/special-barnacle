@@ -15,7 +15,8 @@ an append to that stream needs a separator. The ledger catches up to the complet
 event prefix even on an unrelated or duplicate-only batch. `settle_streams` runs
 the same durability step without records, for a reader (session ingestion) that
 must not trust un-fsynced bytes an interrupted append left behind. Dashboard
-rendering remains outside the writer lock. Public CLI/result/record formats are unchanged.
+rendering lives entirely outside this module (see `app.refresh.refresh_after_write`); this
+writer's own refresh is only the ledger catch-up. Public CLI/result/record formats are unchanged.
 """
 from __future__ import annotations
 
@@ -24,20 +25,30 @@ import os
 import secrets
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from .dashboard import generate_dashboard
-from .record_index import RecordIndex, STREAMS
-from .runtime import (RECORD_INDEX_FILE, default_attribution, default_state_root, encode_jsonl,
-                      fsync_directory, fsync_directory_ancestry, meter, utc_now, write_json, writer_lock)
+from .record_index import RecordIndex
+# core.fs/core.env/core.jsonl and records.metering, not runtime: this module is imported by
+# store.facade.EventStore, which orchestrator.runtime re-exports; importing runtime here would
+# cycle (see docs/architecture-review.md B2.2/B2.3).
+from .core.fs import RECORD_INDEX_FILE, fsync_directory, fsync_directory_ancestry, write_json, writer_lock
+from .core.env import default_attribution, default_state_root, utc_now
+from .core.jsonl import encode_jsonl
+from .records.metering import meter
 from .state import REDUCER_KEY_FIELDS, invalid_key_field, ledger_is_current, replay_ledger
+from .contract import (
+    MAX_BATCH_RECORDS,
+    MAX_RECORD_ID_LENGTH,
+    RETRY_SAME_IDS,
+    STATUS_CHECKPOINT_FAILED,
+    STATUS_OK,
+    STATUS_REFRESH_FAILED,
+    STREAMS,
+)
 
 FORMAT_VERSION = 1
 CHECKPOINT_FILE = RECORD_INDEX_FILE
-MAX_BATCH_RECORDS = 500
-MAX_RECORD_ID_LENGTH = 200
 RESERVED_KEYS = {'stream'}
-RETRY_SAME_IDS = 'same_ids'
 
 
 class BatchValidationError(ValueError):
@@ -152,12 +163,15 @@ def _append_stream(path: Path, lines: list[bytes], *, prefix: int, tail: str | N
 
 
 def _sync_pending(root: Path, index: RecordIndex, persisted: dict[str, int], pending: dict[str, list[bytes]],
-                  duplicates: dict[str, int]) -> list[str]:
+                  duplicates: dict[str, int], *, append: Callable[..., int] = _append_stream) -> list[str]:
     """Append `pending` lines and settle every stream whose complete prefix is not yet known durable.
 
     A stream needs a sync when it gets new lines, when a duplicate-only retry may be re-acknowledging
     bytes whose fsync failed, when bytes appeared since the last commit (`size != durable_size`) or
     when a complete object still lacks its newline. Returns the streams that were touched.
+
+    `append` defaults to the real `_append_stream` and is otherwise identical to it; tests inject a
+    fault by passing a callable with the same signature instead of patching the private function.
     """
     touched: list[str] = []
     for stream, lines in pending.items():
@@ -166,7 +180,7 @@ def _sync_pending(root: Path, index: RecordIndex, persisted: dict[str, int], pen
         if not needs_sync:
             continue
         try:
-            entry['size'] = _append_stream(path, lines, prefix=entry['size'], tail=entry['tail'])
+            entry['size'] = append(path, lines, prefix=entry['size'], tail=entry['tail'])
         except OSError as exc:
             raise BatchAppendError(f'append/fsync of {STREAMS[stream]} failed after persisting {persisted}: {exc}', persisted) from exc
         persisted[stream] = len(lines)
@@ -187,7 +201,7 @@ def settle_streams(root: str | Path | None, *, lock: bool = True) -> dict[str, A
     """
     root = Path(root) if root is not None else default_state_root()
     root.mkdir(parents=True, exist_ok=True)
-    status = 'ok'; error: str | None = None; touched: list[str] = []
+    status = STATUS_OK; error: str | None = None; touched: list[str] = []
     with writer_lock(root) if lock else contextlib.nullcontext():
         try:
             fsync_directory_ancestry(root)
@@ -200,19 +214,29 @@ def settle_streams(root: str | Path | None, *, lock: bool = True) -> dict[str, A
                 try:
                     _write_checkpoint(root, index)
                 except (OSError, sqlite3.Error) as exc:
-                    status = 'checkpoint_failed'
+                    status = STATUS_CHECKPOINT_FAILED
                     error = f'checkpoint write failed after the streams were made durable: {exc}; the next write rebuilds the index'
     return {'ok': error is None, 'status': status, 'settled': touched, 'error': error}
 
 
-def write_batch(root: str | Path | None, records: Any, *, config: dict | None = None, refresh: bool = True,
-                lock: bool = True) -> dict[str, Any]:
+def write_batch(root: str | Path | None, records: Any, *, refresh: bool = True,
+                lock: bool = True, append_stream: Callable[..., int] | None = None) -> dict[str, Any]:
     """Durably append once per ID; report derived-state failure with same-ID retry guidance.
+
+    `refresh=True` (the default) catches the ledger up to the complete durable event prefix
+    before returning; it is the only refresh this function does. Publishing the dashboard is an
+    app-layer decision made afterwards, from this result, by `app.refresh.refresh_after_write` —
+    this module never imports the presentation layer, at module scope or otherwise.
 
     `lock=False` is for a caller that already holds `writer_lock(root)` and must keep its own
     check/append/checkpoint sequence under that one lock (session ingestion). `flock` is per open
-    file description, so re-acquiring here would deadlock. Such a caller refreshes afterwards,
-    outside its lock: the dashboard render never runs under the writer lock.
+    file description, so re-acquiring here would deadlock; the ledger catch-up above runs fine
+    under the caller's own lock instead.
+
+    `append_stream` defaults to the real durable append (`None` means "use `_append_stream`") and
+    is otherwise call-compatible with it; a test injects an append failure (or any other fault) by
+    passing a callable here instead of `mock.patch`-ing the private function (B5,
+    `docs/architecture-review.md`).
     """
     if not lock and refresh:
         raise ValueError('write_batch(lock=False) requires refresh=False; refresh the ledger/dashboard after releasing the lock')
@@ -221,7 +245,7 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
     root.mkdir(parents=True, exist_ok=True)  # the lock file lives inside; durability of the chain is settled under the lock
     persisted = _counts(); duplicates = _counts(); statuses: list[dict[str, Any]] = []
     built: list[dict[str, Any]] = []
-    ledger_updated = False; dashboard_updated = False; error: str | None = None; status = 'ok'
+    ledger_updated = False; dashboard_updated = False; error: str | None = None; status = STATUS_OK
     with writer_lock(root) if lock else contextlib.nullcontext():
         try:
             # Existence is not durability: whoever created these directories (this call, a concurrent
@@ -249,14 +273,14 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
                     statuses.append({'record_id': record_id, 'stream': stream, 'status': 'persisted'})
             except sqlite3.Error as exc:
                 raise BatchAppendError(f'index lookup failed before appending: {exc}', _counts()) from exc
-            _sync_pending(root, index, persisted, pending, duplicates)
+            _sync_pending(root, index, persisted, pending, duplicates, append=append_stream or _append_stream)
             try:
                 for stream, ids in new_ids.items():
                     for record_id in ids:
                         index.add(stream, record_id)
                 _write_checkpoint(root, index)
             except (OSError, sqlite3.Error) as exc:
-                status = 'checkpoint_failed'
+                status = STATUS_CHECKPOINT_FAILED
                 error = (f'checkpoint write failed after the records were durably appended: {exc}; '
                          f'retry with the same record ids to rebuild the index and refresh the ledger')
             if refresh and error is None:
@@ -265,13 +289,7 @@ def write_batch(root: str | Path | None, records: Any, *, config: dict | None = 
                         replay_ledger(root)
                         ledger_updated = True
                 except Exception as exc:  # noqa: BLE001 - records are already durable
-                    status = 'refresh_failed'; error = f'ledger refresh failed: {exc}'
-    if refresh and error is None:
-        try:
-            generate_dashboard(root, config=config)
-            dashboard_updated = True
-        except Exception as exc:  # noqa: BLE001 - records are already durable
-            status = 'refresh_failed'; error = f'dashboard refresh failed: {exc}'
+                    status = STATUS_REFRESH_FAILED; error = f'ledger refresh failed: {exc}'
     return {
         'ok': error is None, 'status': status, 'format_version': FORMAT_VERSION,
         'persisted': persisted, 'duplicates': duplicates, 'ledger_updated': ledger_updated,

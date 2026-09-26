@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -85,8 +84,16 @@ def test_legacy_batch_crash_retry_dashboard_and_active_diagnostics(tmp_path, cra
 import json, os, sys
 from orchestrator import record_batch
 def crash(*args, **kwargs): os._exit(19)
-setattr(record_batch, sys.argv[2], crash)
-record_batch.write_batch(sys.argv[1], json.loads(sys.stdin.read()))
+target = sys.argv[2]
+if target == 'generate_dashboard':
+    from orchestrator.app import refresh as refresh_module
+    setattr(refresh_module, target, crash)
+else:
+    setattr(record_batch, target, crash)
+result = record_batch.write_batch(sys.argv[1], json.loads(sys.stdin.read()))
+if target == 'generate_dashboard':
+    from orchestrator.app.refresh import refresh_after_write
+    refresh_after_write(sys.argv[1], result)
 '''
     crashed = subprocess.run([sys.executable, '-B', '-c', program, str(tmp_path), crash_at],
                              input=json.dumps(records), env=cli_env(tmp_path), cwd=REPO,

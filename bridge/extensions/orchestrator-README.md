@@ -17,7 +17,7 @@ After install, restart HT (or `/reload`):
 
 ```
 /reload
-/orchestrate [flags] <goal> [flags]   # e.g. <goal> [--task-class T] [--complexity N] [--risk R] [--cheap P/M] [--mid P/M] [--premium P/M] [--model cap=P/M] [--max-retries N] [--interactive]
+/orchestrate [flags] <goal> [flags]   # e.g. <goal> [--task-class T] [--complexity N] [--risk R] [--cheap P/M] [--mid P/M] [--premium P/M] [--model cap=P/M] [--max-retries N] [--interactive] [--context FILE] [--with-last-reply] [--force]
 /orchestrator-models [list|set|use|pick|validate --live]
 /orchestrator-roi
 ```
@@ -64,6 +64,66 @@ Show ROI anytime:
 /orchestrator-roi
 ```
 
+## Providing context
+
+Dispatched agents run headless, on the goal string plus whatever the plan/architect/lead
+prompts add — they have no access to the rest of your chat. A goal like `"do A then C then
+B"` or `"implement option 2 from the above"` means nothing to them unless you attach the
+material it refers to:
+
+```
+/orchestrate "do A then C then B" --context docs/plan.md --context notes.txt
+/orchestrate "implement option 2 from the above" --with-last-reply
+```
+
+- `--context <file>` (repeatable, at most 16 per run — a hard count cap enforced before any
+  file is opened; more fails fast with a clear error) reads the file (path resolved against the
+  run's cwd) and inserts it into the architect and lead prompts under `## Provided context`, one
+  sub-block per file, each capped at 40,000 characters with an explicit truncation note if it is
+  cut. A missing or unreadable file stops the command with a clear error — no run is started.
+  Every path component on the way to the file — not just its immediate containing directory — is
+  checked and rejected if it is a symlink, so a symlink several directories up
+  (`docs/link/sso/x.json` with `docs/link -> ~/.aws`) is caught the same as a symlinked immediate
+  parent or the file itself; pass the target path directly instead. The trust anchor for that
+  walk is the run's cwd (when the file is inside it), else the real home directory (when it is
+  inside that), else the file's own top-level directory (`/tmp`, `/var`, ...) — resolved once via
+  `realpath` so a symlinked top-level directory (macOS's `/tmp` → `/private/tmp`, `/var` →
+  `/private/var`) is tolerated without weakening the check on everything below it. Only regular
+  files are accepted; a FIFO, device file, or directory is rejected with a clear message instead.
+  Binary content (a NUL byte, or bytes that are not valid UTF-8) is rejected: this is a
+  text-attachment mechanism, not a general file upload. At most 160,000 bytes of any single file
+  is ever read off disk (truncated with a note reserved inside the 40,000-character cap above, so
+  the note itself is never the thing that gets cut off), and the aggregate **rendered** size of
+  the whole `## Provided context` block — labels, `<provided-context>` wrappers, and notes
+  included, not just raw file content — is capped at 160,000 characters: sources are read and
+  rendered one at a time, in order, and as soon as one would not fit in what is left, reading
+  stops entirely (no later `--context` file is even opened) and everything from that point on is
+  folded into one collapsed notice naming how many attachments were skipped. *Residual race*: Node
+  has no `openat`, so the symlink checks above and the `open()` that follows them are necessarily
+  separate syscalls — a directory component could in principle be swapped for a symlink in the
+  narrow instant between the last check and the open; a post-open re-verification narrows this
+  window but cannot close it entirely.
+- `--with-last-reply`: attaches the current session's last assistant message the same way,
+  labelled `last assistant reply`. Stops with an error if the session has no assistant message
+  yet.
+- Before triage, a short goal (under ~200 characters) that looks like it refers to something
+  outside itself — a standalone letter (`do A then C`), `option N`, `the above`, `as discussed`,
+  `that plan` — is refused with a message pointing at `--context`/`--with-last-reply`/`--force`,
+  instead of dispatching a run that will just block on missing context. Pass `--force` to skip
+  this check (e.g. for a goal that only looks like a reference but genuinely is not one).
+- Every attached source's path is redacted before it is put in front of a model (the label, and
+  the file's own body text — an attachment can just as easily contain the operator's home
+  directory as its filename can), and each source is wrapped in a
+  `<provided-context source="...">...</provided-context>` delimiter, with a header stating
+  explicitly that the block is reference material supplied by the user, not directives from the
+  orchestrator — so a `--context` file (or the last assistant reply) cannot pose as an
+  instruction a lead or the architect should follow.
+- Attached content is sent to whichever model providers are configured for this run (same as
+  the goal and every other part of the prompt), and is retained in this run's local prompt
+  diagnostics (`*.prompt.md`, written mode `0600`) for later inspection. That diagnostic copy is
+  path-redacted, the same as the prompt itself, but is **not** secret-scrubbed — don't attach a
+  file containing credentials, tokens, or other secrets.
+
 ## How it works
 
 1. `/orchestrate` spawns `python3 -m orchestrator.cli plan <args>` to get a `PlanResponse` (topology + selected/recommended route + quality floor).
@@ -76,10 +136,8 @@ Show ROI anytime:
    Leads may still use HT's `subagent` tool for implementation and review fan-out. Those nested children run inside the lead's own context window and are **not** part of this run's authoritative worker accounting: only the parent-owned recon workers above are counted as workers. Their reported cost is still billed: the bridge reads `details.results[].usage.cost` from the lead's `subagent` tool events (`nested-cost.ts`), adds it to the lead's spend-cap total as it grows, shows it in the widget, and includes it in the run's `total cost` (reported separately as "of it in lead subagents"). Leads do not dispatch `orch-qa-agent`; final QA is step 5. The `orchestrator-lead` persona therefore forbids leads from dispatching their own `orch-scout` recon round — that would pay for Rule-2 recon twice, invisibly — and `index.test.ts` ("lead persona recon contract") guards the instruction against regression.
 5. After leads finish, the extension runs `orch-qa-agent` against the union of changed files. Verdict is PASS or FAIL based on parsing `FAIL`/`✗`/`failed` markers from QA output. Every lead report ends with `STATUS: completed|partial|blocked`: if every lead is blocked the run is **BLOCKED** and QA does not run. If every lead reports `Files Changed: None`, files git shows as changed during the run are treated as another session's edits (`external_changes_detected`) and excluded from QA.
 6. On FAIL, escalate per `orchestrator/method.json` Rule 1 (`rules.review_after_fix`): re-dispatch reviews at bumped tier (mid → premium for re-reviews; never stay at cheap on retry). Bounded by `--max-retries` (default 2).
-7. Every dispatch writes two records back via `python3 -m orchestrator.cli metric`:
-   - `model_call`: the actual model call with tokens + cost. `cost_source: reported` if HT reported a non-zero cost, otherwise `estimated-from-reported-tokens`.
-   - `route_executed`: joins the executed model/cost with the plan-time recommendation. Closes the (recommended, executed, observed) triple so the skill's history can learn from real outcomes.
-8. Final summary surfaced via `ctx.ui.notify` and appended to `outcomes.jsonl` via `cli outcome`. `total cost` covers every dispatch the run paid for — triage, architect, recon workers, leads, QA, and escalations — with each result counted once, and a dedicated `recon workers: N/M completed · $cost` line names any failed recon worker with a summarized diagnostic.
+7. Every dispatch queues two records — `recordModelCall` (`model_call`: the actual model call with tokens + cost, `cost_source: reported` if HT reported a non-zero cost, otherwise `estimated-from-reported-tokens`; and `route_executed`, joining the executed model/cost with the plan-time recommendation so the skill's history can learn from real outcomes) via `recordEvent`/`recordModelCall`/`recordOutcome` (`adapters/telemetry.ts`), which enqueue onto a shared `RecordQueue` (`record-queue.ts`) instead of writing directly. Writes do **not** go through `cli metric` per record: the queue stamps a stable `record_id`, batches enqueued rows, and flushes them together via a single `python3 -m orchestrator.cli batch -` call (`runBatch` in `index.ts`) — turning what used to be one Python process per event/metric/outcome into a handful of batch calls per run. A flush fires when the coalescing window elapses (`flushDelayMs`, `HUMAIN_ORCHESTRATOR_TELEMETRY_FLUSH_MS`, default 500ms), when `maxBatch` records are pending (`HUMAIN_ORCHESTRATOR_TELEMETRY_BATCH`, default 100, capped by the Python side's `MAX_BATCH_RECORDS` of 500), or when the caller asks for it directly (run completion, cancellation, crash, session shutdown). Terminal writes (a run's outcome row) are awaited so they are durable before the run reports itself finished. A batch failure is retried per the CLI's exit-code contract (invalid records are re-sent individually; append/refresh/ambiguous failures replay the same ids); after the retry budget is exhausted the failure is surfaced via `onError`, which logs a `[orchestrator] ...` console warning and appends a `telemetry: ...` line to the active run's session log — it is never silently dropped.
+8. Final summary surfaced via `ctx.ui.notify` and appended to `outcomes.jsonl` via the same batch queue (`recordOutcome`). `total cost` covers every dispatch the run paid for — triage, architect, recon workers, leads, QA, and escalations — with each result counted once, and a dedicated `recon workers: N/M completed · $cost` line names any failed recon worker with a summarized diagnostic.
 
 ## Model binding
 
@@ -265,4 +323,4 @@ generic QA gate has passed. Off by default; unaffected unless explicitly request
 - It does not build a real-time HT-side dashboard view. The HTML dashboard at `~/.local/state/coding-agent-orchestrator/dashboard.html` is still canonical.
 - It does not wire shadow routing to emit per-call counterfactuals. The plan-time `adaptive_route_decision` event already carries `recommended_estimated_*`, but per-call comparison still relies on retrospective `skill_vs_baseline.py` repricing — improved now by the `route_executed` events this extension emits.
 - It reads the routing rules from `orchestrator/method.json` (symlinked into the extension dir) and does not re-derive them — the Python skill's `engine.plan_run()` already does that, and the extension trusts the routing it gets back.
-- It does not write persistent orchestrator state itself. The Python `EventStore` does that via `cli metric`/`cli outcome` — the extension only bridges.
+- It does not write persistent orchestrator state itself. The Python `EventStore` does that via `cli batch -` (a batched write of queued event/metric/outcome records; see the telemetry batch-queue description above) — the extension only bridges.

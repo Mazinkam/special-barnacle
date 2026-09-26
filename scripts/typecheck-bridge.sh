@@ -20,7 +20,7 @@
 #   1  type errors found  -> a real failure, fix the code
 #   2  cannot run here    -> environment incomplete, report as SKIPPED not FAIL
 #
-# Scope: bridge/extensions/orchestrator/*.ts by default. Pass --all to check
+# Scope: bridge/extensions/orchestrator/**/*.ts by default. Pass --all to check
 # every bridge/**/*.ts, which is the scope the README's "Before release" gate
 # refers to. Both are expected at zero diagnostics.
 #
@@ -46,7 +46,7 @@ TARGET_DIR="$REPO_ROOT/bridge/extensions/orchestrator"
 if [ "$scope" = "all" ]; then
 	INCLUDE_GLOB="$REPO_ROOT/bridge/**/*.ts"
 else
-	INCLUDE_GLOB="$TARGET_DIR/*.ts"
+	INCLUDE_GLOB="$TARGET_DIR/**/*.ts"
 fi
 
 # --- locate the installed HT workspace ---------------------------------------

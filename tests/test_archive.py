@@ -315,7 +315,7 @@ class FailureTests(ArchiveFixture):
 
     def test_verification_failure_keeps_raw_and_writes_no_archive(self):
         d = self.completed_run(); before = snapshot(d)
-        with patch.object(archive, '_decompressed_digest', return_value=('0' * 64, 0)):
+        with patch.object(archive.execute, '_decompressed_digest', return_value=('0' * 64, 0)):
             entry = self.by_run(self.execute())['old-done']
         self.assertEqual(entry['status'], 'failed')
         self.assertTrue(all(f['reason'] == 'verification_failed' for f in entry['files']))
@@ -337,7 +337,7 @@ class FailureTests(ArchiveFixture):
     def test_file_appended_during_compression_is_not_replaced(self):
         d = self.completed_run(); name = 'old-done-lead-0.events.jsonl'; target = d / name
         original = target.read_bytes()
-        real = archive._compress_to_temp
+        real = archive.execute._compress_to_temp
 
         def racing(src, *a, **k):
             result = real(src, *a, **k)
@@ -346,7 +346,7 @@ class FailureTests(ArchiveFixture):
                 set_age(target, 40)
             return result
 
-        with patch.object(archive, '_compress_to_temp', racing):
+        with patch.object(archive.execute, '_compress_to_temp', racing):
             entry = self.by_run(self.execute())['old-done']
         f = next(x for x in entry['files'] if x['name'] == name)
         self.assertEqual((f['status'], f['reason']), ('skipped', 'modified_during_archive'))
@@ -358,13 +358,13 @@ class FailureTests(ArchiveFixture):
     def test_second_archiver_waits_for_the_first(self):
         self.completed_run()
         entered = threading.Event(); release = threading.Event(); order = []
-        real = archive._compress_to_temp
+        real = archive.execute._compress_to_temp
 
         def slow(src, *a, **k):
             entered.set(); release.wait(5); return real(src, *a, **k)
 
         def first():
-            with patch.object(archive, '_compress_to_temp', slow): order.append(('first', self.execute()))
+            with patch.object(archive.execute, '_compress_to_temp', slow): order.append(('first', self.execute()))
 
         t = threading.Thread(target=first); t.start(); self.assertTrue(entered.wait(5))
         t2 = threading.Thread(target=lambda: order.append(('second', self.execute()))); t2.start()
@@ -417,25 +417,6 @@ class RestoreTests(ArchiveFixture):
         self.execute(); archive.restore_run(self.root, 'old-done'); self.execute(); archive.restore_run(self.root, 'old-done')
         self.assertEqual({name: (d / name).read_bytes() for name in originals}, originals)
         self.assertTrue((d / archive.MANIFEST_FILE).exists())
-
-
-class LocateTests(ArchiveFixture):
-    def test_locate_reports_readable_archived_and_missing_paths(self):
-        d = self.completed_run()
-        readable = archive.locate_run_file(self.root, 'old-done', 'run.log')
-        self.assertEqual(readable['status'], 'readable'); self.assertEqual(readable['path'], str(d / 'run.log'))
-        self.execute()
-        self.assertEqual(archive.locate_run_file(self.root, 'old-done', 'lead-report.md')['status'], 'readable')
-        (d / 'lead-report.md').unlink()  # legacy raw-absent archive
-        archived = archive.locate_run_file(self.root, 'old-done', 'lead-report.md')
-        self.assertEqual(archived['status'], 'archived'); self.assertEqual(archived['archive'], str(d / 'lead-report.md.gz'))
-        self.assertIn('restore-run old-done', archived['restore_command']); self.assertIn('lead-report.md.gz', archived['message']); self.assertIn('restore-run old-done', archived['message'])
-        self.assertEqual(archive.locate_run_file(self.root, 'old-done', 'run.log')['status'], 'readable', 'the progress-board log path still works')
-        missing = archive.locate_run_file(self.root, 'old-done', 'never.txt')
-        self.assertEqual(missing['status'], 'missing'); self.assertIn('never.txt', missing['message'])
-        by_path = archive.locate_path(self.root, d / 'lead-report.md')
-        self.assertEqual(by_path['status'], 'archived')
-        self.assertEqual(archive.locate_path(self.root, self.root / 'events.jsonl')['status'], 'readable')
 
 
 class CliTests(ArchiveFixture):

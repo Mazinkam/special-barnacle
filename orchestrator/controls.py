@@ -1,5 +1,27 @@
+"""Feature-driven control decisions: public API.
+
+Every function here is a pure decision derived from a `features` config dict plus a small amount
+of call/task state; none of them mutate config or have side effects. This module is exercised
+directly by `tests/test_v3_features.py` and is safe to import from other modules that need one of
+these decisions without pulling in `engine`. B3 (`docs/architecture-review.md`) considered
+merging it elsewhere, but nothing else in the tree imports it, so it stays a standalone module
+rather than being folded into a layer it doesn't share a caller with; see the B3 task report for
+this note.
+
+Exports:
+- `stop_loss_action(*, features, actual_cost=0.0, expected_cost=None, retries=0,
+  elapsed_minutes=None) -> str` -- 'continue' or 'replan'.
+- `promotion_action(*, features, conceptual_failures=0, mechanical_failures=0) -> str`.
+- `independent_review_required(*, features, risk, sampled=False) -> bool`.
+- `verification_plan(*, features, risk) -> dict[str, bool]`.
+- `specialized_reviews(*, features, risk, tags=None) -> list[str]`.
+- `approval_for(*, features, action) -> str`.
+- `budget_action(*, features, spent, budget) -> str`.
+"""
 from __future__ import annotations
 from typing import Any
+
+from .vocab import HIGH_RISK
 
 
 def stop_loss_action(*, features:dict[str,Any], actual_cost:float=0.0, expected_cost:float|None=None,
@@ -25,7 +47,7 @@ def promotion_action(*, features:dict[str,Any], conceptual_failures:int=0, mecha
 def independent_review_required(*, features:dict[str,Any], risk:str, sampled:bool=False)->bool:
     mode=features.get('independent_review',{}).get('mode','off')
     if mode=='always': return True
-    if mode=='risk_based': return risk in {'high','critical'}
+    if mode=='risk_based': return risk in HIGH_RISK
     if mode=='sampled': return bool(sampled)
     return False
 
@@ -37,7 +59,7 @@ def verification_plan(*, features:dict[str,Any], risk:str)->dict[str,bool]:
         if state=='on': out[key]=True
         elif state=='off': out[key]=False
         else:
-            out[key] = key not in {'full_test_suite'} or risk in {'high','critical'}
+            out[key] = key not in {'full_test_suite'} or risk in HIGH_RISK
             if key=='integration_tests': out[key]=risk in {'medium','high','critical'}
     return out
 
@@ -47,7 +69,7 @@ def specialized_reviews(*, features:dict[str,Any], risk:str, tags:set[str]|None=
     triggers={'security':{'security','auth','authorization','secrets'},'performance':{'performance','latency','memory'},
               'migration':{'migration','database','schema'},'api_contract':{'api','public_api','contract'}}
     for name,state in cfg.items():
-        if state=='on' or (state=='adaptive' and (risk in {'high','critical'} or bool(tags & triggers.get(name,set())))):
+        if state=='on' or (state=='adaptive' and (risk in HIGH_RISK or bool(tags & triggers.get(name,set())))):
             chosen.append(name)
     return chosen
 

@@ -27,7 +27,7 @@
  * skill's history has (recommended, executed, observed) triples to learn from.
  */
 
-import { RunDiagnostics, appendDiagnosticPath, type DiagnosticWriter } from "./run-diagnostics.ts";
+import { RunDiagnostics, type DiagnosticWriter } from "./run-diagnostics.ts";
 import { runLiveQaStage, type RunLiveQaStageResult } from "./live-qa-stage.ts";
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
@@ -115,7 +115,7 @@ import {
 	readStderrFileBounded,
 	summarizeStderr,
 	trimEventForLog,
-} from "./dispatch-outcome.ts";
+} from "./dispatch/stderr-sink.ts";
 import {
 	DispatchProgressTracker,
 	ORCHESTRATING_CAPABILITIES,
@@ -342,16 +342,6 @@ export function guardChildStreamHandler(
 		} catch {
 			/* the stream listener must never throw */
 		}
-	}
-}
-
-/** Write a JSONL event while omitting recursively repeated worker histories. */
-export function appendTrimmedEventLog(eventsLog: string | undefined, event: unknown): void {
-	if (!eventsLog) return;
-	try {
-		appendDiagnosticPath(eventsLog, `${JSON.stringify(trimEventForLog(event))}\n`);
-	} catch {
-		/* per-dispatch diagnostics must not disrupt the child stream */
 	}
 }
 

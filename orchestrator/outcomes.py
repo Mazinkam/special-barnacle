@@ -1,14 +1,17 @@
 from __future__ import annotations
+import functools
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
 from typing import Iterable
 from .runtime import default_state_root, iter_jsonl
+from .contract import STREAMS
+from .vocab import parse_iso_ts
 
-def _dt(s):
-    try: return datetime.fromisoformat(s.replace('Z','+00:00'))
-    except Exception: return None
+#: `outcomes.py`'s historical `_dt`: no falsy guard, no `str()` coercion — see
+#: `vocab.parse_iso_ts`'s docstring for exactly how this differs from run_evidence's.
+_dt = functools.partial(parse_iso_ts, coerce_str=False)
 
 #: Keys that make an outcome "bad". `major_rewrite` and `incident` are historical additions from
 #: two different call sites (outcome_summary and history.build_route_stats respectively); both are
@@ -70,7 +73,7 @@ def bad_signal(row: dict) -> bool:
 def outcome_summary(root=None, rows:Iterable[dict]|None=None):
     """Per-task delayed-outcome maturity. Pass `rows` to reuse outcomes a caller already streamed."""
     if rows is None:
-        root=Path(root) if root is not None else default_state_root(); rows=iter_jsonl(root/'outcomes.jsonl')
+        root=Path(root) if root is not None else default_state_root(); rows=iter_jsonl(root/STREAMS['outcome'])
     by=defaultdict(list)
     for r in rows:
         if r.get('task_id'): by[r['task_id']].append(r)
