@@ -87,10 +87,15 @@ def cost_class(row: dict) -> str:
     # Older HT bridges labelled a zero placeholder as an estimate before pricing it.
     if source == 'estimated-from-reported-tokens' and not row.get('cost_rate_model') and row_cost(row) == 0:
         return UNMETERED
+    # Explicitly "unknown" provenance (e.g. Forge live-QA's app-under-test cost query failing) is
+    # never spend, however `cost_usd` happens to be populated: unknown means unmeasured, not free
+    # and not estimated.
+    if source.startswith('unknown'):
+        return UNMETERED
     if 'estimat' in source or 'blended' in source or 'derived' in source: return ESTIMATED if measured else UNMETERED
-    if source in {'reported','provider','provider_reported','provider-reported','metered','measured','actual'}:
+    if source in {'reported','provider','provider_reported','provider-reported','metered','measured','actual'} or source.startswith('reported'):
         return REPORTED if measured else UNMETERED
-    if 'not_metered' in source or 'not-metered' in source or 'unmetered' in source or 'unknown' in source:
+    if 'not_metered' in source or 'not-metered' in source or 'unmetered' in source:
         return ESTIMATED if row_cost(row)>0 else UNMETERED
     return ESTIMATED if row_cost(row)>0 else UNMETERED
 
@@ -516,6 +521,7 @@ STREAM_ROLE_ALIASES = frozenset({
     'lead', 'architect', 'technical_lead',
     'implementation_fast', 'implementation_strong', 'implementer', 'scout',
     'technical_review', 'security_review', 'qa_agent', 'qa', 'qa_worker', 'reviewer',
+    'live_qa', 'live_qa_app',
 })
 
 #: Work that is neither coordination nor verification: it *is* the product. Checked first so a name
@@ -542,7 +548,7 @@ def _role_kind(name: Any) -> str | None:
     # `lead_small` / `lead_large` are the triage lead sizes (method.json rules.lead_sizing).
     if key in {'lead', 'architect', 'technical_lead'} or key.endswith('_lead') or key.startswith('lead_'):
         return COORDINATION
-    if key in {'qa', 'qa_agent', 'qa_worker', 'reviewer', 'verifier'}:
+    if key in {'qa', 'qa_agent', 'qa_worker', 'reviewer', 'verifier', 'live_qa', 'live_qa_app'}:
         return VERIFICATION
     if key.endswith('review') or key.endswith('reviewer') or key.endswith('verifier'):
         return VERIFICATION

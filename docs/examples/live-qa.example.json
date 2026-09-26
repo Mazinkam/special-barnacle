@@ -1,0 +1,19 @@
+{
+	"version": 1,
+	"adapters": [
+		{
+			"id": "forge-focused",
+			"kind": "forge-qa",
+			"trusted": true,
+			"runner_cwd": "/absolute/path/to/your/forge/checkout",
+			"argv_prefix": ["bun", "qa"],
+			"flow": "focused",
+			"budget_minutes": 30,
+			"runtime": "codex",
+			"model": "terra",
+			"effort": "medium",
+			"local": true,
+			"required": true
+		}
+	]
+}

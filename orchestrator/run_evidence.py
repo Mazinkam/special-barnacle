@@ -143,6 +143,44 @@ def _is_run_scoped(row: dict) -> bool:
     return row.get('verification_scope') == 'run' or tid in TERMINAL_OUTCOME_TASKS or tid.endswith('-qa')
 
 
+#: Phase 3 opt-in Forge live-QA verification stage. Its outcomes row carries `task_id` ending in
+#: `-live-qa-stage`, deliberately NOT `-qa`, so `_is_run_scoped` never mistakes it for the bridge's
+#: generic `${run}-qa` gate row (see `model_comparison._is_run_scoped_outcome` for the mirrored
+#: check on that side).
+LIVE_QA_SCOPE = 'live_qa'
+
+
+def _is_live_qa_scoped(row: dict) -> bool:
+    return row.get('verification_scope') == LIVE_QA_SCOPE
+
+
+def _live_qa_evidence(o: dict) -> dict[str, Any]:
+    """Normalize one run's live-QA outcome row into its own evidence item.
+
+    Deliberately NOT joined into the ordinary per-task `verifications`/`outcome_tasks` population:
+    a passed live-QA stage must not by itself flip a run's generic verdict to 'passed' when the
+    run-complete/generic gate says otherwise, and an 'unavailable' stage (the runner could not run)
+    must never read as verified — it is unverified evidence, not a quality verdict. `records.
+    verification_evidence` already agrees: 'unavailable' is not a recognised verdict spelling, so it
+    resolves to `NO_VERIFICATION` rather than a pass or a fail, exactly the reading this stage needs.
+    """
+    findings = o.get('findings')
+    artifacts = o.get('artifacts')
+    return {
+        'outcome': o.get('outcome'),
+        'evidence_status': o.get('evidence_status'),
+        'verdict': o.get('live_qa_verdict'),
+        'tested_revision': o.get('tested_revision'),
+        'tested_tree': o.get('tested_tree'),
+        'checkpoint': o.get('checkpoint'),
+        'session_id': o.get('session_id'),
+        'findings_count': len(findings) if isinstance(findings, list) else None,
+        'artifacts_count': len(artifacts) if isinstance(artifacts, list) else None,
+        'required': o.get('required'),
+        'outcome_finality': o.get('outcome_finality'),
+    }
+
+
 def _checks_factually_verified(checks: list) -> bool:
     """At least one parsed QA check actually ran to a `pass`/`fail` verdict — not merely `skipped`
     or `unavailable` (Phase 1 review finding T8).
@@ -349,6 +387,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
     delayed_bad: dict[str, bool] = defaultdict(bool)
     outcome_tasks: dict[str, set[str]] = defaultdict(set)
     verification_evidence: dict[str, dict[str, Any]] = {}
+    live_qa_evidence: dict[str, dict[str, Any]] = {}
     for o in unique_records(outcomes):
         rid = o.get('run_id')
         if rid is None: continue
@@ -358,6 +397,12 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
             status[rid] = TERMINAL_OUTCOME_TASKS[tid]
             terminal[rid] = {**terminal.get(rid, {}), **{k: v for k, v in _terminal_fields(o).items() if v is not None}}
             summary_note[rid] = _note_json(o.get('note'))
+            continue
+        if _is_live_qa_scoped(o):
+            # Its own evidence item (see `_live_qa_evidence`), never joined into the ordinary
+            # per-task verification population below: a live-QA verdict alone must not move the
+            # run's generic `verification`/`verified_tasks` result.
+            live_qa_evidence[rid] = _live_qa_evidence(o)
             continue
         outcome_tasks[rid].add(tid)
         if tid.endswith('-qa') or o.get('verification') is not None:
@@ -417,9 +462,45 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
         note = summary_note.get(rid, {})
         if retries == 0 and _int_or_none(note.get('retries')): retries = int(note['retries'])
         verdict = verification.get(rid)
+        generic_verdict = verdict
+        task_level_failed = any(not _verification_passed(v) for v in latest_verification.values())
+        terminal_says_failed = note.get('verification_passed') is False
+        # T2: a terminal run-complete `verification_passed: false` must never be shadowed by an
+        # earlier-set generic `*-qa` PASS row -- it always forces 'failed', not merely when
+        # `verdict` was still unset. (Reordered from the original if/elif so the pre-override
+        # `generic_verdict`/`task_level_failed` flags above stay available to the live-QA T3
+        # correction below; the net verdict computed here is unchanged from before.)
         if verdict is None and note.get('verification_passed') is not None: verdict = 'passed' if note['verification_passed'] else 'failed'
-        if any(not _verification_passed(v) for v in latest_verification.values()): verdict = 'failed'
+        if task_level_failed: verdict = 'failed'
         if verdict is None and verified_tasks: verdict = 'passed'
+        if terminal_says_failed: verdict = 'failed'
+        # T2: the live-QA stage's own outcome has run-verdict AUTHORITY over a passed generic
+        # reading (never the reverse: a passed live-QA stage must not flip a failed/incomplete
+        # generic verdict to passed -- that is still handled entirely by `_live_qa_evidence`
+        # staying out of `verifications`/`outcome_tasks` above). A `fail` live-QA verdict always
+        # wins; a REQUIRED `unavailable` live-QA verdict reads as unverified ('unknown', the same
+        # spelling used everywhere else in this function for "no recognized claim"), unless the
+        # run is already 'failed' for an unrelated (independently corroborated) reason.
+        live_qa = live_qa_evidence.get(rid)
+        if live_qa:
+            if live_qa.get('verdict') == 'fail':
+                verdict = 'failed'
+            elif live_qa.get('verdict') == 'unavailable' and live_qa.get('required'):
+                # T3: a required live-QA stage that never produced evidence is unverified, never a
+                # pass. When the ONLY reason this run's verdict reads 'failed' is the terminal
+                # summary's bare `verification_passed: false` -- NOT corroborated by an
+                # independently failed generic `*-qa` gate row or a task-level verification
+                # failure -- that terminal false is presumed to be reporting exactly this
+                # required-but-unavailable live-QA stage rather than a separate quality failure,
+                # so the run reads 'unknown' (unverified) here rather than 'failed'. A genuinely
+                # corroborated failure (`generic_verdict == 'failed'` or `task_level_failed`) still
+                # wins and keeps this 'failed'; a plain 'unavailable' with no terminal false at all
+                # was already 'unknown' via the `verdict != 'failed'` half of this condition.
+                only_terminal_false_caused_failure = (
+                    terminal_says_failed and generic_verdict != 'failed' and not task_level_failed
+                )
+                if verdict != 'failed' or only_terminal_false_caused_failure:
+                    verdict = 'unknown'
         term = terminal.get(rid)
         elapsed_ms, elapsed_source = _elapsed(term)
         raw_status = status.get(rid, 'incomplete')
@@ -453,6 +534,11 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
             # Factual verification evidence (Phase 1 item 5), or None when this run's QA gate
             # (if it ran at all) predates this field set. Never backfilled/guessed.
             'verification_evidence': verification_evidence.get(rid),
+            # T1: the `live_qa` KEY itself is present only for a run that actually has a
+            # `verification_scope: 'live_qa'` outcome row -- never added (not even as `None`) for
+            # the vast majority of runs that never requested live QA, preserving the exact
+            # pre-Phase-3 key set for them.
+            **({'live_qa': live_qa_evidence[rid]} if rid in live_qa_evidence else {}),
         })
     return result
 

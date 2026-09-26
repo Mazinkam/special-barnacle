@@ -419,7 +419,7 @@ bridge/                    HUMAIN Terminal integration (paired with orchestrator
   README.md                install + adapter notes
 install.sh                 symlinks bridge/ into ~/.humain-terminal/agent/
 adapters/                  example adapter configs (claude-code, codex, generic)
-docs/                      V3 features, adaptive routing, integration, telemetry
+docs/                      V3 features, adaptive routing, integration, telemetry, live QA (docs/LIVE_QA.md)
 scripts/                   rebuild-ledger / regenerate-dashboard / dynamic_adapter / maintenance tools
 tests/                     Python tests for the reference runtime
 ~/.local/state/coding-agent-orchestrator/   runtime state (events, ledger, dashboard)

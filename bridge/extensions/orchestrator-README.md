@@ -252,6 +252,13 @@ put open questions under `## Open items`, which the completion summary surfaces.
 
 Only one `/orchestrate` may be live per session. Runs automatically approve the triage result and dispatch plan by default. Pass `--interactive` to require confirmation after triage and again before dispatch. `--yes` / `-y` remain accepted as no-op compatibility aliases for the new default.
 
+### Phase 3: opt-in Forge live-QA stage
+
+`--live-qa` / `--live-qa-scope "..."` / `--live-qa-adapter ID` / `--no-live-qa` run an additional,
+additive verification stage against an **existing** Forge live-QA runner, only once the run's own
+generic QA gate has passed. Off by default; unaffected unless explicitly requested. See
+`docs/LIVE_QA.md` for the config schema, trust model, verdict semantics, and Forge prerequisites.
+
 ## What this integration does NOT do
 
 - It does not track workers a lead creates through HT's `subagent` tool. Those run inside the lead's context; only the parent-owned Rule-2 recon workers are observable, billed, and reported as workers by this extension.
