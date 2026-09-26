@@ -30,6 +30,8 @@ describe("core/transient-error.ts isTransientProviderError", () => {
 		["HTTP/version prefix", "HTTP/1.1 520 from the reverse proxy"],
 		["bad gateway phrase alone (no context word, no number needed)", "502 Bad Gateway"],
 		["status: prefix with colon, no space before number", "status: 507"],
+		["HTTP prefix with space before number", "HTTP 500 returned from the load balancer"],
+		["error prefix with space before number", "error 503 from the upstream service"],
 	];
 
 	for (const [label, text] of positive) {
@@ -55,6 +57,8 @@ describe("core/transient-error.ts isTransientProviderError", () => {
 		["bare 503 with unrelated word, no context marker", "found 503 issues"],
 		["bare 502, no context word and no known reason phrase", "changed 502 lines in the diff"],
 		["bare 504, no context word and no known reason phrase", "waited 504 milliseconds"],
+		["marker glued directly to the number, no separator (C3)", "code500 error from the internal cache"],
+		["marker glued to a longer word ending in a 5xx-looking number, no separator (C3)", "errorcode500x from the internal cache"],
 	];
 
 	for (const [label, text] of negative) {
@@ -70,6 +74,10 @@ describe("core/transient-error.ts isTransientProviderError table tests (docs/arc
 		["found 503 issues", "found 503 issues", false],
 		["status: 507", "status: 507", true],
 		["HTTP/1.1 520", "HTTP/1.1 520", true],
+		["HTTP 500", "HTTP 500", true],
+		["error 503", "error 503", true],
+		["code500 (no separator between marker and number)", "code500", false],
+		["errorcode500x (no separator, trailing letter)", "errorcode500x", false],
 	];
 
 	for (const [label, text, expected] of table) {
