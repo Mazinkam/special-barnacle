@@ -50,18 +50,34 @@ export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality
 	};
 }
 
-function parseFailedChecks(text: string): string[] {
+export function parseFailedChecks(text: string): string[] {
 	const fails: string[] = [];
-	// Markdown table rows that contain "FAIL" or "✗" — tolerant.
-	const rowRe = /\|\s*([^|]+?)\s*\|\s*[^|]*?(FAIL|✗|failed|error)[^|]*?\|/gi;
+	// Explicit failing status words, matched whole-word (case-insensitive) and not preceded by a
+	// digit (so a leading count like "0 failed" is judged by nonZeroCountRe instead).
+	const statusWordRe = /(?<!\d)(?<!\d\s)\b(FAILED|FAIL|ERROR)\b/i;
+	// Failing symbols: never part of a count, always a standalone status marker.
+	const statusSymbolRe = /[\u2717\u274c]/;
+	const statusRe = (cell: string): boolean => statusWordRe.test(cell) || statusSymbolRe.test(cell);
+	// A non-zero count of errors/failures, e.g. "2 errors", "1 failed" — but not "0 errors".
+	const nonZeroCountRe = /\b[1-9]\d*\s+(error|errors|failed|failures?)\b/i;
+	// Markdown table rows: `| label | status cell |`.
+	const rowRe = /\|\s*([^|]+?)\s*\|\s*([^|]*)\|/g;
 	let m: RegExpExecArray | null;
 	while ((m = rowRe.exec(text)) !== null) {
-		fails.push(m[1].trim());
+		const label = m[1].trim();
+		const cell = m[2];
+		if (statusRe(cell) || nonZeroCountRe.test(cell)) {
+			fails.push(label);
+		}
 	}
 	// Bullet points labelled FAIL: `- foo: FAIL`.
-	const bulletRe = /^[-*]\s+(.+?):\s*(FAIL|failed|✗)/gim;
+	const bulletRe = /^[-*]\s+(.+?):\s*(.*)$/gim;
 	while ((m = bulletRe.exec(text)) !== null) {
-		fails.push(m[1].trim());
+		const label = m[1].trim();
+		const rest = m[2];
+		if (statusRe(rest) || nonZeroCountRe.test(rest)) {
+			fails.push(label);
+		}
 	}
 	return Array.from(new Set(fails));
 }
