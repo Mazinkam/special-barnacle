@@ -1,5 +1,7 @@
 # Per-Turn Dashboard Sync Implementation Plan
 
+**Status: completed.** Landed on `main` (`618e033` design, `6e10020` tests/implementation).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Capture persisted HUMAIN Terminal usage after every settled turn and show the updated, recoverable state in an already-open dashboard without manual commands or reloads.

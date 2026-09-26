@@ -1,5 +1,8 @@
 # Model Backups and Provider Failover Implementation Plan
 
+**Status: pending.** Owned by branch `feat/model-failover` (not yet merged into `main`); do not
+implement it from `refactor/modular`.
+
 > **For agentic workers:** this plan is executed by `/orchestrate` (see "Orchestration layout"). A lead
 > dispatches one implementer per task, wave by wave. Steps use checkbox (`- [ ]`) syntax. Every task is
 > TDD: failing test → minimal code → green → commit.

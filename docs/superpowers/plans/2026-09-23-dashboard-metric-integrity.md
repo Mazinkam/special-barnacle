@@ -1,5 +1,7 @@
 # Dashboard metric integrity
 
+**Status: completed.** Merged into `main` via `5f8d1fa` (`fix/dashboard-metric-integrity`, `d57b327`).
+
 Branch: `fix/dashboard-metric-integrity`
 
 ## Problem

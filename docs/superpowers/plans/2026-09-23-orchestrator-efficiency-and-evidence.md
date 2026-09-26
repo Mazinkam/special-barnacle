@@ -1,5 +1,7 @@
 # Orchestrator Efficiency and Evidence Implementation Plan
 
+**Status: completed.** Merged into `main` via `eaa9278` (`feat/orchestrator-efficiency`, `dfadc53`).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Reduce measured subprocess/time/memory overhead without losing durable audit evidence, while making cost, duration, and routing evaluations trustworthy.

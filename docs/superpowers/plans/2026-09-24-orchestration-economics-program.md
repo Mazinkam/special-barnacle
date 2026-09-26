@@ -1,5 +1,13 @@
 # Orchestration Economics Program — Implementation Plan
 
+**Status: in-progress.** Phase A (tiers, vendor profiles, triage-sized delegating lead, spend cap,
+codex->Bedrock fallback, BLOCKED outcome, lead waves) merged into `main` (`c553bf4`). Phase B
+(parent-owned recon fan-out) and parts of Phase D (spend cap, provider fallback) have also landed
+separately (see `feat(orchestrator): dispatch recon before leads` and
+`feat(bridge): per-dispatch spend cap`). Phase E (evidence and pricing — re-measuring ROI on
+matched cohorts) is not yet done; `SKILL.md`'s Performance evidence section still calls the prior
+measurement historical pending that work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Cut orchestrated cost and wall time without lowering verified quality: four cost tiers, vendor profiles, a triage-sized lead that delegates, scouts first, short-lived context, provider fallback, isolated self-cleaning worktrees, and a complete evidence loop.

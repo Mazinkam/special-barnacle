@@ -1,5 +1,7 @@
 # Headless Dispatch Shutdown Recovery Implementation Plan
 
+**Status: completed.** Merged into `main` via `67b78c7` (`fix/headless-dispatch-shutdown-recovery`, `d81e30a`).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make headless orchestrator dispatch preserve an authoritative completed child result while accurately reporting later process/cleanup failures, and fix the confirmed HUMAIN Terminal shutdown defect when reproducible.

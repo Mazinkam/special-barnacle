@@ -1,5 +1,8 @@
 # Enforced Worker Topology Implementation Plan
 
+**Status: completed.** Merged into `main` as `8f145a4` (see the companion integration plan,
+`2026-09-23-enforced-worker-topology-integration.md`, marked DONE).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make complexity-5-and-higher orchestrations execute, account for, and report parent-owned reconnaissance workers before a lead runs.
