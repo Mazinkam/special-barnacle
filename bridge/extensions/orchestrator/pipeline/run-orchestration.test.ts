@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@humain/terminal";
 
-import { runOrchestration, type RunOrchestrationDeps } from "./run-orchestration.ts";
+import { runOrchestration, writeLeadReportsDiagnostic, type RunOrchestrationDeps } from "./run-orchestration.ts";
 import { RunCancellation } from "../cancellation.ts";
 import type { RunSession } from "../run/session.ts";
 import type { RunContext } from "../run/context.ts";
@@ -194,5 +194,55 @@ describe("pipeline/run-orchestration.ts runOrchestration", () => {
 		expect(dispatchCalls).toBe(0);
 		expect(failRunCalls).toBe(1);
 		expect(notifications.some((n) => n.text === "Cancelled." && n.level === "info")).toBe(true);
+	});
+});
+
+describe("pipeline/run-orchestration.ts writeLeadReportsDiagnostic", () => {
+	test("no lead reports: does not write, is not logged, and hasLeadReports is false", () => {
+		const logs: string[] = [];
+		let writeCalls = 0;
+		const session = {
+			writeDiagnostic: () => { writeCalls++; return true; },
+			log: (line: string) => { logs.push(line); },
+		};
+		const written = writeLeadReportsDiagnostic(session as never, []);
+		expect(written).toBe(false);
+		expect(writeCalls).toBe(0);
+		expect(logs).toEqual([]);
+	});
+
+	test("write succeeds: returns true, no failure logged", () => {
+		const logs: string[] = [];
+		const writes: Array<{ name: string; text: string }> = [];
+		const session = {
+			writeDiagnostic: (name: string, text: string) => { writes.push({ name, text }); return true; },
+			log: (line: string) => { logs.push(line); },
+		};
+		const written = writeLeadReportsDiagnostic(session as never, ["### lead-0\n\nreport body"]);
+		expect(written).toBe(true);
+		expect(writes).toEqual([{ name: "lead-report.md", text: "### lead-0\n\nreport body" }]);
+		expect(logs).toEqual([]);
+	});
+
+	test("writeDiagnostic returning false (rejected, e.g. diagnostics sealed): returns false and logs the failure", () => {
+		const logs: string[] = [];
+		const session = {
+			writeDiagnostic: () => false,
+			log: (line: string) => { logs.push(line); },
+		};
+		const written = writeLeadReportsDiagnostic(session as never, ["### lead-0\n\nreport body"]);
+		expect(written).toBe(false);
+		expect(logs).toEqual(["lead-report.md write failed: diagnostics writer rejected the write (sealed/closing)"]);
+	});
+
+	test("writeDiagnostic throwing: returns false and logs the error message instead of swallowing it", () => {
+		const logs: string[] = [];
+		const session = {
+			writeDiagnostic: () => { throw new Error("ENOSPC: no space left on device"); },
+			log: (line: string) => { logs.push(line); },
+		};
+		const written = writeLeadReportsDiagnostic(session as never, ["### lead-0\n\nreport body"]);
+		expect(written).toBe(false);
+		expect(logs).toEqual(["lead-report.md write failed: ENOSPC: no space left on device"]);
 	});
 });

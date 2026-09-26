@@ -119,6 +119,32 @@ export function warnTelemetry(ctx: ExtensionContext, report: FlushReport): void 
 }
 
 /**
+ * Write the run's lead reports to `lead-report.md` and return whether the write actually
+ * landed on disk. `RunReport.hasLeadReports`/`leadReportPath` must reflect this, not merely
+ * "there was something to write": a write that throws or is rejected (diagnostics sealed) used
+ * to still report `hasLeadReports: true`, pointing the run summary at a file that was never
+ * created (B4.7). Exported for direct unit coverage — exercising it through a full
+ * `runOrchestration()` run would require standing up a whole dispatch pipeline for one write
+ * call.
+ */
+export function writeLeadReportsDiagnostic(
+	session: { writeDiagnostic(name: string, text: string): boolean; log(line: string): void },
+	leadReports: string[],
+): boolean {
+	if (leadReports.length === 0) return false;
+	try {
+		const written = session.writeDiagnostic("lead-report.md", leadReports.join("\n\n---\n\n"));
+		if (!written) {
+			session.log("lead-report.md write failed: diagnostics writer rejected the write (sealed/closing)");
+		}
+		return written;
+	} catch (err) {
+		session.log(`lead-report.md write failed: ${(err as Error).message}`);
+		return false;
+	}
+}
+
+/**
  * Run the triage -> plan -> size -> confirm -> dispatch -> verify/escalate ->
  * finalize pipeline for an already-claimed session. Throws (rather than
  * returning) only for cancellation (`session.cancellation.throwIfCancelled`)
@@ -577,13 +603,7 @@ export async function runOrchestration(
 			const report = r.stdout.trim() || r.interruption?.partialText || "(no assistant text captured)";
 			return `${marker}### ${r.taskId.replace(`${runId}-`, "")}\n\n${report}`;
 		});
-	if (leadReports.length > 0) {
-		try {
-			session.writeDiagnostic("lead-report.md", leadReports.join("\n\n---\n\n"));
-		} catch {
-			/* best-effort */
-		}
-	}
+	const leadReportWritten = writeLeadReportsDiagnostic(session, leadReports);
 	const firstReport = leadResults.find((r) => r.exitCode === 0)?.stdout.trim() ?? "";
 	const openItems = /##\s*Open items\s*\n([\s\S]*?)(?=\n##\s|$)/i.exec(firstReport)?.[1]?.trim();
 	const showFullReport = allFiles.length === 0 && firstReport;
@@ -622,7 +642,7 @@ export async function runOrchestration(
 		reportLines,
 		showFullReport: Boolean(showFullReport),
 		reportTruncated: Boolean(reportTruncated),
-		hasLeadReports: leadReports.length > 0,
+		hasLeadReports: leadReportWritten,
 		leadReportPath: describeRunArtifact(session.file("lead-report.md")),
 		runLogPath: describeRunArtifact(session.file("run.log")),
 		stateRoot: deps.stateRoot,

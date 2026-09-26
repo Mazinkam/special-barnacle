@@ -204,6 +204,22 @@ describe("core/report.ts buildRunSummary", () => {
 		);
 	});
 
+	test("truncated report but the lead-report.md write failed (hasLeadReports false): no dangling pointer to a file that doesn't exist", () => {
+		const report: RunReport = {
+			...baseReport(),
+			filesChangedCount: 0,
+			showFullReport: true,
+			reportLines: ["line 1", "line 2"],
+			reportTruncated: true,
+			hasLeadReports: false,
+			leadReportPath: "run.log dir/lead-report.md",
+		};
+		const { text } = buildRunSummary(report);
+		expect(text).not.toContain("full report:");
+		expect(text).not.toContain("lead-report.md");
+		expect(text).toContain(["", "lead report:", "line 1", "line 2", "run log: /tmp/run.log"].join("\n"));
+	});
+
 	test("hasLeadReports without reportLines: a single 'lead report:' pointer line, no header/body", () => {
 		const report: RunReport = {
 			...baseReport(),

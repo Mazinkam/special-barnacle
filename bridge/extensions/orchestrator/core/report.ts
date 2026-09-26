@@ -117,7 +117,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		`total cost: $${report.totalCostUsd.toFixed(4)} (${report.dispatchCount} dispatches${report.nestedCostUsd > 0 ? `; $${report.nestedCostUsd.toFixed(4)} of it in lead subagents` : ""})`,
 		...(report.dispatchOk ? [] : [`first failure: ${report.firstFailureLine}`]),
 		...(report.reportLines.length > 0
-			? ["", report.showFullReport ? "lead report:" : "open items from lead:", ...report.reportLines, ...(report.reportTruncated ? [`… full report: ${report.leadReportPath}`] : [])]
+			? ["", report.showFullReport ? "lead report:" : "open items from lead:", ...report.reportLines, ...(report.reportTruncated && report.hasLeadReports ? [`… full report: ${report.leadReportPath}`] : [])]
 			: report.hasLeadReports
 				? [`lead report: ${report.leadReportPath}`]
 				: []),
