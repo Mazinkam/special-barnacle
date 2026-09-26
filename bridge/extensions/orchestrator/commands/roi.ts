@@ -11,8 +11,9 @@ import type { ExtensionAPI } from "@humain/terminal";
 import type { PythonCli } from "../adapters/python-cli.ts";
 
 export interface RoiDeps {
-	/** Builds the one Python spawner this extension uses (C1); called fresh so a test
-	 *  `spyOn(childProcess, "spawn")` installed after activation still takes effect. */
+	/** Builds the one Python spawner this extension uses (C1); called fresh so an injected
+	 *  spawn (index.ts's `createOrchestratorExtension({ spawn })`, B5) still takes effect on
+	 *  every call, matching adapters/orchestrator-cli.ts's own "built fresh per call" `cli()`. */
 	cli(): PythonCli;
 	/** Absolute path to the skill root `scripts/skill_vs_baseline.py` is run from/against. */
 	skillRoot: string;

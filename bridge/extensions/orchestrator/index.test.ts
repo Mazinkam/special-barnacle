@@ -1,5 +1,4 @@
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
-import * as childProcess from "node:child_process";
 import { execFileSync, spawn as nodeSpawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { EventEmitter } from "node:events";
@@ -7,6 +6,7 @@ import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { type SpawnFn } from "./adapters/python-cli.ts";
 import { SessionIngestScheduler } from "./ingest.ts";
 import { planReconTasks } from "./recon.ts";
 import { METHOD, TIER_CAPABILITIES, buildAliasTable } from "./models.ts";
@@ -177,21 +177,19 @@ describe("session ingest hook wiring (index.ts wiring)", () => {
 			// the freshly-set CODING_AGENT_ORCHESTRATOR_HOME. The cache-busting query
 			// string forces a fresh module evaluation under Bun's test runner.
 			const fresh = (await import(`./index.ts?propagate=${Date.now()}-${Math.random()}`)) as typeof orchestrator;
-			expect(fresh.runModule).toBeFunction();
-			// Capture the env that `runModule` forwards to its child via a local spy on the
-			// real `node:child_process` spawn, restored in `finally` so the rest of the
-			// suite keeps using real spawns undisturbed.
+			// Capture the env `runModule` forwards to its child by injecting a spawn (B5)
+			// into a fresh extension instance built from the freshly-set env, instead of
+			// spying on the real `node:child_process` spawn export. Forwards to the real
+			// `nodeSpawn` so this still exercises a real process.
 			const capturedEnvs: NodeJS.ProcessEnv[] = [];
-			const realSpawn = childProcess.spawn;
-			const spy = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
-				capturedEnvs.push(options?.env ?? {});
-				return realSpawn(command, args, options as never);
-			}) as never);
-			try {
-				await fresh.runModule!("noop", []);
-			} finally {
-				spy.mockRestore();
-			}
+			const extension = fresh.createOrchestratorExtension({
+				spawn: (command, args, options) => {
+					capturedEnvs.push(options?.env ?? {});
+					return nodeSpawn(command, args, options);
+				},
+			});
+			expect(extension.runModule).toBeFunction();
+			await extension.runModule("noop", []);
 			expect(capturedEnvs.length).toBeGreaterThan(0);
 			expect(capturedEnvs.at(-1)?.CODING_AGENT_ORCHESTRATOR_HOME).toBe(customRoot);
 		} finally {
@@ -536,7 +534,20 @@ describe("diagnostic writer ownership and sealing (index.ts wiring)", () => {
 });
 
 describe("final triage and shutdown integration (index.ts wiring)", () => {
-	function activate() {
+	/**
+	 * Activates a fresh, isolated orchestrator extension instance (B5:
+	 * `createOrchestratorExtension`) instead of registering the shared
+	 * `orchestrator.default`/`orchestrator.runRegistry` singleton repeatedly.
+	 * `spawn` defaults to the real `nodeSpawn`, so a caller that never
+	 * overrides it gets production-identical behaviour; tests that need to
+	 * intercept a specific dispatch pass their own spawn, forwarding anything
+	 * they do not care about to `nodeSpawn` themselves — replacing the old
+	 * global `node:child_process` spawn-export patch this suite used to install
+	 * with `spyOn`. The returned `RunSession`/
+	 * `activeSession`/`forceActiveSession` are bound to this activation's own
+	 * `runRegistry`, not the module-level production one.
+	 */
+	function activate(spawn: SpawnFn = nodeSpawn) {
 		let handler!: (args: string, ctx: never) => Promise<void>;
 		let cancelHandler!: (args: string, ctx: never) => Promise<void>;
 		let omsgHandler!: (args: string, ctx: never) => Promise<void>;
@@ -545,10 +556,11 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 		let statusTool: {
 			execute: (toolCallId: string, params: { logLines?: number }, signal?: AbortSignal, onUpdate?: unknown, ctx?: unknown) => Promise<{ content: Array<{ type: string; text: string }>; details?: unknown }>;
 		} | undefined;
+		const extension = orchestrator.createOrchestratorExtension({ spawn });
 		const oldTmp = process.env.TMPDIR;
 		try {
 			process.env.TMPDIR = testStateRoot;
-			orchestrator.default({
+			extension({
 				on: (name: string, fn: typeof shutdown[number]) => { if (name === "session_shutdown") shutdown.push(fn); },
 				registerCommand: (name: string, command: { handler: typeof handler }) => {
 					if (name === "orchestrate") handler = command.handler;
@@ -561,7 +573,14 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 		} finally {
 			if (oldTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = oldTmp;
 		}
-		return { handler, cancelHandler, omsgHandler, shutdown, sent, statusTool };
+		const RunSession = extension.RunSession;
+		const activeSession = (): InstanceType<typeof RunSession> | null => extension.runRegistry.active()?.session ?? null;
+		const forceActiveSession = (session: InstanceType<typeof RunSession> | null): void => {
+			const current = extension.runRegistry.active();
+			if (current) extension.runRegistry.release(current);
+			if (session) extension.runRegistry.claim(session, {}, null);
+		};
+		return { handler, cancelHandler, omsgHandler, shutdown, sent, statusTool, extension, RunSession, activeSession, forceActiveSession };
 	}
 	// The models FALLBACK_ADAPTER binds (mirrors the shipped premium profile).
 	function registry() {
@@ -577,9 +596,12 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 	test("a shipped-profile alias missing from the registry aborts /orchestrate before any dispatch", async () => {
 		const profilesPath = process.env.HUMAIN_ORCHESTRATOR_PROFILES_FILE!;
 		writeFileSync(profilesPath, readFileSync(join(import.meta.dir, "..", "..", "orchestrator-profiles.json"), "utf8"));
-		const { handler } = activate();
+		const calls: { args: readonly string[] }[] = [];
+		const { handler } = activate((command, args, opts) => {
+			calls.push({ args });
+			return nodeSpawn(command, args, opts);
+		});
 		const notices: string[] = [];
-		const spawned = spyOn(childProcess, "spawn");
 		try {
 			const noOpus = { getAvailable: () => registry().getAvailable().filter((m) => !m.id.includes("opus-5-5")) };
 			await handler("do a thing --task-class implementation --complexity 5 --risk low", {
@@ -587,9 +609,8 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 			} as never);
 			expect(notices.join("\n")).toContain("Model configuration is invalid — nothing was dispatched");
 			expect(notices.join("\n")).toContain("opus-5-5");
-			expect(spawned.mock.calls.filter(([, args]) => (args as string[] | undefined)?.includes("--mode"))).toHaveLength(0);
+			expect(calls.filter((c) => c.args.includes("--mode"))).toHaveLength(0);
 		} finally {
-			spawned.mockRestore();
 			rmSync(profilesPath, { force: true });
 		}
 	});
@@ -604,19 +625,17 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 		{ model: "claude-sonnet-4-5", costs: [undefined, { total: .1 }], source: "estimated-from-reported-tokens", expected: .0078 },
 	]) {
 		test(`malformed triage is billed to the real run with honest pricing: ${model} ${source} ${JSON.stringify(costs)}`, async () => {
-			const { handler } = activate();
 			const notices: string[] = [];
 			let runId = "";
-			const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>, value) {
+			const { handler, activeSession, RunSession } = activate((command, args, opts) => {
+				if (!args.includes("--mode")) return nodeSpawn(command, args, opts);
+				const events = costs.map(cost => ({ type: "message_end", message: { role: "assistant", model, usage: { input: 1000, cacheRead: 2500, output: 10, cost }, content: [{ type: "text", text: "not JSON" }], stopReason: "stop" } }));
+				return nodeSpawn(process.execPath, ["-e", `${events.map(event => `console.log(${JSON.stringify(JSON.stringify(event))});`).join("")}console.log('{"type":"agent_end"}');`], opts);
+			});
+			const phase = spyOn(RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof RunSession>, value) {
 				runId = this.runId;
 				if (value.startsWith("planning")) throw new Error("stop after triage; no real worker");
 			});
-			const original = childProcess.spawn;
-			const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-				if (!args.includes("--mode")) return original(command, args, opts);
-				const events = costs.map(cost => ({ type: "message_end", message: { role: "assistant", model, usage: { input: 1000, cacheRead: 2500, output: 10, cost }, content: [{ type: "text", text: "not JSON" }], stopReason: "stop" } }));
-				return original(process.execPath, ["-e", `${events.map(event => `console.log(${JSON.stringify(JSON.stringify(event))});`).join("")}console.log('{"type":"agent_end"}');`], opts);
-			}) as typeof childProcess.spawn);
 			try {
 				await handler("synthetic triage", { modelRegistry: registry(), ui: { notify: (n: string) => notices.push(n), setWidget() {}, setStatus() {} } } as never);
 				await activeSession()?.runPromise;
@@ -636,37 +655,39 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 				expect(run.call_rows).toBe(1);
 				expect(run.metered_calls).toBe(priced ? 1 : 0);
 				if (priced) expect(run.overhead_by_role.triage).toBe(rows[0].cost_usd);
-			} finally { phase.mockRestore(); spawn.mockRestore(); }
+			} finally { phase.mockRestore(); }
 		}, 30_000);
 	}
 
 	test("/orchestrate-cancel without child close flushes terminal billing and admits the next run", async () => {
-		const { handler, cancelHandler } = activate();
-		const sessions: InstanceType<typeof orchestrator.RunSession>[] = [];
-		const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) {
-			sessions.push(this);
-			if (sessions.length > 1) throw new Error("stop next run before dispatch");
-		});
 		const child = Object.assign(new EventEmitter(), {
 			stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true,
 		});
-		const original = childProcess.spawn;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("--mode")) return original(command, args, opts);
+		let cancelHandlerRef!: (args: string, ctx: never) => Promise<void>;
+		let ctxRef!: unknown;
+		const { handler, cancelHandler, RunSession } = activate((command, args, opts) => {
+			if (!args.includes("--mode")) return nodeSpawn(command, args, opts);
 			setTimeout(() => {
-				void cancelHandler("", ctx as never); // no session_shutdown safety net
+				void cancelHandlerRef("", ctxRef as never); // no session_shutdown safety net
 				setTimeout(() => child.stdout.write(`${JSON.stringify({ type: "message_end", message: {
 					role: "assistant", model: "claude-sonnet-4-5", content: "partial triage",
 					usage: { input: 10, output: 2, cost: { total: .03 } }, stopReason: "stop",
 				} })}\n`), 10);
 			}, 0);
-			return child;
-		}) as typeof childProcess.spawn);
+			return child as never;
+		});
+		cancelHandlerRef = cancelHandler;
+		const sessions: InstanceType<typeof RunSession>[] = [];
+		const phase = spyOn(RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof RunSession>) {
+			sessions.push(this);
+			if (sessions.length > 1) throw new Error("stop next run before dispatch");
+		});
 		const notices: string[] = [];
 		const ctx = {
 			modelRegistry: registry(),
 			ui: { notify: (message: string) => notices.push(message), setWidget() {}, setStatus() {} },
 		};
+		ctxRef = ctx;
 		let watchdog: ReturnType<typeof setTimeout> | undefined;
 		await handler("synthetic Esc triage", ctx as never);
 		try {
@@ -692,19 +713,17 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 			await sessions[0]?.runPromise;
 			await sessions[1]?.runPromise;
 			child.stdout.destroy(); child.stderr.destroy();
-			phase.mockRestore(); spawn.mockRestore();
+			phase.mockRestore();
 		}
 	}, 15_000);
 
 	test("shutdown is bounded even when session ingestion never exits", async () => {
-		const { shutdown } = activate();
-		const original = childProcess.spawn;
-		let child: ReturnType<typeof childProcess.spawn> | undefined;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("ingest")) return original(command,args,opts);
-			child = original(process.execPath,["-e","setInterval(()=>{},1000)"],opts);
+		let child: ReturnType<typeof nodeSpawn> | undefined;
+		const { shutdown } = activate((command, args, opts) => {
+			if (!args.includes("ingest")) return nodeSpawn(command, args, opts);
+			child = nodeSpawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts);
 			return child;
-		}) as typeof childProcess.spawn);
+		});
 		const realTimer = globalThis.setTimeout;
 		const timer = spyOn(globalThis,"setTimeout").mockImplementation(((fn: () => void, ms: number) => realTimer(fn, ms === 2000 ? 10 : ms)) as typeof setTimeout);
 		const ctx = { sessionManager: { getSessionFile: () => join(testStateRoot,"synthetic-session.jsonl") } };
@@ -717,22 +736,20 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 		} finally {
 			child?.kill();
 			await draining;
-			timer.mockRestore(); spawn.mockRestore();
+			timer.mockRestore();
 		}
 	});
 
 	test("shutdown deadline leaves a stalled plan unsealed even after late completion", async () => {
-		const { handler, shutdown } = activate();
-		const original = childProcess.spawn;
-		let child: ReturnType<typeof childProcess.spawn> | undefined;
+		let child: ReturnType<typeof nodeSpawn> | undefined;
 		let ready!: () => void;
 		const started = new Promise<void>(resolve => { ready = resolve; });
-		let session: InstanceType<typeof orchestrator.RunSession> | undefined;
-		const phase = spyOn(orchestrator.RunSession.prototype,"setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) { session=this; });
-		const spawn = spyOn(childProcess,"spawn").mockImplementation(((command: string,args: string[],opts: object) => {
-			if (!args.includes("plan")) return original(command,args,opts);
-			child=original(process.execPath,["-e","setInterval(()=>{},1000)"],opts); ready(); return child;
-		}) as typeof childProcess.spawn);
+		let session: InstanceType<ReturnType<typeof orchestrator.createOrchestratorExtension>["RunSession"]> | undefined;
+		const { handler, shutdown, RunSession } = activate((command, args, opts) => {
+			if (!args.includes("plan")) return nodeSpawn(command, args, opts);
+			child = nodeSpawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts); ready(); return child;
+		});
+		const phase = spyOn(RunSession.prototype,"setPhase").mockImplementation(function (this: InstanceType<typeof RunSession>) { session=this; });
 		const ctx={ui:{notify() {},setWidget() {},setStatus() {}},sessionManager:{getSessionFile:()=>undefined}};
 		await handler("stalled synthetic plan --complexity 4",ctx as never);
 		const realTimer=globalThis.setTimeout;
@@ -745,34 +762,32 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 			expect(existsSync(session!.file(".diagnostics-sealed.json"))).toBe(false);
 			child?.kill(); await session?.runPromise;
 			expect(existsSync(session!.file(".diagnostics-sealed.json"))).toBe(false);
-		} finally { child?.kill(); await session?.runPromise; timer?.mockRestore(); phase.mockRestore(); spawn.mockRestore(); }
+		} finally { child?.kill(); await session?.runPromise; timer?.mockRestore(); phase.mockRestore(); }
 	});
 
 	test("shutdown captures active escalation usage before cancellation unwinds the retry", async () => {
-		const { handler, shutdown } = activate();
 		const cwd = process.cwd();
 		const repo = mkdtempSync(join(testStateRoot, "escalation-repo-"));
 		execFileSync("git", ["init", "-q", repo]);
 		writeFileSync(join(repo, "work.txt"), "before\n");
 		execFileSync("git", ["-C", repo, "add", "work.txt"]);
-		let session: InstanceType<typeof orchestrator.RunSession> | undefined;
-		const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) { session = this; });
 		let childReady!: () => void;
 		const ready = new Promise<void>(resolve => { childReady = resolve; });
-		const original = childProcess.spawn;
 		let dispatches = 0;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("--mode")) return original(command, args, opts);
+		const { handler, shutdown, RunSession } = activate((command, args, opts) => {
+			if (!args.includes("--mode")) return nodeSpawn(command, args, opts);
 			dispatches++;
 			const retry = dispatches === 3;
 			const text = dispatches === 2 ? "- unit tests: FAIL" : "Changed work.txt";
 			const event = { type: "message_end", message: { role: "assistant", model: "claude-sonnet-4-5", usage: { input: 1000, output: 10, cost: { total: retry ? .3 : .01 } }, content: [{ type: "text", text }], stopReason: "stop" } };
 			const modify = dispatches === 1 ? 'require("node:fs").writeFileSync("work.txt","after\\n");' : "";
 			const finish = retry ? "setInterval(()=>{},1000);" : 'console.log(\'{"type":"agent_end"}\');';
-			const child = original(process.execPath, ["-e", `${modify}console.log(${JSON.stringify(JSON.stringify(event))});${finish}`], opts);
+			const child = nodeSpawn(process.execPath, ["-e", `${modify}console.log(${JSON.stringify(JSON.stringify(event))});${finish}`], opts);
 			if (retry) child.stdout?.once("data", () => queueMicrotask(childReady));
 			return child;
-		}) as typeof childProcess.spawn);
+		});
+		let session: InstanceType<typeof RunSession> | undefined;
+		const phase = spyOn(RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof RunSession>) { session = this; });
 		const ctx = { modelRegistry: registry(), ui: { notify() {}, setWidget() {}, setStatus() {} }, sessionManager: { getSessionFile: () => undefined } };
 		process.chdir(repo);
 		await handler("synthetic escalation --complexity 3 --risk low", ctx as never);
@@ -794,25 +809,23 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 			session?.cancel();
 			await session?.runPromise;
 			process.chdir(cwd);
-			phase.mockRestore(); spawn.mockRestore();
+			phase.mockRestore();
 		}
 	}, 30_000);
 
 	test("shutdown awaits active child settlement and late terminal telemetry", async () => {
-		const { handler, shutdown } = activate();
 		let runId = "";
 		let childReady!: () => void;
 		const ready = new Promise<void>(r => { childReady = r; });
-		let activeSession: InstanceType<typeof orchestrator.RunSession> | undefined;
-		const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) { runId = this.runId; activeSession = this; });
-		const original = childProcess.spawn;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("--mode")) return original(command, args, opts);
+		let activeSession: InstanceType<ReturnType<typeof orchestrator.createOrchestratorExtension>["RunSession"]> | undefined;
+		const { handler, shutdown, RunSession } = activate((command, args, opts) => {
+			if (!args.includes("--mode")) return nodeSpawn(command, args, opts);
 			const event = { type: "message_end", message: { role: "assistant", model: "claude-sonnet-4-5", usage: { input: 1000, output: 10, cost: { total: .1 } }, content: [{ type: "text", text: "not JSON" }] } };
-			const child = original(process.execPath, ["-e", `console.log(${JSON.stringify(JSON.stringify(event))});setTimeout(()=>{},30000);`], opts);
+			const child = nodeSpawn(process.execPath, ["-e", `console.log(${JSON.stringify(JSON.stringify(event))});setTimeout(()=>{},30000);`], opts);
 			child.stdout?.once("data", () => { setTimeout(childReady, 10); });
 			return child;
-		}) as typeof childProcess.spawn);
+		});
+		const phase = spyOn(RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof RunSession>) { runId = this.runId; activeSession = this; });
 		const ctx = { modelRegistry: registry(), ui: { notify() {}, setWidget() {}, setStatus() {} }, sessionManager: { getSessionFile: () => undefined } };
 		await handler("synthetic shutdown triage", ctx as never);
 		try {
@@ -825,22 +838,20 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 			// Also cleans up the pre-fix reproduction, whose shutdown hook did not cancel.
 			activeSession?.cancel();
 			await activeSession?.runPromise;
-			phase.mockRestore(); spawn.mockRestore();
+			phase.mockRestore();
 		}
 	}, 30_000);
 
 	test("the handler returns before the run finishes; /omsg still reaches the live run", async () => {
-		const { handler, omsgHandler } = activate();
 		let ready!: () => void;
 		const started = new Promise<void>(resolve => { ready = resolve; });
-		let child: ReturnType<typeof childProcess.spawn> | undefined;
-		const original = childProcess.spawn;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("plan")) return original(command, args, opts);
-			child = original(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts);
+		let child: ReturnType<typeof nodeSpawn> | undefined;
+		const { handler, omsgHandler, activeSession } = activate((command, args, opts) => {
+			if (!args.includes("plan")) return nodeSpawn(command, args, opts);
+			child = nodeSpawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts);
 			ready();
 			return child;
-		}) as typeof childProcess.spawn);
+		});
 		const notices: string[] = [];
 		const ctx = {
 			ui: { notify: (m: string) => notices.push(m), setWidget() {}, setStatus() {} },
@@ -859,22 +870,19 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 		} finally {
 			child?.kill();
 			await activeSession()?.runPromise;
-			spawn.mockRestore();
 		}
 	}, 15_000);
 
 	test("a second /orchestrate while one is live is rejected", async () => {
-		const { handler } = activate();
 		let ready!: () => void;
 		const started = new Promise<void>(resolve => { ready = resolve; });
-		let child: ReturnType<typeof childProcess.spawn> | undefined;
-		const original = childProcess.spawn;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("plan")) return original(command, args, opts);
-			child = original(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts);
+		let child: ReturnType<typeof nodeSpawn> | undefined;
+		const { handler, activeSession } = activate((command, args, opts) => {
+			if (!args.includes("plan")) return nodeSpawn(command, args, opts);
+			child = nodeSpawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts);
 			ready();
 			return child;
-		}) as typeof childProcess.spawn);
+		});
 		const notices: string[] = [];
 		const ctx = { ui: { notify: (m: string) => notices.push(m), setWidget() {}, setStatus() {} }, sessionManager: { getSessionFile: () => undefined } };
 		try {
@@ -887,28 +895,25 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 		} finally {
 			child?.kill();
 			await activeSession()?.runPromise;
-			spawn.mockRestore();
 		}
 	}, 15_000);
 
 	test("two /orchestrate invocations racing across the resolveAdapter await result in exactly one live run", async () => {
-		const { handler } = activate();
 		let readyCount = 0;
 		let ready!: () => void;
 		const started = new Promise<void>(resolve => { ready = resolve; });
-		const children: ReturnType<typeof childProcess.spawn>[] = [];
-		const original = childProcess.spawn;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("plan")) return original(command, args, opts);
-			const child = original(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts);
+		const children: ReturnType<typeof nodeSpawn>[] = [];
+		const { handler, activeSession } = activate((command, args, opts) => {
+			if (!args.includes("plan")) return nodeSpawn(command, args, opts);
+			const child = nodeSpawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts);
 			children.push(child);
 			readyCount++;
 			ready();
 			return child;
-		}) as typeof childProcess.spawn);
+		});
 		const notices: string[] = [];
 		const ctx = { ui: { notify: (m: string) => notices.push(m), setWidget() {}, setStatus() {} }, sessionManager: { getSessionFile: () => undefined } };
-		let active: InstanceType<typeof orchestrator.RunSession> | null = null;
+		let active: ReturnType<typeof activeSession> = null;
 		try {
 			// Neither call is awaited before the other starts, so both run their synchronous
 			// prelude — including the first "already running" guard, which sees ACTIVE_RUN
@@ -927,52 +932,44 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 		} finally {
 			for (const child of children) child.kill();
 			await active?.runPromise;
-			spawn.mockRestore();
 		}
 	}, 15_000);
 
 	test("a stale run's finally does not clobber ACTIVE_RUN once a newer run has taken it", async () => {
-		const { handler } = activate();
-		const original = childProcess.spawn;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("plan")) return original(command, args, opts);
+		const { handler, activeSession, forceActiveSession, RunSession } = activate((command, args, opts) => {
+			if (!args.includes("plan")) return nodeSpawn(command, args, opts);
 			// Fail the plan dispatch immediately so the run reaches its terminal finally fast.
-			return original(process.execPath, ["-e", "process.exit(1)"], opts);
-		}) as typeof childProcess.spawn);
+			return nodeSpawn(process.execPath, ["-e", "process.exit(1)"], opts);
+		});
 		const ctx = { ui: { notify() {}, setWidget() {}, setStatus() {} }, sessionManager: { getSessionFile: () => undefined } };
-		try {
-			await handler("stale finally synthetic run --complexity 4", ctx as never);
-			const sessionA = activeSession()!;
-			expect(sessionA).not.toBeNull();
-			// The race guard above makes it impossible for a second run to take ACTIVE_RUN while
-			// sessionA still owns it, so simulate the state directly: a newer run has since become
-			// ACTIVE_RUN. sessionA's own finally must recognize it no longer owns the singleton and
-			// leave it alone rather than unconditionally nulling it out.
-			const sessionB = new orchestrator.RunSession!("newer-run-stale-finally-test", ctx as never, "a different goal");
-			forceActiveSession(sessionB);
-			await sessionA.runPromise;
-			expect(activeSession()).toBe(sessionB);
-			sessionB.close();
-			await sessionB.sealDiagnostics();
-			sessionB.finish();
-			forceActiveSession(null);
-		} finally {
-			spawn.mockRestore();
-		}
+		await handler("stale finally synthetic run --complexity 4", ctx as never);
+		const sessionA = activeSession()!;
+		expect(sessionA).not.toBeNull();
+		// The race guard above makes it impossible for a second run to take ACTIVE_RUN while
+		// sessionA still owns it, so simulate the state directly: a newer run has since become
+		// ACTIVE_RUN. sessionA's own finally must recognize it no longer owns the singleton and
+		// leave it alone rather than unconditionally nulling it out.
+		const sessionB = new RunSession("newer-run-stale-finally-test", ctx as never, "a different goal");
+		forceActiveSession(sessionB);
+		await sessionA.runPromise;
+		expect(activeSession()).toBe(sessionB);
+		sessionB.close();
+		await sessionB.sealDiagnostics();
+		sessionB.finish();
+		forceActiveSession(null);
 	}, 15_000);
 
 	test("/orchestrate-cancel cancels the live run, clears widget/status/ACTIVE_RUN, posts a cancelled summary, and admits a new run", async () => {
-		const { handler, cancelHandler, sent } = activate();
 		let ready!: () => void;
 		const started = new Promise<void>(resolve => { ready = resolve; });
-		let child: ReturnType<typeof childProcess.spawn> | undefined;
-		const original = childProcess.spawn;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("plan")) return original(command, args, opts);
-			child = original(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts);
+		let child: ReturnType<typeof nodeSpawn> | undefined;
+		let spawnImpl: SpawnFn = (command, args, opts) => {
+			if (!args.includes("plan")) return nodeSpawn(command, args, opts);
+			child = nodeSpawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts);
 			ready();
 			return child;
-		}) as typeof childProcess.spawn);
+		};
+		const { handler, cancelHandler, sent, activeSession } = activate((command, args, opts) => spawnImpl(command, args, opts));
 		let widget: unknown = "active";
 		let status: unknown = "active";
 		const notices: string[] = [];
@@ -984,62 +981,56 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 			},
 			sessionManager: { getSessionFile: () => undefined },
 		};
-		try {
-			await handler("cancel-me synthetic run --complexity 4", ctx as never);
-			const session = activeSession()!;
-			await started;
-			await cancelHandler("", ctx as never);
-			child?.kill();
-			await session.runPromise;
-			expect(activeSession()).toBeNull();
-			expect(widget).toBeUndefined();
-			expect(status).toBeUndefined();
-			const cancelled = sent.find((s) => s.message.details?.runId === session.runId);
-			expect(cancelled).toBeDefined();
-			expect(cancelled?.message.details?.outcome).toBe("cancelled");
-			expect(cancelled?.message.customType).toBe("orchestrator-run");
-			expect(cancelled?.message.display).toBe(true);
-			expect(cancelled?.options).toEqual({ triggerTurn: false });
+		await handler("cancel-me synthetic run --complexity 4", ctx as never);
+		const session = activeSession()!;
+		await started;
+		await cancelHandler("", ctx as never);
+		child?.kill();
+		await session.runPromise;
+		expect(activeSession()).toBeNull();
+		expect(widget).toBeUndefined();
+		expect(status).toBeUndefined();
+		const cancelled = sent.find((s) => s.message.details?.runId === session.runId);
+		expect(cancelled).toBeDefined();
+		expect(cancelled?.message.details?.outcome).toBe("cancelled");
+		expect(cancelled?.message.customType).toBe("orchestrator-run");
+		expect(cancelled?.message.display).toBe(true);
+		expect(cancelled?.options).toEqual({ triggerTurn: false });
 
-			// A new run is admitted now that the previous one has fully cleaned up.
-			let ready2!: () => void;
-			const started2 = new Promise<void>(resolve => { ready2 = resolve; });
-			let child2: ReturnType<typeof childProcess.spawn> | undefined;
-			spawn.mockImplementation(((command: string, args: string[], opts: object) => {
-				if (!args.includes("plan")) return original(command, args, opts);
-				child2 = original(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts);
-				ready2();
-				return child2;
-			}) as typeof childProcess.spawn);
-			await handler("next synthetic run --complexity 4", ctx as never);
-			await started2;
-			expect(notices.some(n => n.includes("already running"))).toBe(false);
-			child2?.kill();
-			await activeSession()?.runPromise;
-		} finally {
-			spawn.mockRestore();
-		}
+		// A new run is admitted now that the previous one has fully cleaned up.
+		let ready2!: () => void;
+		const started2 = new Promise<void>(resolve => { ready2 = resolve; });
+		let child2: ReturnType<typeof nodeSpawn> | undefined;
+		spawnImpl = (command, args, opts) => {
+			if (!args.includes("plan")) return nodeSpawn(command, args, opts);
+			child2 = nodeSpawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], opts);
+			ready2();
+			return child2;
+		};
+		await handler("next synthetic run --complexity 4", ctx as never);
+		await started2;
+		expect(notices.some(n => n.includes("already running"))).toBe(false);
+		child2?.kill();
+		await activeSession()?.runPromise;
 	}, 15_000);
 
 	test("a completed run posts its full summary to chat with triggerTurn: false", async () => {
-		const { handler, sent } = activate();
 		const cwd = process.cwd();
 		const repo = mkdtempSync(join(testStateRoot, "completion-repo-"));
 		execFileSync("git", ["init", "-q", repo]);
 		writeFileSync(join(repo, "work.txt"), "before\n");
 		execFileSync("git", ["-C", repo, "add", "work.txt"]);
-		let session: InstanceType<typeof orchestrator.RunSession> | undefined;
-		const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) { session = this; });
-		const original = childProcess.spawn;
 		let dispatches = 0;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("--mode")) return original(command, args, opts);
+		const { handler, sent, RunSession } = activate((command, args, opts) => {
+			if (!args.includes("--mode")) return nodeSpawn(command, args, opts);
 			dispatches++;
 			const modify = dispatches === 1 ? 'require("node:fs").writeFileSync("work.txt","after\\n");' : "";
 			const text = dispatches === 1 ? "## Files Changed\n- work.txt\n\nSTATUS: completed" : "no issues found";
 			const event = { type: "message_end", message: { role: "assistant", model: "claude-sonnet-4-5", usage: { input: 100, output: 10, cost: { total: .01 } }, content: [{ type: "text", text }], stopReason: "stop" } };
-			return original(process.execPath, ["-e", `${modify}console.log(${JSON.stringify(JSON.stringify(event))});console.log('{"type":"agent_end"}');`], opts);
-		}) as typeof childProcess.spawn);
+			return nodeSpawn(process.execPath, ["-e", `${modify}console.log(${JSON.stringify(JSON.stringify(event))});console.log('{"type":"agent_end"}');`], opts);
+		});
+		let session: InstanceType<typeof RunSession> | undefined;
+		const phase = spyOn(RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof RunSession>) { session = this; });
 		const ctx = { modelRegistry: registry(), ui: { notify() {}, setWidget() {}, setStatus() {} }, sessionManager: { getSessionFile: () => undefined } };
 		process.chdir(repo);
 		try {
@@ -1056,30 +1047,28 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 			expect(typeof completion?.message.details?.costUsd).toBe("number");
 		} finally {
 			process.chdir(cwd);
-			phase.mockRestore(); spawn.mockRestore();
+			phase.mockRestore();
 		}
 	}, 30_000);
 
 	test("orchestrator_status reports phase/dispatch progress/cost/log tail for a live run, and says no run is active when idle", async () => {
-		const { handler, statusTool } = activate();
+		let childReady!: () => void;
+		const ready = new Promise<void>(resolve => { childReady = resolve; });
+		const { handler, statusTool, RunSession } = activate((command, args, opts) => {
+			if (!args.includes("--mode")) return nodeSpawn(command, args, opts);
+			const toolEvent = { type: "tool_execution_start", toolName: "bash", args: { command: "echo hi" } };
+			const turnEvent = { type: "message_end", message: { role: "assistant", model: "claude-sonnet-4-5", usage: { input: 100, output: 10, cost: { total: .02 } }, content: [{ type: "text", text: "working" }], stopReason: "stop" } };
+			const child = nodeSpawn(process.execPath, ["-e", `console.log(${JSON.stringify(JSON.stringify(toolEvent))});console.log(${JSON.stringify(JSON.stringify(turnEvent))});setInterval(()=>{},1000);`], opts);
+			child.stdout?.once("data", () => setTimeout(childReady, 10));
+			return child;
+		});
 		expect(statusTool).toBeDefined();
 		const idle = await statusTool!.execute("call-1", {});
 		expect(idle.content[0].text).toBe("No orchestrator run is active.");
 		expect(idle.details).toBeUndefined();
 
-		let session: InstanceType<typeof orchestrator.RunSession> | undefined;
-		const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) { session = this; });
-		let childReady!: () => void;
-		const ready = new Promise<void>(resolve => { childReady = resolve; });
-		const original = childProcess.spawn;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("--mode")) return original(command, args, opts);
-			const toolEvent = { type: "tool_execution_start", toolName: "bash", args: { command: "echo hi" } };
-			const turnEvent = { type: "message_end", message: { role: "assistant", model: "claude-sonnet-4-5", usage: { input: 100, output: 10, cost: { total: .02 } }, content: [{ type: "text", text: "working" }], stopReason: "stop" } };
-			const child = original(process.execPath, ["-e", `console.log(${JSON.stringify(JSON.stringify(toolEvent))});console.log(${JSON.stringify(JSON.stringify(turnEvent))});setInterval(()=>{},1000);`], opts);
-			child.stdout?.once("data", () => setTimeout(childReady, 10));
-			return child;
-		}) as typeof childProcess.spawn);
+		let session: InstanceType<typeof RunSession> | undefined;
+		const phase = spyOn(RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof RunSession>) { session = this; });
 		const ctx = { modelRegistry: registry(), ui: { notify() {}, setWidget() {}, setStatus() {} }, sessionManager: { getSessionFile: () => undefined } };
 		await handler("synthetic status check --complexity 3 --risk low", ctx as never);
 		try {
@@ -1104,24 +1093,22 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 		} finally {
 			session?.cancel();
 			await session?.runPromise;
-			phase.mockRestore(); spawn.mockRestore();
+			phase.mockRestore();
 		}
 	}, 30_000);
 
 	test("session shutdown cancels the live run, records it failed, and clears ACTIVE_RUN/widget/status", async () => {
-		const { handler, shutdown, sent } = activate();
 		let childReady!: () => void;
 		const ready = new Promise<void>(resolve => { childReady = resolve; });
-		let session: InstanceType<typeof orchestrator.RunSession> | undefined;
-		const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) { session = this; });
-		const original = childProcess.spawn;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("--mode")) return original(command, args, opts);
+		const { handler, shutdown, sent, activeSession, RunSession } = activate((command, args, opts) => {
+			if (!args.includes("--mode")) return nodeSpawn(command, args, opts);
 			const event = { type: "message_end", message: { role: "assistant", model: "claude-sonnet-4-5", usage: { input: 10, output: 2, cost: { total: .01 } }, content: [{ type: "text", text: "not JSON" }] } };
-			const child = original(process.execPath, ["-e", `console.log(${JSON.stringify(JSON.stringify(event))});setTimeout(()=>{},30000);`], opts);
+			const child = nodeSpawn(process.execPath, ["-e", `console.log(${JSON.stringify(JSON.stringify(event))});setTimeout(()=>{},30000);`], opts);
 			child.stdout?.once("data", () => setTimeout(childReady, 10));
 			return child;
-		}) as typeof childProcess.spawn);
+		});
+		let session: InstanceType<typeof RunSession> | undefined;
+		const phase = spyOn(RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof RunSession>) { session = this; });
 		let widget: unknown = "active";
 		let status: unknown = "active";
 		const ctx = {
@@ -1144,24 +1131,22 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 		} finally {
 			session?.cancel();
 			await session?.runPromise;
-			phase.mockRestore(); spawn.mockRestore();
+			phase.mockRestore();
 		}
 	}, 30_000);
 
 	test("a ctx whose ui getter throws after shutdown still ends with ACTIVE_RUN null and a recorded failed outcome", async () => {
-		const { handler, shutdown } = activate();
 		let childReady!: () => void;
 		const ready = new Promise<void>(resolve => { childReady = resolve; });
-		let session: InstanceType<typeof orchestrator.RunSession> | undefined;
-		const phase = spyOn(orchestrator.RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof orchestrator.RunSession>) { session = this; });
-		const original = childProcess.spawn;
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], opts: object) => {
-			if (!args.includes("--mode")) return original(command, args, opts);
+		const { handler, shutdown, activeSession, RunSession } = activate((command, args, opts) => {
+			if (!args.includes("--mode")) return nodeSpawn(command, args, opts);
 			const event = { type: "message_end", message: { role: "assistant", model: "claude-sonnet-4-5", usage: { input: 10, output: 2, cost: { total: .01 } }, content: [{ type: "text", text: "not JSON" }] } };
-			const child = original(process.execPath, ["-e", `console.log(${JSON.stringify(JSON.stringify(event))});setTimeout(()=>{},30000);`], opts);
+			const child = nodeSpawn(process.execPath, ["-e", `console.log(${JSON.stringify(JSON.stringify(event))});setTimeout(()=>{},30000);`], opts);
 			child.stdout?.once("data", () => setTimeout(childReady, 10));
 			return child;
-		}) as typeof childProcess.spawn);
+		});
+		let session: InstanceType<typeof RunSession> | undefined;
+		const phase = spyOn(RunSession.prototype, "setPhase").mockImplementation(function (this: InstanceType<typeof RunSession>) { session = this; });
 		let uiInvalidated = false;
 		const ui = { notify() {}, setWidget() {}, setStatus() {} };
 		const ctx = {
@@ -1190,7 +1175,7 @@ describe("final triage and shutdown integration (index.ts wiring)", () => {
 			uiInvalidated = false;
 			session?.cancel();
 			await session?.runPromise;
-			phase.mockRestore(); spawn.mockRestore(); errSpy.mockRestore();
+			phase.mockRestore(); errSpy.mockRestore();
 		}
 	}, 30_000);
 });
