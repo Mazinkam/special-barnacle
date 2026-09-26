@@ -44,7 +44,7 @@ from ..outcomes import outcome_summary
 from ..records import NO_DATA
 from ..core.fs import read_json
 from ..core.jsonl import iter_jsonl
-from ..run_evidence import evidence_coverage, summarize_runs
+from ..run_evidence import SPEND_CAP_EVENT, evidence_coverage, spend_cap_breach, summarize_runs
 from ..analytics import flaky_stats
 from ..contract import INGEST_STATUS_FILE, STREAMS
 
@@ -57,6 +57,7 @@ RECENT_EVENTS = 500
 RECENT_METRICS = 2000
 RECENT_ADAPTIVE = 500
 RECENT_RUNS = 200
+RECENT_SPEND_CAP_BREACHES = 50
 
 #: A p99/p50 ratio computed from a handful of calls describes the handful, not the workload. Below
 #: this many per-call samples the tail ratio is `NO_DATA` rather than a number readers would trust.
@@ -310,6 +311,52 @@ def _lead_sizes(orchestrated: list[dict], runs: list[dict]) -> list[dict[str, An
     return out
 
 
+def _spend_caps(cap_events: list[dict], runs: list[dict]) -> dict[str, Any]:
+    """Per-dispatch spend-cap breaches (`rules.dispatch_spend_cap`) from every event, not the tail.
+
+    Grouped by (capability, model). Verification is the run verdict, counted once per breached run
+    so the table answers "did over-cap dispatches still ship verified work?" before `enforce`.
+    """
+    verdict = {str(r.get('run_id')): r.get('verification') for r in runs}
+    breaches = [spend_cap_breach(e) for e in cap_events]
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for b in breaches:
+        g = groups.setdefault((b['capability'], b['model']), {
+            'breaches': 0, 'stopped': 0, 'runs': set(), 'caps': set(), 'costs': [], 'overs': [],
+            'ratios': [], 'nested': 0.0, 'nested_cost_base': 0.0})
+        g['breaches'] += 1
+        g['stopped'] += b['action'] == 'stop'
+        if b['run_id'] is not None: g['runs'].add(b['run_id'])
+        if b['cap_usd'] is not None: g['caps'].add(b['cap_usd'])
+        if b['cost_usd'] is not None: g['costs'].append(b['cost_usd'])
+        if b['over_usd'] is not None: g['overs'].append(b['over_usd'])
+        if b['over_ratio'] is not None: g['ratios'].append(b['over_ratio'])
+        if b['nested_cost_usd'] is not None and b['cost_usd']:
+            g['nested'] += b['nested_cost_usd']; g['nested_cost_base'] += b['cost_usd']
+    out = []
+    for (capability, model), g in groups.items():
+        verdicts = [verdict.get(rid) for rid in g['runs']]
+        out.append({
+            'capability': capability, 'model': model, 'breaches': g['breaches'], 'runs': len(g['runs']),
+            'stopped': g['stopped'],
+            'cap_usd': max(g['caps']) if g['caps'] else NO_DATA, 'cap_changed': len(g['caps']) > 1,
+            'total_cost_usd': sum(g['costs']) if g['costs'] else NO_DATA,
+            'max_cost_usd': max(g['costs']) if g['costs'] else NO_DATA,
+            'max_over_usd': max(g['overs']) if g['overs'] else NO_DATA,
+            'mean_over_ratio': records.ratio(sum(g['ratios']), len(g['ratios'])),
+            'nested_share': records.ratio(g['nested'], g['nested_cost_base']),
+            'verified_pass': sum(v == 'passed' for v in verdicts),
+            'verified_fail': sum(v == 'failed' for v in verdicts),
+            'verification_unknown': sum(v not in ('passed', 'failed') for v in verdicts),
+        })
+    out.sort(key=lambda g: (-_num(g['total_cost_usd']), g['capability'], g['model']))
+    recent = sorted(breaches, key=lambda b: str(b.get('ts') or ''))[-RECENT_SPEND_CAP_BREACHES:]
+    for b in recent:
+        b['verification'] = verdict.get(str(b['run_id'])) or 'unknown'
+    return {'breaches': len(breaches), 'runs': len({b['run_id'] for b in breaches if b['run_id'] is not None}),
+            'by_capability': out, 'recent': recent}
+
+
 def build_ingest_status(raw: Any, *, now: datetime) -> dict[str, Any]:
     """Validate persisted ingest health and derive staleness without trusting its contents."""
     unknown = {
@@ -561,6 +608,7 @@ def build_data(root: Path, config: dict | None = None):
     conflict_rows = 0
     invalidations = 0
     run_events = []
+    cap_events = []
     recent_events: deque[dict] = deque(maxlen=RECENT_EVENTS)
     for event in unique_records(iter_jsonl(root / STREAMS['event'])):
         event_count += 1
@@ -569,6 +617,8 @@ def build_data(root: Path, config: dict | None = None):
         kind = event.get('event')
         conflict_rows += kind in _CONFLICT_EVENTS
         invalidations += kind == 'decision_invalidated'
+        if kind == SPEND_CAP_EVENT:
+            cap_events.append(event)
         if event.get('run_id') is not None or kind == 'decision_invalidated':
             run_events.append(event)
     outcomes = list(unique_records(iter_jsonl(root / STREAMS['outcome'])))
@@ -636,6 +686,7 @@ def build_data(root: Path, config: dict | None = None):
     delayed_bad = sum(1 for x in mature30 if x['bad_outcome'])
     runs = summarize_runs(orchestrated, run_events, outcomes)
     run_cov = evidence_coverage(runs)
+    spend_caps = _spend_caps(cap_events, runs)
 
     def action_count(name: str) -> Any:
         """Count of one adaptive action: a real `0` when decisions exist, `NO_DATA` when none do."""
@@ -683,6 +734,8 @@ def build_data(root: Path, config: dict | None = None):
         'coordination_cost': overhead['coordination_cost'],
         'verification_cost': overhead['verification_cost'],
         'fanout_rework': fanout_rework(run_events),
+        # The bridge emits this event whenever a cap is crossed, so absence is a measured 0.
+        'spend_cap_breaches': spend_caps['breaches'],
         'context_miss_rate': records.ratio(risk['context_misses'], risk['context_packets']),
         # A genuine 0 stays 0; with no producer for merge-conflict events at all, the absence is
         # reported as absence and the renderer labels it `not instrumented`.
@@ -728,6 +781,7 @@ def build_data(root: Path, config: dict | None = None):
             'routes': build_route_stats(orchestrated, outcomes), 'outcomes': outsum,
             'run_evidence': run_cov, 'runs': runs[-RECENT_RUNS:],
             'lead_sizes': _lead_sizes(orchestrated, runs),
+            'spend_caps': spend_caps,
             # flaky_stats only matches rows with event=='verification_result'; session-ingest rows
             # are event=='model_call' and never contribute, but we pass `orchestrated` for
             # consistency with the rest of this function's inputs.

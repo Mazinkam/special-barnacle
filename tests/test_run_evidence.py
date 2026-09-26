@@ -378,3 +378,41 @@ class CoverageTests(unittest.TestCase):
 
 
 if __name__=='__main__': unittest.main()
+
+
+def cap_event(run_id, task_id, **kw):
+    row = {'event': 'spend_cap_exceeded', 'run_id': run_id, 'task_id': task_id, 'capability': 'lead_large',
+           'model': 'bedrock/fable', 'cap_usd': 10, 'cost_usd': 10.02486, 'nested_cost_usd': 5.26763,
+           'action': 'warn', 'ts': '2026-09-24T20:09:22.979Z', 'record_id': f'cap-{run_id}-{task_id}'}
+    row.update(kw); return row
+
+
+class SpendCapTests(unittest.TestCase):
+    def test_run_without_breach_has_empty_hits(self):
+        run = by_run(summarize_runs([call('r1', 't1', cost_usd=0.1, cost_source='reported')], [], []))['r1']
+        self.assertEqual(run['spend_cap_hits'], [])
+        self.assertFalse(run['spend_cap_hit'])
+
+    def test_breach_is_joined_to_its_run_with_overage_and_subagent_share(self):
+        runs = by_run(summarize_runs([call('r1', 'r1-lead-0', cost_usd=10.0, cost_source='reported')],
+                                     [cap_event('r1', 'r1-lead-0')], []))
+        run = runs['r1']
+        self.assertTrue(run['spend_cap_hit'])
+        (hit,) = run['spend_cap_hits']
+        self.assertEqual(hit['task_id'], 'r1-lead-0')
+        self.assertEqual(hit['capability'], 'lead_large')
+        self.assertEqual(hit['action'], 'warn')
+        self.assertAlmostEqual(hit['over_usd'], 0.02486)
+        self.assertAlmostEqual(hit['over_ratio'], 1.002486)
+        self.assertAlmostEqual(hit['nested_share'], 5.26763 / 10.02486)
+
+    def test_malformed_amounts_are_unknown_not_zero(self):
+        runs = by_run(summarize_runs([], [cap_event('r1', 't', cap_usd=None, cost_usd='bogus', nested_cost_usd=None)], []))
+        (hit,) = runs['r1']['spend_cap_hits']
+        for key in ('cap_usd', 'cost_usd', 'nested_cost_usd', 'over_usd', 'over_ratio', 'nested_share'):
+            self.assertIsNone(hit[key], key)
+
+    def test_duplicate_records_count_once(self):
+        e = cap_event('r1', 't')
+        runs = by_run(summarize_runs([], [e, dict(e)], []))
+        self.assertEqual(len(runs['r1']['spend_cap_hits']), 1)

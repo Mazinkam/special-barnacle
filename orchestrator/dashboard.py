@@ -24,6 +24,7 @@ from .presentation.dashboard_data import (
     RECENT_EVENTS,
     RECENT_METRICS,
     RECENT_RUNS,
+    RECENT_SPEND_CAP_BREACHES,
     _FIELD_NOTES,
     _CONFLICT_EVENTS,
     _CONTEXT_MISS_EVENTS,
@@ -34,6 +35,7 @@ from .presentation.dashboard_data import (
     _mirrors,
     _num,
     _rate_provenance,
+    _spend_caps,
     _verification_task_ids,
     build_data,
     build_ingest_status,
@@ -47,7 +49,7 @@ from .presentation.publish import (
 from .presentation import publish as _publish
 
 __all__ = [
-    'RECENT_EVENTS', 'RECENT_METRICS', 'RECENT_ADAPTIVE', 'RECENT_RUNS',
+    'RECENT_EVENTS', 'RECENT_METRICS', 'RECENT_ADAPTIVE', 'RECENT_RUNS', 'RECENT_SPEND_CAP_BREACHES',
     'MIN_TAIL_SAMPLES', 'INSTRUMENTATION', 'EXECUTED_MIRROR_TOLERANCE', 'LEAD_SIZE_ORDER',
     'safe', 'tail_ratio', 'build_ingest_status', 'build_data',
     'stream_version', 'dashboard_is_current', 'generate_dashboard',

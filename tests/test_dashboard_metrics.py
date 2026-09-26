@@ -833,3 +833,55 @@ class LeadSizingTableTests(StreamCase):
 
     def test_empty_without_lead_size_rows(self):
         self.assertEqual(self.build(metrics=[per_call(0.1)])['lead_sizes'], [])
+
+
+class SpendCapBreachTests(StreamCase):
+    """Per-dispatch spend-cap breaches are aggregated from every event, not the recent-events tail."""
+
+    def _cap(self, run_id, capability='lead_large', cost=10.5, nested=5.0, cap=10, action='warn', model='fable'):
+        return {'event': 'spend_cap_exceeded', 'run_id': run_id, 'task_id': f'{run_id}-lead-0',
+                'capability': capability, 'model': model, 'cap_usd': cap, 'cost_usd': cost,
+                'nested_cost_usd': nested, 'action': action, 'ts': f'2026-09-24T10:00:00Z',
+                'record_id': f'cap-{run_id}-{capability}'}
+
+    def test_no_breaches_is_a_real_zero(self):
+        data = self.build(metrics=[per_call(0.1)])
+        self.assertEqual(data['summary']['spend_cap_breaches'], 0)
+        self.assertEqual(data['spend_caps']['by_capability'], [])
+
+    def test_groups_by_capability_and_model_with_verification(self):
+        events = [self._cap('r1'), self._cap('r2', cost=12.0, nested=9.0, action='stop'),
+                  self._cap('r3', capability='lead', cost=4.4, nested=0.0, cap=4)]
+        outcomes = [{'run_id': 'r1', 'task_id': 'r1-qa', 'verification': True, 'outcome': 'verified'},
+                    {'run_id': 'r2', 'task_id': 'r2-qa', 'verification': False, 'outcome': 'fail'}]
+        data = self.build(events=events, outcomes=outcomes)
+        self.assertEqual(data['summary']['spend_cap_breaches'], 3)
+        caps = data['spend_caps']
+        self.assertEqual(caps['breaches'], 3)
+        self.assertEqual(caps['runs'], 3)
+        by = {(g['capability'], g['model']): g for g in caps['by_capability']}
+        large = by[('lead_large', 'fable')]
+        self.assertEqual(large['breaches'], 2)
+        self.assertEqual(large['stopped'], 1)
+        self.assertAlmostEqual(large['max_cost_usd'], 12.0)
+        self.assertAlmostEqual(large['max_over_usd'], 2.0)
+        self.assertAlmostEqual(large['nested_share'], 14.0 / 22.5)
+        self.assertEqual((large['verified_pass'], large['verified_fail'], large['verification_unknown']), (1, 1, 0))
+        self.assertEqual(by[('lead', 'fable')]['verification_unknown'], 1)
+        # most expensive group first
+        self.assertEqual(caps['by_capability'][0]['capability'], 'lead_large')
+        self.assertEqual(len(caps['recent']), 3)
+
+    def test_breaches_survive_beyond_the_recent_events_tail(self):
+        from orchestrator.dashboard import RECENT_EVENTS
+        filler = [{'event': 'noise', 'ts': '2026-09-25T00:00:00Z', 'record_id': f'n{i}'} for i in range(RECENT_EVENTS + 5)]
+        data = self.build(events=[self._cap('old')] + filler)
+        self.assertNotIn('spend_cap_exceeded', {e.get('event') for e in data['events']})
+        self.assertEqual(data['summary']['spend_cap_breaches'], 1)
+
+    def test_breaches_render_in_the_page(self):
+        with tempfile.TemporaryDirectory() as directory:
+            write_stream(directory, [per_call(1.0, run_id='r1')], [self._cap('r1')])
+            html = generate_dashboard(directory, config={}).read_text(encoding='utf-8')
+        self.assertIn('id="spendcaps"', html)
+        self.assertIn('Spend-cap breaches', html)

@@ -123,7 +123,7 @@ Several leads need the architect's `## Lead assignments` (scope + `depends on`).
 
 ### Spend cap and provider fallback
 
-`rules.dispatch_spend_cap` sets a USD ceiling per dispatch (`lead_small` $1.50, `lead` $4, `lead_large` $10, `architect` $2, default $1). `warn` notifies once and records `spend_cap_exceeded`; `enforce` also stops the dispatch; `off` disables. It ships as `warn`.
+`rules.dispatch_spend_cap` sets a USD ceiling per dispatch (`lead_small` $1.50, `lead` $4, `lead_large` $10, `architect` $2, default $1). `warn` notifies once and records `spend_cap_exceeded`; `enforce` also stops the dispatch; `off` disables. It ships as `warn`. The dashboard's **Spend-cap breaches** table groups every breach by capability and model (cap, max cost, overage, subagent share, stopped count, run verdict), the Risk observatory shows the total, and the run evidence table flags each capped run.
 
 A dispatch on an `openai-codex/*` model that fails with a usage-limit, quota or rate-limit error is retried once on the same model id under `amazon-bedrock` and recorded as `route_degraded`. Both attempts are billed.
 

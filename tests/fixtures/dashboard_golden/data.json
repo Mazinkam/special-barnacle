@@ -963,6 +963,8 @@
         "lead"
       ],
       "run_id": "r1",
+      "spend_cap_hit": false,
+      "spend_cap_hits": [],
       "started_at": null,
       "status": "completed",
       "tasks": 2,
@@ -1008,6 +1010,8 @@
         "lead_large"
       ],
       "run_id": "r2",
+      "spend_cap_hit": false,
+      "spend_cap_hits": [],
       "started_at": null,
       "status": "failed",
       "tasks": 1,
@@ -1019,6 +1023,12 @@
       "verified_tasks": 0
     }
   ],
+  "spend_caps": {
+    "breaches": 0,
+    "by_capability": [],
+    "recent": [],
+    "runs": 0
+  },
   "summary": {
     "adaptive_action_counts": {
       "empirical_enforced": 0,
@@ -1106,6 +1116,7 @@
     "shadow_false_pass_rate": null,
     "shadow_over_reject_rate": null,
     "shadow_reviews": 0,
+    "spend_cap_breaches": 0,
     "stable_30d_failure_rate": 1.0,
     "tail_ratio": null,
     "tail_ratio_min_samples": 20,

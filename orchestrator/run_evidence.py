@@ -47,6 +47,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 import json
+import math
 
 from . import records
 from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, has_reported_tokens, is_call_row, is_session_ingest, row_cost, unique_records
@@ -66,6 +67,38 @@ def _int_or_none(value: Any) -> int | None:
     if value is None or value == '': return None
     try: return int(float(value))
     except (TypeError, ValueError): return None
+
+
+def _usd_or_none(value: Any) -> float | None:
+    """A finite USD amount, or None when absent/malformed — never a silent 0."""
+    if value is None or value == '' or isinstance(value, bool): return None
+    try: amount = float(value)
+    except (TypeError, ValueError): return None
+    return amount if math.isfinite(amount) else None
+
+
+SPEND_CAP_EVENT = 'spend_cap_exceeded'
+
+
+def spend_cap_breach(event: dict) -> dict[str, Any]:
+    """Normalize one bridge `spend_cap_exceeded` event (bridge/extensions/orchestrator/index.ts).
+
+    `cost_usd` is the dispatch's running cost including its own subagents; `nested_cost_usd` is the
+    subagent part. Derived fields are None when an input is missing rather than computed from 0.
+    """
+    cap = _usd_or_none(event.get('cap_usd'))
+    cost = _usd_or_none(event.get('cost_usd'))
+    nested = _usd_or_none(event.get('nested_cost_usd'))
+    return {
+        'run_id': None if event.get('run_id') is None else str(event.get('run_id')),
+        'task_id': None if event.get('task_id') is None else str(event.get('task_id')),
+        'capability': str(event.get('capability') or 'unknown'), 'model': str(event.get('model') or 'unknown'),
+        'action': str(event.get('action') or 'unknown'), 'ts': event.get('ts'),
+        'cap_usd': cap, 'cost_usd': cost, 'nested_cost_usd': nested,
+        'over_usd': (cost - cap) if cost is not None and cap is not None else None,
+        'over_ratio': (cost / cap) if cost is not None and cap else None,
+        'nested_share': (nested / cost) if nested is not None and cost else None,
+    }
 
 
 def _role(row: dict) -> str:
@@ -204,6 +237,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
     status: dict[str, str] = {}
     retry_dispatches: dict[str, set[str]] = defaultdict(set)
     rework_events: dict[str, int] = defaultdict(int)
+    cap_hits: dict[str, list[dict]] = defaultdict(list)
     for e in unique_records(events):
         rid = e.get('run_id')
         if rid is None: continue
@@ -213,6 +247,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
             status[rid] = TERMINAL_EVENTS[kind]; terminal[rid] = {**terminal.get(rid, {}), **{k: v for k, v in _terminal_fields(e).items() if v is not None}}
         elif kind == 'dispatch_started' and e.get('retry_of'): retry_dispatches[rid].add(str(e.get('task_id') or e.get('retry_of')))
         elif kind in {'rework', 'decision_invalidated', 'merge_conflict_resolution'}: rework_events[rid] += 1
+        elif kind == SPEND_CAP_EVENT: cap_hits[rid].append(spend_cap_breach(e))
 
     verification: dict[str, str] = {}
     summary_note: dict[str, dict] = {}
@@ -288,6 +323,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
             'roles': sorted({_role(r) for r in rows}), 'retries': retries, 'rework_events': rework_events[rid],
             'verification': verdict or 'unknown', 'verification_rows': len(verifications[rid]), 'verified_tasks': len(verified_tasks),
             'decision_rows': decisions[rid], 'other_metric_rows': other_rows[rid], 'excluded_session_ingest_rows': excluded[rid],
+            'spend_cap_hit': bool(cap_hits[rid]), 'spend_cap_hits': cap_hits[rid],
             'delayed_bad_outcome': delayed_bad[rid] if (outcome_tasks[rid] or delayed_bad[rid]) else None,
             'counterfactual': _counterfactual(rows, baseline_model, pricing) if baseline_model else None,
         })
