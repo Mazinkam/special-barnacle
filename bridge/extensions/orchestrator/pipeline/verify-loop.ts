@@ -60,16 +60,35 @@ export function parseFailedChecks(text: string): string[] {
 	const statusRe = (cell: string): boolean => statusWordRe.test(cell) || statusSymbolRe.test(cell);
 	// A non-zero count of errors/failures, e.g. "2 errors", "1 failed" — but not "0 errors".
 	const nonZeroCountRe = /\b[1-9]\d*\s+(error|errors|failed|failures?)\b/i;
-	// Markdown table rows: `| label | status cell |`.
-	const rowRe = /\|\s*([^|]+?)\s*\|\s*([^|]*)\|/g;
-	let m: RegExpExecArray | null;
-	while ((m = rowRe.exec(text)) !== null) {
-		const label = m[1].trim();
-		const cell = m[2];
-		if (statusRe(cell) || nonZeroCountRe.test(cell)) {
+	// Markdown table rows: `| label | col | ... | status cell |`. Parsed whole-line so a
+	// failing status in any column beyond the label is caught, not just the second cell.
+	const separatorRowRe = /^:?-+:?$/;
+	const lines = text.split(/\r?\n/);
+	const cellsOf = (line: string): string[] | null => {
+		const trimmed = line.trim();
+		if (!trimmed.startsWith("|")) return null;
+		const raw = trimmed.split("|");
+		// A leading/trailing `|` produces an empty first/last element; drop them.
+		if (raw.length > 0 && raw[0]!.trim() === "") raw.shift();
+		if (raw.length > 0 && raw[raw.length - 1]!.trim() === "") raw.pop();
+		if (raw.length < 2) return null;
+		return raw.map((c) => c.trim());
+	};
+	const isSeparatorRow = (cells: string[]): boolean => cells.every((c) => separatorRowRe.test(c));
+	for (let i = 0; i < lines.length; i++) {
+		const cells = cellsOf(lines[i]!);
+		if (!cells) continue;
+		if (isSeparatorRow(cells)) continue;
+		// A row immediately followed by a separator row is the header row — skip it.
+		const nextCells = i + 1 < lines.length ? cellsOf(lines[i + 1]!) : null;
+		if (nextCells && isSeparatorRow(nextCells)) continue;
+		const label = cells[0]!;
+		const rest = cells.slice(1);
+		if (rest.some((cell) => statusRe(cell) || nonZeroCountRe.test(cell))) {
 			fails.push(label);
 		}
 	}
+	let m: RegExpExecArray | null;
 	// Bullet points labelled FAIL: `- foo: FAIL`.
 	const bulletRe = /^[-*]\s+(.+?):\s*(.*)$/gim;
 	while ((m = bulletRe.exec(text)) !== null) {

@@ -58,4 +58,21 @@ describe("parseFailedChecks", () => {
 	test("does not flag 0 failed count", () => {
 		expect(parseFailedChecks("| tests | 0 failed |")).toEqual([]);
 	});
+
+	test("flags a FAIL status cell in the third column of a 3+-column row", () => {
+		expect(parseFailedChecks("| unit | pytest | FAIL |")).toEqual(["unit"]);
+	});
+
+	test("does not flag a zero-error status cell in the third column of a 3+-column row", () => {
+		expect(parseFailedChecks("| lint | ruff | 0 errors |")).toEqual([]);
+	});
+
+	test("does not flag a header row", () => {
+		expect(parseFailedChecks("| Check | Command | Result |")).toEqual([]);
+	});
+
+	test("does not flag a header row followed by a separator row and skips the separator too", () => {
+		const table = ["| Check | Command | Result |", "| --- | --- | --- |", "| unit | pytest | FAIL |"].join("\n");
+		expect(parseFailedChecks(table)).toEqual(["unit"]);
+	});
 });
