@@ -63,6 +63,13 @@ export function parseFailedChecks(text: string): string[] {
 	// Markdown table rows: `| label | col | ... | status cell |`. Parsed whole-line so a
 	// failing status in any column beyond the label is caught, not just the second cell.
 	const separatorRowRe = /^:?-+:?$/;
+	// Header names that identify a column as carrying a pass/fail status.
+	const statusHeaderRe = /^(status|result|verdict|outcome|pass\/fail|state)$/i;
+	// Header names that identify a column as carrying an error/failure count.
+	const countHeaderRe = /^(errors?|failures?|failed)$/i;
+	// Header names for free-text columns that legitimately mention "FAIL" without meaning it
+	// (e.g. "Notes: no FAIL found") — excluded from the header-less fallback scan.
+	const notesHeaderRe = /^(notes?|details?|comments?|description|reason|evidence)$/i;
 	const lines = text.split(/\r?\n/);
 	const cellsOf = (line: string): string[] | null => {
 		const trimmed = line.trim();
@@ -79,12 +86,47 @@ export function parseFailedChecks(text: string): string[] {
 		const cells = cellsOf(lines[i]!);
 		if (!cells) continue;
 		if (isSeparatorRow(cells)) continue;
-		// A row immediately followed by a separator row is the header row — skip it.
+		// A row immediately followed by a separator row is the header row — skip it, but use its
+		// column names to decide which columns of the data rows below are worth checking.
 		const nextCells = i + 1 < lines.length ? cellsOf(lines[i + 1]!) : null;
 		if (nextCells && isSeparatorRow(nextCells)) continue;
+		// Find the nearest preceding header row (a row immediately followed by a separator row),
+		// scanning back through contiguous table rows only.
+		let header: string[] | null = null;
+		for (let j = i - 1; j >= 0; j--) {
+			const prevCells = cellsOf(lines[j]!);
+			if (!prevCells) break; // left the table entirely without finding a header
+			if (isSeparatorRow(prevCells)) continue; // the separator row itself; keep looking above it
+			const afterPrev = cellsOf(lines[j + 1]!);
+			if (afterPrev && isSeparatorRow(afterPrev)) {
+				header = prevCells;
+				break;
+			}
+			// Another data row above `i`; keep scanning back toward the header.
+		}
 		const label = cells[0]!;
 		const rest = cells.slice(1);
-		if (rest.some((cell) => statusRe(cell) || nonZeroCountRe.test(cell))) {
+		const restIndices = rest.map((_, idx) => idx);
+		let indicesToCheck = restIndices;
+		if (header) {
+			const headerRest = header.slice(1);
+			const recognized = restIndices.filter((idx) => {
+				const headerCell = headerRest[idx];
+				return headerCell !== undefined && (statusHeaderRe.test(headerCell) || countHeaderRe.test(headerCell));
+			});
+			if (recognized.length > 0) {
+				indicesToCheck = recognized;
+			} else {
+				// No recognized status/count column: fall back to every non-label cell except
+				// free-text columns (notes/details/comment(s)/description/reason/evidence).
+				indicesToCheck = restIndices.filter((idx) => {
+					const headerCell = headerRest[idx];
+					return headerCell === undefined || !notesHeaderRe.test(headerCell);
+				});
+			}
+		}
+		// Headerless tables: fail-safe, keep checking every non-label cell (indicesToCheck === restIndices).
+		if (indicesToCheck.some((idx) => statusRe(rest[idx]!) || nonZeroCountRe.test(rest[idx]!))) {
 			fails.push(label);
 		}
 	}

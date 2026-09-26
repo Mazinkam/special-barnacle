@@ -118,6 +118,34 @@ describe("parseFailedChecks", () => {
 		const table = ["| Check | Command | Result |", "| --- | --- | --- |", "| unit | pytest | FAIL |"].join("\n");
 		expect(parseFailedChecks(table)).toEqual(["unit"]);
 	});
+
+	test("does not flag a FAIL-looking word inside a Notes column when the header names a Status column", () => {
+		const table = ["| Check | Status | Notes |", "| --- | --- | --- |", "| tests | PASS | Notes: no FAIL found |"].join("\n");
+		expect(parseFailedChecks(table)).toEqual([]);
+	});
+
+	test("does not flag a passing summary cell with a zero failed count and no header", () => {
+		expect(parseFailedChecks("| tests | 12 passed, 0 failed |")).toEqual([]);
+	});
+
+	test("flags a FAIL in a Result column when the header names it", () => {
+		const table = ["| Check | Command | Result |", "| --- | --- | --- |", "| unit | pytest | FAIL |"].join("\n");
+		expect(parseFailedChecks(table)).toEqual(["unit"]);
+	});
+
+	test("flags a FAIL in a headerless table (fail-safe: checks every non-label cell)", () => {
+		expect(parseFailedChecks("| unit | pytest | FAIL |")).toEqual(["unit"]);
+	});
+
+	test("does not flag a FAIL-looking word in a Description column when the header names no status/count column", () => {
+		const table = ["| Check | Description |", "| --- | --- |", "| tests | if this fails, investigate FAIL cases |"].join("\n");
+		expect(parseFailedChecks(table)).toEqual([]);
+	});
+
+	test("falls back to checking every non-label, non-notes cell when the header names no recognized column", () => {
+		const table = ["| Check | Summary |", "| --- | --- |", "| unit | FAIL |"].join("\n");
+		expect(parseFailedChecks(table)).toEqual(["unit"]);
+	});
 });
 
 describe("runVerification", () => {
