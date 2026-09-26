@@ -58,10 +58,10 @@ def _build_wheel(dest_dir: Path) -> Path:
     """Build a wheel for the repo into dest_dir, returning its path.
 
     Uses --no-build-isolation (no `build` module / network-isolated build env
-    available) and --ignore-requires-python, since the repo's
-    `requires-python = ">=3.10"` is unmet by the Python 3.9.6 interpreter this
-    suite runs under; that is a test-environment accommodation only, not a
-    metadata change.
+    available) and --ignore-requires-python for robustness across whichever
+    interpreter this suite runs under; `requires-python` matches the 3.9.6
+    interpreter this repo is developed and tested on, so the flag is normally a
+    no-op here.
     """
     result = subprocess.run(
         [

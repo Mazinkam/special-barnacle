@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "hierarchical-agent-orchestrator"
 version = "0.3.0"
 description = "Model-agnostic hierarchical development orchestrator reference runtime"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 
 [tool.setuptools.packages.find]
 include = ["orchestrator*"]
