@@ -73,6 +73,10 @@ The Python packaging regression check `python3 -m pytest -q tests/test_packaging
 |---|---|---|
 | B4.6 `index.ts` wiring | fixed-now | 9fb00f9, 6e411f7, 3900c01, c93d85c |
 | B4.7 `parseFailedChecks` zero rows | fixed-now | 8fb3c57 |
+| B4.7 `parseFailedChecks` multi-column status cells | fixed-now | 720b833, ea5055a |
+| B4.7 explicit QA FAIL verdict with exit 0 | fixed-now | c17c7e6 |
+| B4.7 quoted, blockquoted, and fenced content handling | fixed-now | 921af0d, 21febf4 |
+| B4.7 real CLI plan fixture for `parsePlanResponse` | fixed-now | 86a64b1, f062c2b |
 | B4.7 PlanResponse validation | fixed-now | ef683bf |
 | B4.7 coupling/parallelizable defaults | fixed-now | e3b4a0c |
 | B4.7 prompt-write/discovery failures | fixed-now | 87fb1ee |
@@ -83,3 +87,14 @@ The Python packaging regression check `python3 -m pytest -q tests/test_packaging
 | B4.7 `reconWorkers` missing complexity band | fixed-now | 5214332 |
 | Dashboard spend-cap panel merge from main | fixed-now | 3b7bf5d |
 | `models.ts` reconWorkers has no production caller | open — Phase 2 dead-code candidate | — |
+
+## Phase 1 gate
+
+At commit `21febf4`:
+
+- `python3 -m pytest -q`: 885 passed, 1 skipped
+- `bun test` (bridge): 626 pass, 0 fail
+- `scripts/typecheck-bridge.sh`: 0 diagnostics
+- `tests/test_layers.py` + `tests/test_dashboard_golden.py`: 11 passed
+
+`index.ts` is 400 lines: imports, config destructuring, dependency-binding wrappers, one labelled compatibility re-export block (to be removed by B5 when `index.test.ts` is split), and the registration default export.

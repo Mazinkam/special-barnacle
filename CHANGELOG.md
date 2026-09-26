@@ -3,6 +3,7 @@
 ### B4.7 fixes
 
 - Fixed `parseFailedChecks` treating `0 errors`/`0 failed` rows as QA failures (B4.7).
+- QA verification now checks every status/count column of a QA table (header-aware; Notes/Description columns ignored), treats an explicit `## Verdict` FAIL as a failure even when the QA process exits 0, and ignores quoted/fenced content (unterminated fences are parsed, fail-safe) (B4.7).
 - `orchestrator.cli plan` JSON is validated before being used as a PlanResponse (B4.7).
 - `planRun` no longer sends `--coupling 0.5 --parallelizable 0.5`; Python defaults are already 0.5, no behaviour change (B4.7).
 - Persona prompt-file write/discovery failures are logged to the session and written as a per-dispatch diagnostic instead of silently falling back (B4.7).
