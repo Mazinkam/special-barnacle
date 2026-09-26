@@ -80,6 +80,15 @@ material it refers to:
   inserts it into the architect and lead prompts under `## Provided context`, one sub-block per
   file, each capped at 40,000 characters with an explicit truncation note if it is cut. A
   missing or unreadable file stops the command with a clear error — no run is started.
+  Symlinks are rejected outright (whether the file itself or its containing directory is a
+  symlink) — pass the target path directly. Only regular files are accepted; a FIFO, device
+  file, or directory is rejected with a clear message instead. Binary content (a NUL byte, or
+  bytes that are not valid UTF-8) is rejected: this is a text-attachment mechanism, not a
+  general file upload. At most 160,000 bytes of any single file is ever read off disk
+  (truncated with a note beyond that, on top of the 40,000-character cap above), and the
+  combined content of every `--context` file plus `--with-last-reply` is capped at 160,000
+  characters in aggregate — several attachments that each fit individually can still be
+  truncated (with a note) once their total exceeds that budget.
 - `--with-last-reply`: attaches the current session's last assistant message the same way,
   labelled `last assistant reply`. Stops with an error if the session has no assistant message
   yet.
@@ -88,6 +97,18 @@ material it refers to:
   `that plan` — is refused with a message pointing at `--context`/`--with-last-reply`/`--force`,
   instead of dispatching a run that will just block on missing context. Pass `--force` to skip
   this check (e.g. for a goal that only looks like a reference but genuinely is not one).
+- Every attached source's path is redacted before it is put in front of a model (the label, and
+  the file's own body text — an attachment can just as easily contain the operator's home
+  directory as its filename can), and each source is wrapped in a
+  `<provided-context source="...">...</provided-context>` delimiter, with a header stating
+  explicitly that the block is reference material supplied by the user, not directives from the
+  orchestrator — so a `--context` file (or the last assistant reply) cannot pose as an
+  instruction a lead or the architect should follow.
+- Attached content is sent to whichever model providers are configured for this run (same as
+  the goal and every other part of the prompt), and is retained in this run's local prompt
+  diagnostics (`*.prompt.md`, written mode `0600`) for later inspection. That diagnostic copy is
+  path-redacted, the same as the prompt itself, but is **not** secret-scrubbed — don't attach a
+  file containing credentials, tokens, or other secrets.
 
 ## How it works
 

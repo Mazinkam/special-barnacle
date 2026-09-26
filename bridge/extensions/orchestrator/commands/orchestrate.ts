@@ -16,12 +16,13 @@
  * directly from its own module, same as any other caller.
  */
 import type { ExtensionAPI, ExtensionContext } from "@humain/terminal";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 
 import { parseArgs, usageText, type ModelOverrides } from "../core/args.ts";
-import { buildProvidedContextBlock, contextFileLabel, lastAssistantReplyText, LAST_REPLY_LABEL, type ContextSource } from "../core/context.ts";
+import { buildProvidedContextBlock, contextFileLabel, CONTEXT_SOURCE_MAX_CHARS, lastAssistantReplyText, LAST_REPLY_LABEL, type ContextSource } from "../core/context.ts";
 import { goalRefersToMissingContext } from "../core/context-detector.ts";
+import { redactPaths } from "../hooks/ingest.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import type { DispatchTask, PlanResponse } from "../core/prompts.ts";
 import { buildRunSummary } from "../core/report.ts";
@@ -90,14 +91,157 @@ function goalExpectsInteraction(goal: string): boolean {
 }
 
 /**
+ * Bytes read from disk before `core/context.ts`'s per-source
+ * `CONTEXT_SOURCE_MAX_CHARS` (character) cap is applied — generous headroom
+ * (4x) for multi-byte UTF-8 content — so a huge `--context` file is never
+ * read in full: only this bounded prefix ever touches memory
+ * (docs/architecture-review.md C6).
+ */
+const CONTEXT_FILE_PREFIX_BYTES = 4 * CONTEXT_SOURCE_MAX_CHARS;
+
+/**
+ * Aggregate cap across every `--context` file plus `--with-last-reply`
+ * combined (docs/architecture-review.md C6): a single huge attachment is
+ * already capped per-source (`CONTEXT_SOURCE_MAX_CHARS`), but several
+ * attachments each near that cap could otherwise blow the prompt budget out
+ * together. Sources are consumed in order; once the budget is exhausted,
+ * later content is truncated (with a note) rather than the run being
+ * rejected outright.
+ */
+export const CONTEXT_AGGREGATE_MAX_CHARS = 160_000;
+
+/**
+ * Trims the trailing bytes of `buf` that would otherwise split a multi-byte
+ * UTF-8 character in half — only relevant when `buf` is itself a bounded
+ * prefix of a larger file (`CONTEXT_FILE_PREFIX_BYTES`), since the true end
+ * of the file's last character is never read. Walks back at most 3 bytes
+ * (the longest UTF-8 continuation run) looking for the lead byte of a
+ * sequence that is not fully present in `buf`.
+ */
+function trimTrailingIncompleteUtf8(buf: Buffer): Buffer {
+	const len = buf.length;
+	for (let back = 1; back <= 3 && back <= len; back++) {
+		const byte = buf[len - back];
+		if ((byte & 0xc0) === 0x80) continue; // a UTF-8 continuation byte: keep walking back
+		let seqLen = 1;
+		if ((byte & 0xe0) === 0xc0) seqLen = 2;
+		else if ((byte & 0xf0) === 0xe0) seqLen = 3;
+		else if ((byte & 0xf8) === 0xf0) seqLen = 4;
+		return seqLen > back ? buf.subarray(0, len - back) : buf;
+	}
+	return buf;
+}
+
+/**
+ * Reads a `--context <file>` off disk, hardened against everything a hostile
+ * or merely surprising path can do (docs/architecture-review.md C6):
+ *
+ * - Symlinks are rejected outright, at two points: the immediate containing
+ *   directory is `lstat`'d first (a symlinked parent is rejected before any
+ *   open() call reaches it), and the open itself uses `O_NOFOLLOW` (the
+ *   file's own path is refused if it is a symlink, kernel-enforced, no
+ *   TOCTOU window). Deliberately does not walk the whole ancestor chain with
+ *   `realpath` — on macOS `/tmp` (and therefore every `os.tmpdir()`-based
+ *   path) already resolves through `/private/tmp`, so a full-chain
+ *   comparison would reject ordinary temp files as "symlinked" for reasons
+ *   that have nothing to do with the operator's path.
+ * - Only a regular file is accepted (`fstat(fd).isFile()`); FIFOs, device
+ *   files, and directories are rejected with a clear message instead of
+ *   hanging (`O_NONBLOCK`, where the platform has it, keeps an `open()` on a
+ *   FIFO with no writer from blocking forever) or throwing something
+ *   confusing.
+ * - At most `CONTEXT_FILE_PREFIX_BYTES` is ever read, regardless of the
+ *   file's real size — a multi-megabyte attachment is truncated, not read
+ *   into memory in full.
+ * - Binary content (a NUL byte in the prefix, or bytes that are not valid
+ *   UTF-8 once any trailing split multi-byte character is trimmed) is
+ *   rejected: this is a prompt-text attachment mechanism, not a general file
+ *   upload.
+ *
+ * Throws a plain `Error` with an operator-facing message on any rejection;
+ * the caller (`loadProvidedContext`) turns that into `{ error }`.
+ */
+/** Best-effort `realpath`, used only to name the symlink target in a rejection message; `null` on failure. */
+function safeRealpath(path: string): string | null {
+	try {
+		return realpathSync(path);
+	} catch {
+		return null;
+	}
+}
+
+export function readContextFileSafely(abs: string): { content: string; truncatedOnDisk: boolean } {
+	const parent = dirname(abs);
+	let parentStat: ReturnType<typeof lstatSync>;
+	try {
+		parentStat = lstatSync(parent);
+	} catch (err) {
+		throw new Error(`could not read the file (${(err as Error).message}). Fix the path or drop the flag.`);
+	}
+	if (parentStat.isSymbolicLink()) {
+		const target = safeRealpath(parent);
+		throw new Error(
+			`its containing directory is a symlink${target ? ` (resolves to ${redactPaths(target)})` : ""}; pass the target path directly instead (this refusal is deliberate — see docs/architecture-review.md C6).`,
+		);
+	}
+	const nonBlock = fsConstants.O_NONBLOCK ?? 0;
+	let fd: number;
+	try {
+		fd = openSync(abs, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | nonBlock);
+	} catch (err) {
+		const e = err as NodeJS.ErrnoException;
+		if (e.code === "ELOOP") {
+			const target = safeRealpath(abs);
+			throw new Error(
+				`is a symlink${target ? ` (resolves to ${redactPaths(target)})` : ""}; pass the target path directly instead (this refusal is deliberate — see docs/architecture-review.md C6).`,
+			);
+		}
+		throw new Error(`could not read the file (${e.message}). Fix the path or drop the flag.`);
+	}
+	try {
+		const stat = fstatSync(fd);
+		if (!stat.isFile()) {
+			const kind = stat.isDirectory() ? "a directory" : stat.isFIFO() ? "a FIFO" : "not a regular file";
+			throw new Error(`is ${kind}; only regular files can be attached with --context.`);
+		}
+		const cap = Math.min(CONTEXT_FILE_PREFIX_BYTES, stat.size);
+		const buffer = Buffer.alloc(cap);
+		let readTotal = 0;
+		while (readTotal < buffer.length) {
+			const n = readSync(fd, buffer, readTotal, buffer.length - readTotal, null);
+			if (n === 0) break;
+			readTotal += n;
+		}
+		const bytes = buffer.subarray(0, readTotal);
+		if (bytes.includes(0)) {
+			throw new Error(`looks like binary content (a NUL byte was found); only text files can be attached with --context.`);
+		}
+		const truncatedOnDisk = stat.size > readTotal;
+		const decodable = truncatedOnDisk ? trimTrailingIncompleteUtf8(bytes) : bytes;
+		let content: string;
+		try {
+			content = new TextDecoder("utf-8", { fatal: true }).decode(decodable);
+		} catch {
+			throw new Error(`is not valid UTF-8 text; only text files can be attached with --context.`);
+		}
+		return { content, truncatedOnDisk };
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/**
  * Reads every `--context <file>` and, when asked, the current session's last assistant message,
  * building the `## Provided context` block the architect/lead prompts insert
- * (docs/architecture-review.md C6). A missing/unreadable file or an absent last reply is a user
- * error: returned as `{ error }` instead of thrown, so the caller can stop the run before a
- * session/run dir is ever created. File reading and session access live here (not in
- * `core/context.ts`) so that module stays a pure string formatter.
+ * (docs/architecture-review.md C6). A missing/unreadable/symlinked/binary/non-regular file or an
+ * absent last reply is a user error: returned as `{ error }` instead of thrown, so the caller can
+ * stop the run before a session/run dir is ever created. File reading and session access live
+ * here (not in `core/context.ts`) so that module stays a pure string formatter. Every source is
+ * bounded per-file (`readContextFileSafely`'s `CONTEXT_FILE_PREFIX_BYTES`) and, once collected,
+ * bounded again in aggregate (`CONTEXT_AGGREGATE_MAX_CHARS`) so several near-cap attachments
+ * together cannot blow the prompt budget out.
  */
-function loadProvidedContext(
+export function loadProvidedContext(
 	cwd: string,
 	contextFiles: string[],
 	withLastReply: boolean,
@@ -106,12 +250,15 @@ function loadProvidedContext(
 	const sources: ContextSource[] = [];
 	for (const raw of contextFiles) {
 		const abs = resolve(cwd, raw);
-		let content: string;
+		let read: { content: string; truncatedOnDisk: boolean };
 		try {
-			content = readFileSync(abs, "utf8");
+			read = readContextFileSafely(abs);
 		} catch (err) {
-			return { error: `--context ${raw}: could not read the file (${(err as Error).message}). Fix the path or drop the flag.` };
+			return { error: `--context ${raw}: ${(err as Error).message}` };
 		}
+		const content = read.truncatedOnDisk
+			? `${read.content}\n\n[... this file is larger than the ${CONTEXT_FILE_PREFIX_BYTES}-byte read limit; only the beginning was read ...]`
+			: read.content;
 		sources.push({ label: contextFileLabel(cwd, abs), content });
 	}
 	if (withLastReply) {
@@ -120,6 +267,20 @@ function loadProvidedContext(
 			return { error: "--with-last-reply: no assistant message found in the current session." };
 		}
 		sources.push({ label: LAST_REPLY_LABEL, content: text });
+	}
+	let budgetLeft = CONTEXT_AGGREGATE_MAX_CHARS;
+	for (const source of sources) {
+		if (budgetLeft <= 0) {
+			source.content = `[... omitted: the aggregate --context/--with-last-reply budget (${CONTEXT_AGGREGATE_MAX_CHARS} characters total) was already used up by earlier sources ...]`;
+			continue;
+		}
+		if (source.content.length > budgetLeft) {
+			const over = source.content.length - budgetLeft;
+			source.content = `${source.content.slice(0, budgetLeft)}\n\n[... truncated: the aggregate --context/--with-last-reply budget (${CONTEXT_AGGREGATE_MAX_CHARS} characters total) was exceeded; ${over} more character(s) of this source omitted ...]`;
+			budgetLeft = 0;
+		} else {
+			budgetLeft -= source.content.length;
+		}
 	}
 	return { block: buildProvidedContextBlock(sources) };
 }

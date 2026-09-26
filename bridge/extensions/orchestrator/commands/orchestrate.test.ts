@@ -1,10 +1,16 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ExtensionAPI, ExtensionContext } from "@humain/terminal";
 
-import { registerOrchestrateCommand, type OrchestrateDeps } from "./orchestrate.ts";
+import {
+	CONTEXT_AGGREGATE_MAX_CHARS,
+	loadProvidedContext,
+	readContextFileSafely,
+	registerOrchestrateCommand,
+	type OrchestrateDeps,
+} from "./orchestrate.ts";
 import { RunRegistry } from "../run/context.ts";
 import type { RunSession } from "../run/session.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
@@ -182,5 +188,125 @@ describe("commands/orchestrate.ts C6: --context / --with-last-reply", () => {
 
 		expect(calls.resolveAdapter).toBe(1);
 		expect(notifications.some((n) => n.text.includes("no assistant message"))).toBe(false);
+	});
+});
+
+describe("commands/orchestrate.ts readContextFileSafely / loadProvidedContext (docs/architecture-review.md C6 hardening)", () => {
+	let dir: string;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "orch-c6-hardening-"));
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	function fakeCtxNoLastReply(): ExtensionContext {
+		return { sessionManager: { getEntries: () => [] } } as unknown as ExtensionContext;
+	}
+
+	test("a symlinked file is rejected, naming the target", () => {
+		const real = join(dir, "real.md");
+		writeFileSync(real, "the real content");
+		const link = join(dir, "link.md");
+		symlinkSync(real, link);
+
+		expect(() => readContextFileSafely(link)).toThrow(/is a symlink/);
+	});
+
+	test("a file reached through a symlinked parent directory is rejected", () => {
+		const realDir = join(dir, "real-dir");
+		mkdirSync(realDir);
+		const target = join(realDir, "notes.md");
+		writeFileSync(target, "notes");
+		const linkedDir = join(dir, "linked-dir");
+		symlinkSync(realDir, linkedDir);
+
+		expect(() => readContextFileSafely(join(linkedDir, "notes.md"))).toThrow(/containing directory is a symlink/);
+	});
+
+	test("a FIFO is rejected instead of hanging", () => {
+		const fifo = join(dir, "pipe");
+		const mkfifo = Bun.spawnSync(["mkfifo", fifo]);
+		if (mkfifo.exitCode !== 0) {
+			console.warn("mkfifo not available on this platform; skipping FIFO test");
+			return;
+		}
+
+		expect(() => readContextFileSafely(fifo)).toThrow(/is a FIFO/);
+	});
+
+	test("a directory is rejected", () => {
+		const sub = join(dir, "a-directory");
+		mkdirSync(sub);
+
+		expect(() => readContextFileSafely(sub)).toThrow(/is a directory/);
+	});
+
+	test("binary content (a NUL byte) is rejected", () => {
+		const bin = join(dir, "binary.dat");
+		writeFileSync(bin, Buffer.from([0x48, 0x49, 0x00, 0x42, 0x59, 0x45]));
+
+		expect(() => readContextFileSafely(bin)).toThrow(/binary content/);
+	});
+
+	test("content that is not valid UTF-8 is rejected", () => {
+		const bad = join(dir, "invalid-utf8.txt");
+		// 0xC3 alone (no continuation byte) is not valid UTF-8, and contains no NUL byte.
+		writeFileSync(bad, Buffer.from([0x41, 0x42, 0xc3]));
+
+		expect(() => readContextFileSafely(bad)).toThrow(/not valid UTF-8/);
+	});
+
+	test("a huge file (over the per-file prefix cap) is only read up to the prefix, with a truncation note", () => {
+		const huge = join(dir, "huge.txt");
+		writeFileSync(huge, "x".repeat(1024 * 1024)); // 1 MB, well over CONTEXT_FILE_PREFIX_BYTES (160,000 bytes)
+
+		const { content, truncatedOnDisk } = readContextFileSafely(huge);
+		expect(truncatedOnDisk).toBe(true);
+		expect(content.length).toBe(4 * 40_000);
+	});
+
+	test("aggregate budget: several --context files that individually fit under the per-file cap still get truncated once their combined size exceeds CONTEXT_AGGREGATE_MAX_CHARS", () => {
+		// Each file is comfortably under both the per-file prefix cap (160,000 bytes) and the
+		// per-source formatting cap (CONTEXT_SOURCE_MAX_CHARS = 40,000 characters), but five of
+		// them together (175,000) exceed the 160,000-character aggregate budget.
+		// A non-ASCII filler that cannot collide with anything else in the block (random
+		// tmpdir path components, note wording, labels): unambiguous to count.
+		const perFile = 35_000;
+		const files = ["a.md", "b.md", "c.md", "d.md", "e.md"].map((name) => {
+			const p = join(dir, name);
+			writeFileSync(p, "\u2022".repeat(perFile));
+			return p;
+		});
+
+		const result = loadProvidedContext(dir, files, false, fakeCtxNoLastReply());
+		expect("block" in result).toBe(true);
+		if (!("block" in result)) return;
+		expect(result.block).toContain("aggregate --context/--with-last-reply budget");
+		const sections = result.block.split("\n\n---\n\n");
+		expect(sections).toHaveLength(5);
+		// The first four sources are unaffected; the fifth's filler run is shorter than what was
+		// written to disk \u2014 the aggregate budget, not just the (much larger) per-file cap, is
+		// what cut it short.
+		for (const section of sections.slice(0, 4)) {
+			expect(section.match(/\u2022+/)?.[0].length).toBe(perFile);
+		}
+		const lastRun = sections[4].match(/\u2022+/)?.[0] ?? "";
+		expect(lastRun.length).toBeLessThan(perFile);
+		expect(lastRun.length).toBe(CONTEXT_AGGREGATE_MAX_CHARS - 4 * perFile);
+	});
+
+	test("a single source under both the per-file and aggregate caps is included verbatim, with no truncation note", () => {
+		const p = join(dir, "small.md");
+		writeFileSync(p, "small content");
+
+		const result = loadProvidedContext(dir, [p], false, fakeCtxNoLastReply());
+		expect("block" in result).toBe(true);
+		if (!("block" in result)) return;
+		expect(result.block).toContain("small content");
+		expect(result.block).not.toContain("truncated");
+		expect(result.block).not.toContain("omitted");
 	});
 });
