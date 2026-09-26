@@ -125,6 +125,31 @@
   lead is instructed to record them under `## Open items`, which the summary
   shows. `--yes` flag; one live run per session.
 
+### architecture-review fixes (C3–C7)
+
+- **C3.** A lead that exits because of a transient provider error (5xx/529/overloaded/rate-limit/
+  common socket errors, not a quota/billing error) is re-dispatched once with a `## Resume`
+  section — its own last report plus the files changed since it started — instead of the run
+  discarding whatever the lead's subagents already left on disk. Never resumes a cancelled
+  dispatch or a lead that reported `STATUS: blocked`; both attempts are billed, only the final one
+  speaks for the lead's status. (`core/transient-error.ts`, `pipeline/hierarchy.ts`,
+  `resumeLeadPrompt` in `core/prompts.ts`.)
+- **C4.** QA and lead prompts now name the run's absolute repo root and the repo's own
+  verification commands (`repoRootGuardrail` in `core/prompts.ts`), and QA is skipped entirely
+  when no lead succeeded instead of being sent to verify a failed lead's unreported partial work.
+- **C5.** The run summary's verification line is now built from the actual verification state
+  (not run / skipped — no lead succeeded / timed out / failed with these checks / passed) instead
+  of a summary that could say `NOT RUN` while QA had in fact failed.
+- **C6.** `--context <file>` (repeatable) and `--with-last-reply` attach material the goal refers
+  to — file contents or the current session's last assistant message — into the architect and
+  lead prompts under `## Provided context`, capped at 40,000 characters per source with an
+  explicit truncation note, paths redacted. A missing file or an absent last reply stops the
+  command with a clear error before any run starts.
+- **C7.** Before triage, a short goal (under ~200 characters) that refers to something outside
+  itself — a standalone letter, `option N`, `the above`, `as discussed`, `that plan` — is refused
+  with a message pointing at `--context`/`--with-last-reply`/`--force` instead of dispatching a
+  run that will just block waiting for context it was never given. `--force` skips the check.
+
 # Changelog
 
 ## [Unreleased]
