@@ -323,6 +323,38 @@ export function leadPrompt(
 	].join("\n");
 }
 
+/** Bound length for the previous report text pasted into a resume prompt (docs/architecture-review.md C3). */
+export const RESUME_REPORT_MAX_CHARS = 8000;
+
+/**
+ * Original lead prompt + a `## Resume` section (docs/architecture-review.md
+ * C3): the lead's own last report (bounded to the last
+ * `RESUME_REPORT_MAX_CHARS` characters, `"(none)"` when empty) and the files
+ * changed since it started, plus an instruction to continue rather than redo
+ * the work. Used to re-dispatch a lead once after it exits with a transient
+ * provider error.
+ */
+export function resumeLeadPrompt(originalPrompt: string, lastReportText: string, filesChangedSinceStart: string[]): string {
+	const report = lastReportText.trim();
+	const boundedReport = report ? report.slice(-RESUME_REPORT_MAX_CHARS) : "(none)";
+	const files = filesChangedSinceStart.length > 0 ? filesChangedSinceStart.map((f) => `- ${f}`).join("\n") : "(none)";
+	return [
+		originalPrompt,
+		"",
+		"## Resume",
+		"",
+		"Your previous attempt at this task stopped because of a transient provider error, not because of anything wrong with your work. You are being re-dispatched once to continue — do not redo work that is already on disk; pick up from where you left off.",
+		"",
+		"Your last report:",
+		"",
+		boundedReport,
+		"",
+		"Files changed since you started:",
+		"",
+		files,
+	].join("\n");
+}
+
 /** Leads cannot edit (persona tools exclude write/edit); this states it in the prompt too. */
 export const LEAD_DELEGATION_RULE =
 	"Delegation rule: you do not have write or edit tools. All source changes go to orch-implementation-strong or orch-implementation-fast through the subagent tool. Do not modify files through bash redirection, sed -i, heredocs, patch tools, or scripts. You may run read-only and verification commands.";

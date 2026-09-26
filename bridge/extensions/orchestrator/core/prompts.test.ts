@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { effectiveLeadCount, formatTaskPrompt, leadPrompt, parsePlanResponse, repoRootGuardrail, VERIFICATION_COMMANDS, type PlanResponse } from "./prompts.ts";
+import { effectiveLeadCount, formatTaskPrompt, leadPrompt, parsePlanResponse, repoRootGuardrail, resumeLeadPrompt, RESUME_REPORT_MAX_CHARS, VERIFICATION_COMMANDS, type PlanResponse } from "./prompts.ts";
 import planFixture from "../fixtures/orchestrator-cli-plan-response.json";
 
 function plan(leads: number): PlanResponse {
@@ -65,6 +65,31 @@ describe("core/prompts.ts leadPrompt", () => {
 		const prompt = leadPrompt("goal", plan(1), undefined, "", 0, 1, { lead: { model: "provider/model" } }, "/abs/repo/root");
 		expect(prompt).toContain("The repo root is /abs/repo/root (your cwd). Never search outside it; never run `find /`.");
 		expect(prompt).toContain("Verification commands:");
+	});
+});
+
+describe("core/prompts.ts resumeLeadPrompt", () => {
+	test("keeps the original prompt and appends a ## Resume section with the last report and changed files", () => {
+		const prompt = resumeLeadPrompt("ORIGINAL PROMPT TEXT", "previous report body", ["src/a.ts", "src/b.ts"]);
+		expect(prompt.startsWith("ORIGINAL PROMPT TEXT")).toBe(true);
+		expect(prompt).toContain("## Resume");
+		expect(prompt).toContain("previous report body");
+		expect(prompt).toContain("- src/a.ts");
+		expect(prompt).toContain("- src/b.ts");
+		expect(prompt).toContain("continue");
+	});
+
+	test("no previous report or changed files render as (none)", () => {
+		const prompt = resumeLeadPrompt("ORIGINAL", "", []);
+		expect(prompt).toContain("Your last report:\n\n(none)");
+		expect(prompt).toContain("Files changed since you started:\n\n(none)");
+	});
+
+	test("bounds the report to the last RESUME_REPORT_MAX_CHARS characters", () => {
+		const long = `${"x".repeat(RESUME_REPORT_MAX_CHARS + 500)}TAIL`;
+		const prompt = resumeLeadPrompt("ORIGINAL", long, []);
+		expect(prompt).toContain("TAIL");
+		expect(prompt).not.toContain("x".repeat(RESUME_REPORT_MAX_CHARS + 1));
 	});
 });
 
