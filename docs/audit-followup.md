@@ -13,27 +13,27 @@ Re-check of `~/.local/state/coding-agent-orchestrator/runs/ht-orch-1790329059995
 | A7 | `planRun` unvalidated response and hard-coded coupling/parallelizable values | fixed-now | PlanResponse validation in ef683bf; coupling/parallelizable defaults in e3b4a0c | B4.7 |
 | A8 | Oversized bridge/Python units, especially orchestrate and subagent dispatch | fixed-already | `bridge/extensions/orchestrator/commands/orchestrate.ts`, `pipeline/`, `dispatch/child-process.ts:362`, and extracted modules demonstrate the split | B3/B4.5 |
 | A9a | Dead/test-only code (`runCli`, event-log helper, archive locate helpers, no-op parameter, test aliases, unused imports) | fixed-now | `appendTrimmedEventLog` was deleted in cfb6711 (no production caller); see Phase 2 status for the cleanup details | B3/B4.1 |
-| A10a | SKILL/dashboard/README/PUBLISH/method docs disagree with code | open | Plan retains these doc corrections | B6 |
+| A10a | SKILL/dashboard/README/PUBLISH/method docs disagree with code | fixed-now | SKILL.md 1402271; orchestrator-README batch-queue path 2a53122; PUBLISH table d905b4c; CHANGELOG 4417605 | B6 |
 | A10b | Duplicated shared values and vocabulary | fixed-already | `orchestrator/vocab.py:59,111` centralizes terminal task IDs/high-risk vocabulary; TS `expandHome` is centralized at `bridge/extensions/orchestrator/config.ts:55` and used at lines 84–85; shared contract constants live in `orchestrator/contract.py` | B1 |
 | A10c | Defaults differ (min samples, lead limits, state-root variables) | fixed-now | MAX_LEADS in 6f2636d; SCHEDULER_MIN_SAMPLES in db7ab6a; state-root env in 2caf00a and 4c8c208 | B4.7/B1 |
-| A10d | Declared Python minimum differs from local runtime | open | `pyproject.toml` still says `>=3.10`; Ruff target is explicitly `py39`, but runtime support decision is outside this baseline change | B6 |
+| A10d | Declared Python minimum differs from local runtime | fixed-now | `requires-python = ">=3.9"` in 7ace236, README floor e9997a0 | B6 |
 | A10e | Agent `model:` front matter not checked against routing | fixed-already | `bridge/extensions/orchestrator/adapters/agents-frontmatter.test.ts:47–63` checks the map and resolved fallback model | B4.3 |
 | A10f | Dashboard `import os as os` test patch hook | fixed-already | No such import exists on `refactor/modular`; `rg` confirms | B3 |
 | A10g | Prompt/report writes swallow errors; `any` usages | fixed-now | Prompt-write/discovery failures in 87fb1ee; failed report link in 6f6da8b; bridge `any` types in cab688d | B4.7 |
 | A10h | Outdated `reconWorkers` duplication claim | fixed-already | Current `bridge/extensions/orchestrator/recon.ts` imports the shared model value; old review claim is stale | B4.7 |
-| T1 | Missing direct tests for policy recommendations, run diagnostics, parseFailedChecks | open | Outstanding test-coverage items; parseFailedChecks is explicitly B4.7 | B5/B4.7 |
-| T2 | Sleep-based tests may be timing-sensitive | open | No test changes in this run | B5 |
-| T3 | Large bridge and ingest checkpoint test files | open | Still listed in B5; no test-file split performed | B5 |
+| T1 | Missing direct tests for policy recommendations, run diagnostics, parseFailedChecks | fixed-now | policy_recommendations f87e249; run-diagnostics f95ff6a; parseFailedChecks (B4.7) 720b833/ea5055a | B5/B4.7 |
+| T2 | Sleep-based tests may be timing-sensitive | deferred | Sleep-based timing tests were not rewritten in this run; one 5 s timeout seen once under concurrent load in review, passed on rerun; needs a fake-clock pass | B5 |
+| T3 | Large bridge and ingest checkpoint test files | fixed-now | index.test.ts split per owning module (0c210f8…b6e3170, 21 commits); tests/ingest_checkpoint/ package a0fdc31 (80 tests, same count) | B5 |
 | C3 | Resume a lead after transient provider failure | fixed-now | See Phase 3 status; implemented in ca57c1e, 8549acf, a57198e, e5f9578, d1a052e | C3 |
 | C4 | Skip QA if no lead succeeds and ground prompts in repo | fixed-now | See Phase 3 status; fixed in 2d7e285 | C4 |
 | C5 | Summary verification state contradictions | fixed-now | See Phase 3 status; fixed in 9f10b6e | C5 |
 | C6 | Explicit context/last-reply flags and prompt insertion | fixed-now | See Phase 3 status; fixed in c692f2f, 3a5010e, 5407b9a, 6713923 | C6 |
 | C7 | Detect short goals missing context | fixed-now | See Phase 3 status; fixed in 2ba0711, 438844f | C7 |
 | B4.6 | Context and missing-context safeguards in bridge | fixed-now | C6/C7 fixed; see Phase 3 status | B4.6 |
-| B4.7 | Remaining bridge correctness items (report parsing, duration, plan validation/options, swallowed writes, Python/TS parity) | open | Plan follow-ups remain; this run changes no TS source | B4.7 |
-| B3-P2 | Remaining Python dead-code/module cleanup (policy recommendations, flaky stats, controls decision, thin CLI wrappers) | open | Not part of this tooling/docs-only run | B3 Phase 2 |
-| B5 | Test-file modularization and explicit fault injection | open | Not part of this run | B5 |
-| B6 | Documentation cleanup / release-plan notes / Python version alignment | open | This file records audit follow-up; remaining listed cleanup is outstanding | B6 |
+| B4.7 | Remaining bridge correctness items (report parsing, duration, plan validation/options, swallowed writes, Python/TS parity) | fixed-now | See Fixed-now status updates table | B4.7 |
+| B3-P2 | Remaining Python dead-code/module cleanup (policy recommendations, flaky stats, controls decision, thin CLI wrappers) | deferred | Not in this goal's scope: controls.py kept as documented public API (goal), policy_recommendations now has direct tests (f87e249); flaky-stats and thin-CLI-wrapper cleanup left for a follow-up | B3 Phase 2 |
+| B5 | Test-file modularization and explicit fault injection | fixed-now (partial fault injection) | See Phase 4 status | B5 |
+| B6 | Documentation cleanup / release-plan notes / Python version alignment | fixed-now | See Phase 4 status | B6 |
 
 ## Tool baselines
 
@@ -152,3 +152,26 @@ At commit `d1a052e`:
 - layers + golden: 11 passed
 
 Reviews: Phase 3 technical + security review FAIL → fixed over two rounds → security PASS-WITH-WARNINGS (residual TOCTOU accepted).
+
+## Phase 4 status
+
+| Finding | Status | Commit | Note |
+|---|---|---|---|
+| B5 index.test.ts split per module | fixed-now | 0c210f8 … b6e3170 | 825 bun tests (809 + 16 new); 5 “(index.ts wiring)” integration describes stay in index.test.ts |
+| B5 global node:child_process mock → injected spawn | fixed-now | e783826, 8cea78a | `createOrchestratorCli({ spawn })`; `createOrchestratorExtension({ spawn })`; no `spyOn(childProcess)` left |
+| B5 stale BorderedLoader mock; index.ts test-only re-exports | fixed-now | 42d8235 | index.ts wiring only |
+| B5 tests/ingest_checkpoint package | fixed-now | a0fdc31 | 80 tests before/after |
+| B5 direct tests policy_recommendations / run-diagnostics | fixed-now | f87e249, f95ff6a | |
+| B5 private-function patches → fault injection | partial | 44c96f2 | `write_batch(append_stream=)` done; deferred: `archive.execute._compress_to_temp` (3 private hops below `archive_runs`), subprocess/CLI-level `_append_stream` (needs a CLI flag — design decision), ingest-pipeline `_append_stream` (cross-package API); `cli.ROOT` is a documented test seam |
+| B6 SKILL.md false claims | fixed-now | 1402271 | `max_recon_cost_usd` documented as advisory/unenforced (not wired) |
+| B6 orchestrator-README batch-queue write path | fixed-now | 2a53122 | |
+| B6 PUBLISH.md file table | fixed-now | d905b4c | |
+| B6 CHANGELOG single Unreleased | fixed-now | 4417605 | |
+| B6 requires-python vs 3.9 | fixed-now | 7ace236, e9997a0 | `>=3.9` |
+| B6 docs/superpowers/plans status | fixed-now | c60239a | model-failover plan marked pending on feat/model-failover |
+| scripts/lint.sh (ruff + vulture + knip) in the gate | fixed-now | 9026f2a | README, bridge/README, PUBLISH |
+| CI workflow (from the uncommitted recovery-plan edit in architecture-review.md) | deferred | — | Not in this goal; the recovery-plan edit is uncommitted and conflicts with the goal's SCHEDULER_MIN_SAMPLES=12 decision — left for the user |
+
+## Phase 4 gate
+
+At commit <filled by lead>: see final run report.
