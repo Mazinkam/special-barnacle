@@ -79,12 +79,13 @@ and they're the new canonical version for every machine that pulls this repo.
 
 ## Verification gates
 
-Run all three from the repo root before integrating a bridge change:
+Run all four from the repo root before integrating a bridge change:
 
 ```bash
 cd bridge/extensions/orchestrator && bun test   # unit; expect 0 fail
 python3 -m pytest tests -q                      # Python runtime; expect 0 fail
 ./scripts/typecheck-bridge.sh                   # strict typecheck; expect exit 0
+./scripts/lint.sh                               # ruff + vulture + knip; expect exit 0
 ```
 
 This repo intentionally has no `package.json`, `node_modules`, or `tsconfig.json`

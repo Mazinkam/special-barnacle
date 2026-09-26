@@ -311,6 +311,7 @@ python3 -B scripts/benchmark_refresh.py --source "$SCRATCH/frozen" \
 python3 -B -m pytest -p no:cacheprovider -q
 bun test ./bridge  # when Bun is available; fake/test workers only
 ./scripts/typecheck-bridge.sh --all  # strict typecheck; exit 0 clean, 1 errors, 2 env incomplete
+./scripts/lint.sh  # ruff + vulture + knip; exit 0 clean, 1 findings/failure, 2 env incomplete
 # Keep the JSON reports and frozen inputs for comparison; remove only your scratch directory later.
 ```
 
@@ -371,7 +372,9 @@ Before release:
   `scripts/typecheck-bridge.sh` resolves the installed HT workspace and runs strict `tsc`
   (`--orchestrator` by default, `--all` for the `bridge/**/*.ts` scope this gate means; exit 2
   means the environment is incomplete, which is *not* a code failure — see `bridge/README.md`).
-  Both scopes report **0 diagnostics**.
+  Both scopes report **0 diagnostics**. `scripts/lint.sh` (`ruff check`, `vulture`, and `knip
+  --production` against a throwaway probe workspace) must also report 0 findings; exit 2 there
+  means `uvx`/`bunx` is unavailable, not a code failure.
   (`bridge/extensions/cross-review-demo.ts` has since been removed; it was broken and not part of
   the product.)
   The three TS2683 implicit-`this` errors formerly at `orchestrator/index.test.ts:722,723,733`
