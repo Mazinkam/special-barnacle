@@ -26,6 +26,10 @@ describe("core/transient-error.ts isTransientProviderError", () => {
 		["generic 5xx with status context", "status 507: insufficient storage at the provider"],
 		["generic 5xx with HTTP 5xx literal", "HTTP 5xx from the upstream provider"],
 		["generic 5xx with error context", "error 520: unknown error from Cloudflare"],
+		["generic 5xx with code context", "code 503 returned from the sidecar"],
+		["HTTP/version prefix", "HTTP/1.1 520 from the reverse proxy"],
+		["bad gateway phrase alone (no context word, no number needed)", "502 Bad Gateway"],
+		["status: prefix with colon, no space before number", "status: 507"],
 	];
 
 	for (const [label, text] of positive) {
@@ -47,11 +51,30 @@ describe("core/transient-error.ts isTransientProviderError", () => {
 		["plain exit", "exit 1"],
 		["line count mention, not an HTTP status", "the report is 550 lines long"],
 		["another line count mention, no status context", "the diff touched about 560 lines across the module"],
+		["bare 500 with unrelated word containing \"code\" as a substring", "decode 500 bytes"],
+		["bare 503 with unrelated word, no context marker", "found 503 issues"],
+		["bare 502, no context word and no known reason phrase", "changed 502 lines in the diff"],
+		["bare 504, no context word and no known reason phrase", "waited 504 milliseconds"],
 	];
 
 	for (const [label, text] of negative) {
 		test(`not transient: ${label}`, () => {
 			expect(isTransientProviderError(text)).toBe(false);
+		});
+	}
+});
+
+describe("core/transient-error.ts isTransientProviderError table tests (docs/architecture-review.md C3 5xx word-boundary fix)", () => {
+	const table: Array<[string, string, boolean]> = [
+		["decode 500 bytes", "decode 500 bytes", false],
+		["found 503 issues", "found 503 issues", false],
+		["status: 507", "status: 507", true],
+		["HTTP/1.1 520", "HTTP/1.1 520", true],
+	];
+
+	for (const [label, text, expected] of table) {
+		test(`${label} -> ${expected}`, () => {
+			expect(isTransientProviderError(text)).toBe(expected);
 		});
 	}
 });

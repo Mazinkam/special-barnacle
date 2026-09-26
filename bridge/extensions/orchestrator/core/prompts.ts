@@ -7,6 +7,7 @@
 import type { Binding } from "../models.ts";
 import { METHOD } from "../models.ts";
 import type { LeadAssignment } from "../lead-plan.ts";
+import { sanitizeControlChars } from "./text-safety.ts";
 
 type Adapter = Record<string, Binding>;
 
@@ -333,32 +334,27 @@ export function leadPrompt(
 export const RESUME_REPORT_MAX_CHARS = 8000;
 
 /**
- * Escapes control characters (including newlines) in a changed-file name so
- * a crafted path (e.g. containing `\n## Some heading`) cannot inject new
- * Markdown structure into the resume prompt's `## Resume` section — every
- * name is rendered on its own single-line `- ` bullet no matter what bytes
- * it contains (docs/architecture-review.md C3).
- */
-function sanitizeChangedFileName(name: string): string {
-	return name.replace(/[\u0000-\u001f\u007f]/g, (ch) => {
-		switch (ch) {
-			case "\n": return "\\n";
-			case "\r": return "\\r";
-			case "\t": return "\\t";
-			default: return `\\x${ch.charCodeAt(0).toString(16).padStart(2, "0")}`;
-		}
-	});
-}
-
-/**
  * Quotes `text` as inert reference material (a Markdown blockquote) so any
  * Markdown structure inside it — e.g. a `## ` heading in a lead's own report
  * — is rendered as quoted prose rather than parsed as a new section of the
  * prompt (docs/architecture-review.md C3). The literal `"(none)"` fallback
  * is never passed here; callers only quote real report text.
+ *
+ * `\r\n` and lone `\r` are normalized to `\n` before splitting: a report
+ * using CR/CRLF line endings would otherwise have every line after the
+ * first one rendered as one un-prefixed physical line sharing a line with
+ * the previous `> `-quoted line's trailing `\r` — visually still "quoted"
+ * in a renderer that treats `\r` as a line break, but not actually prefixed
+ * with `> ` in the literal text a model reads token-by-token. Normalizing
+ * first guarantees every logical line gets its own `> ` prefix regardless
+ * of which line-ending convention the report used.
  */
 function quoteReferenceText(text: string): string {
-	return text.split("\n").map((line) => `> ${line}`).join("\n");
+	return text
+		.replace(/\r\n?/g, "\n")
+		.split("\n")
+		.map((line) => `> ${line}`)
+		.join("\n");
 }
 
 /**
@@ -375,7 +371,7 @@ export function resumeLeadPrompt(originalPrompt: string, lastReportText: string,
 	const report = lastReportText.trim();
 	const boundedReport = report ? quoteReferenceText(report.slice(-RESUME_REPORT_MAX_CHARS)) : "(none)";
 	const files = filesChangedSinceStart.length > 0
-		? filesChangedSinceStart.map((f) => `- ${sanitizeChangedFileName(f)}`).join("\n")
+		? filesChangedSinceStart.map((f) => `- ${sanitizeControlChars(f)}`).join("\n")
 		: "(none)";
 	return [
 		originalPrompt,

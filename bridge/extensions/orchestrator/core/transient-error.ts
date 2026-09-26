@@ -19,38 +19,42 @@
 import { isQuotaError } from "../provider-fallback.ts";
 
 /**
- * Nearby-context markers that make a bare `5\d\d` HTTP status code plausible
- * as a transient signal (as opposed to an unrelated number — e.g. "500
- * lines changed" in a normal report body). Applies to status codes NOT
- * already in the explicit list below (507, 520, 521, ... any 5xx).
+ * A bare `5\d\d` number is never, on its own, a strong enough signal that a
+ * report is describing an HTTP status code: a report can legitimately say
+ * "500 lines changed" or "found 503 issues" with nothing to do with an HTTP
+ * response. This requires a whole-word context marker (`HTTP`, `status`,
+ * `error`, or `code`) immediately before the number, with only whitespace
+ * or `:`/`=`/`#` separating them — e.g. "status: 507", "HTTP/1.1 520",
+ * "error 520". The leading `\b` on the alternation is what makes this
+ * whole-word: `code` must start at a real word boundary, so `decode 500`
+ * does NOT count `code` as a marker (docs/architecture-review.md C3 — the
+ * previous version's context check used unanchored substring matching and
+ * fired on `code` inside `decode`).
  */
-const HTTP_5XX_CONTEXT_WORD = /status|http|error|code/i;
+const HTTP_5XX_WITH_CONTEXT_RE = /\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?:\s+code)?|error|code)[\s:=#]*5\d\d\b/i;
 
-/** True when `text` contains a 5xx-looking number near one of the words above, or the literal "5xx". */
-function hasContextualHttp5xx(text: string): boolean {
-	if (/\bhttp\b[^\n]{0,10}\b5xx\b/i.test(text)) return true;
-	const numberRe = /\b5\d\d\b/g;
-	let m: RegExpExecArray | null;
-	while ((m = numberRe.exec(text))) {
-		const before = text.slice(Math.max(0, m.index - 20), m.index);
-		const after = text.slice(m.index + m[0].length, m.index + m[0].length + 20);
-		if (HTTP_5XX_CONTEXT_WORD.test(before) || HTTP_5XX_CONTEXT_WORD.test(after)) return true;
-	}
-	return false;
-}
+/** The literal token "5xx" mentioned near the word "http" (e.g. "HTTP 5xx from the upstream provider"). */
+const HTTP_5XX_LITERAL_RE = /\bhttp\b[^\n]{0,10}\b5xx\b/i;
 
-/** HTTP 5xx (or Anthropic's 529 overloaded), overloaded/rate-limit wording, common Node socket
- *  errors, timeout/throttling wording, and a couple of provider-specific transient phrasings
- *  seen in the field. A generic 5xx code outside this explicit list (e.g. 507, 520) only counts
- *  as transient when it appears near a status-ish word (see `hasContextualHttp5xx` above) so an
- *  unrelated number like "500 lines changed" is not mistaken for a status code. */
+/**
+ * Well-known HTTP reason phrases, Anthropic's "overloaded", common Node
+ * socket errors, and timeout/throttling wording — all transient on their
+ * own, independent of any adjacent number. Deliberately contains NO bare
+ * numeric HTTP status code (500, 502, 503, 504, 529, ...): a bare number by
+ * itself is only ever transient via `HTTP_5XX_WITH_CONTEXT_RE`/
+ * `HTTP_5XX_LITERAL_RE` above (docs/architecture-review.md C3). "bad
+ * gateway"/"gateway timeout" are included as phrases (not tied to 502/504's
+ * digits) because they are the canonical, unambiguous HTTP reason strings
+ * for those codes, the same way "service unavailable" already stood in for
+ * 503 and "internal server error" for 500.
+ */
 export const TRANSIENT_ERROR_RE =
-	/\b(429|500|502|503|504|529)\b|overloaded|rate[ -]?limit|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|socket hang up|stream ended|premature close|service unavailable|internal server error|timed?[ -]?out|throttl(?:ed|ing)/i;
+	/overloaded|rate[ -]?limit|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|socket hang up|stream ended|premature close|service unavailable|internal server error|bad gateway|gateway timeout|timed?[ -]?out|throttl(?:ed|ing)/i;
 
 /** True when `text` looks like a transient provider/network failure worth retrying, and is not
  *  a permanent quota/billing error (see module header for the 429/rate-limit overlap note). */
 export function isTransientProviderError(text: string): boolean {
 	if (!text) return false;
 	if (isQuotaError(text)) return false;
-	return TRANSIENT_ERROR_RE.test(text) || hasContextualHttp5xx(text);
+	return TRANSIENT_ERROR_RE.test(text) || HTTP_5XX_WITH_CONTEXT_RE.test(text) || HTTP_5XX_LITERAL_RE.test(text);
 }

@@ -301,4 +301,15 @@ describe("pipeline/hierarchy.ts isTransientLeadFailure (docs/architecture-review
 	test("STATUS: blocked is never resumed", () => {
 		expect(isTransientLeadFailure(baseResult({ stdout: "STATUS: blocked" }))).toBe(false);
 	});
+
+	test("stdout mentioning timeout/503 does not make a non-transient failure resumable (docs/architecture-review.md C3): only stderr/stopReason/timeoutReason are inspected, never stdout", () => {
+		expect(
+			isTransientLeadFailure(
+				baseResult({
+					stdout: "## Completed\n\nfixed the timeout test, HTTP 503 handling\n\nSTATUS: partial",
+					stderr: "TypeError: cannot read properties of undefined (reading 'foo')",
+				}),
+			),
+		).toBe(false);
+	});
 });
