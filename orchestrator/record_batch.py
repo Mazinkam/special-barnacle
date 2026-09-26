@@ -25,7 +25,7 @@ import os
 import secrets
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .record_index import RecordIndex
 # core.fs/core.env/core.jsonl and records.metering, not runtime: this module is imported by
@@ -163,12 +163,15 @@ def _append_stream(path: Path, lines: list[bytes], *, prefix: int, tail: str | N
 
 
 def _sync_pending(root: Path, index: RecordIndex, persisted: dict[str, int], pending: dict[str, list[bytes]],
-                  duplicates: dict[str, int]) -> list[str]:
+                  duplicates: dict[str, int], *, append: Callable[..., int] = _append_stream) -> list[str]:
     """Append `pending` lines and settle every stream whose complete prefix is not yet known durable.
 
     A stream needs a sync when it gets new lines, when a duplicate-only retry may be re-acknowledging
     bytes whose fsync failed, when bytes appeared since the last commit (`size != durable_size`) or
     when a complete object still lacks its newline. Returns the streams that were touched.
+
+    `append` defaults to the real `_append_stream` and is otherwise identical to it; tests inject a
+    fault by passing a callable with the same signature instead of patching the private function.
     """
     touched: list[str] = []
     for stream, lines in pending.items():
@@ -177,7 +180,7 @@ def _sync_pending(root: Path, index: RecordIndex, persisted: dict[str, int], pen
         if not needs_sync:
             continue
         try:
-            entry['size'] = _append_stream(path, lines, prefix=entry['size'], tail=entry['tail'])
+            entry['size'] = append(path, lines, prefix=entry['size'], tail=entry['tail'])
         except OSError as exc:
             raise BatchAppendError(f'append/fsync of {STREAMS[stream]} failed after persisting {persisted}: {exc}', persisted) from exc
         persisted[stream] = len(lines)
@@ -217,7 +220,7 @@ def settle_streams(root: str | Path | None, *, lock: bool = True) -> dict[str, A
 
 
 def write_batch(root: str | Path | None, records: Any, *, refresh: bool = True,
-                lock: bool = True) -> dict[str, Any]:
+                lock: bool = True, append_stream: Callable[..., int] | None = None) -> dict[str, Any]:
     """Durably append once per ID; report derived-state failure with same-ID retry guidance.
 
     `refresh=True` (the default) catches the ledger up to the complete durable event prefix
@@ -229,6 +232,11 @@ def write_batch(root: str | Path | None, records: Any, *, refresh: bool = True,
     check/append/checkpoint sequence under that one lock (session ingestion). `flock` is per open
     file description, so re-acquiring here would deadlock; the ledger catch-up above runs fine
     under the caller's own lock instead.
+
+    `append_stream` defaults to the real durable append (`None` means "use `_append_stream`") and
+    is otherwise call-compatible with it; a test injects an append failure (or any other fault) by
+    passing a callable here instead of `mock.patch`-ing the private function (B5,
+    `docs/architecture-review.md`).
     """
     if not lock and refresh:
         raise ValueError('write_batch(lock=False) requires refresh=False; refresh the ledger/dashboard after releasing the lock')
@@ -265,7 +273,7 @@ def write_batch(root: str | Path | None, records: Any, *, refresh: bool = True,
                     statuses.append({'record_id': record_id, 'stream': stream, 'status': 'persisted'})
             except sqlite3.Error as exc:
                 raise BatchAppendError(f'index lookup failed before appending: {exc}', _counts()) from exc
-            _sync_pending(root, index, persisted, pending, duplicates)
+            _sync_pending(root, index, persisted, pending, duplicates, append=append_stream or _append_stream)
             try:
                 for stream, ids in new_ids.items():
                     for record_id in ids:

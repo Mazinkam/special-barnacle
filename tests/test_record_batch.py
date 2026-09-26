@@ -327,16 +327,15 @@ class RecoveryTests(TemporaryRootTestCase):
 
     def test_io_failure_between_streams_keeps_earlier_appends_durable_and_retry_completes(self):
         from orchestrator import record_batch
-        original = record_batch._append_stream
+        real_append = record_batch._append_stream
 
         def fail_metrics(path, lines, **kwargs):
             if path.name == "metrics.jsonl":
                 raise OSError(28, "No space left on device")
-            return original(path, lines, **kwargs)
+            return real_append(path, lines, **kwargs)
 
-        with patch.object(record_batch, "_append_stream", fail_metrics):
-            with self.assertRaises(record_batch.BatchAppendError) as caught:
-                record_batch.write_batch(self.root, sample_batch())
+        with self.assertRaises(record_batch.BatchAppendError) as caught:
+            record_batch.write_batch(self.root, sample_batch(), append_stream=fail_metrics)
         self.assertEqual(caught.exception.persisted, {"event": 3, "metric": 0, "outcome": 0})
         self.assertEqual(stream_ids(self.root, "event"), ["e-1", "e-2", "e-3"], "earlier stream appends stay durable")
         self.assertEqual(stream_ids(self.root, "metric"), [])
@@ -777,9 +776,12 @@ class ReviewRegressionTests(TemporaryRootTestCase):
 
     def test_append_failure_body_carries_retry_guidance(self):
         from orchestrator import record_batch
-        with patch.object(record_batch, "_append_stream", side_effect=OSError(28, "No space left on device")):
-            with self.assertRaises(record_batch.BatchAppendError) as caught:
-                record_batch.write_batch(self.root, sample_batch())
+
+        def fail(path, lines, **kwargs):
+            raise OSError(28, "No space left on device")
+
+        with self.assertRaises(record_batch.BatchAppendError) as caught:
+            record_batch.write_batch(self.root, sample_batch(), append_stream=fail)
         self.assertIn("same record ids", str(caught.exception))
         self.assertEqual(caught.exception.persisted, {"event": 0, "metric": 0, "outcome": 0})
 
