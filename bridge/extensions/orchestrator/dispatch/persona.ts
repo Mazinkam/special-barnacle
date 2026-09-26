@@ -45,6 +45,13 @@ export interface PersonaResolution {
 	tools?: string[];
 	/** Absolute path to the written system-prompt file, if the persona has a non-empty body. */
 	promptPath?: string;
+	/**
+	 * Set when persona resolution threw (agent discovery or the prompt-file write). Callers must
+	 * not silently proceed on this: log it to the session and surface it as a dispatch
+	 * diagnostic — an agent that WAS found but whose prompt file failed to write otherwise runs
+	 * on the default persona with no trace of why.
+	 */
+	error?: string;
 	/** Remove the temp prompt-file dir this resolution created, if any. Idempotent; safe to call even when nothing was created. */
 	cleanup: () => void;
 }
@@ -64,6 +71,7 @@ export function resolvePersona(opts: ResolvePersonaOptions): PersonaResolution {
 	let tools: string[] | undefined;
 	let promptDir: string | undefined;
 	let promptPath: string | undefined;
+	let error: string | undefined;
 	try {
 		const discovered = opts.discoverAgents(opts.cwd, "both");
 		const agent = discovered.agents.find((a) => a.name === opts.agentName);
@@ -71,19 +79,26 @@ export function resolvePersona(opts: ResolvePersonaOptions): PersonaResolution {
 			tools = agent.tools;
 			if (agent.systemPrompt.trim()) {
 				promptDir = mkdtempFn(opts.tmpPrefix);
-				promptPath = join(promptDir, `${opts.agentName}.md`);
-				writeFileFn(promptPath, agent.systemPrompt);
+				const candidatePath = join(promptDir, `${opts.agentName}.md`);
+				// Only trust `promptPath` once the write has actually succeeded — a
+				// write failure used to still return this path, which the caller
+				// then passed to `--append-system-prompt` pointing at a file that
+				// was never created.
+				writeFileFn(candidatePath, agent.systemPrompt);
+				promptPath = candidatePath;
 			}
 		} else {
 			warn(`[orchestrator] agent persona not found: ${opts.agentName} (using default persona)`);
 		}
 	} catch (err) {
-		warn(`[orchestrator] agent persona load failed: ${(err as Error).message}`);
+		error = (err as Error).message;
+		warn(`[orchestrator] agent persona load failed: ${error}`);
 	}
 
 	return {
 		tools,
 		promptPath,
+		error,
 		cleanup: () => {
 			if (!promptDir) return;
 			try {

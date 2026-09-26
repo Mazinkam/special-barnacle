@@ -87,6 +87,35 @@ describe("resolvePersona", () => {
 		expect(warnings).toEqual(["[orchestrator] agent persona load failed: agents dir unreadable"]);
 	});
 
+	test("discoverAgents throwing: surfaces the failure on the result so callers can log/diagnose it", () => {
+		const result = resolvePersona({
+			cwd: "/repo",
+			agentName: "orch-scout",
+			noPersonaSentinel: NO_PERSONA,
+			discoverAgents: () => { throw new Error("agents dir unreadable"); },
+			tmpPrefix: "orch-agent-",
+			warn: () => {},
+		});
+		expect(result.error).toBe("agents dir unreadable");
+	});
+
+	test("writeFileFn throwing: does not return a promptPath pointing at a file that was never written, and surfaces the failure", () => {
+		const warnings: string[] = [];
+		const result = resolvePersona({
+			cwd: "/repo",
+			agentName: "orch-scout",
+			noPersonaSentinel: NO_PERSONA,
+			discoverAgents: discovery([{ name: "orch-scout", tools: ["read"], systemPrompt: "you are a scout" }]),
+			tmpPrefix: "orch-agent-",
+			mkdtempFn: () => "/tmp/orch-agent-abc123",
+			writeFileFn: () => { throw new Error("EACCES: permission denied"); },
+			warn: (message) => warnings.push(message),
+		});
+		expect(result.promptPath).toBeUndefined();
+		expect(result.error).toBe("EACCES: permission denied");
+		expect(warnings).toEqual(["[orchestrator] agent persona load failed: EACCES: permission denied"]);
+	});
+
 	test("cleanup removes the temp dir exactly once via the injected rm behaviour, and is idempotent", () => {
 		const removed: string[] = [];
 		const result = resolvePersona({

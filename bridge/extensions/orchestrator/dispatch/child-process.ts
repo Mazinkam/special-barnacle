@@ -401,6 +401,11 @@ export async function runSubagentProcess(opts: {
 	 */
 	spawnChild?: ChildSpawner;
 	/**
+	 * Test seam only: replaces the real `discoverAgents` import from `@humain/terminal`.
+	 * Production callers never set this; defaults to the real `discoverAgents`.
+	 */
+	discoverAgentsFn?: typeof discoverAgents;
+	/**
 	 * Telemetry sink for `spend_cap_exceeded`. Optional so dispatch/* never
 	 * has to import index.ts's `recordEvent` (which wraps its telemetry
 	 * singleton); defaults to a no-op. index.ts's re-exported
@@ -450,9 +455,20 @@ export async function runSubagentProcess(opts: {
 		cwd: opts.cwd,
 		agentName: opts.agentName,
 		noPersonaSentinel: NO_PERSONA,
-		discoverAgents,
+		discoverAgents: opts.discoverAgentsFn ?? discoverAgents,
 		tmpPrefix: PERSONA_TMP_PREFIX,
 	});
+	// A persona that WAS found but whose prompt file failed to write (or whose
+	// discovery threw) must not silently fall back to the default persona with
+	// no trace: log it on the session and surface it as a dispatch diagnostic.
+	if (personaResolution.error && session) {
+		session.log(`persona resolution for ${opts.agentName} failed: ${personaResolution.error}`);
+		try {
+			session.writeDiagnostic(`${safeTaskId}.persona-error.log`, personaResolution.error);
+		} catch {
+			/* best-effort diagnostic write */
+		}
+	}
 
 	const tools = opts.tools && opts.tools.length > 0 ? opts.tools : personaResolution.tools;
 	const personaCanMutate = personaCanMutateFor(tools);
