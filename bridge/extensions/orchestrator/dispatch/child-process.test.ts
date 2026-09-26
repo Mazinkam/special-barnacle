@@ -19,7 +19,7 @@ mock.module("@humain/terminal", () => ({
 	renderTaskWithContext: (task: string) => task,
 }));
 
-const { runSubagentProcess } = await import("./child-process.ts");
+const { guardChildStreamHandler, runSubagentProcess } = await import("./child-process.ts");
 const { RunSession } = await import("../run/session.ts");
 
 const NO_PERSONA = "__no_persona__";
@@ -1345,3 +1345,53 @@ describe("runSubagentProcess process/event handling", () => {
 	});
 });
 
+
+describe("child stream handler safety", () => {
+	test("converts a stdout handler throw into a failed dispatch", async () => {
+		let stderr = "";
+		let killed = false;
+		const exitCode = await new Promise<number>((resolve) => {
+			guardChildStreamHandler(
+				"stdout",
+				() => {
+					throw new Error("capture overflow");
+				},
+				{
+					appendStderr: (text: string) => {
+						stderr += text;
+					},
+					kill: () => {
+						killed = true;
+					},
+					finish: resolve,
+				},
+			);
+		});
+
+		expect(exitCode).toBe(1);
+		expect(killed).toBe(true);
+		expect(stderr).toBe("\n[orchestrator] stdout handler failed: capture overflow");
+	});
+
+	test("still fails the dispatch when error formatting fails", async () => {
+		let stderr = "";
+		const exitCode = await new Promise<number>((resolve) => {
+			guardChildStreamHandler(
+				"stdout",
+				() => {
+					throw { toString: () => { throw new Error("cannot format"); } };
+				},
+				{
+					appendStderr: (text: string) => {
+						stderr += text;
+					},
+					kill: () => {},
+					finish: resolve,
+				},
+			);
+		});
+
+		expect(exitCode).toBe(1);
+		expect(stderr).toBe("\n[orchestrator] stdout handler failed: unknown error");
+	});
+});

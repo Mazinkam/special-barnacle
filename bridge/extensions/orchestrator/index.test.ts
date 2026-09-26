@@ -214,57 +214,6 @@ describe("session ingest hook wiring (index.ts wiring)", () => {
 });
 
 
-describe("child stream handler safety", () => {
-	test("converts a stdout handler throw into a failed dispatch", async () => {
-		expect(orchestrator.guardChildStreamHandler).toBeFunction();
-		let stderr = "";
-		let killed = false;
-		const exitCode = await new Promise<number>((resolve) => {
-			orchestrator.guardChildStreamHandler!(
-				"stdout",
-				() => {
-					throw new Error("capture overflow");
-				},
-				{
-					appendStderr: (text: string) => {
-						stderr += text;
-					},
-					kill: () => {
-						killed = true;
-					},
-					finish: resolve,
-				},
-			);
-		});
-
-		expect(exitCode).toBe(1);
-		expect(killed).toBe(true);
-		expect(stderr).toBe("\n[orchestrator] stdout handler failed: capture overflow");
-	});
-
-	test("still fails the dispatch when error formatting fails", async () => {
-		let stderr = "";
-		const exitCode = await new Promise<number>((resolve) => {
-			orchestrator.guardChildStreamHandler!(
-				"stdout",
-				() => {
-					throw { toString: () => { throw new Error("cannot format"); } };
-				},
-				{
-					appendStderr: (text: string) => {
-						stderr += text;
-					},
-					kill: () => {},
-					finish: resolve,
-				},
-			);
-		});
-
-		expect(exitCode).toBe(1);
-		expect(stderr).toBe("\n[orchestrator] stdout handler failed: unknown error");
-	});
-});
-
 describe("RunSession cancellation presentation", () => {
 	test("clears the widget and status after cancellation cleanup, keeping the trace in run.log", () => {
 		const widgets: unknown[] = [];
