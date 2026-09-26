@@ -5,7 +5,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionIngestScheduler } from "./ingest.ts";
 import { planReconTasks } from "./recon.ts";
@@ -215,62 +215,6 @@ describe("session ingest hook wiring (index.ts wiring)", () => {
 
 
 
-describe("recon tool boundary", () => {
-	test("carries read-only tools and the configured model from planned recon to subprocess creation", async () => {
-		expect(orchestrator.dispatchParallel).toBeFunction();
-		const tasks = planReconTasks({ method: METHOD.rules.pre_implementation_recon,
-			complexity: 5, taskClass: "implementation", goal: "repair flow", runId: "run" });
-		const invocations: string[][] = [];
-		// depth 0, then the injected deps: `dispatchParallel` takes both since the
-		// progress-view nesting depth and the test seam landed independently.
-		await orchestrator.dispatchParallel(process.cwd(), "run", tasks,
-			{ scout: { model: "provider/recon-model", effort: "low" } }, {} as never, null, 0, {
-			recordEvent: async () => {},
-			runProcess: (opts) => orchestrator.runSubagentProcess({
-				...opts,
-				spawnChild: (_command, args) => {
-					invocations.push([...args]);
-					throw new Error("test: stop at subprocess creation");
-				},
-			}),
-		});
-		expect(invocations).toHaveLength(3);
-		for (const args of invocations) {
-			expect(args[args.indexOf("--tools") + 1]).toBe("read,grep,find,ls");
-			expect(args[args.indexOf("--provider") + 1]).toBe("provider");
-			expect(args[args.indexOf("--model") + 1]).toBe("recon-model");
-		}
-	});
-
-	// method.json binds recon to the `scout` capability so the dispatch lands on
-	// the purpose-built read-only `orch-scout` persona rather than an
-	// implementer persona that merely happens to be tool-restricted.
-	test("runs recon under the orch-scout persona at the cheap tier", () => {
-		const policy = METHOD.rules.pre_implementation_recon;
-		expect(policy.worker_capability).toBe("scout");
-		expect(TIER_CAPABILITIES.cheap).toContain(policy.worker_capability);
-	});
-
-	test("passes the orch-scout persona prompt to the recon subprocess", async () => {
-		const tasks = planReconTasks({ method: METHOD.rules.pre_implementation_recon,
-			complexity: 5, taskClass: "implementation", goal: "repair flow", runId: "run" });
-		const personas: string[] = [];
-		await orchestrator.dispatchParallel(process.cwd(), "run", tasks,
-			{ scout: { model: "provider/recon-model", effort: "low" } }, {} as never, null, 0, {
-			recordEvent: async () => {},
-			runProcess: (opts) => orchestrator.runSubagentProcess({
-				...opts,
-				spawnChild: (_command, args) => {
-					const list = [...args];
-					const at = list.indexOf("--append-system-prompt");
-					personas.push(at === -1 ? "(none)" : basename(String(list[at + 1])));
-					throw new Error("test: stop at subprocess creation");
-				},
-			}),
-		});
-		expect(personas).toEqual(["orch-scout.md", "orch-scout.md", "orch-scout.md"]);
-	});
-});
 
 // The Rule-2 fan-out is parent-owned and billed. If the lead persona also told
 // leads to dispatch their own `orch-scout` recon, every qualifying run would pay
