@@ -7,9 +7,10 @@
  * Evaluated once and eagerly, matching the pre-B4.2 behaviour: index.ts's own
  * module-level consts were computed once at import time, and index.test.ts's
  * "runModule forwards STATE_ROOT..." test relies on exactly that — it mutates
- * `process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT` and then does a cache-busting
- * dynamic re-`import()` of the whole module to pick up the new value, rather
- * than expecting a later call to observe it. Nothing here needs to be lazy.
+ * `process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT` (the deprecated alias; the canonical
+ * name is `CODING_AGENT_ORCHESTRATOR_HOME`, see `resolveStateRoot`) and then does a
+ * cache-busting dynamic re-`import()` of the whole module to pick up the new value,
+ * rather than expecting a later call to observe it. Nothing here needs to be lazy.
  */
 
 import { realpathSync } from "node:fs";
@@ -110,11 +111,26 @@ function positiveIntEnv(env: BridgeEnv, name: string, fallback: number): number 
 	return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : fallback;
 }
 
+/**
+ * Resolve the state root the same way both runtimes do: `contract.state_root.env_vars.canonical`
+ * (`CODING_AGENT_ORCHESTRATOR_HOME`) if set and non-empty, else the first non-empty entry of
+ * `contract.state_root.env_vars.aliases` (currently just the deprecated
+ * `HUMAIN_ORCHESTRATOR_STATE_ROOT`), else `contract.state_root.default`. See
+ * `orchestrator/core/env.py`'s `default_state_root` for the Python-side mirror.
+ */
+function resolveStateRoot(env: BridgeEnv): string {
+	for (const name of [contract.state_root.env_vars.canonical, ...contract.state_root.env_vars.aliases]) {
+		const value = env[name];
+		if (value) return value;
+	}
+	return contract.state_root.default;
+}
+
 const CHARS_PER_TOKEN_ESTIMATE = 4;
 
 export function loadBridgeConfig(env: BridgeEnv, home: string): BridgeConfig {
 	const skillRoot = env.HUMAIN_ORCHESTRATOR_SKILL_ROOT ?? "~/.local/share/agent-skills/hierarchical-agent-orchestrator";
-	const stateRoot = env[contract.state_root.env_vars.ts] ?? contract.state_root.default;
+	const stateRoot = resolveStateRoot(env);
 	const python = env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3";
 	const expandedSkillRoot = expandHome(skillRoot, home);
 	const expandedStateRoot = expandHome(stateRoot, home);

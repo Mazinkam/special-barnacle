@@ -12,14 +12,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..contract import DEFAULT_STATE_ROOT, STATE_ROOT_ENV_VAR
+from ..contract import DEFAULT_STATE_ROOT, STATE_ROOT_ENV_ALIASES, STATE_ROOT_ENV_VAR
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def default_state_root() -> Path:
-    return Path(os.environ.get(STATE_ROOT_ENV_VAR, DEFAULT_STATE_ROOT)).expanduser()
+    """Resolve the state root: `STATE_ROOT_ENV_VAR` (canonical) if set and non-empty, else the
+    first non-empty `STATE_ROOT_ENV_ALIASES` entry (deprecated fallback), else `DEFAULT_STATE_ROOT`.
+    """
+    for name in (STATE_ROOT_ENV_VAR, *STATE_ROOT_ENV_ALIASES):
+        value = os.environ.get(name)
+        if value:
+            return Path(value).expanduser()
+    return Path(DEFAULT_STATE_ROOT).expanduser()
 
 def default_attribution() -> dict[str, str]:
     return {

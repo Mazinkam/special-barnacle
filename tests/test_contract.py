@@ -85,16 +85,32 @@ def test_python_redaction_regex_matches_contract_and_cli() -> None:
 
 def test_state_root_env_vars_and_default_match_contract() -> None:
     raw = _raw_contract()['state_root']
-    assert contract.STATE_ROOT_ENV_VAR == raw['env_vars']['python'] == 'CODING_AGENT_ORCHESTRATOR_HOME'
-    assert contract.TS_STATE_ROOT_ENV_VAR == raw['env_vars']['ts'] == 'HUMAIN_ORCHESTRATOR_STATE_ROOT'
+    assert contract.STATE_ROOT_ENV_VAR == raw['env_vars']['canonical'] == 'CODING_AGENT_ORCHESTRATOR_HOME'
+    assert contract.STATE_ROOT_ENV_ALIASES == tuple(raw['env_vars']['aliases']) == ('HUMAIN_ORCHESTRATOR_STATE_ROOT',)
     assert contract.DEFAULT_STATE_ROOT == raw['default']
 
 
 def test_default_state_root_uses_contract_env_var_and_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(contract.STATE_ROOT_ENV_VAR, raising=False)
+    for alias in contract.STATE_ROOT_ENV_ALIASES:
+        monkeypatch.delenv(alias, raising=False)
     assert runtime.default_state_root() == Path(contract.DEFAULT_STATE_ROOT).expanduser()
     monkeypatch.setenv(contract.STATE_ROOT_ENV_VAR, '/tmp/some-other-root')
     assert runtime.default_state_root() == Path('/tmp/some-other-root')
+
+
+def test_default_state_root_alias_only_resolves_to_alias_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """2.3: the deprecated `HUMAIN_ORCHESTRATOR_STATE_ROOT` alias alone must still be honoured."""
+    monkeypatch.delenv(contract.STATE_ROOT_ENV_VAR, raising=False)
+    monkeypatch.setenv('HUMAIN_ORCHESTRATOR_STATE_ROOT', '/tmp/alias-only-root')
+    assert runtime.default_state_root() == Path('/tmp/alias-only-root')
+
+
+def test_default_state_root_canonical_wins_when_both_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """2.3: when both the canonical name and the deprecated alias are set, canonical wins."""
+    monkeypatch.setenv(contract.STATE_ROOT_ENV_VAR, '/tmp/canonical-root')
+    monkeypatch.setenv('HUMAIN_ORCHESTRATOR_STATE_ROOT', '/tmp/alias-root')
+    assert runtime.default_state_root() == Path('/tmp/canonical-root')
 
 
 # --- parse_iso_ts: exact per-caller semantics (B1 review) ------------------------------
@@ -221,7 +237,8 @@ def test_runtime_state_root_env_var_matches_contract() -> None:
 
 
 def test_install_sh_default_state_root_matches_contract() -> None:
-    """The active shell fallback must match `state_root.default` in the contract."""
+    """The active shell fallback must match `state_root.default` in the contract, and must
+    check the canonical env var before the deprecated alias (2.3)."""
 
     install_sh = (REPO_ROOT / 'install.sh').read_text(encoding='utf-8')
     assignments = [
@@ -230,7 +247,7 @@ def test_install_sh_default_state_root_matches_contract() -> None:
     ]
     assert len(assignments) == 1
     match = re.fullmatch(
-        r'\s*STATE_ROOT="\$\{HUMAIN_ORCHESTRATOR_STATE_ROOT:-(?P<default>[^}]*)\}"\s*',
+        r'\s*STATE_ROOT="\$\{CODING_AGENT_ORCHESTRATOR_HOME:-\$\{HUMAIN_ORCHESTRATOR_STATE_ROOT:-(?P<default>[^}]*)\}\}"\s*',
         assignments[0],
     )
     assert match is not None

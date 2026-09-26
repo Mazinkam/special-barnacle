@@ -69,10 +69,14 @@ RETRY_SAME_IDS: str = _batch['retry_same_ids']
 PATH_REDACTION_RE: re.Pattern[str] = re.compile(_CONTRACT['redaction_regex']['python'])
 
 _state_root = _CONTRACT['state_root']
-#: Env var Python reads for the state root (`runtime.default_state_root`).
-STATE_ROOT_ENV_VAR: str = _state_root['env_vars']['python']
-#: Env var name the TS bridge reads for its own state-root config, kept here so
-#: Python-side tests can assert both sides agree without duplicating the string.
-TS_STATE_ROOT_ENV_VAR: str = _state_root['env_vars']['ts']
-#: Default state root when no env var is set, expanded by callers with `~`.
+_state_root_env = _state_root['env_vars']
+#: Canonical env var both runtimes prefer for the state root (`core.env.default_state_root`,
+#: the TS bridge's `config.ts`). Resolution order on both sides: this name if set and
+#: non-empty, then each of `STATE_ROOT_ENV_ALIASES` in order, then `DEFAULT_STATE_ROOT`.
+STATE_ROOT_ENV_VAR: str = _state_root_env['canonical']
+#: Deprecated fallback alias(es), tried only if `STATE_ROOT_ENV_VAR` is unset/empty. Kept here
+#: so both runtimes share exactly the same list instead of re-typing it.
+STATE_ROOT_ENV_ALIASES: tuple[str, ...] = tuple(_state_root_env['aliases'])
+#: Default state root when neither the canonical name nor any alias is set, expanded by
+#: callers with `~`.
 DEFAULT_STATE_ROOT: str = _state_root['default']

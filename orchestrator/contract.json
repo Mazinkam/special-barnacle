@@ -61,8 +61,9 @@
 
   "state_root": {
     "env_vars": {
-      "python": "CODING_AGENT_ORCHESTRATOR_HOME",
-      "ts": "HUMAIN_ORCHESTRATOR_STATE_ROOT"
+      "canonical": "CODING_AGENT_ORCHESTRATOR_HOME",
+      "aliases": ["HUMAIN_ORCHESTRATOR_STATE_ROOT"],
+      "_note": "2.3: both runtimes resolve the canonical name first, then each alias in order, then default. HUMAIN_ORCHESTRATOR_STATE_ROOT is a deprecated fallback alias, kept for existing callers; do not add new readers of it."
     },
     "default": "~/.local/state/coding-agent-orchestrator"
   }

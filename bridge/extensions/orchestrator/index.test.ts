@@ -360,11 +360,14 @@ describe("session ingest hook wiring", () => {
 
 	test("runModule forwards STATE_ROOT as CODING_AGENT_ORCHESTRATOR_HOME", async () => {
 		const customRoot = mkdtempSync(join(tmpdir(), "orch-runmodule-state-"));
-		const previousState = process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT;
-		process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = customRoot;
+		// 2.3: CODING_AGENT_ORCHESTRATOR_HOME (canonical) now wins over the deprecated
+		// HUMAIN_ORCHESTRATOR_STATE_ROOT alias when both are set, so set the canonical name here
+		// (the file-level setup above already sets both to the same testStateRoot).
+		const previousCanonical = process.env.CODING_AGENT_ORCHESTRATOR_HOME;
+		process.env.CODING_AGENT_ORCHESTRATOR_HOME = customRoot;
 		try {
 			// Re-import the module so STATE_ROOT (read at module load time) reflects
-			// the freshly-set HUMAIN_ORCHESTRATOR_STATE_ROOT. The cache-busting query
+			// the freshly-set CODING_AGENT_ORCHESTRATOR_HOME. The cache-busting query
 			// string forces a fresh module evaluation under Bun's test runner.
 			const fresh = (await import(`./index.ts?propagate=${Date.now()}-${Math.random()}`)) as typeof orchestrator;
 			expect(fresh.runModule).toBeFunction();
@@ -381,8 +384,8 @@ describe("session ingest hook wiring", () => {
 			expect(capturedRunModuleEnvs.length).toBeGreaterThan(0);
 			expect(capturedRunModuleEnvs.at(-1)?.CODING_AGENT_ORCHESTRATOR_HOME).toBe(customRoot);
 		} finally {
-			if (previousState === undefined) delete process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT;
-			else process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = previousState;
+			if (previousCanonical === undefined) delete process.env.CODING_AGENT_ORCHESTRATOR_HOME;
+			else process.env.CODING_AGENT_ORCHESTRATOR_HOME = previousCanonical;
 			rmSync(customRoot, { recursive: true, force: true });
 		}
 	});

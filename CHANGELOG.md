@@ -1,5 +1,18 @@
 ## Unreleased
 
+### state-root env var (2.3)
+
+- `contract.json`'s `state_root.env_vars` now records a single canonical name,
+  `CODING_AGENT_ORCHESTRATOR_HOME`, plus an `aliases` list containing the deprecated
+  `HUMAIN_ORCHESTRATOR_STATE_ROOT` (previously the two were unrelated per-runtime literals, one
+  named `python`, one `ts`). Both `orchestrator/contract.py`/`core/env.py`'s
+  `default_state_root()` and the bridge's `config.ts` `loadBridgeConfig` now resolve the state
+  root the same way: the canonical name if set and non-empty, else the first non-empty alias,
+  else the contract's default. `install.sh` checks `CODING_AGENT_ORCHESTRATOR_HOME` before
+  falling back to `HUMAIN_ORCHESTRATOR_STATE_ROOT`. No behaviour change for callers that already
+  set only one of the two names; when both are set, `CODING_AGENT_ORCHESTRATOR_HOME` now wins on
+  both sides (previously each runtime read only its own name and ignored the other).
+
 ### scheduler: min_samples default
 
 - `orchestrator.vocab.SCHEDULER_MIN_SAMPLES` (the sample-count threshold below which

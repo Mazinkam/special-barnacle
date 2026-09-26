@@ -57,7 +57,7 @@ describe("config.ts loadBridgeConfig env overrides", () => {
 		const cfg = loadBridgeConfig(
 			{
 				HUMAIN_ORCHESTRATOR_SKILL_ROOT: "/custom/skill",
-				[contract.state_root.env_vars.ts]: "/custom/state",
+				[contract.state_root.env_vars.canonical]: "/custom/state",
 				HUMAIN_ORCHESTRATOR_PYTHON: "python3.11",
 				HUMAIN_ORCHESTRATOR_PROFILES_FILE: "/custom/profiles.json",
 				HUMAIN_ORCHESTRATOR_ADAPTER_FILE: "/custom/adapter.json",
@@ -109,5 +109,30 @@ describe("config.ts loadBridgeConfig env overrides", () => {
 		);
 		expect(cfg.maxLeads).toBe(contract.max_leads);
 		expect(cfg.maxConcurrentDispatches).toBe(4);
+	});
+});
+
+describe("config.ts loadBridgeConfig state-root env precedence (2.3)", () => {
+	const CANONICAL = contract.state_root.env_vars.canonical;
+	const [ALIAS] = contract.state_root.env_vars.aliases;
+
+	test("the deprecated alias alone is still honoured", () => {
+		const cfg = loadBridgeConfig({ [ALIAS]: "/alias/state" }, HOME);
+		expect(cfg.stateRoot).toBe("/alias/state");
+	});
+
+	test("the canonical name alone is honoured", () => {
+		const cfg = loadBridgeConfig({ [CANONICAL]: "/canonical/state" }, HOME);
+		expect(cfg.stateRoot).toBe("/canonical/state");
+	});
+
+	test("when both are set, the canonical name wins", () => {
+		const cfg = loadBridgeConfig({ [CANONICAL]: "/canonical/state", [ALIAS]: "/alias/state" }, HOME);
+		expect(cfg.stateRoot).toBe("/canonical/state");
+	});
+
+	test("an empty-string canonical value falls back to the alias", () => {
+		const cfg = loadBridgeConfig({ [CANONICAL]: "", [ALIAS]: "/alias/state" }, HOME);
+		expect(cfg.stateRoot).toBe("/alias/state");
 	});
 });

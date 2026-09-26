@@ -52,8 +52,8 @@ describe("contract.json parity", () => {
 	});
 
 	test("state_root env vars and default match the documented names", () => {
-		expect(contract.state_root.env_vars.python).toBe("CODING_AGENT_ORCHESTRATOR_HOME");
-		expect(contract.state_root.env_vars.ts).toBe("HUMAIN_ORCHESTRATOR_STATE_ROOT");
+		expect(contract.state_root.env_vars.canonical).toBe("CODING_AGENT_ORCHESTRATOR_HOME");
+		expect(contract.state_root.env_vars.aliases).toEqual(["HUMAIN_ORCHESTRATOR_STATE_ROOT"]);
 		expect(contract.state_root.default).toBe("~/.local/state/coding-agent-orchestrator");
 	});
 
