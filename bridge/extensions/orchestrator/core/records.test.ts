@@ -248,3 +248,34 @@ describe("dispatch records (T6)", () => {
 		}
 	});
 });
+
+describe("effort telemetry vocabulary", () => {
+	test("thinking levels map onto method.json efforts", async () => {
+		const { METHOD } = await import("../models.ts");
+		expect(methodEffortFor(undefined)).toBe("standard");
+		expect(methodEffortFor("medium")).toBe("standard");
+		expect(methodEffortFor("low")).toBe("low");
+		expect(methodEffortFor("high")).toBe("high");
+		expect(methodEffortFor("xhigh")).toBe("maximum");
+		expect(methodEffortFor("off")).toBe("minimal");
+		for (const t of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+			expect(METHOD.effort_levels).toContain(methodEffortFor(t));
+		}
+	});
+
+	test("method.json effort_aliases matches the formerly hard-coded switch in index.ts", async () => {
+		// Snapshot of the literal switch that used to live in index.ts before it moved
+		// into method.json's effort_aliases (B1 step 5). "medium" and any unlisted
+		// thinking level fell through to the `default: return "standard"` branch.
+		const { METHOD } = await import("../models.ts");
+		expect(METHOD.effort_aliases).toEqual({
+			off: "minimal",
+			minimal: "minimal",
+			low: "low",
+			medium: "standard",
+			high: "high",
+			xhigh: "maximum",
+			max: "maximum",
+		});
+	});
+});

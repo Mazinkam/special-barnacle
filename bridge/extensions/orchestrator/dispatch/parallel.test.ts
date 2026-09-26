@@ -200,3 +200,30 @@ describe("review fixes (Phase A review)", () => {
 		}
 	});
 });
+
+describe("capability persona overrides", () => {
+	test("method.json capability_personas matches the formerly hard-coded CAPABILITY_AGENT_ALIASES in index.ts", () => {
+		// Snapshot of the static overrides that used to live in index.ts before they
+		// moved into method.json's capability_personas (B1 step 5). The lead-size
+		// overrides (lead_small/lead/lead_large -> orchestrator-lead) are excluded
+		// here because they were already derived from rules.lead_sizing.sizes.
+		expect(METHOD.capability_personas).toEqual({
+			analysis_mid: "orch-technical-lead",
+			analysis_strong: "orch-architect",
+			integration_review: "orch-technical-review",
+			migration_review: "orch-technical-review",
+			performance_review: "orch-technical-review",
+			api_contract_review: "orch-technical-review",
+		});
+	});
+
+	test("agentNameFor still resolves every previously-aliased capability", () => {
+		expect(agentNameFor("analysis_mid")).toBe("orch-technical-lead");
+		expect(agentNameFor("analysis_strong")).toBe("orch-architect");
+		expect(agentNameFor("integration_review")).toBe("orch-technical-review");
+		expect(agentNameFor("migration_review")).toBe("orch-technical-review");
+		expect(agentNameFor("performance_review")).toBe("orch-technical-review");
+		expect(agentNameFor("api_contract_review")).toBe("orch-technical-review");
+		expect(agentNameFor("implementation_strong")).toBe("orch-implementation-strong");
+	});
+});
