@@ -1,8 +1,13 @@
 /**
  * QA verification (B4.6): dispatch the QA agent against the union of files
  * changed by workers/leads and return a pass/fail verdict the caller's
- * escalation logic can act on. Parses a tolerant output shape: ANY "FAIL"
- * token in the QA output flips the verdict.
+ * escalation logic can act on. Parses a tolerant output shape: fenced code
+ * blocks and blockquoted lines are stripped first (so quoted/example output
+ * can't flip the verdict), then a row/bullet fails when its recognized
+ * status/count column (or, absent a header, any non-label cell) carries a
+ * FAIL/FAILED/ERROR word, a fail symbol (✗/❌), or a non-zero error/failure
+ * count — or when the output has an explicit `## Verdict`/`Verdict:`/`Status:`
+ * line reading FAIL/FAILED (see `parseFailedChecks`, `hasExplicitFailVerdict`).
  *
  * pipeline/* must not import index.ts. `dispatch`/`captureDispatchCost`/
  * `recordOutcome` are required fields on `deps` (no default referencing an
@@ -50,7 +55,32 @@ export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality
 	};
 }
 
-export function parseFailedChecks(text: string): string[] {
+/**
+ * Strip fenced code blocks (``` / ~~~) and blockquote lines (`> ...`) before parsing a QA
+ * report for status tables/bullets/verdict lines. A QA report legitimately quotes or shows
+ * example FAIL output (e.g. "here's what a failing report looks like") without that being its
+ * own actual verdict; without this, such an example flips the real verdict.
+ */
+function stripQuotedAndFencedContent(text: string): string {
+	const lines = text.split(/\r?\n/);
+	const kept: string[] = [];
+	let inFence = false;
+	const fenceRe = /^\s*(```|~~~)/;
+	const blockquoteRe = /^\s*>/;
+	for (const line of lines) {
+		if (fenceRe.test(line)) {
+			inFence = !inFence;
+			continue;
+		}
+		if (inFence) continue;
+		if (blockquoteRe.test(line)) continue;
+		kept.push(line);
+	}
+	return kept.join("\n");
+}
+
+export function parseFailedChecks(rawText: string): string[] {
+	const text = stripQuotedAndFencedContent(rawText);
 	const fails: string[] = [];
 	// Explicit failing status words, matched whole-word (case-insensitive) and not preceded by a
 	// digit (so a leading count like "0 failed" is judged by nonZeroCountRe instead).
@@ -149,7 +179,8 @@ export function parseFailedChecks(text: string): string[] {
  * the looser `Verdict: FAIL` / `STATUS: fail` line forms. Returns true only for an explicit
  * FAIL — an explicit PASS, or no verdict line at all, returns false.
  */
-export function hasExplicitFailVerdict(text: string): boolean {
+export function hasExplicitFailVerdict(rawText: string): boolean {
+	const text = stripQuotedAndFencedContent(rawText);
 	// `## Verdict` heading followed (on a later non-blank line) by FAIL/FAILED, before the next
 	// heading or end of text.
 	const headingMatch = /^#{1,6}\s*Verdict\s*$/im.exec(text);
@@ -172,8 +203,10 @@ export function hasExplicitFailVerdict(text: string): boolean {
 
 /**
  * Run the QA agent against the union of files changed by workers. Returns a
- * pass/fail verdict that downstream escalation logic can act on. Parses a
- * tolerant output shape: ANY "FAIL" token in the QA output flips the verdict.
+ * pass/fail verdict that downstream escalation logic can act on — see
+ * `parseFailedChecks`/`hasExplicitFailVerdict` for the exact tolerant-parsing
+ * rules (header-aware status/count columns, explicit verdict lines, and
+ * fenced/blockquoted content ignored).
  */
 export async function runVerification(
 	runId: string,

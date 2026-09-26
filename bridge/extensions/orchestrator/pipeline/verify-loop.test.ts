@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@humain/terminal";
 
-import { parseFailedChecks, runVerification, type VerifyDeps } from "./verify-loop.ts";
+import { parseFailedChecks, runVerification, type VerifyDeps, hasExplicitFailVerdict } from "./verify-loop.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import type { RunContext } from "../run/context.ts";
 import type { RunSession } from "../run/session.ts";
@@ -148,6 +148,39 @@ describe("parseFailedChecks", () => {
 	});
 });
 
+describe("hasExplicitFailVerdict fenced code block / blockquote handling", () => {
+	test("ignores a FAIL verdict inside a fenced code block (``` fence)", () => {
+		const text = ["## Verdict", "PASS.", "", "Example of a failing report for reference:", "```", "Verdict: FAIL", "```"].join("\n");
+		expect(hasExplicitFailVerdict(text)).toBe(false);
+	});
+
+	test("ignores a FAIL verdict inside a fenced code block (~~~ fence)", () => {
+		const text = ["## Verdict", "PASS.", "", "~~~", "Verdict: FAIL", "~~~"].join("\n");
+		expect(hasExplicitFailVerdict(text)).toBe(false);
+	});
+
+	test("ignores a 'Verdict: FAIL' line quoted in a blockquote", () => {
+		const text = ["## Verdict", "PASS.", "", "> Verdict: FAIL"].join("\n");
+		expect(hasExplicitFailVerdict(text)).toBe(false);
+	});
+
+	test("still detects a real '## Verdict' FAIL heading outside fences/blockquotes", () => {
+		const text = ["## Verdict", "FAIL."].join("\n");
+		expect(hasExplicitFailVerdict(text)).toBe(true);
+	});
+});
+
+describe("parseFailedChecks fenced code block / blockquote handling", () => {
+	test("ignores a FAIL status cell inside a fenced code block", () => {
+		const text = ["```", "| tests | FAIL |", "```"].join("\n");
+		expect(parseFailedChecks(text)).toEqual([]);
+	});
+
+	test("ignores a FAIL bullet quoted in a blockquote", () => {
+		expect(parseFailedChecks("> - foo: FAIL")).toEqual([]);
+	});
+});
+
 describe("runVerification", () => {
 	test("an explicit '## Verdict' FAIL heading fails verification even though the QA dispatch exited 0", async () => {
 		const qaOut = ["## Checks", "- `typecheck`: PASS", "", "## Verdict", "FAIL."].join("\n");
@@ -172,6 +205,31 @@ describe("runVerification", () => {
 
 	test("an explicit '## Verdict' PASS heading does not flag, and does not falsely fail", async () => {
 		const qaOut = ["## Checks", "- `typecheck`: PASS", "", "## Verdict", "PASS."].join("\n");
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		expect(result.passed).toBe(true);
+		expect(result.failedChecks).not.toContain("verdict");
+	});
+
+	test("a real PASS verdict is not overridden by a FAIL verdict quoted inside a fenced code block in the same output", async () => {
+		const qaOut = [
+			"## Checks",
+			"- `typecheck`: PASS",
+			"",
+			"## Verdict",
+			"PASS.",
+			"",
+			"Example of a failing report for reference:",
+			"```",
+			"Verdict: FAIL",
+			"```",
+		].join("\n");
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		expect(result.passed).toBe(true);
+		expect(result.failedChecks).not.toContain("verdict");
+	});
+
+	test("a real PASS verdict is not overridden by a FAIL verdict quoted inside a blockquote in the same output", async () => {
+		const qaOut = ["## Checks", "- `typecheck`: PASS", "", "## Verdict", "PASS.", "", "> Verdict: FAIL"].join("\n");
 		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
 		expect(result.passed).toBe(true);
 		expect(result.failedChecks).not.toContain("verdict");
