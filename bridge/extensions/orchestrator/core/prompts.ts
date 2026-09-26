@@ -73,6 +73,94 @@ export function effectiveLeadCount(plan: PlanResponse, maxLeads = 8): number {
 	return Number.isFinite(leads) ? Math.min(maxLeads, Math.max(1, Math.trunc(leads))) : 1;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requireString(obj: Record<string, unknown>, path: string): string {
+	const value = obj[path.split(".").pop() as string];
+	if (typeof value !== "string") {
+		throw new Error(`invalid plan response: field "${path}" must be a string, got ${JSON.stringify(value)}`);
+	}
+	return value;
+}
+
+function requireNumber(obj: Record<string, unknown>, path: string): number {
+	const value = obj[path.split(".").pop() as string];
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		throw new Error(`invalid plan response: field "${path}" must be a number, got ${JSON.stringify(value)}`);
+	}
+	return value;
+}
+
+function requireObject(obj: Record<string, unknown>, path: string): Record<string, unknown> {
+	const key = path.split(".").pop() as string;
+	const value = obj[key];
+	if (!isRecord(value)) {
+		throw new Error(`invalid plan response: field "${path}" must be an object, got ${JSON.stringify(value)}`);
+	}
+	return value;
+}
+
+/**
+ * Validate the shape of a parsed `orchestrator.cli plan` JSON response before it is trusted as a
+ * `PlanResponse`. Only checks the fields the pipeline actually reads (`planRun`'s caller threads
+ * every failure through the existing plan-failure path in `pipeline/run-orchestration.ts`, which
+ * needs a clear, field-naming `Error` message, not a silent bad cast).
+ */
+export function parsePlanResponse(value: unknown): PlanResponse {
+	if (!isRecord(value)) {
+		throw new Error(`invalid plan response: expected a JSON object, got ${JSON.stringify(value)}`);
+	}
+	const plan_id = requireString(value, "plan_id");
+	const run_id = requireString(value, "run_id");
+	const task_class = requireString(value, "task_class");
+	const complexity = requireNumber(value, "complexity");
+	const risk = requireString(value, "risk");
+
+	const topologyObj = requireObject(value, "topology");
+	const topology = {
+		depth: requireNumber(topologyObj, "topology.depth"),
+		leads: requireNumber(topologyObj, "topology.leads"),
+		workers: requireNumber(topologyObj, "topology.workers"),
+		shape: requireString(topologyObj, "topology.shape"),
+	};
+
+	const routeObj = requireObject(value, "route");
+	const selectedObj = requireObject(routeObj, "route.selected");
+	const recommendedObj = requireObject(routeObj, "route.recommended");
+	const route = {
+		selected: {
+			capability: requireString(selectedObj, "route.selected.capability"),
+			effort: requireString(selectedObj, "route.selected.effort"),
+			verification_depth: requireString(selectedObj, "route.selected.verification_depth"),
+		},
+		recommended: {
+			capability: requireString(recommendedObj, "route.recommended.capability"),
+			effort: requireString(recommendedObj, "route.recommended.effort"),
+			verification_depth: requireString(recommendedObj, "route.recommended.verification_depth"),
+		},
+		mode: requireString(routeObj, "route.mode"),
+		history_sufficient: Boolean(routeObj.history_sufficient),
+		explanation: isRecord(routeObj.explanation) ? routeObj.explanation : {},
+	};
+
+	const effective_quality_floor = requireNumber(value, "effective_quality_floor");
+	const cost_aggressiveness = requireNumber(value, "cost_aggressiveness");
+
+	return {
+		plan_id,
+		run_id,
+		task_class,
+		complexity,
+		risk,
+		topology,
+		route,
+		effective_quality_floor,
+		cost_aggressiveness,
+	};
+}
+
 function leadAssignmentInstructions(plan: PlanResponse, maxLeads: number): string[] {
 	const n = effectiveLeadCount(plan, maxLeads);
 	if (n <= 1) return [];

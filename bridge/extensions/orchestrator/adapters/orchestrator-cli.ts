@@ -18,7 +18,7 @@
 import { spawn } from "node:child_process";
 
 import { createPythonCli, type PythonCli } from "./python-cli.ts";
-import type { PlanResponse } from "../core/prompts.ts";
+import { parsePlanResponse, type PlanResponse } from "../core/prompts.ts";
 
 export interface OrchestratorCliConfig {
 	/** Default Python interpreter; a per-call `runModule` `options.python` overrides it. */
@@ -109,8 +109,16 @@ export function createOrchestratorCli(config: OrchestratorCliConfig): Orchestrat
 		if (res.exitCode !== 0) {
 			throw new Error(`plan failed (exit ${res.exitCode}): ${res.stderr}`);
 		}
-		// The plan command emits a single pretty-printed JSON object on stdout.
-		return JSON.parse(res.stdout.trim());
+		// The plan command emits a single pretty-printed JSON object on stdout. Validate its
+		// shape before trusting it as a `PlanResponse` — an unvalidated cast let a malformed
+		// response through as a plan the pipeline would silently misread (B4.7).
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(res.stdout.trim());
+		} catch (err) {
+			throw new Error(`plan response is not valid JSON: ${(err as Error).message}`);
+		}
+		return parsePlanResponse(parsed);
 	}
 
 	return { cli, runModule, planRun };

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { effectiveLeadCount, formatTaskPrompt, type PlanResponse } from "./prompts.ts";
+import { effectiveLeadCount, formatTaskPrompt, parsePlanResponse, type PlanResponse } from "./prompts.ts";
 
 function plan(leads: number): PlanResponse {
 	return {
@@ -44,5 +44,35 @@ describe("core/prompts.ts formatTaskPrompt", () => {
 		const withMsg = formatTaskPrompt({ taskId: "t1", capability: "worker", task: "do it" }, "run-1", ["stop early"]);
 		expect(withMsg).toContain("stop early");
 		expect(withMsg).toContain("User messages while this run was in progress");
+	});
+});
+
+describe("core/prompts.ts parsePlanResponse", () => {
+	test("accepts a valid plan and returns it unchanged", () => {
+		const valid = plan(3);
+		expect(parsePlanResponse(valid)).toEqual(valid);
+	});
+
+	test("rejects a plan missing a required field, naming it", () => {
+		const invalid = plan(3) as unknown as Record<string, unknown>;
+		delete invalid.task_class;
+		expect(() => parsePlanResponse(invalid)).toThrow(/task_class/);
+	});
+
+	test("rejects a plan whose field has the wrong type, naming it", () => {
+		const invalid = plan(3) as unknown as Record<string, unknown>;
+		invalid.complexity = "five";
+		expect(() => parsePlanResponse(invalid)).toThrow(/complexity/);
+	});
+
+	test("rejects a plan with a missing nested topology field, naming it", () => {
+		const invalid = plan(3) as unknown as { topology: Record<string, unknown> };
+		delete invalid.topology.leads;
+		expect(() => parsePlanResponse(invalid)).toThrow(/topology\.leads/);
+	});
+
+	test("rejects a non-object value", () => {
+		expect(() => parsePlanResponse(null)).toThrow(/plan response/i);
+		expect(() => parsePlanResponse("nope")).toThrow(/plan response/i);
 	});
 });
