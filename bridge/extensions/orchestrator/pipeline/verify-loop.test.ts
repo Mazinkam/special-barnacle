@@ -1,6 +1,49 @@
 import { describe, expect, test } from "bun:test";
+import type { ExtensionContext } from "@humain/terminal";
 
-import { parseFailedChecks } from "./verify-loop.ts";
+import { parseFailedChecks, runVerification, type VerifyDeps } from "./verify-loop.ts";
+import type { CaptureOpts, DispatchResult } from "../core/records.ts";
+import type { RunContext } from "../run/context.ts";
+import type { RunSession } from "../run/session.ts";
+
+function fakeCaptureOpts(): CaptureOpts {
+	return {
+		runId: "run-1",
+		planId: "plan-1",
+		taskClass: "crud",
+		complexity: 4,
+		risk: "low",
+		recommended: { capability: "implementation_fast", effort: "low", verification_depth: "targeted" },
+		mode: "adaptive",
+	} as unknown as CaptureOpts;
+}
+
+function fakeQaResult(stdout: string, exitCode = 0): DispatchResult {
+	return {
+		taskId: "run-1-qa",
+		capability: "qa_agent",
+		model: "provider/model",
+		exitCode,
+		stdout,
+		stderr: "",
+		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+		durationMs: 10,
+		costUsd: 0.01,
+		costReported: true,
+		filesChanged: [],
+	} as unknown as DispatchResult;
+}
+
+function fakeVerifyDeps(qaStdout: string, exitCode = 0): VerifyDeps {
+	return {
+		dispatch: async () => [fakeQaResult(qaStdout, exitCode)],
+		captureDispatchCost: async () => {},
+		recordOutcome: () => {},
+	};
+}
+
+const fakeCtx = {} as ExtensionContext;
+const fakeRun: RunContext<RunSession> | null = null;
 
 describe("parseFailedChecks", () => {
 	test("does not flag a passing row with a zero count", () => {
@@ -74,5 +117,35 @@ describe("parseFailedChecks", () => {
 	test("does not flag a header row followed by a separator row and skips the separator too", () => {
 		const table = ["| Check | Command | Result |", "| --- | --- | --- |", "| unit | pytest | FAIL |"].join("\n");
 		expect(parseFailedChecks(table)).toEqual(["unit"]);
+	});
+});
+
+describe("runVerification", () => {
+	test("an explicit '## Verdict' FAIL heading fails verification even though the QA dispatch exited 0", async () => {
+		const qaOut = ["## Checks", "- `typecheck`: PASS", "", "## Verdict", "FAIL."].join("\n");
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		expect(result.passed).toBe(false);
+		expect(result.failedChecks).toContain("verdict");
+	});
+
+	test("a 'Verdict: FAIL' line fails verification even though the QA dispatch exited 0", async () => {
+		const qaOut = "Verdict: FAIL";
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		expect(result.passed).toBe(false);
+		expect(result.failedChecks).toContain("verdict");
+	});
+
+	test("a 'STATUS: fail' line fails verification even though the QA dispatch exited 0", async () => {
+		const qaOut = "STATUS: fail";
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		expect(result.passed).toBe(false);
+		expect(result.failedChecks).toContain("verdict");
+	});
+
+	test("an explicit '## Verdict' PASS heading does not flag, and does not falsely fail", async () => {
+		const qaOut = ["## Checks", "- `typecheck`: PASS", "", "## Verdict", "PASS."].join("\n");
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		expect(result.passed).toBe(true);
+		expect(result.failedChecks).not.toContain("verdict");
 	});
 });

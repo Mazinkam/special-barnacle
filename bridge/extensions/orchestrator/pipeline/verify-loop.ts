@@ -102,6 +102,33 @@ export function parseFailedChecks(text: string): string[] {
 }
 
 /**
+ * Detect an explicit QA verdict of FAIL when the QA agent's output follows the standard
+ * `orch-qa-agent.md` output format (a `## Verdict` heading followed by `PASS`/`FAIL`), or
+ * the looser `Verdict: FAIL` / `STATUS: fail` line forms. Returns true only for an explicit
+ * FAIL — an explicit PASS, or no verdict line at all, returns false.
+ */
+export function hasExplicitFailVerdict(text: string): boolean {
+	// `## Verdict` heading followed (on a later non-blank line) by FAIL/FAILED, before the next
+	// heading or end of text.
+	const headingMatch = /^#{1,6}\s*Verdict\s*$/im.exec(text);
+	if (headingMatch) {
+		const rest = text.slice(headingMatch.index + headingMatch[0].length);
+		const nextHeading = /^#{1,6}\s/m.exec(rest);
+		const body = nextHeading ? rest.slice(0, nextHeading.index) : rest;
+		const firstNonBlank = body.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+		if (firstNonBlank && /\b(FAIL|FAILED)\b/i.test(firstNonBlank) && !/\bPASS\b/i.test(firstNonBlank)) {
+			return true;
+		}
+	}
+	// `Verdict: FAIL` / `STATUS: fail` line forms.
+	const lineMatch = /^\s*(?:Verdict|Status)\s*:\s*(.+)$/im.exec(text);
+	if (lineMatch && /\b(FAIL|FAILED)\b/i.test(lineMatch[1]!) && !/\bPASS\b/i.test(lineMatch[1]!)) {
+		return true;
+	}
+	return false;
+}
+
+/**
  * Run the QA agent against the union of files changed by workers. Returns a
  * pass/fail verdict that downstream escalation logic can act on. Parses a
  * tolerant output shape: ANY "FAIL" token in the QA output flips the verdict.
@@ -152,6 +179,9 @@ export async function runVerification(
 
 	const out = qaResult.stdout;
 	const failedChecks = parseFailedChecks(out);
+	if (hasExplicitFailVerdict(out) && !failedChecks.includes("verdict")) {
+		failedChecks.push("verdict");
+	}
 	const passed = qaResult.exitCode === 0 && failedChecks.length === 0;
 
 	deps.recordOutcome(qaVerificationOutcomeFor(runId, passed, passed ? 0.95 : 0.0, out.slice(0, 2000)));
