@@ -57,3 +57,16 @@ describe("core/triage.ts heuristicTriage", () => {
 		expect(heuristicTriage("update the billing invoice flow").risk).toBe("high");
 	});
 });
+
+describe("/orchestrate argument parsing (clampComplexity)", () => {
+	test("clampComplexity treats absent or non-numeric triage values as the fallback, not the minimum", () => {
+		for (const absent of [undefined, null, "", "  ", true, false, [], [7], {}, "abc", Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(clampComplexity(absent)).toBe(5);
+		}
+		expect(clampComplexity(7)).toBe(7);
+		expect(clampComplexity("7")).toBe(7);
+		expect(clampComplexity(-3)).toBe(1);
+		expect(clampComplexity(12)).toBe(10);
+		expect(clampComplexity(6.5)).toBe(7);
+	});
+});

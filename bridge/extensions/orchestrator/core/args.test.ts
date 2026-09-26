@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { planReconTasks } from "../recon.ts";
+import { METHOD } from "../models.ts";
 import { emptyOverrides, parseArgs, usageText } from "./args.ts";
 
 describe("core/args.ts parseArgs", () => {
@@ -89,5 +91,33 @@ describe("core/args.ts emptyOverrides", () => {
 		expect(a).toEqual({ tiers: {}, capabilities: {} });
 		a.tiers.cheap = "x";
 		expect(b.tiers.cheap).toBeUndefined();
+	});
+});
+
+describe("/orchestrate argument parsing (parseArgs)", () => {
+	test("runs without confirmation unless interactive mode is explicitly requested", () => {
+		const parsed = parseArgs("repair the login race");
+
+		expect(parsed.goal).toBe("repair the login race");
+		expect(parsed.interactive).toBe(false);
+	});
+
+	test("enables confirmation gates when --interactive is supplied", () => {
+		const parsed = parseArgs("repair the login race --interactive");
+
+		expect(parsed.goal).toBe("repair the login race");
+		expect(parsed.interactive).toBe(true);
+		expect(parsed.unknownFlags).toEqual([]);
+	});
+
+	test("normalises --complexity onto the integer 1-10 scale Rule-2 bands use", () => {
+		expect(parseArgs("repair flow --complexity 6.5").complexity).toBe(7);
+		expect(parseArgs("repair flow --complexity 12").complexity).toBe(10);
+		expect(parseArgs("repair flow --complexity 0").complexity).toBe(1);
+		expect(parseArgs("repair flow --complexity abc").complexity).toBe(5);
+		// Previously 6.5 matched no workers_by_complexity band and planned zero recon.
+		const tasks = planReconTasks({ method: METHOD.rules.pre_implementation_recon, complexity: parseArgs("repair flow --complexity 6.5").complexity,
+			taskClass: "implementation", goal: "repair flow", runId: "run" });
+		expect(tasks.length).toBe(4);
 	});
 });

@@ -214,49 +214,6 @@ describe("session ingest hook wiring (index.ts wiring)", () => {
 });
 
 
-describe("/orchestrate argument parsing", () => {
-	test("runs without confirmation unless interactive mode is explicitly requested", () => {
-		expect(orchestrator.parseArgs).toBeFunction();
-		const parsed = orchestrator.parseArgs!("repair the login race");
-
-		expect(parsed.goal).toBe("repair the login race");
-		expect(parsed.interactive).toBe(false);
-	});
-
-	test("enables confirmation gates when --interactive is supplied", () => {
-		expect(orchestrator.parseArgs).toBeFunction();
-		const parsed = orchestrator.parseArgs!("repair the login race --interactive");
-
-		expect(parsed.goal).toBe("repair the login race");
-		expect(parsed.interactive).toBe(true);
-		expect(parsed.unknownFlags).toEqual([]);
-	});
-
-	test("normalises --complexity onto the integer 1-10 scale Rule-2 bands use", () => {
-		const parse = orchestrator.parseArgs!;
-		expect(parse("repair flow --complexity 6.5").complexity).toBe(7);
-		expect(parse("repair flow --complexity 12").complexity).toBe(10);
-		expect(parse("repair flow --complexity 0").complexity).toBe(1);
-		expect(parse("repair flow --complexity abc").complexity).toBe(5);
-		// Previously 6.5 matched no workers_by_complexity band and planned zero recon.
-		const tasks = planReconTasks({ method: METHOD.rules.pre_implementation_recon, complexity: parse("repair flow --complexity 6.5").complexity,
-			taskClass: "implementation", goal: "repair flow", runId: "run" });
-		expect(tasks.length).toBe(4);
-	});
-
-	test("clampComplexity treats absent or non-numeric triage values as the fallback, not the minimum", () => {
-		const clamp = orchestrator.clampComplexity;
-		for (const absent of [undefined, null, "", "  ", true, false, [], [7], {}, "abc", Number.NaN, Number.POSITIVE_INFINITY]) {
-			expect(clamp(absent)).toBe(5);
-		}
-		expect(clamp(7)).toBe(7);
-		expect(clamp("7")).toBe(7);
-		expect(clamp(-3)).toBe(1);
-		expect(clamp(12)).toBe(10);
-		expect(clamp(6.5)).toBe(7);
-	});
-});
-
 describe("child stream handler safety", () => {
 	test("converts a stdout handler throw into a failed dispatch", async () => {
 		expect(orchestrator.guardChildStreamHandler).toBeFunction();
