@@ -50,7 +50,7 @@ export function verificationVerdictFor(input: VerificationVerdictInput): string 
  */
 export interface RunReport {
 	runId: string;
-	/** `Date.now() - Number(runId.split("-")[2])`, computed once at finalize time. */
+	/** `session.terminalTiming().elapsed_ms` — the session's recorded start to its finalize-time close, not derived from the run id. */
 	elapsedMs: number;
 	/** True when every lead reported `STATUS: blocked` — no QA, no PASS. */
 	blocked: boolean;
