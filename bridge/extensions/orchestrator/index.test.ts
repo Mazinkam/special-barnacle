@@ -240,7 +240,7 @@ const repoRootFixture = "/repo";
 
 
 
-describe("batched telemetry through the Python batch CLI", () => {
+describe("batched telemetry through the Python batch CLI (index.ts wiring)", () => {
 	function rows(file: string): Record<string, unknown>[] {
 		const path = join(pythonStateRoot, file);
 		if (!existsSync(path)) return [];
@@ -546,7 +546,7 @@ describe("diagnostic writer ownership and sealing (index.ts wiring)", () => {
 	});
 });
 
-describe("final triage and shutdown integration", () => {
+describe("final triage and shutdown integration (index.ts wiring)", () => {
 	function activate() {
 		let handler!: (args: string, ctx: never) => Promise<void>;
 		let cancelHandler!: (args: string, ctx: never) => Promise<void>;
@@ -1206,36 +1206,6 @@ describe("final triage and shutdown integration", () => {
 	}, 30_000);
 });
 
-describe("archived run diagnostics lookup", () => {
-	test("a readable path is returned unchanged; an archived one names the .gz and the restore command; a missing one says so", () => {
-		const runDir = join(testStateRoot, "runs", "ht-orch-1790000000000-abcdef");
-		mkdirSync(runDir, { recursive: true });
-		const log = join(runDir, "run.log");
-		writeFileSync(log, "2026-08-01T00:00:00Z run started\n");
-		expect(orchestrator.describeRunArtifact(log)).toBe(log);
-
-		const report = join(runDir, "lead-report.md");
-		writeFileSync(`${report}.gz`, "not really gzip, existence is what matters here");
-		writeFileSync(
-			join(runDir, "archive.manifest.json"),
-			JSON.stringify({ format_version: 1, run_id: "ht-orch-1790000000000-abcdef", files: { "lead-report.md": { archive: "lead-report.md.gz", sha256: "00" } } }),
-		);
-		const described = orchestrator.describeRunArtifact(report);
-		expect(described).toContain(report);
-		expect(described).toContain(`${report}.gz`);
-		expect(described).toContain("restore-run ht-orch-1790000000000-abcdef");
-
-		// once restored (or never archived) the plain path wins again
-		writeFileSync(report, "report\n");
-		expect(orchestrator.describeRunArtifact(report)).toBe(report);
-
-		// a .gz without a manifest entry is not ours to describe as archived
-		const stray = join(runDir, "other.stderr.log");
-		writeFileSync(`${stray}.gz`, "x");
-		expect(orchestrator.describeRunArtifact(stray)).toBe(`${stray} (missing)`);
-		expect(orchestrator.describeRunArtifact(join(runDir, "never.txt"))).toBe(`${join(runDir, "never.txt")} (missing)`);
-	});
-});
 
 describe("lead sizing wiring (Phase A)", () => {
 	const lowPlan = { ...planFixture, complexity: 2, risk: "low", topology: { depth: 2, leads: 1, workers: 0, shape: "lead-workers" } };

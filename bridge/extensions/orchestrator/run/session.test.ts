@@ -1,11 +1,11 @@
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { RunSession } from "./session.ts";
+import { describeRunArtifact, RunSession } from "./session.ts";
 
 // The diagnostic-sealing tests below shell out to python3's orchestrator.archive to check the
 // TS/Python archive contract against the real seal marker; PYTHONPATH must resolve THIS
@@ -400,5 +400,41 @@ print(json.dumps(result))
 		session.close();
 		expect(await session.sealDiagnostics(Promise.resolve(false))).toBe(false);
 		expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
+	});
+});
+
+describe("archived run diagnostics lookup", () => {
+	test("a readable path is returned unchanged; an archived one names the .gz and the restore command; a missing one says so", () => {
+		const runRoot = mkdtempSync(join(tmpdir(), "orch-archived-diag-test-"));
+		const runDir = join(runRoot, "runs", "ht-orch-1790000000000-abcdef");
+		mkdirSync(runDir, { recursive: true });
+		try {
+			const log = join(runDir, "run.log");
+			writeFileSync(log, "2026-08-01T00:00:00Z run started\n");
+			expect(describeRunArtifact(log)).toBe(log);
+
+			const report = join(runDir, "lead-report.md");
+			writeFileSync(`${report}.gz`, "not really gzip, existence is what matters here");
+			writeFileSync(
+				join(runDir, "archive.manifest.json"),
+				JSON.stringify({ format_version: 1, run_id: "ht-orch-1790000000000-abcdef", files: { "lead-report.md": { archive: "lead-report.md.gz", sha256: "00" } } }),
+			);
+			const described = describeRunArtifact(report);
+			expect(described).toContain(report);
+			expect(described).toContain(`${report}.gz`);
+			expect(described).toContain("restore-run ht-orch-1790000000000-abcdef");
+
+			// once restored (or never archived) the plain path wins again
+			writeFileSync(report, "report\n");
+			expect(describeRunArtifact(report)).toBe(report);
+
+			// a .gz without a manifest entry is not ours to describe as archived
+			const stray = join(runDir, "other.stderr.log");
+			writeFileSync(`${stray}.gz`, "x");
+			expect(describeRunArtifact(stray)).toBe(`${stray} (missing)`);
+			expect(describeRunArtifact(join(runDir, "never.txt"))).toBe(`${join(runDir, "never.txt")} (missing)`);
+		} finally {
+			rmSync(runRoot, { recursive: true, force: true });
+		}
 	});
 });
