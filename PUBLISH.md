@@ -71,10 +71,11 @@ machine produces the *events*.
 
 ## Pre-publish verification
 
-Before pushing, run the three verification gates from a clean tree:
+Before pushing, run the verification gates from a clean tree:
 
 ```bash
 python3 -m pytest -q
+(cd bridge/extensions/orchestrator && bun test)
 bash scripts/typecheck-bridge.sh
 bash scripts/lint.sh
 ```
