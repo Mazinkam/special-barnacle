@@ -1,5 +1,44 @@
 ## Unreleased
 
+### tests: split large test files (B5)
+
+- `bridge/extensions/orchestrator/index.test.ts` split alongside each new module, with the
+  global `node:child_process` mock replaced by an injected `spawn` and the stale `BorderedLoader`
+  mock dropped.
+- `tests/test_ingest_checkpoint.py` reorganized as a `tests/ingest_checkpoint/` package with
+  shared helpers in `conftest.py`/`helpers.py`, grouped by behaviour instead of by review round.
+- Direct tests added for `orchestrator/policy_recommendations.py` and
+  `bridge/extensions/orchestrator/run-diagnostics.ts` (previously exercised only indirectly).
+- Patches of private functions (`archive._compress_to_temp`, `record_batch._append_stream`,
+  `cli.ROOT`, ...) replaced with explicit fault-injection parameters.
+
+### docs, packaging and lint (B6)
+
+- `SKILL.md` no longer claims a `policy_overlay.json` runtime-state file, `re_review_violations`/
+  `recon_coverage`/`enforcement_readiness` dashboard metrics, or an enforced "$0.50 recon
+  ceiling": none of these exist in the code (`policy_overlay.json` is written by no module;
+  `orchestrator/presentation/dashboard_data.py` has no such metrics; `method.json`'s
+  `max_recon_cost_usd` is never read). Replaced with descriptions of what actually exists today
+  (the durable event/metric streams, the dashboard's spend-cap/adaptive panels, and the advisory,
+  unenforced recon cost field).
+- `bridge/extensions/orchestrator-README.md` no longer says telemetry writes go via
+  `python3 -m orchestrator.cli metric`; it now documents the real path — `recordEvent`/
+  `recordModelCall`/`recordOutcome` enqueue onto `RecordQueue`, which batches and flushes via a
+  single `orchestrator.cli batch -` call (`flushDelayMs`/`maxBatch` from `config.ts`), with
+  failures surfaced through `onError` as a console warning and a session-log line.
+- `PUBLISH.md`'s file-layout table was stale (missing `orchestrator/{core,config,records,store,
+  ingest,analytics,routing,presentation,app,cli,archive}`, `bridge/extensions/orchestrator/
+  {adapters,core,dispatch,pipeline,run,commands,hooks,tools}`, `knip.json`, `scripts/lint.sh`);
+  rebuilt against `git ls-files`, and `scripts/lint.sh` added to the pre-publish checklist.
+- `docs/superpowers/plans/` entries each got a short status line (completed / superseded /
+  in-progress / pending on another branch) based on plan content and `git log`.
+- `requires-python` in `pyproject.toml` changed from `>=3.10` to `>=3.9` to match the interpreter
+  the suite actually runs and is tested on (3.9.6), and `ruff`'s `py39` target.
+- Added `scripts/lint.sh`: runs `ruff check`, `vulture` (Python dead-code) and `knip --production`
+  (unused bridge TS exports, via a temporary probe package.json) from the repo root, printing a
+  summary and exiting non-zero on any finding or tool failure. Added to the verification gate
+  lists in `README.md`, `bridge/README.md`, and `PUBLISH.md`.
+
 ### state-root env var (2.3)
 
 - `contract.json`'s `state_root.env_vars` now records a single canonical name,
@@ -149,10 +188,6 @@
   itself — a standalone letter, `option N`, `the above`, `as discussed`, `that plan` — is refused
   with a message pointing at `--context`/`--with-last-reply`/`--force` instead of dispatching a
   run that will just block waiting for context it was never given. `--force` skips the check.
-
-# Changelog
-
-## [Unreleased]
 
 ### Fixed
 
