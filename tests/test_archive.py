@@ -419,25 +419,6 @@ class RestoreTests(ArchiveFixture):
         self.assertTrue((d / archive.MANIFEST_FILE).exists())
 
 
-class LocateTests(ArchiveFixture):
-    def test_locate_reports_readable_archived_and_missing_paths(self):
-        d = self.completed_run()
-        readable = archive.locate_run_file(self.root, 'old-done', 'run.log')
-        self.assertEqual(readable['status'], 'readable'); self.assertEqual(readable['path'], str(d / 'run.log'))
-        self.execute()
-        self.assertEqual(archive.locate_run_file(self.root, 'old-done', 'lead-report.md')['status'], 'readable')
-        (d / 'lead-report.md').unlink()  # legacy raw-absent archive
-        archived = archive.locate_run_file(self.root, 'old-done', 'lead-report.md')
-        self.assertEqual(archived['status'], 'archived'); self.assertEqual(archived['archive'], str(d / 'lead-report.md.gz'))
-        self.assertIn('restore-run old-done', archived['restore_command']); self.assertIn('lead-report.md.gz', archived['message']); self.assertIn('restore-run old-done', archived['message'])
-        self.assertEqual(archive.locate_run_file(self.root, 'old-done', 'run.log')['status'], 'readable', 'the progress-board log path still works')
-        missing = archive.locate_run_file(self.root, 'old-done', 'never.txt')
-        self.assertEqual(missing['status'], 'missing'); self.assertIn('never.txt', missing['message'])
-        by_path = archive.locate_path(self.root, d / 'lead-report.md')
-        self.assertEqual(by_path['status'], 'archived')
-        self.assertEqual(archive.locate_path(self.root, self.root / 'events.jsonl')['status'], 'readable')
-
-
 class CliTests(ArchiveFixture):
     def cli(self, *args: str, root: Path | None = None) -> subprocess.CompletedProcess:
         env = {**os.environ, 'CODING_AGENT_ORCHESTRATOR_HOME': str(root or self.root), 'PYTHONPATH': str(REPO), 'PYTHONDONTWRITEBYTECODE': '1'}

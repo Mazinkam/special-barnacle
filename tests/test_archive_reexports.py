@@ -44,6 +44,7 @@ from orchestrator.archive import codec, execute, manifest, plan, restore, seal
 
 #: Every module-level name `orchestrator/archive.py` bound just before the B3 split (see the
 #: module docstring above for exactly how).
+# locate_run_file/locate_path removed as test-only dead code (audit follow-up 2.1a)
 EXPECTED_ARCHIVE_REEXPORTS: frozenset = frozenset({
     'Any', 'Iterator', 'Optional', 'Path',
     'gzip', 'hashlib', 'json', 'math', 'os', 're', 'shutil', 'stat', 'tempfile', 'zlib',
@@ -62,7 +63,7 @@ EXPECTED_ARCHIVE_REEXPORTS: frozenset = frozenset({
     '_run_dirs', '_candidate_files', '_skip', 'plan_run', 'plan_archive',
     '_archive_file', '_commit_archive_file', '_run_storage_bytes', '_execute_run',
     'archive_lock', 'archive_runs',
-    '_restore_file', 'restore_run', 'locate_run_file', 'locate_path',
+    '_restore_file', 'restore_run',
 })
 
 #: name -> the object every one of the above (except the plain stdlib/typing singletons, covered
@@ -131,8 +132,6 @@ ARCHIVE_NEW_HOME_IDENTITY: dict = {
 
     '_restore_file': restore._restore_file,
     'restore_run': restore.restore_run,
-    'locate_run_file': restore.locate_run_file,
-    'locate_path': restore.locate_path,
 }
 
 #: name -> the stdlib/typing object it must be the exact same singleton as.

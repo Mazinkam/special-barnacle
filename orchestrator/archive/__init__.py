@@ -32,8 +32,7 @@ This used to be one 659-line module (B3, `docs/architecture-review.md`); it is n
   `terminal_outcomes`).
 * `execute.py` — archiving under `archive.lock` (`archive_runs`, `_execute_run`, `_archive_file`),
   plus `summarize_archive_results`, the CLI summary aggregation moved out of `cli.py`.
-* `restore.py` — restoring archived files and locating a run diagnostic (`restore_run`,
-  `locate_run_file`, `locate_path`).
+* `restore.py` — restoring archived files (`restore_run`).
 
 Every name that used to be importable from `orchestrator.archive` (public API, private helpers,
 and the stdlib names it imported for its own use, including `unittest.mock.patch.object(archive,
@@ -124,8 +123,6 @@ from .plan import (
 )
 from .restore import (
     _restore_file,
-    locate_path,
-    locate_run_file,
     restore_run,
 )
 from .seal import OWNER_FILE, SEAL_FILE, SEAL_PROTOCOL, load_seal
@@ -157,7 +154,7 @@ __all__ = [
     # execution
     'archive_lock', 'archive_runs', 'summarize_archive_results',
     # restore / lookup
-    'restore_run', 'locate_run_file', 'locate_path',
+    'restore_run',
     # submodules (for patch targets)
     'codec', 'manifest', 'seal', 'plan', 'execute', 'restore',
 ]
