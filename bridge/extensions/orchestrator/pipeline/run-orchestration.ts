@@ -587,6 +587,12 @@ export async function runOrchestration(
 		models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
 		log_dir: session.dir,
 	}, session.terminalTiming(), session.telemetryBaseline);
+	// Elapsed time for the run summary: the session's own monotonic clock (started when the
+	// run's RunSession was constructed), not Date.now() minus a timestamp parsed out of the run
+	// id -- the run id's third segment is not guaranteed to be a timestamp, and parsing it as one
+	// used to silently produce NaN (B4.7).
+	const elapsedMs = session.terminalTiming().elapsed_ms;
+
 
 	// The lead's final report is the only place its reasoning, open
 	// questions, and non-file results (audits, package lists, verdicts)
@@ -623,7 +629,7 @@ export async function runOrchestration(
 
 	const report: RunReport = {
 		runId,
-		elapsedMs: Date.now() - Number(runId.split("-")[2]),
+		elapsedMs,
 		blocked: runOutcome === "blocked",
 		dispatchOk,
 		succeededLeads,

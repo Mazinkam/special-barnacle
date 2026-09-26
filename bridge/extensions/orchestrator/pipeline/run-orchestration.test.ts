@@ -246,3 +246,71 @@ describe("pipeline/run-orchestration.ts writeLeadReportsDiagnostic", () => {
 		expect(logs).toEqual(["lead-report.md write failed: ENOSPC: no space left on device"]);
 	});
 });
+
+describe("pipeline/run-orchestration.ts runOrchestration elapsedMs (B4.7)", () => {
+	test("elapsed time comes from the session's recorded start, not a timestamp parsed out of the run id", async () => {
+		// A run id whose third `-`-separated segment is not a timestamp at all — the old
+		// `Number(runId.split("-")[2])` parse produced `NaN` here, and `Date.now() - NaN` is
+		// `NaN`, silently breaking the "Orchestration complete in ..." line.
+		const runId = "ht-orch-not-a-timestamp-abcdef";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan: PlanResponse = {
+			plan_id: "plan-123456789012",
+			run_id: runId,
+			task_class: "bugfix",
+			complexity: 3,
+			risk: "medium",
+			topology: { depth: 1, leads: 1, workers: 0, shape: "flat" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto",
+				history_sufficient: true,
+				explanation: {},
+			},
+			effective_quality_floor: 0.5,
+			cost_aggressiveness: 0.5,
+		};
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async (_cwd, runId2, tasks) => tasks.map((t) => ({
+				taskId: t.taskId,
+				capability: t.capability,
+				model: "p/lead",
+				exitCode: 0,
+				stdout: "STATUS: done\n\nFiles Changed: None",
+				stderr: "",
+				usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+				durationMs: 1,
+				costUsd: 0,
+				nestedCostUsd: 0,
+				costReported: true,
+				outcome: "completed" as const,
+				filesChanged: [],
+			})),
+		});
+
+		const result = await runOrchestration(
+			runId,
+			"/tmp/cwd-not-a-git-repo",
+			fakeArgs(),
+			adapter,
+			resolved,
+			ctx,
+			session,
+			{ ...claimed, session },
+			deps,
+		);
+
+		expect(result.kind).toBe("completed");
+		if (result.kind === "completed") {
+			// fakeSession()'s terminalTiming() always returns elapsed_ms: 1000, regardless of
+			// the run id's shape — the fix must read that instead of parsing the run id.
+			expect(result.report.elapsedMs).toBe(1000);
+			expect(Number.isNaN(result.report.elapsedMs)).toBe(false);
+		}
+	});
+});
