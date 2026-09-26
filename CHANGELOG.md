@@ -6,11 +6,11 @@
   global `node:child_process` mock replaced by an injected `spawn` and the stale `BorderedLoader`
   mock dropped.
 - `tests/test_ingest_checkpoint.py` reorganized as a `tests/ingest_checkpoint/` package with
-  shared helpers in `conftest.py`/`helpers.py`, grouped by behaviour instead of by review round.
+  shared helpers in `helpers.py`, grouped by behaviour instead of by review round.
 - Direct tests added for `orchestrator/policy_recommendations.py` and
   `bridge/extensions/orchestrator/run-diagnostics.ts` (previously exercised only indirectly).
-- Patches of private functions (`archive._compress_to_temp`, `record_batch._append_stream`,
-  `cli.ROOT`, ...) replaced with explicit fault-injection parameters.
+- `record_batch.write_batch` gained an `append_stream=` fault-injection parameter, replacing the in-process `_append_stream` patches in `tests/test_record_batch.py`. The remaining private patches (`archive.execute._compress_to_temp`, subprocess/CLI-level `_append_stream`, the ingest-pipeline `_append_stream` site) are deferred; `cli.ROOT` is a documented test seam and stays.
+- The `index.ts` composition is built by `createOrchestratorExtension({ spawn })`; integration tests inject `spawn` instead of spying on `node:child_process`.
 
 ### docs, packaging and lint (B6)
 
