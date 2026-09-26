@@ -12,7 +12,9 @@
  * than expecting a later call to observe it. Nothing here needs to be lazy.
  */
 
-import { join } from "node:path";
+import { realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { METHOD } from "./models.ts";
 import contract from "./contract.json";
 
@@ -49,6 +51,34 @@ export interface BridgeConfig {
 	telemetryMaxBatch: number;
 	/** Bounds the aggregate parent-owned recon evidence packet handed to every lead prompt. */
 	reconEvidenceMaxChars: number;
+	/**
+	 * Age after which an unclaimed persona temp dir is considered orphaned. Leads
+	 * may run up to the absolute ceiling (6h by default), but each prompt file is
+	 * read once when its child starts, so the TTL only needs to cover spawn.
+	 */
+	personaTmpTtlMs: number;
+}
+
+/**
+ * The profiles shipped with the skill (`bridge/orchestrator-profiles.json`).
+ * Resolved through the real path of this module because install.sh symlinks
+ * the extension directory into ~/.humain-terminal/agent/extensions/. This
+ * file and index.ts live in the same directory
+ * (`bridge/extensions/orchestrator/`), so `dirname(realpathSync(...))` here
+ * resolves to the exact same directory index.ts's own `import.meta.url`
+ * would have resolved to, including through the install.sh symlink.
+ */
+export function shippedProfilesPath(): string {
+	try {
+		return join(dirname(realpathSync(fileURLToPath(import.meta.url))), "..", "..", "orchestrator-profiles.json");
+	} catch {
+		return join(dirname(fileURLToPath(import.meta.url)), "..", "..", "orchestrator-profiles.json");
+	}
+}
+
+/** Where per-run logs land: `<config.expandedStateRoot>/runs/<runId>/`. */
+export function runsDir(config: Pick<BridgeConfig, "expandedStateRoot">): string {
+	return join(config.expandedStateRoot, "runs");
 }
 
 /** `~`-expand a leading `~` in `path` to `home`; every other path is returned unchanged. */
@@ -85,6 +115,7 @@ export function loadBridgeConfig(env: BridgeEnv, home: string): BridgeConfig {
 	const expandedStateRoot = expandHome(stateRoot, home);
 	const profilesPath = env.HUMAIN_ORCHESTRATOR_PROFILES_FILE ?? join(home, ".humain-terminal", "agent", "orchestrator-profiles.json");
 	const legacyAdapterPath = env.HUMAIN_ORCHESTRATOR_ADAPTER_FILE ?? join(home, ".humain-terminal", "agent", "orchestrator-adapter.json");
+	const dispatchTimeoutMs = positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS", 20 * 60 * 1000);
 
 	return {
 		skillRoot,
@@ -101,7 +132,7 @@ export function loadBridgeConfig(env: BridgeEnv, home: string): BridgeConfig {
 		pythonTimeoutMs: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_PYTHON_TIMEOUT_MS", 60_000),
 		maxConcurrentDispatches: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_MAX_CONCURRENCY", 4),
 		maxLeads: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_MAX_LEADS", 8),
-		dispatchTimeoutMs: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_DISPATCH_TIMEOUT_MS", 20 * 60 * 1000),
+		dispatchTimeoutMs,
 		telemetryFlushMs: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_TELEMETRY_FLUSH_MS", 500),
 		telemetryMaxBatch: positiveIntEnv(env, "HUMAIN_ORCHESTRATOR_TELEMETRY_BATCH", 100),
 		reconEvidenceMaxChars: positiveIntEnv(
@@ -109,5 +140,6 @@ export function loadBridgeConfig(env: BridgeEnv, home: string): BridgeConfig {
 			"HUMAIN_ORCHESTRATOR_RECON_EVIDENCE_MAX_CHARS",
 			METHOD.rules.pre_implementation_recon.evidence_packet_max_tokens * CHARS_PER_TOKEN_ESTIMATE,
 		),
+		personaTmpTtlMs: Math.max(2 * 60 * 60 * 1000, dispatchTimeoutMs * 6),
 	};
 }
