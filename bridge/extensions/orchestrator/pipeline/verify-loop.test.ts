@@ -168,6 +168,21 @@ describe("hasExplicitFailVerdict fenced code block / blockquote handling", () =>
 		const text = ["## Verdict", "FAIL."].join("\n");
 		expect(hasExplicitFailVerdict(text)).toBe(true);
 	});
+
+	test("an unterminated ``` fence does not swallow a real verdict that follows it", () => {
+		const text = ["```", "some unterminated code", "## Verdict", "FAIL"].join("\n");
+		expect(hasExplicitFailVerdict(text)).toBe(true);
+	});
+
+	test("a ~~~ fence does not close a ``` fence (mismatched markers); a real verdict after it is detected", () => {
+		const text = ["```", "Verdict: FAIL (example)", "~~~", "## Verdict", "FAIL"].join("\n");
+		expect(hasExplicitFailVerdict(text)).toBe(true);
+	});
+
+	test("a properly closed ``` fence containing FAIL is stripped; a later PASS verdict is detected as passing", () => {
+		const text = ["```", "Verdict: FAIL (example)", "```", "## Verdict", "PASS"].join("\n");
+		expect(hasExplicitFailVerdict(text)).toBe(false);
+	});
 });
 
 describe("parseFailedChecks fenced code block / blockquote handling", () => {
@@ -230,6 +245,27 @@ describe("runVerification", () => {
 
 	test("a real PASS verdict is not overridden by a FAIL verdict quoted inside a blockquote in the same output", async () => {
 		const qaOut = ["## Checks", "- `typecheck`: PASS", "", "## Verdict", "PASS.", "", "> Verdict: FAIL"].join("\n");
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		expect(result.passed).toBe(true);
+		expect(result.failedChecks).not.toContain("verdict");
+	});
+
+	test("an unterminated ``` fence does not hide a real FAIL verdict that follows it", async () => {
+		const qaOut = ["```", "some unterminated code", "## Verdict", "FAIL"].join("\n");
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		expect(result.passed).toBe(false);
+		expect(result.failedChecks).toContain("verdict");
+	});
+
+	test("a ``` fence mismatched-closed by ~~~ does not hide a real FAIL verdict that follows it", async () => {
+		const qaOut = ["```", "Verdict: FAIL (example)", "~~~", "## Verdict", "FAIL"].join("\n");
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
+		expect(result.passed).toBe(false);
+		expect(result.failedChecks).toContain("verdict");
+	});
+
+	test("a properly closed fence containing FAIL followed by a real PASS verdict passes", async () => {
+		const qaOut = ["```", "Verdict: FAIL (example)", "```", "## Verdict", "PASS"].join("\n");
 		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0));
 		expect(result.passed).toBe(true);
 		expect(result.failedChecks).not.toContain("verdict");

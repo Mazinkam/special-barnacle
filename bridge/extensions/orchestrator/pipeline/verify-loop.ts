@@ -63,18 +63,48 @@ export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality
  */
 function stripQuotedAndFencedContent(text: string): string {
 	const lines = text.split(/\r?\n/);
-	const kept: string[] = [];
-	let inFence = false;
-	const fenceRe = /^\s*(```|~~~)/;
+	// A fence marker is a run of 3+ backticks or 3+ tildes (not mixed). Captured so a closing
+	// fence can be checked against the opening one: same character, and at least as long
+	// (CommonMark's closing-fence rule) — a ~~~ never closes a ``` fence, and vice versa.
+	const fenceRe = /^\s*(`{3,}|~{3,})/;
 	const blockquoteRe = /^\s*>/;
-	for (const line of lines) {
-		if (fenceRe.test(line)) {
-			inFence = !inFence;
+	// Find the matching closing fence for an opening fence at `openIndex`, scanning forward.
+	// Returns -1 if the fence never closes (fail-safe: caller then leaves the lines from the
+	// unmatched opening fence onward untouched, so a real verdict after it is never swallowed).
+	const findClosingFence = (openIndex: number, marker: string): number => {
+		const char = marker[0]!;
+		const minLen = marker.length;
+		for (let i = openIndex + 1; i < lines.length; i++) {
+			const m = fenceRe.exec(lines[i]!);
+			if (m && m[1]!.startsWith(char) && m[1]!.length >= minLen && /^[`~]*$/.test(lines[i]!.trim())) {
+				return i;
+			}
+		}
+		return -1;
+	};
+	const kept: string[] = [];
+	let i = 0;
+	while (i < lines.length) {
+		const line = lines[i]!;
+		const m = fenceRe.exec(line);
+		if (m) {
+			const closeIndex = findClosingFence(i, m[1]!);
+			if (closeIndex === -1) {
+				// Unterminated fence: fail-safe, keep everything from here on and parse it normally
+				// instead of discarding it (an unclosed fence must never hide a real verdict).
+				for (let j = i; j < lines.length; j++) kept.push(lines[j]!);
+				break;
+			}
+			// Skip the opening fence, the fenced body, and the closing fence.
+			i = closeIndex + 1;
 			continue;
 		}
-		if (inFence) continue;
-		if (blockquoteRe.test(line)) continue;
+		if (blockquoteRe.test(line)) {
+			i++;
+			continue;
+		}
 		kept.push(line);
+		i++;
 	}
 	return kept.join("\n");
 }
