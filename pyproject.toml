@@ -17,3 +17,15 @@ include = ["orchestrator*"]
 # package (repo-root siblings) and are installed from a git checkout via
 # install.sh, not from the wheel -- do not list them here.
 orchestrator = ["*.json", "presentation/*.html"]
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E9", "F", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"orchestrator/archive/__init__.py" = ["F401"]
+"orchestrator/ingest/__init__.py" = ["F401"]
+"orchestrator/ingest_checkpoint.py" = ["F401"]
+"orchestrator/runtime.py" = ["F401"]

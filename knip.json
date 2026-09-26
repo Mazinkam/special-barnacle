@@ -1,0 +1,13 @@
+{
+  "$schema": "https://knip.dev/schema.json",
+  "entry": ["bridge/extensions/orchestrator/index.ts"],
+  "project": ["bridge/**/*.ts"],
+  "ignoreDependencies": [
+    "@humain/terminal",
+    "@humain/terminal/*",
+    "typebox",
+    "@sinclair/typebox",
+    "bun:test"
+  ],
+  "ignore": ["@humain/*"]
+}
