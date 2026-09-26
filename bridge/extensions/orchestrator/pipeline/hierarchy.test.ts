@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { dispatchReconAndLeads } from "./hierarchy.ts";
+import { dispatchReconAndLeads, isTransientLeadFailure } from "./hierarchy.ts";
 import type { DispatchResult } from "../core/records.ts";
 import type { DispatchTask, PlanResponse } from "../core/prompts.ts";
 
@@ -226,5 +226,79 @@ describe("pipeline/hierarchy.ts dispatchReconAndLeads lead resume after a transi
 		expect(leadBatches).toHaveLength(2);
 		expect(leadBatches[1][0].task).toContain("- src/c.ts");
 		expect(result.resumedLeadTaskIds).toEqual(["run-lead-0"]);
+	});
+
+	test("dispatch's own timeout (outcome: timed_out) with transient-looking stderr: no resume, exactly 1 lead dispatch", async () => {
+		const leadBatches: DispatchTask[][] = [];
+
+		const result = await dispatchReconAndLeads(baseInput(), {
+			dispatch: async (tasks) => {
+				leadBatches.push(tasks);
+				return [transientFailure(tasks[0], { outcome: "timed_out", timeoutReason: "inactivity" })];
+			},
+			capture: async () => {},
+			setPhase: () => {},
+			throwIfCancelled: () => {},
+			markFiles: () => "mark",
+			filesChangedSince: () => [],
+		});
+
+		expect(leadBatches).toHaveLength(1);
+		expect(result.resumedLeadTaskIds).toEqual([]);
+	});
+
+	test("spend-cap stop (stopReason: spend_cap) with transient-looking stderr: no resume, exactly 1 lead dispatch", async () => {
+		const leadBatches: DispatchTask[][] = [];
+
+		const result = await dispatchReconAndLeads(baseInput(), {
+			dispatch: async (tasks) => {
+				leadBatches.push(tasks);
+				return [transientFailure(tasks[0], { stopReason: "spend_cap" })];
+			},
+			capture: async () => {},
+			setPhase: () => {},
+			throwIfCancelled: () => {},
+			markFiles: () => "mark",
+			filesChangedSince: () => [],
+		});
+
+		expect(leadBatches).toHaveLength(1);
+		expect(result.resumedLeadTaskIds).toEqual([]);
+	});
+});
+
+describe("pipeline/hierarchy.ts isTransientLeadFailure (docs/architecture-review.md C3)", () => {
+	function baseResult(opts: Partial<DispatchResult> = {}): DispatchResult {
+		return {
+			taskId: "t", capability: "lead", model: "provider/model", exitCode: 1,
+			stdout: "", stderr: "Service unavailable: Bedrock is unable to process your request.",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.01, contextTokens: 2, turns: 1 },
+			durationMs: 1, costUsd: 0.01, costReported: true, filesChanged: [], outcome: "failed",
+			...opts,
+		};
+	}
+
+	test("a genuinely transient failure is resumable", () => {
+		expect(isTransientLeadFailure(baseResult())).toBe(true);
+	});
+
+	test("outcome: timed_out is never resumed, even with transient-looking stderr", () => {
+		expect(isTransientLeadFailure(baseResult({ outcome: "timed_out" }))).toBe(false);
+	});
+
+	test("stopReason: spend_cap is never resumed, even with transient-looking stderr", () => {
+		expect(isTransientLeadFailure(baseResult({ stopReason: "spend_cap" }))).toBe(false);
+	});
+
+	test("a clean exit (exitCode 0) is never resumed", () => {
+		expect(isTransientLeadFailure(baseResult({ exitCode: 0 }))).toBe(false);
+	});
+
+	test("a cancelled dispatch is never resumed", () => {
+		expect(isTransientLeadFailure(baseResult({ outcome: "cancelled" }))).toBe(false);
+	});
+
+	test("STATUS: blocked is never resumed", () => {
+		expect(isTransientLeadFailure(baseResult({ stdout: "STATUS: blocked" }))).toBe(false);
 	});
 });

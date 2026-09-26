@@ -348,7 +348,7 @@ describe("pipeline/run-orchestration.ts runOrchestration lead resume after a tra
 		expect(text).toContain("resumes: 1 (lead-0)");
 	});
 
-	test("a lead that fails transiently twice: exactly 2 lead dispatches, run FAILED, no resumes line", async () => {
+	test("a lead that fails transiently twice: exactly 2 lead dispatches, run FAILED, resumes line still present (the resume attempt happened even though it also failed)", async () => {
 		const runId = "ht-orch-1700000000000-resume-b";
 		const session = fakeSession();
 		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
@@ -380,6 +380,7 @@ describe("pipeline/run-orchestration.ts runOrchestration lead resume after a tra
 		expect(result.report.resumedLeadIds).toEqual(["lead-0"]);
 		const { text } = buildRunSummary(result.report);
 		expect(text.startsWith("Orchestration FAILED")).toBe(true);
+		expect(text).toContain("resumes: 1 (lead-0)");
 	});
 });
 

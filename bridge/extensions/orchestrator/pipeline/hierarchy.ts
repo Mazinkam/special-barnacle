@@ -44,19 +44,32 @@ import type { RunSession } from "../run/session.ts";
 /**
  * True when a lead's `DispatchResult` ended because of a transient provider
  * error (docs/architecture-review.md C3) rather than a bad result, a blocked
- * status, or cancellation — the single decision point both the wave loop
- * below and its tests use, so "should this lead be resumed" is judged
- * exactly once, from exactly this text. A cancelled dispatch is never
- * resumed; a lead that exited 0 needs no resuming; a lead whose own report
- * says `STATUS: blocked` stopped at a precondition, not a transient failure.
- * Deliberately does not look at `stdout`: a lead's own prose can legitimately
- * mention words like "overloaded" while describing something else, and the
- * result's error/stderr/stopReason/exit text is what actually reflects why
- * the dispatch itself ended.
+ * status, cancellation, its own dispatch timeout, or a spend-cap stop — the
+ * single decision point both the wave loop below and its tests use, so
+ * "should this lead be resumed" is judged exactly once, from exactly this
+ * text. A cancelled dispatch is never resumed; a lead that exited 0 needs no
+ * resuming; a lead whose own report says `STATUS: blocked` stopped at a
+ * precondition, not a transient failure; a dispatch that hit its own
+ * inactivity/absolute timeout (`outcome === "timed_out"`) or was stopped by
+ * the per-dispatch spend cap (`stopReason === "spend_cap"`) is not resumed
+ * either, mirroring dispatch/parallel.ts's quota-fallback eligibility check
+ * (`r.outcome !== "timed_out" && r.stopReason !== "spend_cap"`) — resuming
+ * either would re-run work that already ran to its own limit rather than a
+ * transient provider hiccup. Deliberately does not look at `stdout`: a
+ * lead's own prose can legitimately mention words like "overloaded" while
+ * describing something else, and the result's error/stderr/stopReason/exit
+ * text is what actually reflects why the dispatch itself ended.
  */
 export function isTransientLeadFailure(r: DispatchResult): boolean {
 	if (r.exitCode === 0) return false;
 	if (r.outcome === "cancelled") return false;
+	// Never resume a dispatch that hit its own timeout (`timed_out`) or was
+	// stopped by the per-dispatch spend cap (`spend_cap`): resuming either
+	// would re-run work that already ran to its own limit, mirroring
+	// dispatch/parallel.ts's quota-fallback eligibility check
+	// (`r.outcome !== "timed_out" && r.stopReason !== "spend_cap"`).
+	if (r.outcome === "timed_out") return false;
+	if (r.stopReason === "spend_cap") return false;
 	if (parseLeadStatus(r.stdout) === "blocked") return false;
 	const text = [r.stderr, r.stopReason, r.timeoutReason].filter(Boolean).join("\n");
 	return isTransientProviderError(text);

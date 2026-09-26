@@ -18,6 +18,14 @@ describe("core/transient-error.ts isTransientProviderError", () => {
 		["premature close", "Error: Premature close"],
 		["internal server error phrasing", "internal server error, please try again"],
 		["service unavailable phrasing", "503: service unavailable"],
+		["timeout wording", "request timeout while waiting for the provider"],
+		["timed out wording", "the request timed out after 60s"],
+		["timed-out hyphenated wording", "connection timed-out"],
+		["throttled wording", "the request was throttled by the provider"],
+		["throttling wording", "provider is throttling requests right now"],
+		["generic 5xx with status context", "status 507: insufficient storage at the provider"],
+		["generic 5xx with HTTP 5xx literal", "HTTP 5xx from the upstream provider"],
+		["generic 5xx with error context", "error 520: unknown error from Cloudflare"],
 	];
 
 	for (const [label, text] of positive) {
@@ -37,6 +45,8 @@ describe("core/transient-error.ts isTransientProviderError", () => {
 		["bare rate limit wording (quota overlaps)", "rate limit exceeded, slow down"],
 		["unrelated crash", "TypeError: cannot read properties of undefined (reading 'foo')"],
 		["plain exit", "exit 1"],
+		["line count mention, not an HTTP status", "the report is 550 lines long"],
+		["another line count mention, no status context", "the diff touched about 560 lines across the module"],
 	];
 
 	for (const [label, text] of negative) {
