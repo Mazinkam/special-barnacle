@@ -81,6 +81,21 @@ function readOnlyReconPrompt(goal: string, question: string): string {
 }
 
 /**
+ * Rule 2: how many pre-implementation recon workers a task warrants, from the
+ * method's own policy; 0 = skip recon. A missing band (complexity above every
+ * `workers_by_complexity` entry's `max`) is 0 workers, not a fallback to the
+ * highest band's count. This is the one production implementation —
+ * `models.ts` used to carry a second, test-only copy that could (and once
+ * did, B4.7) silently disagree with this.
+ */
+export function reconWorkerCount(method: ReconPolicy, complexity: number, taskClass?: string): number {
+	if (complexity < method.min_complexity) return 0;
+	if (taskClass && method.skip_for_task_classes.includes(taskClass)) return 0;
+	const band = method.workers_by_complexity.find(({ min, max }) => complexity >= min && complexity <= max);
+	return Math.max(0, band?.workers ?? 0);
+}
+
+/**
  * Rule 2: derive the parallel, read-only recon fan-out for a task from the
  * method's own policy. Returns [] when the task is below the policy's
  * minimum complexity or its task class is exempt (e.g. investigation and
@@ -88,13 +103,7 @@ function readOnlyReconPrompt(goal: string, question: string): string {
  */
 export function planReconTasks(input: ReconPlanInput): ReconTaskPlan[] {
 	const { method, complexity, taskClass, goal, runId } = input;
-	if (complexity < method.min_complexity) return [];
-	if (method.skip_for_task_classes.includes(taskClass)) return [];
-	// A missing band (complexity above every workers_by_complexity entry's max) is 0 workers
-	// (skip recon), not a fallback to the highest band's count — this is the production
-	// behaviour models.ts's reconWorkers must match (B4.7: the two disagreed before).
-	const band = method.workers_by_complexity.find(({ min, max }) => complexity >= min && complexity <= max);
-	const count = Math.max(0, band?.workers ?? 0);
+	const count = reconWorkerCount(method, complexity, taskClass);
 	return RECON_QUESTIONS.slice(0, count).map((question, index) => ({
 		taskId: `${runId}-recon-${index}`,
 		capability: method.worker_capability,
