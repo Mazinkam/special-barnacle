@@ -1,5 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
-import * as childProcess from "node:child_process";
+import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
@@ -41,7 +40,7 @@ function validPlanJson(): string {
 describe("createOrchestratorCli planRun", () => {
 	test("does not pass --coupling/--parallelizable — the Python CLI's own defaults for both are 0.5", async () => {
 		let capturedArgs: string[] = [];
-		const spawn = spyOn(childProcess, "spawn").mockImplementation(((_python: string, args: string[]) => {
+		const spawn = ((_python: string, args: string[]) => {
 			capturedArgs = args;
 			const child = fakeChild();
 			queueMicrotask(() => {
@@ -49,7 +48,7 @@ describe("createOrchestratorCli planRun", () => {
 				child.emit("close", 0);
 			});
 			return child as never;
-		}) as never);
+		}) as never;
 
 		const cli = createOrchestratorCli({
 			python: "python3",
@@ -57,13 +56,12 @@ describe("createOrchestratorCli planRun", () => {
 			stateRoot: "/state",
 			defaultTimeoutMs: 5_000,
 			baseEnv: () => ({}),
+			spawn,
 		});
 
 		await cli.planRun("run-1", { goal: "do it", taskClass: "coding", complexity: 0.6, risk: "medium" });
 
 		expect(capturedArgs).not.toContain("--coupling");
 		expect(capturedArgs).not.toContain("--parallelizable");
-
-		spawn.mockRestore();
 	});
 });

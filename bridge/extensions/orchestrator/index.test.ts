@@ -34,20 +34,6 @@ mock.module("@humain/terminal", () => ({
 	renderTaskWithContext: (task: string) => task,
 }));
 
-// Capture env that runModule forwards to spawned children. Existing tests rely
-// on real spawn behavior, so the mock forwards to the real implementation
-// outside of capture mode.
-let captureRunModuleEnv = false;
-const capturedRunModuleEnvs: NodeJS.ProcessEnv[] = [];
-mock.module("node:child_process", () => {
-	const real = require("node:child_process");
-	const fakeSpawn = ((command: any, args: any, options: any) => {
-		if (captureRunModuleEnv) capturedRunModuleEnvs.push(options?.env ?? {});
-		return real.spawn(command, args, options);
-	}) as typeof real.spawn;
-	return { ...real, spawn: fakeSpawn };
-});
-
 // TypeBox isn't installed in this standalone bridge checkout (no package.json/node_modules of
 // its own — see scripts/typecheck-bridge.sh). The real package is only reachable when HT loads
 // the extension from inside its own workspace. This stub provides just enough of the `Type`
@@ -193,18 +179,22 @@ describe("session ingest hook wiring (index.ts wiring)", () => {
 			// string forces a fresh module evaluation under Bun's test runner.
 			const fresh = (await import(`./index.ts?propagate=${Date.now()}-${Math.random()}`)) as typeof orchestrator;
 			expect(fresh.runModule).toBeFunction();
-			// Capture the env that `runModule` forwards to its child via the file-level
-			// captureRunModuleEnv seam; restore the flag in `finally` so the rest of the
-			// suite keeps using real spawns.
-			captureRunModuleEnv = true;
-			capturedRunModuleEnvs.length = 0;
+			// Capture the env that `runModule` forwards to its child via a local spy on the
+			// real `node:child_process` spawn, restored in `finally` so the rest of the
+			// suite keeps using real spawns undisturbed.
+			const capturedEnvs: NodeJS.ProcessEnv[] = [];
+			const realSpawn = childProcess.spawn;
+			const spy = spyOn(childProcess, "spawn").mockImplementation(((command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+				capturedEnvs.push(options?.env ?? {});
+				return realSpawn(command, args, options as never);
+			}) as never);
 			try {
 				await fresh.runModule!("noop", []);
 			} finally {
-				captureRunModuleEnv = false;
+				spy.mockRestore();
 			}
-			expect(capturedRunModuleEnvs.length).toBeGreaterThan(0);
-			expect(capturedRunModuleEnvs.at(-1)?.CODING_AGENT_ORCHESTRATOR_HOME).toBe(customRoot);
+			expect(capturedEnvs.length).toBeGreaterThan(0);
+			expect(capturedEnvs.at(-1)?.CODING_AGENT_ORCHESTRATOR_HOME).toBe(customRoot);
 		} finally {
 			if (previousCanonical === undefined) delete process.env.CODING_AGENT_ORCHESTRATOR_HOME;
 			else process.env.CODING_AGENT_ORCHESTRATOR_HOME = previousCanonical;

@@ -6,18 +6,18 @@
  * parameters instead; index.ts calls it once at module load and re-exports
  * the result.
  *
- * `spawn` is imported directly here (not threaded through `config`) so every
- * call to `cli()` reads whatever `node:child_process`'s `spawn` binding
- * currently is at the moment it runs, exactly like the pre-move code did.
- * Passing `spawn` through `config` instead would capture whatever the
- * binding resolved to when `createOrchestratorCli()` was called (module
- * load, before index.test.ts's `spyOn(childProcess, "spawn")` calls run),
- * permanently missing every later spy — see python-cli.test.ts and
- * index.test.ts's `mock.module("node:child_process", ...)`.
+ * `spawn` defaults to node:child_process's own `spawn`, read from this
+ * module's live ESM import binding inside `cli()` itself (not captured into
+ * a local at module load), so a caller that never supplies `config.spawn`
+ * keeps seeing whatever that binding currently resolves to on every call —
+ * unchanged from before this seam existed. Tests inject `config.spawn`
+ * directly (a capturing fake) instead of patching the real binding globally;
+ * see adapters/orchestrator-cli.test.ts and python-cli.ts, which already
+ * takes `spawn` the same way.
  */
-import { spawn } from "node:child_process";
+import { spawn as nodeSpawn } from "node:child_process";
 
-import { createPythonCli, type PythonCli } from "./python-cli.ts";
+import { createPythonCli, type PythonCli, type SpawnFn } from "./python-cli.ts";
 import { parsePlanResponse, type PlanResponse } from "../core/prompts.ts";
 
 export interface OrchestratorCliConfig {
@@ -29,6 +29,10 @@ export interface OrchestratorCliConfig {
 	/** Read fresh on every `cli()` call, matching the pre-move `liveEnv()` semantics. */
 	baseEnv: () => NodeJS.ProcessEnv;
 	extraEnv?: Record<string, string | undefined>;
+	/** Test seam: overrides node:child_process's `spawn`. Defaults to this module's live
+	 *  `nodeSpawn` import binding, looked up inside `cli()` at call time (see the module doc
+	 *  comment) — production callers never set this. */
+	spawn?: SpawnFn;
 }
 
 export interface CliResult {
@@ -68,7 +72,7 @@ export function createOrchestratorCli(config: OrchestratorCliConfig): Orchestrat
 			python: pythonOverride ?? config.python,
 			skillRoot: config.skillRoot,
 			stateRoot: config.stateRoot,
-			spawn,
+			spawn: config.spawn ?? nodeSpawn,
 			defaultTimeoutMs: config.defaultTimeoutMs,
 			baseEnv: config.baseEnv(),
 			extraEnv: config.extraEnv,
