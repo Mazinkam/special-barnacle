@@ -23,7 +23,7 @@ import type { ExtensionAPI, ExtensionContext } from "@humain/terminal";
 import { parseArgs, usageText, type ModelOverrides } from "../core/args.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import { complexityNeedsArchitect, type DispatchTask, type PlanResponse } from "../core/prompts.ts";
-import { verificationVerdictFor } from "../core/report.ts";
+import { buildRunSummary } from "../core/report.ts";
 import type { TriageResult } from "../core/triage.ts";
 import { pickModel } from "../core/routing.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
@@ -34,11 +34,10 @@ import { planEscalation, type EscalationLeadInput } from "../escalation.ts";
 import { leadSizeOf, sizeLead, type LeadSizeDecision } from "../lead-sizing.ts";
 import { classifyRunOutcome, externalChangeFiles, parseLeadStatus } from "../run-outcome.ts";
 import { summarizeStderr } from "../dispatch/stderr-sink.ts";
-import { fmtElapsed } from "../run-ui.ts";
 import { confirmStep, safeUi } from "../run/ui-sink.ts";
 import { describeRunArtifact, type RunSession, type RunTiming } from "../run/session.ts";
 import type { RunContext, RunRegistry } from "../run/context.ts";
-import { telemetryHealthy, telemetryWarning, type FlushReport, type QueueStats } from "../record-queue.ts";
+import { telemetryWarning, type FlushReport, type QueueStats } from "../record-queue.ts";
 import {
 	collectBilledResults,
 	dispatchHierarchical,
@@ -677,46 +676,41 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 						: [];
 				const reportTruncated = showFullReport && firstReport.split("\n").length > 40;
 
-				const verdict = verificationVerdictFor({
+				// The run FAILED because no lead succeeded, so name a lead first;
+				// recon/architect failures are reported on their own lines.
+				const firstFailure = leadResults.find((r) => r.exitCode !== 0) ?? billedResults.find((r) => r.exitCode !== 0);
+				const firstFailureLine = firstFailure
+					? `${firstFailure.taskId.replace(`${runId}-`, "")} exit ${firstFailure.exitCode}: ${summarizeStderr(firstFailure.stderr, 300) || "(no output)"}`
+					: "(no dispatch attempted)";
+
+				const { text: summaryText, succeeded } = buildRunSummary({
+					runId,
+					elapsedMs: Date.now() - Number(runId.split("-")[2]),
 					blocked: runOutcome === "blocked",
 					dispatchOk,
-					verificationSkipped,
+					succeededLeads,
+					totalLeads: leadResults.length,
+					skippedLeads,
+					retries,
 					filesChangedCount: allFiles.length,
+					externalFilesCount: externalFiles.length,
+					reconWorkersLine: summarizeReconWorkers(workerResults),
+					verificationSkipped,
 					passedVerification,
+					totalCostUsd: totalCost,
+					dispatchCount: billedResults.length + (triageCost.usd > 0 ? 1 : 0),
+					nestedCostUsd: nestedCost,
+					firstFailureLine,
+					reportLines,
+					showFullReport: Boolean(showFullReport),
+					reportTruncated: Boolean(reportTruncated),
+					hasLeadReports: leadReports.length > 0,
+					leadReportPath: describeRunArtifact(session.file("lead-report.md")),
+					runLogPath: describeRunArtifact(session.file("run.log")),
+					stateRoot: deps.stateRoot,
+					telemetryReport: telemetry,
 				});
-
-				const summary = [
-					`Orchestration ${runOutcome === "blocked" ? "BLOCKED" : dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(Date.now() - Number(runId.split("-")[2]))}.`,
-					`run_id: ${runId}`,
-					`leads: ${succeededLeads}/${leadResults.length} ${runOutcome === "blocked" ? "blocked" : "succeeded"}${skippedLeads > 0 ? ` (+${skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${retries} · files: ${allFiles.length} changed${externalFiles.length > 0 ? ` (+${externalFiles.length} changed by someone else, not verified)` : ""}`,
-					summarizeReconWorkers(workerResults),
-					`verification: ${verdict}`,
-					`total cost: $${totalCost.toFixed(4)} (${billedResults.length + (triageCost.usd > 0 ? 1 : 0)} dispatches${nestedCost > 0 ? `; $${nestedCost.toFixed(4)} of it in lead subagents` : ""})`,
-					...(dispatchOk
-						? []
-						: [
-								`first failure: ${(() => {
-									// The run FAILED because no lead succeeded, so name a lead first;
-									// recon/architect failures are reported on their own lines.
-									const failed = leadResults.find((r) => r.exitCode !== 0) ?? billedResults.find((r) => r.exitCode !== 0);
-									if (!failed) return "(no dispatch attempted)";
-									return `${failed.taskId.replace(`${runId}-`, "")} exit ${failed.exitCode}: ${summarizeStderr(failed.stderr, 300) || "(no output)"}`;
-								})()}`,
-							]),
-					...(reportLines.length > 0
-						? ["", showFullReport ? "lead report:" : "open items from lead:", ...reportLines, ...(reportTruncated ? [`… full report: ${describeRunArtifact(session.file("lead-report.md"))}`] : [])]
-						: leadReports.length > 0
-							? [`lead report: ${describeRunArtifact(session.file("lead-report.md"))}`]
-							: []),
-					`run log: ${describeRunArtifact(session.file("run.log"))}`,
-					`ledger: ${deps.stateRoot}/metrics.jsonl`,
-					...telemetryWarning(telemetry),
-				];
-				session.log(summary.join("\n"));
-				const summaryText = summary.join("\n");
-				// Whether the run is reported as a success in the notify and in chat must agree:
-				// a run whose verification failed is not "completed" just because dispatch succeeded.
-				const succeeded = (passedVerification || (dispatchOk && verificationSkipped)) && telemetryHealthy(telemetry);
+				session.log(summaryText);
 				safeUi(() => ctx.ui.notify(summaryText, succeeded ? "info" : "warning"));
 				postRunMessage(pi, runId, succeeded ? "completed" : "failed", summaryText, totalCost);
 			} catch (err) {
