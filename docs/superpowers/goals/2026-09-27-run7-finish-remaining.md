@@ -42,7 +42,7 @@ Finish the remaining run-5 items on branch feat/lead-ci-wait in /Users/abdulkari
 
 WORKSPACE: This worktree only. Never edit the main checkout. Commit on feat/lead-ci-wait after each item passes its scoped tests. Do not merge or push.
 
-ALREADY DONE (verify with `git log --oneline a2e46cd..HEAD`; do not redo): A1, A2 (+ 2 review fixes), A3, A4, A5/N1 part (a) in 791865c, and the A6 WIP in the latest "wip(run6)" commit.
+ALREADY DONE and MERGED to main at 4b78097 (the orchestrator running this run already includes A1–A5a). Verify with `git log --oneline a2e46cd..HEAD`; do not redo: A1, A2 (+ 2 review fixes), A3, A4, A5/N1 part (a) in 791865c, and the A6 WIP in the latest "wip(run6)" commit.
 Evidence of the last failure: ~/.local/state/coding-agent-orchestrator/runs/ht-orch-1790509047474-hv4i5g/ (lead-1 stderr and events: nested worker t11 went silent during ENOTFOUND bedrock-runtime.eu-west-2).
 
 REMAINING WORK, in order, one commit per item:
@@ -58,6 +58,7 @@ REMAINING WORK, in order, one commit per item:
    - Fixtures: the tails of the vcy00z lead-0, s11yls lead-0 and hv4i5g lead-1 event logs, and the hv4i5g qa stderr.
 
 3. A6 + N2: finish the WIP.
+   - Known issue: typecheck currently FAILS on the WIP: core/report.test.ts(63) is missing the new required RunReport field `outOfTreeChangesLine`. Fix this first.
    - Check core/live-tree.ts against the spec: warn when the run repo contains the running extension, and report "changes outside run tree: <path>" when a lead's work lands in a different git tree than the run cwd.
    - Finish it, test it, commit it.
 
