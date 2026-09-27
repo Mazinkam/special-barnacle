@@ -70,6 +70,7 @@ function baseReport(): RunReport {
 		skippedLeads: 0,
 		retries: 0,
 		resumedLeadIds: [],
+		leadAttemptLines: [],
 		filesChangedCount: 3,
 		externalFilesCount: 0,
 		reconWorkersLine: "recon: 0 workers dispatched",
@@ -188,6 +189,16 @@ describe("core/report.ts buildRunSummary", () => {
 	test("no resumes: the summary is byte-identical to a run with the field omitted (no resumes line at all)", () => {
 		const { text } = buildRunSummary(baseReport());
 		expect(text).not.toContain("resumes:");
+	});
+
+	test("lead attempt lines: rendered right after the recon line, before verification", () => {
+		const { text } = buildRunSummary({ ...baseReport(), leadAttemptLines: ["lead-0: failed (exit 1) \u2192 retry-1 succeeded"] });
+		expect(text).toContain("recon: 0 workers dispatched\nlead-0: failed (exit 1) \u2192 retry-1 succeeded\nverification: PASS");
+	});
+
+	test("no lead attempt lines: nothing extra rendered", () => {
+		const { text } = buildRunSummary(baseReport());
+		expect(text).not.toContain("\u2192");
 	});
 
 	test("full report: shown inline (no files changed) with a 'lead report:' header, no truncation notice", () => {

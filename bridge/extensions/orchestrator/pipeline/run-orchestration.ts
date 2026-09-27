@@ -44,6 +44,7 @@ import { describeRunArtifact, type RunTiming } from "../run/session.ts";
 import type { RunContext, RunSessionLike } from "../run/context.ts";
 import { telemetryWarning, type FlushReport, type QueueStats } from "../record-queue.ts";
 import { collectBilledResults, dispatchHierarchical, summarizeReconWorkers } from "./hierarchy.ts";
+import { collectLeadAttempts, formatLeadAttemptLines } from "./lead-attempts.ts";
 import { runVerification, type VerificationResult } from "./verify-loop.ts";
 import {
 	buildLiveQaSummaryField,
@@ -617,6 +618,24 @@ export async function runOrchestration(
 		}
 	}
 
+	// A lead that failed and was later retried (C3's transient resume, or an escalation retry after
+	// a failed verification, taskId `<lead>-retry-N`) is judged by its FINAL attempt from here on —
+	// `leadResults` alone only ever holds the ONE result used to decide that lead's status, which
+	// for a resumed lead is already its final attempt, but for an escalated lead is still its
+	// FAILED first attempt. `succeededLeads`/`dispatchOk`/`leadStatuses`/`runOutcome` above are
+	// deliberately left as computed (from the initial `leadResults`) for the QA-gating decisions
+	// already made by this point; everything from here on reports the run's actual final outcome.
+	const leadAttempts = collectLeadAttempts(leadResults, resumedAttemptResults, escalationResults);
+	const leadAttemptLines = formatLeadAttemptLines(runId, leadAttempts);
+	const finalSucceededLeads = leadAttempts.filter((l) => l.succeeded).length;
+	const finalDispatchOk = leadAttempts.length > 0 && finalSucceededLeads > 0;
+	const finalLeadStatuses = leadAttempts.map((l) => parseLeadStatus(l.final.stdout));
+	const finalRunOutcome = classifyRunOutcome({
+		leadStatuses: finalLeadStatuses,
+		succeededLeads: finalSucceededLeads,
+		leads: leadAttempts.length,
+	});
+
 	// Step 4: Finalize.
 	// Total cost must cover EVERY dispatch this run paid for — architect,
 	// parent-owned recon workers, and escalations included. Summing leads
@@ -635,10 +654,11 @@ export async function runOrchestration(
 	const nestedCost = billedResults.reduce((s, r) => s + (r.nestedCostUsd ?? 0), 0);
 	let totalCost =
 		triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0) + nestedCost;
-	// `succeededLeads`/`dispatchOk` are computed earlier (before the QA retry
-	// loop) so it can skip QA when no lead succeeded; reused here unchanged.
+	// `passedVerification` uses `finalDispatchOk` (not the pre-retry-loop `dispatchOk` used to
+	// gate QA above): a lead that failed initially but succeeded on a later retry must not make an
+	// otherwise-passing verification read as unverified.
 	const verificationSkipped = lastVerification?.skipped ?? false;
-	const passedVerification = dispatchOk && (lastVerification?.passed ?? false);
+	const passedVerification = finalDispatchOk && (lastVerification?.passed ?? false);
 	// The QA dispatch itself timing out (inactivity/absolute ceiling) is a distinct state from QA
 	// completing and reporting failing checks — the summary must say so instead of folding both
 	// into a plain FAIL (docs/architecture-review.md C5).
@@ -661,9 +681,9 @@ export async function runOrchestration(
 	let liveQaStageResult: RunLiveQaStageResult | null = null;
 	let liveQaNotRunReason: string | null = null;
 	if (parsed.liveQa) {
-		if (runOutcome === "blocked") {
+		if (finalRunOutcome === "blocked") {
 			liveQaNotRunReason = "run was blocked";
-		} else if (!dispatchOk) {
+		} else if (!finalDispatchOk) {
 			liveQaNotRunReason = "dispatch did not succeed";
 		} else if (!passedVerification) {
 			liveQaNotRunReason = verificationSkipped
@@ -700,10 +720,10 @@ export async function runOrchestration(
 
 	session.cancellation.throwIfCancelled();
 	const telemetry = await deps.completeRun(runId, {
-		success_rate: succeededLeads / Math.max(1, leadResults.length),
+		success_rate: finalSucceededLeads / Math.max(1, leadAttempts.length),
 		verification_passed: passedVerification,
-		blocked: runOutcome === "blocked",
-		lead_statuses: leadStatuses,
+		blocked: finalRunOutcome === "blocked",
+		lead_statuses: finalLeadStatuses,
 		external_changes: externalFiles.length,
 		total_cost_usd: totalCost,
 		files_changed: allFiles,
@@ -738,7 +758,9 @@ export async function runOrchestration(
 			return `${marker}### ${r.taskId.replace(`${runId}-`, "")}\n\n${report}`;
 		});
 	const leadReportWritten = writeLeadReportsDiagnostic(session, leadReports);
-	const firstReport = leadResults.find((r) => r.exitCode === 0)?.stdout.trim() ?? "";
+	// Prefer the final successful attempt's stdout — a lead retried after a failed dispatch or a
+	// failed verification speaks through its LAST attempt, not a discarded failed one.
+	const firstReport = leadAttempts.find((l) => l.succeeded)?.final.stdout.trim() ?? "";
 	const openItems = /##\s*Open items\s*\n([\s\S]*?)(?=\n##\s|$)/i.exec(firstReport)?.[1]?.trim();
 	const showFullReport = allFiles.length === 0 && firstReport;
 	const reportLines = showFullReport
@@ -748,9 +770,13 @@ export async function runOrchestration(
 			: [];
 	const reportTruncated = showFullReport && firstReport.split("\n").length > 40;
 
-	// The run FAILED because no lead succeeded, so name a lead first;
-	// recon/architect failures are reported on their own lines.
-	const firstFailure = leadResults.find((r) => r.exitCode !== 0) ?? billedResults.find((r) => r.exitCode !== 0);
+	// The run FAILED because no lead succeeded, so name a lead first — but only a lead whose FINAL
+	// attempt failed; a lead retried to success is not a failure to report. If no lead finally
+	// failed, fall back to the existing recon/architect/verification billedResults logic, but only
+	// when the run didn't finally succeed (`!finalDispatchOk`) — a lead-level success must never be
+	// overridden by naming an unrelated billed dispatch as "the" failure.
+	const firstFailedLeadAttempt = leadAttempts.find((l) => !l.succeeded)?.final;
+	const firstFailure = firstFailedLeadAttempt ?? (finalDispatchOk ? undefined : billedResults.find((r) => r.exitCode !== 0));
 	const firstFailureLine = firstFailure
 		? `${firstFailure.taskId.replace(`${runId}-`, "")} exit ${firstFailure.exitCode}: ${summarizeStderr(firstFailure.stderr, 300) || "(no output)"}`
 		: "(no dispatch attempted)";
@@ -758,12 +784,13 @@ export async function runOrchestration(
 	const report: RunReport = {
 		runId,
 		elapsedMs,
-		blocked: runOutcome === "blocked",
-		dispatchOk,
-		succeededLeads,
+		blocked: finalRunOutcome === "blocked",
+		dispatchOk: finalDispatchOk,
+		succeededLeads: finalSucceededLeads,
 		totalLeads: leadResults.length,
 		skippedLeads,
 		retries,
+		leadAttemptLines,
 		resumedLeadIds: resumedLeadTaskIds.map((id) => id.replace(`${runId}-`, "")),
 		filesChangedCount: allFiles.length,
 		externalFilesCount: externalFiles.length,

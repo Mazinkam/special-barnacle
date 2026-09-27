@@ -79,6 +79,10 @@ export interface RunReport {
 	 *  provider error (docs/architecture-review.md C3); empty on every run with no resume, so
 	 *  existing summary output is byte-identical when this feature never fires. */
 	resumedLeadIds: string[];
+	/** One line per lead that took more than one attempt or still failed on its final attempt
+	 *  (`pipeline/lead-attempts.ts`'s `formatLeadAttemptLines`), e.g. `lead-0: failed (inactivity) →
+	 *  retry-1 succeeded`. Empty when every lead succeeded on its first (only) attempt. */
+	leadAttemptLines: string[];
 	/** Files verified this run (after excluding files changed by someone else). */
 	filesChangedCount: number;
 	/** Files changed during the run that no lead reported changing (excluded from QA). */
@@ -164,6 +168,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		`leads: ${report.succeededLeads}/${report.totalLeads} ${report.blocked ? "blocked" : "succeeded"}${report.skippedLeads > 0 ? ` (+${report.skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${report.retries} · files: ${report.filesChangedCount} changed${report.externalFilesCount > 0 ? ` (+${report.externalFilesCount} changed by someone else, not verified)` : ""}`,
 		report.reconWorkersLine,
 		...(report.resumedLeadIds.length > 0 ? [`resumes: ${report.resumedLeadIds.length} (${report.resumedLeadIds.join(", ")})`] : []),
+		...report.leadAttemptLines,
 		`verification: ${verdict}`,
 		`total cost: $${report.totalCostUsd.toFixed(4)} (${report.dispatchCount} dispatches${report.nestedCostUsd > 0 ? `; $${report.nestedCostUsd.toFixed(4)} of it in lead subagents` : ""})`,
 		...(report.dispatchOk ? [] : [`first failure: ${report.firstFailureLine}`]),

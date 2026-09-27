@@ -388,6 +388,93 @@ describe("pipeline/run-orchestration.ts runOrchestration lead resume after a tra
 	});
 });
 
+describe("pipeline/run-orchestration.ts runOrchestration lead escalation retry succeeding (bug fix: final attempt, not first, decides the lead's status)", () => {
+	test("lead-0 fails (exit 1), lead-1 succeeds, QA fails naming checks, escalation retries lead-0 as lead-0-retry-1 which succeeds, QA #2 passes: report shows every lead succeeded, no first-failure line, and an attempt line for lead-0", async () => {
+		const runId = "ht-orch-1700000000000-escalate";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan: PlanResponse = {
+			plan_id: "plan-123456789012",
+			run_id: runId,
+			task_class: "investigation", // exempt from Rule-2 recon (method.json skip_for_task_classes) so the fake dispatcher only has to model architect/lead/qa
+			complexity: 8,
+			risk: "medium",
+			topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto",
+				history_sufficient: true,
+				explanation: {},
+			},
+			effective_quality_floor: 0.5,
+			cost_aggressiveness: 0.5,
+		};
+		const usage = { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 };
+		let qaCalls = 0;
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async (_cwd, _runId2, tasks) => {
+				const cap = tasks[0]?.capability;
+				if (cap === "architect") {
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/architect", exitCode: 0,
+						stdout: "## Lead assignments\nLead 1: backend (depends on: none)\nLead 2: frontend (depends on: none)\n",
+						stderr: "", usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				if (cap === "qa_agent") {
+					qaCalls++;
+					const stdout = qaCalls === 1 ? "## Verdict\nFAIL\n\nnaming checks failed." : "## Verdict\nPASS\n";
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0, stdout, stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				// Lead capability: either the initial 2-lead wave, or the lead-0 escalation retry.
+				if (tasks.some((t) => t.taskId.includes("-retry-"))) {
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+					}));
+				}
+				return tasks.map((t) => {
+					if (t.taskId.endsWith("-lead-0")) {
+						return {
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 1,
+							stdout: "boom mid-way through", stderr: "lead crashed",
+							usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "failed" as const, filesChanged: ["src/a.ts"],
+						};
+					}
+					return {
+						taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "STATUS: completed\n\n## Files Changed\n- `src/b.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/b.ts"],
+					};
+				});
+			},
+		});
+
+		const result = await runOrchestration(
+			runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(qaCalls).toBe(2);
+		expect(result.report.succeededLeads).toBe(result.report.totalLeads);
+		expect(result.report.totalLeads).toBe(2);
+		expect(result.report.dispatchOk).toBe(true);
+		expect(result.report.leadAttemptLines).toEqual(["lead-0: failed (exit 1) \u2192 retry-1 succeeded"]);
+		const { text } = buildRunSummary(result.report);
+		expect(text).toContain("lead-0: failed (exit 1) \u2192 retry-1 succeeded");
+		expect(text).not.toContain("first failure:");
+	});
+});
+
 describe("pipeline/run-orchestration.ts writeLeadReportsDiagnostic", () => {
 	test("no lead reports: does not write, is not logged, and hasLeadReports is false", () => {
 		const logs: string[] = [];
