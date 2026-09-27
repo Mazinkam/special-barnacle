@@ -31,8 +31,12 @@ export interface LeadAttempts {
 	leadTaskId: string;
 	/** In the order they actually ran: original, then resume (if any), then retry-1, retry-2, ... */
 	attempts: LeadAttempt[];
-	/** The last attempt — what the lead's status/report/exit code is judged by now. */
+	/** The attempt that speaks for the lead: normally the last attempt, but a lead that already
+	 *  succeeded and was only re-dispatched because an escalation retry hedged across every lead is
+	 *  judged by its last SUCCEEDED attempt instead, even if a later escalation retry failed — see
+	 *  `finalAttemptFor`. */
 	final: DispatchResult;
+	/** Whether the lead counts as succeeded overall — see `finalAttemptFor`; not simply `final.exitCode === 0`. */
 	succeeded: boolean;
 }
 
@@ -46,6 +50,33 @@ export function leadTaskIdFor(taskId: string): string {
 function retryNumberFor(taskId: string): number | null {
 	const m = RETRY_SUFFIX.exec(taskId);
 	return m ? Number(m[1]) : null;
+}
+
+const ESCALATION_RETRY_LABEL = /^retry-\d+$/;
+
+/**
+ * Decide which attempt speaks for a lead and whether the lead counts as succeeded overall.
+ *
+ * The obvious rule — "the last attempt decides" — misclassifies a lead that already succeeded
+ * and was only re-dispatched because `planEscalation` retried EVERY lead (it couldn't tell which
+ * lead(s) actually caused a failed QA check, so it hedges by retrying all of them). That
+ * escalation retry failing does not undo the lead's earlier success; the lead's success still
+ * stands, and its LAST SUCCEEDED attempt (not its failed retry) is what should be reported.
+ *
+ * So: a lead counts as succeeded if its last attempt succeeded, OR if some earlier attempt
+ * succeeded and every attempt after it is an escalation retry (`retry-N`) — never a resume or
+ * in-wave retry, both of which exist specifically because the attempt before them genuinely
+ * failed and needs a completely fresh attempt to speak for the lead.
+ */
+function finalAttemptFor(attempts: LeadAttempt[]): { final: DispatchResult; succeeded: boolean } {
+	const last = attempts[attempts.length - 1]!;
+	if (last.result.exitCode === 0) return { final: last.result, succeeded: true };
+	for (let i = attempts.length - 2; i >= 0; i--) {
+		const laterAreAllEscalationRetries = attempts.slice(i + 1).every((a) => ESCALATION_RETRY_LABEL.test(a.label));
+		if (!laterAreAllEscalationRetries) break; // a non-retry attempt after i means i's success was superseded for real
+		if (attempts[i]!.result.exitCode === 0) return { final: attempts[i]!.result, succeeded: true };
+	}
+	return { final: last.result, succeeded: false };
 }
 
 /**
@@ -89,8 +120,8 @@ export function collectLeadAttempts(
 			const n = retryNumberFor(retryResult.taskId) ?? attempts.length;
 			attempts.push({ label: `retry-${n}`, result: retryResult });
 		}
-		const final = attempts[attempts.length - 1]!.result;
-		return { leadTaskId, attempts, final, succeeded: final.exitCode === 0 };
+		const { final, succeeded } = finalAttemptFor(attempts);
+		return { leadTaskId, attempts, final, succeeded };
 	});
 }
 

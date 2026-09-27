@@ -702,11 +702,12 @@ export async function runOrchestration(
 	const nestedCost = billedResults.reduce((s, r) => s + (r.nestedCostUsd ?? 0), 0);
 	let totalCost =
 		triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0) + nestedCost;
-	// `passedVerification` uses `finalDispatchOk` (not the pre-retry-loop `dispatchOk` used to
-	// gate QA above): a lead that failed initially but succeeded on a later retry must not make an
-	// otherwise-passing verification read as unverified.
+	// `passedVerification` accepts EITHER `dispatchOk` (the pre-retry-loop gate QA actually ran
+	// under) or `finalDispatchOk` (a lead that failed initially but succeeded on a later retry): a
+	// lead-attempts accounting quirk in either direction must never make an otherwise-passing QA
+	// verdict read as unverified.
 	const verificationSkipped = lastVerification?.skipped ?? false;
-	const passedVerification = finalDispatchOk && (lastVerification?.passed ?? false);
+	const passedVerification = (lastVerification?.passed ?? false) && (dispatchOk || finalDispatchOk);
 	// The QA dispatch itself timing out (inactivity/absolute ceiling) is a distinct state from QA
 	// completing and reporting failing checks — the summary must say so instead of folding both
 	// into a plain FAIL (docs/architecture-review.md C5).
@@ -834,6 +835,10 @@ export async function runOrchestration(
 		elapsedMs,
 		blocked: finalRunOutcome === "blocked",
 		dispatchOk: finalDispatchOk,
+		// The verdict line must not read "NOT RUN (no lead succeeded)" for a run where QA actually
+		// ran (it only ever does while `dispatchOk`, the pre-loop gate, held) even if `finalDispatchOk`
+		// later reads false for an unrelated reason — see `VerificationVerdictInput.dispatchOk`.
+		verificationDispatchOk: dispatchOk || finalDispatchOk,
 		succeededLeads: finalSucceededLeads,
 		totalLeads: leadResults.length,
 		skippedLeads,

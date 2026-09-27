@@ -65,6 +65,7 @@ function baseReport(): RunReport {
 		elapsedMs: 65_000, // fmtElapsed: 65s -> "1m05s"
 		blocked: false,
 		dispatchOk: true,
+		verificationDispatchOk: true,
 		succeededLeads: 2,
 		totalLeads: 2,
 		skippedLeads: 0,
@@ -115,6 +116,7 @@ describe("core/report.ts buildRunSummary", () => {
 		const report: RunReport = {
 			...baseReport(),
 			dispatchOk: false,
+			verificationDispatchOk: false,
 			succeededLeads: 0,
 			totalLeads: 2,
 			passedVerification: false,
@@ -332,5 +334,14 @@ describe("core/report.ts buildRunSummary", () => {
 		const { text } = buildRunSummary(report);
 		expect(text).toContain("verification: FAIL (unparsed)");
 		expect(text).not.toContain("NOT RUN (no lead succeeded)");
+	});
+
+	test("regression (A2): a lead that succeeded originally but whose escalation retry later failed must not turn a real PASS into NOT RUN", () => {
+		// `dispatchOk` (the run's final dispatch verdict) can read false here even though QA actually
+		// ran and passed — `verificationDispatchOk` is what the verdict must key off instead.
+		const report = { ...baseReport(), dispatchOk: false, verificationDispatchOk: true, passedVerification: true };
+		const { text } = buildRunSummary(report);
+		expect(text).toContain("verification: PASS");
+		expect(text).not.toContain("NOT RUN");
 	});
 });

@@ -106,6 +106,38 @@ describe("pipeline/lead-attempts.ts collectLeadAttempts", () => {
 		expect(attempts[1]!.attempts).toEqual([{ label: "original", result: lead1 }]);
 		expect(attempts[1]!.succeeded).toBe(true);
 	});
+
+	test("A2 regression: a lead that succeeded originally, then failed an escalation retry that hedged across every lead, still counts as succeeded via its last succeeded attempt", () => {
+		const original = fakeResult({ taskId: "run-1-lead-1", exitCode: 0, stdout: "STATUS: done" });
+		const retry1 = fakeResult({ taskId: "run-1-lead-1-retry-1", exitCode: 1 });
+		const attempts = collectLeadAttempts([original], [], [retry1]);
+		expect(attempts).toEqual([{
+			leadTaskId: "run-1-lead-1",
+			attempts: [{ label: "original", result: original }, { label: "retry-1", result: retry1 }],
+			final: original,
+			succeeded: true,
+		}]);
+	});
+
+	test("A2 regression: two escalation retries after an original success, the last one succeeding, is still judged by the LAST succeeded attempt", () => {
+		const original = fakeResult({ taskId: "run-1-lead-1", exitCode: 0 });
+		const retry1 = fakeResult({ taskId: "run-1-lead-1-retry-1", exitCode: 1 });
+		const retry2 = fakeResult({ taskId: "run-1-lead-1-retry-2", exitCode: 0 });
+		const attempts = collectLeadAttempts([original], [], [retry1, retry2]);
+		expect(attempts[0]!.succeeded).toBe(true);
+		expect(attempts[0]!.final).toBe(retry2);
+	});
+
+	test("a lead resumed to success (C3) then failing an escalation retry still counts as succeeded via the resume", () => {
+		const discarded = fakeResult({ taskId: "run-1-lead-0", exitCode: 1, outcome: "failed" });
+		const resumed = fakeResult({ taskId: "run-1-lead-0", exitCode: 0 });
+		const retry1 = fakeResult({ taskId: "run-1-lead-0-retry-1", exitCode: 1 });
+		const attempts = collectLeadAttempts([resumed], [discarded], [retry1]);
+		// The resume succeeded and every later attempt (retry-1) is an escalation retry, so this
+		// still counts as succeeded via the resume.
+		expect(attempts[0]!.succeeded).toBe(true);
+		expect(attempts[0]!.final).toBe(resumed);
+	});
 });
 
 describe("pipeline/lead-attempts.ts formatLeadAttemptLines", () => {

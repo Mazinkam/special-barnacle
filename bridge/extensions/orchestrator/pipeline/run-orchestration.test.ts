@@ -308,8 +308,13 @@ describe("pipeline/run-orchestration.ts runOrchestration lead resume after a tra
 		const adapter = fakeAdapter();
 		const resolved = fakeResolution(adapter);
 		let leadCalls = 0;
+		let completedSummary: Record<string, unknown> | undefined;
 		const deps = fakeDeps({
 			planRun: async () => resumePlan(runId),
+			completeRun: async (_runId, summary) => {
+				completedSummary = summary;
+				return healthyTelemetry;
+			},
 			dispatchParallel: async (_cwd, _runId2, tasks) => {
 				if (tasks[0].capability !== "lead") return tasks.map((t) => ({
 					taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0,
@@ -342,6 +347,7 @@ describe("pipeline/run-orchestration.ts runOrchestration lead resume after a tra
 		expect(result.kind).toBe("completed");
 		if (result.kind !== "completed") return;
 		expect(result.report.dispatchOk).toBe(true);
+		expect(completedSummary?.verification_passed).toBe(true);
 		expect(result.report.resumedLeadIds).toEqual(["lead-0"]);
 		// (e) A resume is not a verification retry: the QA retry counter is untouched.
 		expect(result.report.retries).toBe(0);
@@ -472,6 +478,103 @@ describe("pipeline/run-orchestration.ts runOrchestration lead escalation retry s
 		const { text } = buildRunSummary(result.report);
 		expect(text).toContain("lead-0: failed (exit 1) \u2192 retry-1 succeeded");
 		expect(text).not.toContain("first failure:");
+	});
+
+	test("A2 regression: both leads succeed originally, QA #1 fails with an undeterminable (non-overlapping) check so escalation hedges and retries EVERY lead, lead-1's retry fails but lead-0's retry succeeds, QA #2 passes: verdict is PASS, succeededLeads is 2, no 'NOT RUN' text", async () => {
+		const runId = "ht-orch-1700000000000-escalate-all";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan: PlanResponse = {
+			plan_id: "plan-123456789013",
+			run_id: runId,
+			task_class: "investigation",
+			complexity: 8,
+			risk: "medium",
+			topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto",
+				history_sufficient: true,
+				explanation: {},
+			},
+			effective_quality_floor: 0.5,
+			cost_aggressiveness: 0.5,
+		};
+		const usage = { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 };
+		let qaCalls = 0;
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async (_cwd, _runId2, tasks) => {
+				const cap = tasks[0]?.capability;
+				if (cap === "architect") {
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/architect", exitCode: 0,
+						stdout: "## Lead assignments\nLead 1: backend (depends on: none)\nLead 2: frontend (depends on: none)\n",
+						stderr: "", usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				if (cap === "qa_agent") {
+					qaCalls++;
+					// QA #1 names a generic failing check ("verdict") that overlaps neither lead's files —
+					// undeterminable from the verification output alone, so `leadsToRetry` hedges and
+					// retries EVERY lead, including the two that already succeeded.
+					const stdout = qaCalls === 1 ? "## Verdict\nFAIL\n\nnaming checks failed." : "## Verdict\nPASS\n";
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0, stdout, stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				// Lead capability: either the initial 2-lead wave (both succeed), or the escalation
+				// retry wave (lead-0's retry succeeds, lead-1's retry fails).
+				if (tasks.some((t) => t.taskId.includes("-retry-"))) {
+					return tasks.map((t) => {
+						if (t.taskId.includes("-lead-1-")) {
+							return {
+								taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 1,
+								stdout: "boom during retry", stderr: "lead crashed on retry",
+								usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "failed" as const, filesChanged: [],
+							};
+						}
+						return {
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+							stdout: "STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+							usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+						};
+					});
+				}
+				return tasks.map((t) => {
+					if (t.taskId.endsWith("-lead-0")) {
+						return {
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+							stdout: "STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+							usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+						};
+					}
+					return {
+						taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "STATUS: completed\n\n## Files Changed\n- `src/b.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/b.ts"],
+					};
+				});
+			},
+		});
+
+		const result = await runOrchestration(
+			runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(qaCalls).toBe(2);
+		expect(result.report.succeededLeads).toBe(2);
+		expect(result.report.totalLeads).toBe(2);
+		expect(result.report.passedVerification).toBe(true);
+		const { text } = buildRunSummary(result.report);
+		expect(text).toContain("verification: PASS");
+		expect(text).not.toContain("NOT RUN");
 	});
 });
 

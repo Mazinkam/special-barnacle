@@ -22,7 +22,10 @@ import { fmtElapsed } from "../run-ui.ts";
 export interface VerificationVerdictInput {
 	/** True when every dispatched lead stopped at a stop condition or precondition. */
 	blocked: boolean;
-	/** True when at least one lead succeeded (dispatch produced usable work). */
+	/** True whenever QA actually got dispatched (i.e. the pre-loop `dispatchOk` gate that decides
+	 *  whether QA runs at all held true) — NOT necessarily the run's own final dispatch verdict. A
+	 *  lead that succeeded initially but whose escalation retry later failed must not turn an
+	 *  otherwise-real QA verdict into "NOT RUN (no lead succeeded)"; see `RunReport.verificationDispatchOk`. */
 	dispatchOk: boolean;
 	/** True when QA was skipped (e.g. no files changed). */
 	verificationSkipped: boolean;
@@ -70,6 +73,11 @@ export interface RunReport {
 	blocked: boolean;
 	/** True when at least one lead succeeded. */
 	dispatchOk: boolean;
+	/** True whenever QA actually got dispatched — fed to `verificationVerdictFor` instead of
+	 *  `dispatchOk` above, which is the run's own final success/failure verdict (used for the
+	 *  "complete"/"FAILED" label and `firstFailureLine`) and can read false even when QA ran and
+	 *  produced a real, reportable verdict (`pipeline/run-orchestration.ts`'s `dispatchOk || finalDispatchOk`). */
+	verificationDispatchOk: boolean;
 	succeededLeads: number;
 	totalLeads: number;
 	/** Leads never started because a dependency failed or was blocked. */
@@ -139,7 +147,7 @@ export interface RunReport {
 export function buildRunSummary(report: RunReport): { text: string; succeeded: boolean } {
 	let verdict = verificationVerdictFor({
 		blocked: report.blocked,
-		dispatchOk: report.dispatchOk,
+		dispatchOk: report.verificationDispatchOk,
 		verificationSkipped: report.verificationSkipped,
 		filesChangedCount: report.filesChangedCount,
 		passedVerification: report.passedVerification,
