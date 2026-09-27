@@ -19,7 +19,7 @@
  */
 import type { DispatchResult } from "../core/records.ts";
 
-export type LeadAttemptLabel = "original" | "resume" | `retry-${number}`;
+export type LeadAttemptLabel = "original" | "resume" | "in-wave retry" | `retry-${number}`;
 
 export interface LeadAttempt {
 	label: LeadAttemptLabel;
@@ -58,9 +58,13 @@ export function collectLeadAttempts(
 	leadResults: DispatchResult[],
 	resumedAttemptResults: DispatchResult[],
 	escalationResults: DispatchResult[],
+	/** taskIds recovered via A3's in-wave retry (not C3's transient-error resume); shares
+	 *  `resumedAttemptResults` for billing, but is labeled "in-wave retry" instead of "resume" here. */
+	retriedLeadTaskIds: readonly string[] = [],
 ): LeadAttempts[] {
 	const resumedByTaskId = new Map<string, DispatchResult>();
 	for (const r of resumedAttemptResults) resumedByTaskId.set(r.taskId, r);
+	const retriedSet = new Set(retriedLeadTaskIds);
 
 	const retriesByLead = new Map<string, DispatchResult[]>();
 	for (const r of escalationResults) {
@@ -79,7 +83,7 @@ export function collectLeadAttempts(
 		const leadTaskId = r.taskId; // leadResults' own taskId is never retry-suffixed
 		const resumedFrom = resumedByTaskId.get(leadTaskId);
 		const attempts: LeadAttempt[] = resumedFrom
-			? [{ label: "original", result: resumedFrom }, { label: "resume", result: r }]
+			? [{ label: "original", result: resumedFrom }, { label: retriedSet.has(leadTaskId) ? "in-wave retry" : "resume", result: r }]
 			: [{ label: "original", result: r }];
 		for (const retryResult of retriesByLead.get(leadTaskId) ?? []) {
 			const n = retryNumberFor(retryResult.taskId) ?? attempts.length;

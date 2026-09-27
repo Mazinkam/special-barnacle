@@ -375,7 +375,7 @@ export async function runOrchestration(
 	// `workerResults` carries the parent-owned recon dispatches; they must stay
 	// destructured here or the run stops billing them (plan Task 3).
 	const repoRoot = resolve(cwd);
-	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks, resumedLeadTaskIds, resumedAttemptResults } = await dispatchHierarchical(
+	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks, resumedLeadTaskIds, retriedLeadTaskIds, resumedAttemptResults } = await dispatchHierarchical(
 		runId,
 		plan.plan_id,
 		parsed.goal,
@@ -391,6 +391,11 @@ export async function runOrchestration(
 			evidenceMaxChars: deps.reconEvidenceMaxChars,
 			repoRoot,
 			providedContext: deps.providedContext,
+			// A3: an in-wave-dependent lead that still fails after C3's transient-resume pass gets one
+			// more in-wave recovery attempt instead of blocking every dependent wave until the post-QA
+			// escalation loop recovers it too late for those waves to ever be dispatched. Gated on
+			// `--max-retries` > 0, the same knob that gates the post-QA escalation loop below.
+			inWaveRecovery: parsed.maxRetries > 0,
 			// C3: a lead's resume prompt needs "files changed since it started", using
 			// the same git dirty-snapshot machinery `changedSince` below uses for QA
 			// scope — a snapshot taken right before the lead's (wave's) dispatch,
@@ -625,7 +630,7 @@ export async function runOrchestration(
 	// FAILED first attempt. `succeededLeads`/`dispatchOk`/`leadStatuses`/`runOutcome` above are
 	// deliberately left as computed (from the initial `leadResults`) for the QA-gating decisions
 	// already made by this point; everything from here on reports the run's actual final outcome.
-	const leadAttempts = collectLeadAttempts(leadResults, resumedAttemptResults, escalationResults);
+	const leadAttempts = collectLeadAttempts(leadResults, resumedAttemptResults, escalationResults, retriedLeadTaskIds);
 	const leadAttemptLines = formatLeadAttemptLines(runId, leadAttempts);
 	const finalSucceededLeads = leadAttempts.filter((l) => l.succeeded).length;
 	const finalDispatchOk = leadAttempts.length > 0 && finalSucceededLeads > 0;

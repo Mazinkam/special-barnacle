@@ -129,6 +129,25 @@ describe("pipeline/lead-attempts.ts formatLeadAttemptLines", () => {
 		expect(lines).toEqual(["lead-1: failed (inactivity) \u2192 resume succeeded"]);
 	});
 
+	test("A3: a lead recovered via in-wave retry (not C3's transient resume) reads as 'in-wave retry', not 'resume'", () => {
+		const discarded = fakeResult({ taskId: "run-1-lead-0", exitCode: 1, outcome: "timed_out", timeoutReason: "inactivity" });
+		const retried = fakeResult({ taskId: "run-1-lead-0", exitCode: 0 });
+		const attempts = collectLeadAttempts([retried], [discarded], [], ["run-1-lead-0"]);
+		expect(attempts[0]!.attempts).toEqual([
+			{ label: "original", result: discarded },
+			{ label: "in-wave retry", result: retried },
+		]);
+		const lines = formatLeadAttemptLines("run-1", attempts);
+		expect(lines).toEqual(["lead-0: failed (inactivity) \u2192 in-wave retry succeeded"]);
+	});
+
+	test("A3: the same taskId not listed in retriedLeadTaskIds still reads as 'resume' (C3, unchanged)", () => {
+		const discarded = fakeResult({ taskId: "run-1-lead-0", exitCode: 1, outcome: "failed" });
+		const resumed = fakeResult({ taskId: "run-1-lead-0", exitCode: 0 });
+		const attempts = collectLeadAttempts([resumed], [discarded], [], []);
+		expect(attempts[0]!.attempts.map((a) => a.label)).toEqual(["original", "resume"]);
+	});
+
 	test("a lead that failed, retried, and failed again: 'lead-2: failed (exit 1) \u2192 retry-1 failed (exit 1)'", () => {
 		const original = fakeResult({ taskId: "run-1-lead-2", exitCode: 1 });
 		const retry1 = fakeResult({ taskId: "run-1-lead-2-retry-1", exitCode: 1 });

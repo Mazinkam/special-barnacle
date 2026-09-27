@@ -664,3 +664,179 @@ describe("orchestrator fixes from run ht-orch-1790237987755-lyjkn8 (A8)", () => 
 		expect(QA_SCOPE_RULES.join(" ")).toContain("after 2 attempts");
 	});
 });
+
+/**
+ * A3 ("a lead that fails in wave 1 stops every wave that depends on it, and used to only be
+ * recovered later by the post-QA escalation loop, after which no dependent wave was ever
+ * dispatched"): `inWaveRecovery: true` gives an in-wave-dependent lead one more recovery attempt
+ * BEFORE `stopped` is computed for its wave, so a successful recovery lets dependent waves run in
+ * the same call instead of never running at all.
+ */
+describe("pipeline/hierarchy.ts dispatchReconAndLeads in-wave recovery (A3)", () => {
+	const architect = (text: string): DispatchResult => ({
+		taskId: "r-architect", capability: "architect", model: "m", exitCode: 0, stdout: text, stderr: "",
+		usage: {} as never, durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
+	});
+	const leadResult = (task: DispatchTask, overrides: Partial<DispatchResult> = {}): DispatchResult => ({
+		taskId: task.taskId, capability: task.capability, model: "m", exitCode: 0, stdout: "report\nSTATUS: completed",
+		stderr: "", usage: {} as never, durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
+		...overrides,
+	});
+	const twoLeadPlan = { ...reconLeadPlan, task_class: "investigation", complexity: 8, topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" } };
+	const twoLeadChain = "## Lead assignments\nLead 1: phase 0 (depends on: none)\nLead 2: phase 1 (depends on: 1)\n";
+
+	/** `lead0Behavior` decides what lead-0's dispatch returns on its Nth call (0-indexed); every other
+	 *  lead task (and every later call to lead-0) succeeds. */
+	function runTwoLeadChain(inWaveRecovery: boolean, lead0Behavior: (call: number, task: DispatchTask) => DispatchResult | undefined) {
+		const batches: string[][] = [];
+		const billed: DispatchResult[] = [];
+		const phases: string[] = [];
+		let lead0Calls = 0;
+		return dispatchReconAndLeads(
+			{
+				runId: "r", goal: "g", plan: twoLeadPlan, adapter: { lead: { model: "provider/model" } },
+				architectResult: architect(twoLeadChain), evidenceMaxChars: 4000, maxLeads: 4, repoRoot: "/repo",
+				inWaveRecovery,
+			},
+			{
+				dispatch: async (tasks) => {
+					batches.push(tasks.map((t) => t.taskId));
+					return tasks.map((t) => {
+						if (t.taskId === "r-lead-0") {
+							const call = lead0Calls++;
+							return lead0Behavior(call, t) ?? leadResult(t);
+						}
+						return leadResult(t);
+					});
+				},
+				capture: async (r) => { billed.push(r); },
+				setPhase: (p) => phases.push(p),
+				throwIfCancelled: () => {},
+				markFiles: () => "mark",
+				filesChangedSince: () => ["src/a.ts"],
+			},
+		).then((result) => ({ result, batches, billed, phases }));
+	}
+
+	const timedOut = (task: DispatchTask): DispatchResult => leadResult(task, {
+		exitCode: 1, stdout: "", stderr: "", outcome: "timed_out", timeoutReason: "inactivity",
+	});
+
+	test("(a) lead 1 times out, lead 2 depends on it; the in-wave retry succeeds so lead 2 IS dispatched", async () => {
+		const { result, batches } = await runTwoLeadChain(true, (call, task) => (call === 0 ? timedOut(task) : undefined));
+
+		expect(batches).toEqual([["r-lead-0"], ["r-lead-0"], ["r-lead-1"]]);
+		expect(result.skippedLeads).toBe(0);
+		expect(result.leadResults).toHaveLength(2);
+		expect(result.retriedLeadTaskIds).toEqual(["r-lead-0"]);
+		expect(result.resumedLeadTaskIds).toEqual([]);
+		expect(result.resumedAttemptResults).toHaveLength(1);
+		expect(result.resumedAttemptResults[0].taskId).toBe("r-lead-0");
+		expect(result.resumedAttemptResults[0].exitCode).toBe(1);
+	});
+
+	test("(b) the in-wave retry also fails: lead 2 is not started, and there is no third attempt", async () => {
+		const { result, batches } = await runTwoLeadChain(true, (_call, task) => timedOut(task));
+
+		expect(batches).toEqual([["r-lead-0"], ["r-lead-0"]]);
+		expect(result.leadResults).toHaveLength(1);
+		expect(result.skippedLeads).toBe(1);
+		expect(result.retriedLeadTaskIds).toEqual(["r-lead-0"]);
+	});
+
+	test("(c) inWaveRecovery: false (default): today's behavior — no in-wave retry, lead 2 never starts", async () => {
+		const { result, batches } = await runTwoLeadChain(false, (call, task) => (call === 0 ? timedOut(task) : undefined));
+
+		expect(batches).toEqual([["r-lead-0"]]);
+		expect(result.leadResults).toHaveLength(1);
+		expect(result.skippedLeads).toBe(1);
+		expect(result.retriedLeadTaskIds).toEqual([]);
+	});
+
+	test("(d) a lead with no dependents is not retried in-wave even when it fails", async () => {
+		// Lead 1 and Lead 2 both run in wave 0 (neither depends on the other); Lead 3 depends on Lead 2
+		// only. Lead 1 has NO dependent and must not be retried even though inWaveRecovery is on.
+		const threeLeadPlan = { ...reconLeadPlan, task_class: "investigation", complexity: 8, topology: { depth: 3, leads: 3, workers: 0, shape: "multi_lead" } };
+		const chain = "## Lead assignments\nLead 1: phase 0 (depends on: none)\nLead 2: phase 1 (depends on: none)\nLead 3: phase 2 (depends on: 2)\n";
+		const batches: string[][] = [];
+		const result = await dispatchReconAndLeads(
+			{
+				runId: "r", goal: "g", plan: threeLeadPlan, adapter: { lead: { model: "provider/model" } },
+				architectResult: architect(chain), evidenceMaxChars: 4000, maxLeads: 4, repoRoot: "/repo",
+				inWaveRecovery: true,
+			},
+			{
+				dispatch: async (tasks) => {
+					batches.push(tasks.map((t) => t.taskId));
+					return tasks.map((t) => (t.taskId === "r-lead-0" ? timedOut(t) : leadResult(t)));
+				},
+				capture: async () => {},
+				setPhase: () => {},
+				throwIfCancelled: () => {},
+				markFiles: () => "mark",
+				filesChangedSince: () => [],
+			},
+		);
+
+		// Wave 0 dispatches lead-0 and lead-1 together; no extra batch retries lead-0. Lead-0 still ran
+		// (and failed) so it is not "skipped" (never started) — it simply has no dependent to protect.
+		expect(batches).toEqual([["r-lead-0", "r-lead-1"], ["r-lead-2"]]);
+		expect(result.retriedLeadTaskIds).toEqual([]);
+		expect(result.skippedLeads).toBe(0);
+	});
+
+	test.each([
+		["blocked", (task: DispatchTask) => leadResult(task, { exitCode: 1, stdout: "report\nSTATUS: blocked" })],
+		["cancelled", (task: DispatchTask) => leadResult(task, { exitCode: 1, outcome: "cancelled" as const })],
+		["spend_cap", (task: DispatchTask) => leadResult(task, { exitCode: 1, stopReason: "spend_cap" })],
+	])("(e) a lead that is %s is never retried in-wave", async (_label, makeResult) => {
+		const { result, batches } = await runTwoLeadChain(true, (call, task) => (call === 0 ? makeResult(task) : undefined));
+
+		expect(batches).toEqual([["r-lead-0"]]);
+		expect(result.retriedLeadTaskIds).toEqual([]);
+		expect(result.skippedLeads).toBe(1);
+	});
+
+	test("(f) the retry prompt states the real other-lead state and never claims another lead is running", async () => {
+		const { batches } = await runTwoLeadChain(true, (call, task) => (call === 0 ? timedOut(task) : undefined));
+		const retryTask = batches[1]?.[0];
+		expect(retryTask).toBe("r-lead-0");
+
+		// Grab the actual prompt text dispatched on the retry call by re-running with a capture hook.
+		const prompts: string[] = [];
+		let lead0Calls = 0;
+		await dispatchReconAndLeads(
+			{
+				runId: "r", goal: "g", plan: twoLeadPlan, adapter: { lead: { model: "provider/model" } },
+				architectResult: architect(twoLeadChain), evidenceMaxChars: 4000, maxLeads: 4, repoRoot: "/repo",
+				inWaveRecovery: true,
+			},
+			{
+				dispatch: async (tasks) => {
+					for (const t of tasks) if (t.taskId === "r-lead-0") prompts.push(t.task);
+					return tasks.map((t) => {
+						if (t.taskId === "r-lead-0") {
+							const call = lead0Calls++;
+							return call === 0 ? timedOut(t) : leadResult(t);
+						}
+						return leadResult(t);
+					});
+				},
+				capture: async () => {},
+				setPhase: () => {},
+				throwIfCancelled: () => {},
+				markFiles: () => "mark",
+				filesChangedSince: () => [],
+			},
+		);
+
+		expect(prompts).toHaveLength(2);
+		const retryPrompt = prompts[1];
+		expect(retryPrompt).toContain("## Retry");
+		expect(retryPrompt).toContain("inactivity timeout");
+		expect(retryPrompt).toContain("## Other leads");
+		expect(retryPrompt).toContain("No other lead is running while you work on this recovery");
+		expect(retryPrompt).toContain("Lead 2: not started yet — runs in a later wave after this recovery");
+		expect(retryPrompt).not.toContain("Leads 2 and 3 are still changing the same tree");
+	});
+});
