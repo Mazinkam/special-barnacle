@@ -500,6 +500,11 @@ export async function runOrchestration(
 	let retries = 0;
 	let lastVerification: VerificationResult | null = null;
 	const verificationResults: DispatchResult[] = [];
+	// A6/A4: at most ONE QA re-run per run, triggered only by the QA dispatch itself timing out
+	// (never by QA completing and reporting a failing check). Tracked outside the while loop so a
+	// later QA dispatch (after an escalation retry) that also times out does not get a second
+	// re-run — it just ends the run with the TIMED OUT verdict, same as the first re-run failing.
+	let qaRerunUsed = false;
 	while (runOutcome !== "blocked" && dispatchOk && retries <= parsed.maxRetries) {
 		if (allFiles.length > 0) {
 			session.setPhase(
@@ -525,6 +530,44 @@ export async function runOrchestration(
 		session.cancellation.throwIfCancelled();
 		if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
 		if (lastVerification.passed) break;
+
+		if (lastVerification.timedOut) {
+			if (qaRerunUsed) {
+				// Already used this run's one re-run and QA timed out again — finish with the
+				// TIMED OUT verdict; a timed-out QA never had a real verdict to escalate on.
+				session.log("QA dispatch timed out again after the re-run; ending the run with QA TIMED OUT (no escalation)");
+				break;
+			}
+			qaRerunUsed = true;
+			session.log("QA dispatch timed out; re-running QA once with scoped-test-command guidance");
+			deps.recordEvent("qa_timed_out_rerun", { run_id: runId, attempt: 1 });
+			session.setPhase(`QA re-run (attempt 1) on ${allFiles.length} changed file(s) after a timeout`);
+			lastVerification = await runVerification(
+				runId,
+				plan.plan_id,
+				allFiles,
+				ctx,
+				claimed,
+				captureOpts,
+				{
+					dispatch: (tasks) => deps.dispatchParallel(cwd, runId, tasks, adapter, ctx, claimed),
+					captureDispatchCost: deps.captureDispatchCost,
+					recordOutcome: deps.recordOutcome,
+				},
+				repoRoot,
+				{ attempt: 1 },
+			);
+			session.cancellation.throwIfCancelled();
+			if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
+			if (lastVerification.passed) break;
+			if (lastVerification.timedOut) {
+				// The re-run also timed out — finish with that verdict now, no escalation.
+				session.log("QA re-run also timed out; ending the run with QA TIMED OUT (no escalation)");
+				break;
+			}
+			// The re-run completed and reported a real (non-timeout) verdict; fall through to the
+			// normal failure/escalation handling below using this re-run's `lastVerification`.
+		}
 
 		session.log(`verification failed: ${lastVerification.failedChecks.join(", ") || "(unparsed)"}`);
 		// Pair each lead's ORIGINAL dispatch task (goal/scope/model-routing

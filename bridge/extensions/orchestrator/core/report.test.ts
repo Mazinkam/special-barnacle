@@ -35,11 +35,11 @@ describe("core/report.ts verificationVerdictFor", () => {
 	});
 
 	test("the QA dispatch timing out reads as TIMED OUT, distinct from a completed FAIL", () => {
-		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true })).toBe("TIMED OUT (QA dispatch did not complete)");
+		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true })).toBe("QA TIMED OUT (QA dispatch did not complete)");
 	});
 
 	test("a timeout still wins over named failed checks (QA never finished judging them)", () => {
-		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true, failedChecks: ["typecheck"] })).toBe("TIMED OUT (QA dispatch did not complete)");
+		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true, failedChecks: ["typecheck"] })).toBe("QA TIMED OUT (QA dispatch did not complete)");
 	});
 
 	test("regression: QA dispatched and failed unparsed must never read as 'NOT RUN (no lead succeeded)' (docs/architecture-review.md C5)", () => {
@@ -311,7 +311,7 @@ describe("core/report.ts buildRunSummary", () => {
 	test("QA dispatch timed out: verification line reads TIMED OUT, distinct from a completed FAIL, and the run is not reported as succeeded", () => {
 		const report = { ...baseReport(), passedVerification: false, verificationTimedOut: true, failedChecks: [] };
 		const { text, succeeded } = buildRunSummary(report);
-		expect(text).toContain("verification: TIMED OUT (QA dispatch did not complete)");
+		expect(text).toContain("verification: QA TIMED OUT (QA dispatch did not complete)");
 		expect(succeeded).toBe(false);
 	});
 

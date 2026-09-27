@@ -93,8 +93,22 @@ export interface VerificationResult {
 	failedChecks: string[];
 	/** True when no QA agent ran at all (nothing changed) — `passed` is vacuous. */
 	skipped?: boolean;
+	/** True when the QA dispatch itself timed out (inactivity/absolute ceiling) rather than
+	 *  completing and reporting a verdict. `failedChecks` is always `[]` in this case — a
+	 *  timed-out dispatch's partial stdout is never parsed for check rows, since a row that
+	 *  looked like it was failing may simply have been mid-write when the process was killed. */
+	timedOut?: boolean;
 	/** The QA dispatch, so the caller can bill it into the run total. */
 	dispatch?: DispatchResult;
+}
+
+/** Optional per-call overrides for `runVerification`. `attempt` distinguishes a QA re-run
+ *  (after the first QA dispatch timed out) from the initial dispatch: it changes the dispatch's
+ *  `taskId` (so its logs/records don't collide with the first attempt's) and appends scoped-
+ *  test-command guidance to the QA prompt instructing it to avoid a repeat timeout. */
+export interface RunVerificationOptions {
+	/** 1-based re-run attempt number. Absent/undefined on the first (normal) QA dispatch. */
+	attempt?: number;
 }
 
 /** The dispatch/billing/telemetry seams `runVerification` needs; index.ts's caller supplies the real ones. */
@@ -353,6 +367,7 @@ export async function runVerification(
 	/** The run's cwd, resolved absolute (docs/architecture-review.md C4): grounds the QA prompt in
 	 *  the repo it is actually running against, instead of letting it guess and run `find /`. */
 	repoRoot: string,
+	options: RunVerificationOptions = {},
 ): Promise<VerificationResult> {
 	if (filesChanged.length === 0) {
 		return {
@@ -363,6 +378,9 @@ export async function runVerification(
 		};
 	}
 
+	const { attempt } = options;
+	const taskId = attempt ? `${runId}-qa-rerun-${attempt}` : `${runId}-qa`;
+
 	const qaTask = [
 		`Run the project verification suite for these changed files:`,
 		"",
@@ -372,10 +390,16 @@ export async function runVerification(
 		"",
 		"Run typecheck, unit tests, integration tests, lint as applicable.",
 		...QA_SCOPE_RULES,
+		...(attempt
+			? [
+					"",
+					"Re-run notice: a previous QA dispatch on this run timed out before it finished. This time, run ONLY scoped test commands targeting the files listed above (e.g. `bun test <file>`, or targeted pytest paths for the listed files) — never the full test suite if it is slow, and never a filesystem-wide search such as `find /` or `find ~`. Stay inside the repo root at all times.",
+				]
+			: []),
 		"Respond with the standard QA output format.",
 	].join("\n");
 
-	const [qaResult] = await deps.dispatch([{ capability: "qa_agent", task: qaTask, taskId: `${runId}-qa` }]);
+	const [qaResult] = await deps.dispatch([{ capability: "qa_agent", task: qaTask, taskId }]);
 
 	if (!qaResult) {
 		return {
@@ -388,6 +412,27 @@ export async function runVerification(
 	// The QA agent is a billable dispatch like any other. Recording only its
 	// outcome left its spend out of both metrics.jsonl and the run total.
 	await deps.captureDispatchCost({ ...captureOpts, planId }, qaResult, run);
+
+	if (qaResult.outcome === "timed_out") {
+		// A timed-out QA dispatch's stdout is partial — it may contain a row that looks like a
+		// failing check simply because the process was killed mid-write, not because QA actually
+		// judged that check as failing. Parsing it into `failedChecks` would misreport a run-level
+		// timeout as a specific code defect (e.g. `unit`), which then feeds a bogus escalation.
+		// `failedChecks` stays `[]`; `timedOut: true` is the caller's signal to re-run QA once
+		// instead of escalating.
+		const note = `QA dispatch timed out before completing.\n\n${qaResult.stdout.slice(0, 2000)}`;
+		deps.recordOutcome(qaVerificationOutcomeFor(runId, false, 0.0, note, {
+			review_verdicts: [{ role: "qa_agent", verdict: "timed_out" }],
+			artifacts: [],
+		}));
+		return {
+			passed: false,
+			timedOut: true,
+			summary: "QA dispatch timed out before completing — verdict not determined.",
+			failedChecks: [],
+			dispatch: qaResult,
+		};
+	}
 
 	const out = qaResult.stdout;
 	const failedChecks = parseFailedChecks(out);

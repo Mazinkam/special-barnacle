@@ -50,7 +50,7 @@ export function verificationVerdictFor(input: VerificationVerdictInput): string 
 			? "N/A (no files changed — report-only goal)"
 			: "SKIPPED (no files changed)";
 	}
-	if (input.verificationTimedOut) return "TIMED OUT (QA dispatch did not complete)";
+	if (input.verificationTimedOut) return "QA TIMED OUT (QA dispatch did not complete)";
 	if (input.passedVerification) return "PASS";
 	const checks = input.failedChecks ?? [];
 	return checks.length > 0 ? `FAIL (${checks.join(", ")})` : "FAIL (unparsed)";
