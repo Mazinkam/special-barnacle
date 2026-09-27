@@ -574,10 +574,19 @@ export async function runOrchestration(
 		// prompt) with its own outcome so planEscalation can retry with the
 		// real prompt instead of the failed report (BUG 2), and can decide
 		// per-lead whether a retry is warranted instead of only ever
-		// retrying lead 0.
+		// retrying lead 0. `task` stays the lead's ORIGINAL prompt/taskId
+		// (from `leadTasks`) so planEscalation keeps building `<lead>-retry-N`
+		// off the original taskId — but `result` must be the lead's LATEST
+		// attempt so far (this round's own `escalationResults`, if any retry
+		// has already run for this lead, else the original `leadResults`
+		// entry), not the stale original exit code/filesChanged/report a
+		// second-round selection or feedback section would otherwise see.
+		const leadAttemptsSoFar = collectLeadAttempts(leadResults, resumedAttemptResults, escalationResults, retriedLeadTaskIds);
+		const latestResultByLeadTaskId = new Map(leadAttemptsSoFar.map((l) => [l.leadTaskId, l.attempts[l.attempts.length - 1]!.result]));
 		const leadsForEscalation: EscalationLeadInput[] = leadResults.map((r) => {
 			const task = leadTasks.find((t) => t.taskId === r.taskId) ?? { capability: r.capability, task: r.stdout, taskId: r.taskId };
-			return { task, result: { exitCode: r.exitCode, stdout: r.stdout, filesChanged: r.filesChanged } };
+			const latest = latestResultByLeadTaskId.get(r.taskId) ?? r;
+			return { task, result: { exitCode: latest.exitCode, stdout: latest.stdout, filesChanged: latest.filesChanged } };
 		});
 		const escalationTasks = planEscalation(
 			lastVerification.failedChecks,

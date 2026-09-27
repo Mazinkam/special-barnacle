@@ -578,6 +578,127 @@ describe("pipeline/run-orchestration.ts runOrchestration lead escalation retry s
 	});
 });
 
+describe("pipeline/run-orchestration.ts runOrchestration escalation feedback/selection uses the LATEST attempt, not the original leadResults (A2 review fix)", () => {
+	test("QA fails twice with maxRetries 2: retry-2's prompt carries retry-1's stdout as feedback (not the original report), and lead-1 (whose retry-1 succeeded with no overlap) is not re-selected on round 2 when lead-0's retry-1 failed", async () => {
+		const runId = "ht-orch-1700000000000-escalate-latest";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan: PlanResponse = {
+			plan_id: "plan-123456789099",
+			run_id: runId,
+			task_class: "investigation",
+			complexity: 8,
+			risk: "medium",
+			topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto",
+				history_sufficient: true,
+				explanation: {},
+			},
+			effective_quality_floor: 0.5,
+			cost_aggressiveness: 0.5,
+		};
+		const usage = { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 };
+		let qaCalls = 0;
+		const capturedTasks: Array<{ taskId: string; task: string }> = [];
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async (_cwd, _runId2, tasks) => {
+				for (const t of tasks) capturedTasks.push({ taskId: t.taskId, task: t.task });
+				const cap = tasks[0]?.capability;
+				if (cap === "architect") {
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/architect", exitCode: 0,
+						stdout: "## Lead assignments\nLead 1: backend (depends on: none)\nLead 2: frontend (depends on: none)\n",
+						stderr: "", usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				if (cap === "qa_agent") {
+					qaCalls++;
+					// Deliberately generic/undeterminable: names no specific file, so `leadsToRetry`'s
+					// only handle is `failedDispatch` (each lead's latest exit code) -- never `overlap`.
+					const stdout = qaCalls < 3 ? "## Verdict\nFAIL\n\ngeneric failure, no specific files named." : "## Verdict\nPASS\n";
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0, stdout, stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				// Round 2 escalation retry: only lead-0 should ever be dispatched here (lead-1's
+				// retry-1 succeeded with no overlap and must not be re-selected).
+				if (tasks.some((t) => t.taskId.includes("-retry-2"))) {
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "RETRY2_MARKER_XYZ STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+					}));
+				}
+				// Round 1 escalation retry: QA #1's undeterminable failure hedges and retries BOTH
+				// leads. lead-0's retry-1 fails again; lead-1's retry-1 succeeds unchanged.
+				if (tasks.some((t) => t.taskId.includes("-retry-1"))) {
+					return tasks.map((t) => {
+						if (t.taskId.includes("-lead-0-retry-1")) {
+							return {
+								taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 1,
+								stdout: "RETRY1_MARKER_XYZ boom during retry-1", stderr: "lead crashed on retry-1",
+								usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "failed" as const, filesChanged: ["src/a.ts"],
+							};
+						}
+						return {
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+							stdout: "STATUS: completed\n\n## Files Changed\n- `src/b.ts`", stderr: "",
+							usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/b.ts"],
+						};
+					});
+				}
+				// Initial wave: both leads succeed.
+				return tasks.map((t) => {
+					if (t.taskId.endsWith("-lead-0")) {
+						return {
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+							stdout: "ORIGINAL_MARKER_XYZ STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+							usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+						};
+					}
+					return {
+						taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "STATUS: completed\n\n## Files Changed\n- `src/b.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/b.ts"],
+					};
+				});
+			},
+		});
+
+		const result = await runOrchestration(
+			runId, "/tmp/cwd-not-a-git-repo", fakeArgs({ maxRetries: 2 }), adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(qaCalls).toBe(3);
+		expect(result.report.retries).toBe(2);
+		expect(result.report.passedVerification).toBe(true);
+		expect(result.report.succeededLeads).toBe(2);
+		expect(result.report.totalLeads).toBe(2);
+
+		// Round 2 escalation retried ONLY lead-0 -- lead-1's retry-1 (exit 0, no overlap with
+		// QA's generic, non-file-naming failure) must never be re-selected just because QA
+		// failed again.
+		const lead1Retry2Tasks = capturedTasks.filter((t) => t.taskId.includes("-lead-1-retry-2"));
+		expect(lead1Retry2Tasks).toEqual([]);
+		const lead0Retry2Task = capturedTasks.find((t) => t.taskId.includes("-lead-0-retry-2"));
+		expect(lead0Retry2Task).toBeDefined();
+
+		// Retry-2's prompt carries retry-1's own report as feedback, not the ORIGINAL report --
+		// the bug this test guards against fed every later round the stale original report.
+		expect(lead0Retry2Task?.task).toContain("RETRY1_MARKER_XYZ");
+		expect(lead0Retry2Task?.task).not.toContain("ORIGINAL_MARKER_XYZ");
+	});
+});
+
 describe("pipeline/run-orchestration.ts runOrchestration QA dispatch timing out (A4)", () => {
 	function flatPlan(runId: string): PlanResponse {
 		return {
