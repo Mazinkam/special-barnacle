@@ -201,6 +201,12 @@ export function architectPrompt(goal: string, plan: PlanResponse, maxLeads = 8, 
 	].join("\n");
 }
 
+/** Headless leads must never wait synchronously for external checks. */
+export const NO_BLOCKING_WAITS_RULE = `No blocking waits
+
+Do not use sleep/poll/watch loops, or run any single command expected to take longer than about 3 minutes. This includes \`sleep\` in a loop, \`glab ci status --live\`, \`gh run watch\`, and \`until ...; do sleep\`.
+Check CI with ONE bounded status command (\`glab ci get -p <id>\` or \`gh run view <id>\`), then move on. If CI is still running when all other work is done, stop and list the pipeline/run id and MR under a \`## Pending external checks\` section of the final report — do not wait. Write \`None.\` in that section when there are no pending checks.`;
+
 /** Keeps QA on this run's files and stops it from debugging the environment. */
 export const QA_SCOPE_RULES = [
 	"Scope: verify ONLY the files listed above and the tests that cover them. Do not read or judge other files, even if they look modified.",
@@ -318,6 +324,8 @@ export function leadPrompt(
 		"",
 		LEAD_DELEGATION_RULE,
 		"",
+		NO_BLOCKING_WAITS_RULE,
+		"",
 		"Use the subagent tool for implementation and review work. Nested subagent calls you make run inside your own context: the orchestrator bridge bills their reported cost to your dispatch and counts it toward your spend cap, but does not log them as dispatches the way it does the parent-owned recon above, so they are not authoritative worker accounting for this run — only your own final report is. For each nested dispatch:",
 		"- Choose the right agent (orch-worker, orch-implementation-strong, orch-implementation-fast, orch-technical-review, orch-security-review).",
 		"- Pass a narrowly-scoped task prompt.",
@@ -376,6 +384,8 @@ export function resumeLeadPrompt(originalPrompt: string, lastReportText: string,
 	return [
 		originalPrompt,
 		"",
+		NO_BLOCKING_WAITS_RULE,
+		"",
 		"## Resume",
 		"",
 		"Your previous attempt at this task stopped because of a transient provider error, not because of anything wrong with your work. You are being re-dispatched once to continue — do not redo work that is already on disk; pick up from where you left off.",
@@ -424,6 +434,7 @@ export function formatTaskPrompt(
 		"What was done.",
 		"## Files Changed",
 		"- `path/to/file` — what changed",
+		...(t.capability.startsWith("lead") ? ["## Pending external checks", "Pipeline/run id + MR for any CI still running, or None."] : []),
 		"## Verification",
 		"Checks run + result.",
 		"## Notes / Escalation",

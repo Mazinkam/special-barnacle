@@ -162,6 +162,17 @@ export interface SubagentProcessResult {
 	/** Process disposition after considering terminal JSON events. */
 	outcome: "completed" | "completed_after_process_error" | "failed" | "timed_out" | "cancelled";
 	timeoutReason?: "inactivity" | "absolute";
+	/** Tool call in flight at kill time, when the dispatch timed out mid-tool-call. */
+	toolInFlight?: {
+		name: string;
+		command?: string;
+		/** True when the raw (pre-redaction) in-flight command matched `isWaitCommand` (core/wait-stall.ts). */
+		waitPattern?: boolean;
+		/** CI pipeline/run references extracted from the raw in-flight command (core/wait-stall.ts's `extractCiRefs`).
+		 *  Defined structurally here — not imported from core/wait-stall.ts — mirroring core/records.ts's
+		 *  `DispatchResult.toolInFlight` so the two stay in lockstep without either importing `CiRef`. */
+		ciRefs?: Array<{ provider: "gitlab" | "github"; kind: "pipeline" | "run"; id: string }>;
+	};
 	interruption?: InterruptionReport;
 	/** Raw child exit code before terminal-result recovery. */
 	processExitCode: number;
@@ -491,6 +502,12 @@ export async function runSubagentProcess(opts: {
 		let timedOut = false;
 		let cancelledByListener = false;
 		let timeoutReason: "inactivity" | "absolute" | undefined;
+		let toolInFlight: {
+			name: string;
+			command?: string;
+			waitPattern?: boolean;
+			ciRefs?: Array<{ provider: "gitlab" | "github"; kind: "pipeline" | "run"; id: string }>;
+		} | undefined;
 		let interruption: InterruptionReport | undefined;
 		let spawnFailed = false;
 		let settled = false;
@@ -649,6 +666,7 @@ export async function runSubagentProcess(opts: {
 				outcome: outcome.status,
 				processExitCode,
 				timeoutReason,
+				toolInFlight,
 				interruption,
 				postCompletionError: outcome.status === "completed_after_process_error" ? outcome.note : undefined,
 			});
@@ -783,6 +801,7 @@ export async function runSubagentProcess(opts: {
 			if (settled || cancelledByListener) return;
 			timedOut = true;
 			timeoutReason = reason;
+			toolInFlight = progressTracker?.toolInFlight();
 			const explanation = progressTracker?.describeExpiry(reason, opts.capability, Date.now()) ?? reason;
 			stderrCapture.append(`\n[orchestrator] ${reason} timeout: ${explanation}`);
 			const report = recordInterruption(reason === "inactivity" ? "inactivity_timeout" : "absolute_timeout");

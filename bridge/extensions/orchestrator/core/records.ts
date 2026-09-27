@@ -27,6 +27,17 @@ export interface DispatchResult {
 	/** Process disposition after considering terminal JSON events (see index.ts's SubagentProcessResult). */
 	outcome?: "completed" | "completed_after_process_error" | "failed" | "timed_out" | "cancelled";
 	timeoutReason?: "inactivity" | "absolute";
+	/** Tool call in flight at kill time, when the dispatch expired mid-tool-call (see core/wait-stall.ts's classifyTimeout). */
+	toolInFlight?: {
+		name: string;
+		command?: string;
+		/** True when the raw (pre-redaction) in-flight command matched `isWaitCommand` (core/wait-stall.ts). */
+		waitPattern?: boolean;
+		/** CI pipeline/run references extracted from the raw in-flight command (core/wait-stall.ts's `extractCiRefs`).
+		 *  Defined structurally here — not imported from core/wait-stall.ts — so this module never depends on that
+		 *  module's load order/exports; a `CiRef` from there is always assignable to this shape. */
+		ciRefs?: Array<{ provider: "gitlab" | "github"; kind: "pipeline" | "run"; id: string }>;
+	};
 	interruption?: InterruptionReport;
 	filesChanged: string[];
 	/** HT thinking level the dispatch ran at (from the binding), when one was set. */

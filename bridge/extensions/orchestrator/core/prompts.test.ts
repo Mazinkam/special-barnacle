@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { architectPrompt, effectiveLeadCount, formatTaskPrompt, leadPrompt, parsePlanResponse, repoRootGuardrail, resumeLeadPrompt, RESUME_REPORT_MAX_CHARS, VERIFICATION_COMMANDS, type PlanResponse } from "./prompts.ts";
+import { architectPrompt, effectiveLeadCount, formatTaskPrompt, leadPrompt, NO_BLOCKING_WAITS_RULE, parsePlanResponse, repoRootGuardrail, resumeLeadPrompt, RESUME_REPORT_MAX_CHARS, VERIFICATION_COMMANDS, type PlanResponse } from "./prompts.ts";
 import planFixture from "../fixtures/orchestrator-cli-plan-response.json";
 
 function plan(leads: number): PlanResponse {
@@ -49,6 +49,13 @@ describe("core/prompts.ts formatTaskPrompt", () => {
 		expect(withMsg).toContain("stop early");
 		expect(withMsg).toContain("User messages while this run was in progress");
 	});
+
+	test("includes pending external checks as a standalone heading only for leads", () => {
+		const lead = formatTaskPrompt({ taskId: "t1", capability: "lead", task: "do it" }, "run-1");
+		const worker = formatTaskPrompt({ taskId: "t1", capability: "worker", task: "do it" }, "run-1");
+		expect(lead.split("\n")).toContain("## Pending external checks");
+		expect(worker.split("\n")).not.toContain("## Pending external checks");
+	});
 });
 
 describe("core/prompts.ts repoRootGuardrail", () => {
@@ -63,7 +70,24 @@ describe("core/prompts.ts repoRootGuardrail", () => {
 	});
 });
 
+describe("core/prompts.ts no-blocking-waits rule", () => {
+	test("names bounded CI checks and pending-check reporting", () => {
+		for (const example of ["`sleep` in a loop", "glab ci status --live", "gh run watch", "until ...; do sleep"]) {
+			expect(NO_BLOCKING_WAITS_RULE).toContain(example);
+		}
+		expect(NO_BLOCKING_WAITS_RULE).toContain("glab ci get -p");
+		expect(NO_BLOCKING_WAITS_RULE).toContain("gh run view");
+		expect(NO_BLOCKING_WAITS_RULE).toContain("## Pending external checks");
+	});
+});
+
 describe("core/prompts.ts leadPrompt", () => {
+	test("includes the no-blocking-waits rule and pending-check report section", () => {
+		const prompt = leadPrompt("goal", plan(1), undefined, "", 0, 1, { lead: { model: "provider/model" } }, "/abs/repo/root");
+		expect(prompt).toContain(NO_BLOCKING_WAITS_RULE);
+		expect(prompt).toContain("## Pending external checks");
+	});
+
 	test("grounds the lead in the absolute repo root and forbids find / (docs/architecture-review.md C4)", () => {
 		const prompt = leadPrompt("goal", plan(1), undefined, "", 0, 1, { lead: { model: "provider/model" } }, "/abs/repo/root");
 		expect(prompt).toContain("The repo root is /abs/repo/root (your cwd). Never search outside it; never run `find /`.");
@@ -100,6 +124,12 @@ describe("core/prompts.ts architectPrompt", () => {
 });
 
 describe("core/prompts.ts resumeLeadPrompt", () => {
+	test("includes no-blocking-waits guidance in the resumed prompt", () => {
+		const prompt = resumeLeadPrompt("ORIGINAL PROMPT TEXT", "previous report body", []);
+		expect(prompt).toContain(NO_BLOCKING_WAITS_RULE);
+		expect(prompt).toContain("## Pending external checks");
+	});
+
 	test("keeps the original prompt and appends a ## Resume section with the last report and changed files", () => {
 		const prompt = resumeLeadPrompt("ORIGINAL PROMPT TEXT", "previous report body", ["src/a.ts", "src/b.ts"]);
 		expect(prompt.startsWith("ORIGINAL PROMPT TEXT")).toBe(true);

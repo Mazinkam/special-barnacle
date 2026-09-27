@@ -378,3 +378,261 @@ describe("DispatchProgressTracker", () => {
 		expect(summary).not.toContain("\\n");
 	});
 });
+
+function bashStart(command: string, toolCallId = "bash-1") {
+	return { type: "tool_execution_start", toolName: "bash", args: { command }, toolCallId };
+}
+function end(toolCallId: string) {
+	return { type: "tool_execution_end", toolCallId };
+}
+
+const WAIT_COMMAND = "for i in $(seq 1 40); do glab ci get -p 219469; sleep 60; done";
+
+describe("DispatchProgressTracker.toolInFlight", () => {
+	test("is set after a bash tool_execution_start and cleared after its matching end", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		expect(tracker.toolInFlight()).toBeUndefined();
+		tracker.observe(bashStart("npm test"), 1);
+		expect(tracker.toolInFlight()).toEqual({ name: "bash", command: "npm test", waitPattern: false, ciRefs: [] });
+		tracker.observe(end("bash-1"), 2);
+		expect(tracker.toolInFlight()).toBeUndefined();
+	});
+
+	test("ignores non-bash tool calls and calls with no string command", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		tracker.observe(start("read", { path: "index.ts" }), 1);
+		expect(tracker.toolInFlight()).toBeUndefined();
+		tracker.observe(start("bash", ["npm", "test"], "bash-2"), 2);
+		expect(tracker.toolInFlight()).toBeUndefined();
+	});
+
+	test("redacts token/password/secret/api-key assignments, Bearer tokens, glpat/gh tokens, and URL userinfo", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		tracker.observe(bashStart(
+			"curl -H 'Authorization: Bearer abc123' " +
+			"-H token=xyz789 --data password=hunter2 --data secret=shh --data api_key=k1 --data API-KEY=k2 " +
+			"https://user:pass@example.com/glpat-abcdefgh1234 ghp_abcdefgh1234",
+		), 1);
+		const command = tracker.toolInFlight()!.command;
+		expect(command).not.toContain("abc123");
+		expect(command).not.toContain("xyz789");
+		expect(command).not.toContain("hunter2");
+		expect(command).not.toContain("shh");
+		expect(command).not.toContain("k1");
+		expect(command).not.toContain("k2");
+		expect(command).not.toContain("user:pass");
+		expect(command).not.toContain("glpat-abcdefgh1234");
+		expect(command).not.toContain("ghp_abcdefgh1234");
+		expect(command).toContain("Bearer [REDACTED]");
+
+		for (const [input, secret, marker] of [
+			["curl -H token=xyz789", "xyz789", "token=[REDACTED]"],
+			["curl --data password=hunter2", "hunter2", "password=[REDACTED]"],
+			["curl --data secret=shh", "shh", "secret=[REDACTED]"],
+			["curl --data api_key=k1", "k1", "api_key=[REDACTED]"],
+			["git clone https://user:pass@example.com/r.git", "user:pass", "https://***@example.com"],
+			["echo glpat-abcdefgh1234", "glpat-abcdefgh1234", "[REDACTED]"],
+			["echo ghp_abcdefgh1234", "ghp_abcdefgh1234", "[REDACTED]"],
+		]) {
+			const shapeTracker = new DispatchProgressTracker(leadPolicy, 0);
+			shapeTracker.observe(bashStart(input), 1);
+			const redacted = shapeTracker.toolInFlight()!.command;
+			expect(redacted).not.toContain(secret);
+			expect(redacted).toContain(marker);
+		}
+	});
+
+	test("caps a redacted command at 2000 chars", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		tracker.observe(bashStart(`echo ${"x".repeat(3000)}`), 1);
+		expect(tracker.toolInFlight()!.command).toHaveLength(2000);
+	});
+});
+
+describe("wait-aware inactivity messaging", () => {
+	test("warning and expiry text call out a wait loop for the u25qe4-style poll command", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		tracker.observe(bashStart(WAIT_COMMAND), 0);
+		const warning = tracker.check(23 * minute).warnings[0];
+		expect(warning.text).toContain("blocked waiting");
+		expect(warning.text).toContain("wait loop");
+		expect(warning.text).toContain("Pending external checks");
+		expect(warning.text).toContain("stopgap");
+		expect(warning.text).toContain("glab ci get");
+		const expiry = tracker.describeExpiry("inactivity", "lead", 30 * minute);
+		expect(expiry).toContain("blocked waiting");
+		expect(expiry).toContain("Pending external checks");
+	});
+
+	test("leaves the warning/expiry text unchanged for tail -500 and npm test", () => {
+		for (const command of ["tail -500 x.log", "npm test"]) {
+			const tracker = new DispatchProgressTracker(leadPolicy, 0);
+			tracker.observe(bashStart(command), 0);
+			const warning = tracker.check(23 * minute).warnings[0];
+			expect(warning.text).toBe(
+				`⚠ no meaningful progress for 23min (limit 30min; 7min remaining; raise HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS) — last: bash ${JSON.stringify({ command })}`,
+			);
+			const expiry = tracker.describeExpiry("inactivity", "lead", 30 * minute);
+			expect(expiry).toBe(
+				`dispatch timed out after 30min without meaningful progress (last progress: bash ${JSON.stringify({ command })} 30min ago; capability=lead)`,
+			);
+		}
+	});
+
+	test("expiry timing is identical whether or not the in-flight command is a wait command", () => {
+		const waitTracker = new DispatchProgressTracker(leadPolicy, 0);
+		waitTracker.observe(bashStart(WAIT_COMMAND), 0);
+		const plainTracker = new DispatchProgressTracker(leadPolicy, 0);
+		plainTracker.observe(bashStart("npm test"), 0);
+		for (const at of [22 * minute + 30_000, 23 * minute, 30 * minute]) {
+			expect(waitTracker.check(at).expired).toEqual(plainTracker.check(at).expired);
+			expect(waitTracker.check(at).nextCheckMs).toEqual(plainTracker.check(at).nextCheckMs);
+		}
+	});
+});
+
+describe("toolInFlight redaction, control-char safety, raw-command wait/ciRefs detection", () => {
+	test("an inactivity warning and expiry never leak the raw credentials in the in-flight command", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		const command = "curl -H 'PRIVATE-TOKEN: glpat-abc123' https://u:p@x/y; GITLAB_TOKEN=supersecret for i in 1 2; do sleep 60; done";
+		tracker.observe(bashStart(command), 0);
+		const warning = tracker.check(23 * minute).warnings[0];
+		const expiry = tracker.describeExpiry("inactivity", "lead", 30 * minute);
+		for (const secret of ["glpat-abc123", "supersecret", "u:p@"]) {
+			expect(warning.text).not.toContain(secret);
+			expect(expiry).not.toContain(secret);
+		}
+	});
+
+	test("progressDetail escapes control characters so a forged heading/ESC sequence cannot render literally", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		const command = "echo \x1b[2J\rFORGED\n## heading";
+		tracker.observe(bashStart(command), 0);
+		const warning = tracker.check(23 * minute).warnings[0];
+		const expiry = tracker.describeExpiry("inactivity", "lead", 30 * minute);
+		for (const rendered of [warning.text, expiry, tracker.lastProgressDetail]) {
+			expect(rendered).not.toContain("\x1b");
+			expect(rendered).not.toContain("\r");
+			expect(rendered.includes("\n")).toBe(false);
+		}
+		expect(tracker.lastProgressDetail).toContain("FORGED");
+	});
+
+	test("wait detection and CI ref extraction use the raw command, not the redacted/capped preview", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		// Padding pushes the actual `sleep`/`glab` wait shape past the 2000-char
+		// redacted-command cap; if detection ran against the capped preview
+		// instead of the raw command, this would be missed entirely.
+		const padding = "x".repeat(2100);
+		const command = `echo ${padding}; for i in $(seq 1 40); do glab ci get -p 219469; sleep 60; done`;
+		tracker.observe(bashStart(command), 0);
+		const inFlight = tracker.toolInFlight()!;
+		expect(inFlight.command).toHaveLength(2000);
+		expect(inFlight.waitPattern).toBe(true);
+		expect(inFlight.ciRefs).toEqual([{ provider: "gitlab", kind: "pipeline", id: "219469" }]);
+		const warning = tracker.check(23 * minute).warnings[0];
+		expect(warning.text).toContain("blocked waiting");
+	});
+});
+
+describe("toolInFlight tracking by toolCallId (bash calls only, insertion-ordered)", () => {
+	test("tracks multiple concurrent bash calls and returns the most recently started still-active one", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		tracker.observe(bashStart(WAIT_COMMAND, "call-a"), 0);
+		tracker.observe(bashStart("npm test", "call-b"), 1);
+		expect(tracker.toolInFlight()!.command).toBe("npm test");
+		tracker.observe(end("call-b"), 2);
+		expect(tracker.toolInFlight()!.command).toBe(WAIT_COMMAND);
+		tracker.observe(end("call-a"), 3);
+		expect(tracker.toolInFlight()).toBeUndefined();
+	});
+
+	test("an id-less end for a non-bash tool does not clear an id-less in-flight bash call", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		tracker.observe({ type: "tool_execution_start", toolName: "bash", args: { command: "npm test" } }, 0);
+		expect(tracker.toolInFlight()).toBeDefined();
+		tracker.observe({ type: "tool_execution_end", toolName: "read" }, 1);
+		expect(tracker.toolInFlight()).toBeDefined();
+		tracker.observe({ type: "tool_execution_end", toolName: "bash" }, 2);
+		expect(tracker.toolInFlight()).toBeUndefined();
+	});
+
+	test("an id-less end with no toolName clears an id-less in-flight bash call", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		tracker.observe({ type: "tool_execution_start", toolName: "bash", args: { command: "npm test" } }, 0);
+		tracker.observe({ type: "tool_execution_end" }, 1);
+		expect(tracker.toolInFlight()).toBeUndefined();
+	});
+});
+
+describe("progress detail redacts credentials that only appear as quoted values inside serialized JSON args", () => {
+	test("redacts a quoted secret inside a non-bash tool's args before JSON-serializing them, through the observed progress detail", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		const observation = tracker.observe(
+			start("watch", { command: 'watch echo password="two words secret"' }, "call-secret"),
+			0,
+		);
+		for (const rendered of [observation.detail, tracker.lastProgressDetail]) {
+			expect(rendered).not.toContain("words");
+			expect(rendered).not.toContain("secret");
+		}
+	});
+
+	test("the leak does not resurface through an inactivity warning or describeExpiry text", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		tracker.observe(start("watch", { command: 'watch echo password="two words secret"' }, "call-secret"), 0);
+		const warning = tracker.check(23 * minute).warnings[0];
+		const expiry = tracker.describeExpiry("inactivity", "lead", 30 * minute);
+		for (const rendered of [warning.text, expiry]) {
+			expect(rendered).not.toContain("words");
+			expect(rendered).not.toContain("secret");
+		}
+	});
+
+	test("redacts quoted secrets nested inside array/object args, not just top-level string args", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		const observation = tracker.observe(
+			start("multiEdit", { edits: [{ command: 'echo token="a b c"' }] }, "call-nested"),
+			0,
+		);
+		expect(observation.detail).not.toContain("a b c");
+	});
+});
+
+describe("redactDeep fails closed on credential-shaped keys, over-deep nesting, and oversized structures", () => {
+	test("redacts a credential-shaped key's value outright, regardless of type", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		const observation = tracker.observe(
+			start("someTool", { password: "EXPOSED" }, "call-key"),
+			0,
+		);
+		expect(observation.detail).not.toContain("EXPOSED");
+		expect(observation.detail).toContain("[REDACTED]");
+	});
+
+	test("a credential key deeply nested (10 levels) never leaks its value through progress detail", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		const deep = { a: { b: { c: { d: { e: { f: { g: { h: { i: { j: { password: "two words EXPOSED" } } } } } } } } } } };
+		const observation = tracker.observe(start("someTool", deep, "call-deep"), 0);
+		for (const rendered of [observation.detail, tracker.lastProgressDetail]) {
+			expect(rendered).not.toContain("EXPOSED");
+			expect(rendered).not.toContain("words");
+		}
+	});
+});
+
+describe("bash command JSON-style credential keys are redacted everywhere the command surfaces", () => {
+	for (const [label, padding] of [["unpadded", ""], ["padded past 100KiB", "x".repeat(100 * 1024)]] as const) {
+		test(`echo '{"password":"EXPOSED"}' (${label}) never leaks EXPOSED via progress detail, check() warnings, describeExpiry, or toolInFlight().command`, () => {
+			const tracker = new DispatchProgressTracker(leadPolicy, 0);
+			const command = `echo '{"password":"EXPOSED"}' ${padding}`;
+			const observation = tracker.observe(bashStart(command), 0);
+			const warning = tracker.check(23 * minute).warnings[0];
+			const expiry = tracker.describeExpiry("inactivity", "lead", 30 * minute);
+			const inFlightCommand = tracker.toolInFlight()?.command ?? "";
+			for (const rendered of [observation.detail, tracker.lastProgressDetail, warning.text, expiry, inFlightCommand]) {
+				expect(rendered).not.toContain("EXPOSED");
+			}
+		});
+	}
+});

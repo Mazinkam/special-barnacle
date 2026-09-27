@@ -1,4 +1,6 @@
 import { METHOD } from "./models.ts";
+import { extractCiRefs, isWaitCommand, type CiRef } from "./core/wait-stall.ts";
+import { isCredentialName, redactCredentials, sanitizeControlChars } from "./core/text-safety.ts";
 
 const DEFAULT_DISPATCH_TIMEOUT_MS = 20 * 60 * 1000;
 const DEFAULT_LEAD_INACTIVITY_TIMEOUT_MS = 20 * 60 * 1000;
@@ -193,13 +195,67 @@ function assistantContent(message: Record<string, unknown>): string {
 		.join("");
 }
 
+/**
+ * Recursively redacts every string leaf of `value` (bounded to 8 levels of
+ * nesting — plenty for tool-args shapes, and enough to stop a maliciously
+ * deep/cyclic-looking structure from doing unbounded work). Applied to tool
+ * args BEFORE `stableJson`/`JSON.stringify` below: serializing first and
+ * redacting the resulting string second would turn a value's `"` into `\"`,
+ * which the quoted-value patterns in `redactCredentials` no longer
+ * recognize as a quote — so `{command: 'echo password="two words secret"'}`
+ * would serialize to `password=\"two words secret\"` and the unquoted-value
+ * fallback would only eat up to the first space, leaking "words secret".
+ * Redacting the raw string leaves first means the quotes `redactCredentials`
+ * sees are still real, unescaped quotes.
+ *
+ * Fails closed in two further ways, so a value can never survive this walk
+ * raw and unaccounted-for:
+ * - an object KEY that is itself credential-shaped (`isCredentialName`, the
+ *   same TOKEN/SECRET/PASSWORD/... name set `redactCredentials` uses) has its
+ *   value replaced with `"[REDACTED]"` outright, regardless of the value's
+ *   type (string, number, nested object, ...) — a credential must not
+ *   survive just because it happens to be a number or an object;
+ * - anything at or beyond the depth cap is replaced with `"[TRUNCATED]"`
+ *   rather than returned as-is, and both arrays and objects are bounded to
+ *   their first 50 entries, so a hostile deeply-nested/oversized structure
+ *   can never be handed back unredacted or used to do unbounded work.
+ */
+const REDACT_DEEP_MAX_DEPTH = 8;
+const REDACT_DEEP_MAX_ENTRIES = 50;
+
+function redactDeep(value: unknown, depth = 0): unknown {
+	if (depth > REDACT_DEEP_MAX_DEPTH) return "[TRUNCATED]";
+	if (typeof value === "string") return redactCredentials(value);
+	if (Array.isArray(value)) {
+		return value.slice(0, REDACT_DEEP_MAX_ENTRIES).map((item) => redactDeep(item, depth + 1));
+	}
+	if (value && typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		return Object.fromEntries(
+			Object.entries(record)
+				.slice(0, REDACT_DEEP_MAX_ENTRIES)
+				.map(([key, val]) => [key, isCredentialName(key) ? "[REDACTED]" : redactDeep(val, depth + 1)]),
+		);
+	}
+	return value;
+}
+
 function detailForTool(toolName: string, args: unknown): string {
 	let rendered: string;
-	if (typeof args === "string") rendered = args;
-	else if (Array.isArray(args) && args.every((arg) => typeof arg === "string")) rendered = args.join(" ");
+	if (typeof args === "string") rendered = redactCredentials(args);
+	else if (Array.isArray(args) && args.every((arg) => typeof arg === "string")) rendered = args.map((arg) => redactCredentials(arg)).join(" ");
 	else if (args === undefined || args === null) rendered = "";
-	else rendered = stableJson(args);
-	const detail = rendered ? `${toolName} ${rendered}` : toolName;
+	// Redact string leaves BEFORE JSON-serializing (see `redactDeep`'s doc
+	// comment) so a quoted credential inside a serialized object/array value
+	// is redacted while its quotes are still real quotes, not `\"`.
+	else rendered = stableJson(redactDeep(args));
+	const raw = rendered ? `${toolName} ${rendered}` : toolName;
+	// Redact again over the fully-assembled string (belt-and-suspenders: catches
+	// anything redactDeep's string-leaf walk couldn't reach, e.g. credentials
+	// spanning a key name and its value), then escape any control byte
+	// (ESC/CR/LF) before this text is retained as `progressDetail` or surfaced
+	// in a warning/expiry message (core/text-safety.ts).
+	const detail = sanitizeControlChars(redactCredentials(raw));
 	return detail.length > 200 ? `${detail.slice(0, 197)}…` : detail;
 }
 
@@ -208,6 +264,52 @@ function formatDuration(ms: number): string {
 	if (durationMs < 60_000) return `${Math.round(durationMs / 1000)}s`;
 	return `${Math.max(1, Math.round(durationMs / 60_000))}min`;
 }
+
+/** Cap on a stored/reported in-flight bash command, applied after redaction. */
+const TOOL_IN_FLIGHT_COMMAND_LIMIT = 2000;
+
+/** Cap on the command preview embedded in a warning/expiry message. */
+const TOOL_IN_FLIGHT_PREVIEW_LIMIT = 120;
+
+/**
+ * Sanitize and cap a bash command before it is retained as "in flight":
+ * `redactCredentials` (core/text-safety.ts) first, so a secret never sits in
+ * memory/warnings/expiry text longer than necessary, then
+ * `sanitizeControlChars` so an ESC/CR/LF byte in the raw command can never
+ * forge terminal output or inject a fake Markdown heading into a rendered
+ * warning, then the 2000-char cap.
+ */
+function sanitizeToolInFlightCommand(command: string): string {
+	const safe = sanitizeControlChars(redactCredentials(command));
+	return safe.length > TOOL_IN_FLIGHT_COMMAND_LIMIT
+		? safe.slice(0, TOOL_IN_FLIGHT_COMMAND_LIMIT)
+		: safe;
+}
+
+/** A short, already-sanitized preview for embedding in a warning/expiry message. */
+function previewToolInFlightCommand(command: string): string {
+	return command.length > TOOL_IN_FLIGHT_PREVIEW_LIMIT
+		? `${command.slice(0, TOOL_IN_FLIGHT_PREVIEW_LIMIT - 1)}\u2026`
+		: command;
+}
+
+export interface ToolInFlight {
+	name: string;
+	command: string;
+	/** True when the raw (pre-redaction) command matched `isWaitCommand` — a poll/watch loop. */
+	waitPattern?: boolean;
+	/** CI pipeline/run references extracted from the raw (pre-redaction) command. */
+	ciRefs?: CiRef[];
+}
+
+interface ToolInFlightRecord extends ToolInFlight {
+	toolCallId?: string;
+}
+
+/** Map key for a bash tool call that started without a `toolCallId`. Only one
+ *  such call can be tracked "in flight" at a time (see `bashInFlightById`'s
+ *  doc comment); a fresh id-less bash start replaces whatever was there. */
+const NO_TOOL_CALL_ID_KEY = "\u0000no-tool-call-id";
 
 export class DispatchProgressTracker {
 	private readonly policy: DispatchTimeoutPolicy;
@@ -219,6 +321,18 @@ export class DispatchProgressTracker {
 	private readonly toolCallsById = new Map<string, ToolCallRecord>();
 	private mostRecentToolCall?: ToolCallRecord;
 	private repeatedToolCallCount = 0;
+	/**
+	 * Bash tool calls currently "in flight", keyed by `toolCallId` (or
+	 * `NO_TOOL_CALL_ID_KEY` for a call that started without one) and kept in
+	 * insertion order (a JS `Map`'s iteration order is its insertion order,
+	 * and a `delete`-then-`set` on an existing key moves it to the end, exactly
+	 * like `toolCallsById` above). `tool_execution_end` removes only the entry
+	 * whose `toolCallId` matches; an end WITHOUT a `toolCallId` may only clear
+	 * the id-less slot, and only when that end's own `toolName` is bash (or
+	 * absent) — an id-less end for a different, non-bash tool must never
+	 * clear an id-less bash call that is still genuinely running.
+	 */
+	private readonly bashInFlightById = new Map<string, ToolInFlightRecord>();
 	private readonly workers = new Map<string, NestedWorkerSnapshot>();
 	private readonly evictedWorkerIds = new Set<string>();
 	private inactivityWarningFired = false;
@@ -240,6 +354,26 @@ export class DispatchProgressTracker {
 
 	get repeatedToolCalls(): number {
 		return this.repeatedToolCallCount;
+	}
+
+	/**
+	 * The most recently started bash tool call that has not yet ended (by
+	 * `toolCallId`), sanitized and length-capped. `undefined` once that call's
+	 * matching `tool_execution_end` has been observed, or when nothing bash-like
+	 * is currently in flight. Observational only — never affects what counts as
+	 * progress.
+	 */
+	toolInFlight(): ToolInFlight | undefined {
+		const record = this.currentBashRecord();
+		if (!record) return undefined;
+		return { name: record.name, command: record.command, waitPattern: record.waitPattern, ciRefs: record.ciRefs };
+	}
+
+	/** The insertion-order-last (i.e. most recently started) still-active bash record, if any. */
+	private currentBashRecord(): ToolInFlightRecord | undefined {
+		let last: ToolInFlightRecord | undefined;
+		for (const record of this.bashInFlightById.values()) last = record;
+		return last;
 	}
 
 	observe(event: unknown, now: number): ProgressObservation {
@@ -273,16 +407,53 @@ export class DispatchProgressTracker {
 						}
 					}
 					this.mostRecentToolCall = record;
+					if (value.toolName.toLowerCase() === "bash") {
+						const args = value.args;
+						const command = args && typeof args === "object" && !Array.isArray(args)
+							? (args as Record<string, unknown>).command
+							: undefined;
+						if (typeof command === "string" && command.length > 0) {
+							// Wait-detection and CI-ref extraction run against the RAW command,
+							// never the redacted/capped preview retained below — a secret
+							// substring landing inside a `sleep`/`glab` argument must not be
+							// able to change whether this looks like a wait loop, and a CI id
+							// past the redacted preview's cap must still be found.
+							const key = record.toolCallId ?? NO_TOOL_CALL_ID_KEY;
+							this.bashInFlightById.delete(key);
+							this.bashInFlightById.set(key, {
+								toolCallId: record.toolCallId,
+								name: value.toolName,
+								command: sanitizeToolInFlightCommand(command),
+								waitPattern: isWaitCommand(command),
+								ciRefs: extractCiRefs(command),
+							});
+							if (this.bashInFlightById.size > TOOL_CALL_RECORD_LIMIT) {
+								const oldestKey = this.bashInFlightById.keys().next().value;
+								if (oldestKey !== undefined) this.bashInFlightById.delete(oldestKey);
+							}
+						}
+					}
 					const detail = detailForTool(value.toolName, value.args);
 					return counted ? this.progress(detail, now) : { kind: "loop", detail };
 				}
 				case "tool_execution_end": {
 					const toolCallId = typeof value.toolCallId === "string" ? value.toolCallId : undefined;
+					const endToolName = typeof value.toolName === "string" ? value.toolName : undefined;
 					const record = toolCallId === undefined
 						? this.mostRecentToolCall
 						: this.toolCallsById.get(toolCallId);
 					if (toolCallId !== undefined) this.toolCallsById.delete(toolCallId);
 					else if (record?.toolCallId !== undefined) this.toolCallsById.delete(record.toolCallId);
+					if (toolCallId !== undefined) {
+						this.bashInFlightById.delete(toolCallId);
+					} else if (endToolName === undefined || endToolName.toLowerCase() === "bash") {
+						// An id-less end may only clear the id-less slot when it is itself
+						// bash-shaped (or carries no toolName at all, in which case there is
+						// no basis to say it is NOT the bash call); an id-less end for a
+						// clearly different, non-bash tool must never clear a still-running
+						// id-less bash call.
+						this.bashInFlightById.delete(NO_TOOL_CALL_ID_KEY);
+					}
 					if (value.isError === true) return { kind: "heartbeat", detail: "tool execution failed" };
 					if (!record || !record.counted || record.completed) {
 						return { kind: "heartbeat", detail: "tool execution ended without counted work" };
@@ -473,9 +644,10 @@ export class DispatchProgressTracker {
 		const warnings: TimeoutWarning[] = [];
 		if (this.policy.mode === "lead" && !this.inactivityWarningFired && inactiveMs >= this.policy.inactivityMs * 0.75) {
 			this.inactivityWarningFired = true;
+			const waitHint = this.waitStallHint();
 			warnings.push({
 				kind: "inactivity",
-				text: `⚠ no meaningful progress for ${formatDuration(inactiveMs)} (limit ${formatDuration(this.policy.inactivityMs)}; ${formatDuration(inactivityRemaining)} remaining; raise HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS) — last: ${this.progressDetail}`,
+				text: `⚠ no meaningful progress for ${formatDuration(inactiveMs)} (limit ${formatDuration(this.policy.inactivityMs)}; ${formatDuration(inactivityRemaining)} remaining; raise HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS) — last: ${this.progressDetail}${waitHint ? ` — ${waitHint}` : ""}`,
 			});
 		}
 		if (!this.absoluteWarningFired && elapsedMs >= this.policy.absoluteMs * 0.9) {
@@ -504,7 +676,25 @@ export class DispatchProgressTracker {
 			return `dispatch exceeded absolute ceiling ${formatDuration(this.policy.absoluteMs)} (capability=${capabilityLabel})`;
 		}
 		const inactiveForMs = Math.max(0, now - this.progressAt);
-		return `dispatch timed out after ${formatDuration(this.policy.inactivityMs)} without meaningful progress (last progress: ${this.progressDetail} ${formatDuration(inactiveForMs)} ago; capability=${capabilityLabel})`;
+		const waitHint = this.waitStallHint();
+		const base = `dispatch timed out after ${formatDuration(this.policy.inactivityMs)} without meaningful progress (last progress: ${this.progressDetail} ${formatDuration(inactiveForMs)} ago; capability=${capabilityLabel})`;
+		return waitHint ? `${base} — ${waitHint}` : base;
+	}
+
+	/**
+	 * When a bash tool call is currently in flight and its command matches
+	 * `isWaitCommand` (a poll/watch loop — e.g. the incident command
+	 * `for i in $(seq 1 40); do glab ci get -p 219469; sleep 60; done`), returns a
+	 * hint that the inactivity the watchdog is seeing is most likely the lead
+	 * legitimately blocked on that wait command, not a stuck process. `undefined`
+	 * for any other in-flight tool (or none), leaving the base warning/expiry
+	 * text unchanged.
+	 */
+	private waitStallHint(): string | undefined {
+		const inFlight = this.currentBashRecord();
+		if (!inFlight || !inFlight.waitPattern) return undefined;
+		const preview = previewToolInFlightCommand(inFlight.command);
+		return `the lead appears to be blocked waiting (e.g. on CI) in a wait loop (\`${preview}\`); leads must not block on CI — list it under "## Pending external checks" in the final report instead; raising HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS is only a stopgap`;
 	}
 
 	private progress(detail: string, now: number): ProgressObservation {

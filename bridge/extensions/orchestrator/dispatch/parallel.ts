@@ -269,6 +269,7 @@ export async function dispatchParallel(
 				stopReason: r.stopReason,
 				outcome: r.outcome,
 				timeoutReason: r.timeoutReason,
+				toolInFlight: r.toolInFlight,
 				interruption: r.interruption,
 				// parseFilesChanged scrapes the child's prose, so a read-only reviewer
 				// or QA agent would "report" every path it merely mentioned.

@@ -169,6 +169,26 @@ describe("runSubagentProcess process/event handling", () => {
 		expect(result.outcome).toBe("timed_out");
 		expect(result.timeoutReason).toBe("inactivity");
 		expect(result.stderr).toContain("UNVERIFIED PARTIAL WORK — inactivity");
+		expect(result.toolInFlight).toBeUndefined();
+	});
+
+	test("a lead killed by inactivity mid-bash-wait-loop carries the in-flight command as toolInFlight", async () => {
+		const result = await runLead(
+			`process.stdout.write(JSON.stringify({type:"tool_execution_start",toolName:"bash",toolCallId:"call-1",args:{command:"for i in $(seq 1 40); do glab ci get -p 219469; sleep 60; done"}})+"\\n");setInterval(()=>{},1000);`,
+			"wait-loop-lead",
+			{ inactivityMs: 600, maxMs: 3000 },
+		);
+
+		expect(result.exitCode).toBe(124);
+		expect(result.outcome).toBe("timed_out");
+		expect(result.timeoutReason).toBe("inactivity");
+		expect(result.toolInFlight).toEqual({
+			name: "bash",
+			command: "for i in $(seq 1 40); do glab ci get -p 219469; sleep 60; done",
+			waitPattern: true,
+			ciRefs: [{ provider: "gitlab", kind: "pipeline", id: "219469" }],
+		});
+		expect(result.stderr).toContain("blocked waiting");
 	});
 
 	test("looping lead reports repeated tool calls before inactivity timeout", async () => {

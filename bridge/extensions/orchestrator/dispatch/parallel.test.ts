@@ -227,3 +227,38 @@ describe("capability persona overrides", () => {
 		expect(agentNameFor("implementation_strong")).toBe("orch-implementation-strong");
 	});
 });
+
+describe("toolInFlight pass-through", () => {
+	test("carries the child process's toolInFlight onto the returned DispatchResult", async () => {
+		const base = {
+			exitCode: 124, stdout: "", finalText: "", rawStdout: "", personaCanMutate: false, stderr: "",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			costUsd: 0, costReported: false, durationMs: 1, processExitCode: 124,
+			outcome: "timed_out" as const, timeoutReason: "inactivity" as const,
+			toolInFlight: { name: "bash", command: "for i in $(seq 1 40); do glab ci get -p 219469; sleep 60; done" },
+		};
+		const [result] = await dispatchParallel(process.cwd(), "run", [{ capability: "lead", task: "t", taskId: "run-lead" }],
+			{ lead: { model: "provider/model" } }, {} as never, null, 0, {
+				recordEvent: () => {},
+				maxConcurrentDispatches: 5,
+				runProcess: async () => base,
+			});
+		expect(result.toolInFlight).toEqual(base.toolInFlight);
+	});
+
+	test("leaves toolInFlight undefined when the child process did not report one", async () => {
+		const base = {
+			exitCode: 0, stdout: "", finalText: "", rawStdout: "", personaCanMutate: false, stderr: "",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			costUsd: 0, costReported: false, durationMs: 1, processExitCode: 0,
+			outcome: "completed" as const,
+		};
+		const [result] = await dispatchParallel(process.cwd(), "run", [{ capability: "lead", task: "t", taskId: "run-lead" }],
+			{ lead: { model: "provider/model" } }, {} as never, null, 0, {
+				recordEvent: () => {},
+				maxConcurrentDispatches: 5,
+				runProcess: async () => base,
+			});
+		expect(result.toolInFlight).toBeUndefined();
+	});
+});
