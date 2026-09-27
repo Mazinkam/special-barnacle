@@ -136,6 +136,13 @@ export interface RunReport {
 		notRunReason: string | null;
 		hasUnknownCost: boolean;
 	};
+	/**
+	 * A6/N2: `core/live-tree.ts`'s `outOfTreeChangesSummaryLine` output for this run, pre-rendered
+	 * so this module never has to depend on `pipeline/*`. `null` on every run where no lead claimed
+	 * a file change the run's own git tree couldn't confirm — i.e. every run before this feature,
+	 * and the overwhelming majority of runs after it, get byte-identical summary output.
+	 */
+	outOfTreeChangesLine: string | null;
 }
 
 /**

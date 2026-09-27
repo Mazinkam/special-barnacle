@@ -23,10 +23,14 @@
  * `deps` instead, same as `pipeline/hierarchy.ts` and `pipeline/verify-loop.ts`.
  */
 import type { ExtensionContext } from "@humain/terminal";
-import { resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { OrchestrateArgs } from "../core/args.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
+import { detectLiveExtensionTree, detectOutOfTreeChanges, outOfTreeChangesSummaryLine, type LiveTreeSeams } from "../core/live-tree.ts";
 import { complexityNeedsArchitect, type DispatchTask, type PlanResponse } from "../core/prompts.ts";
 import type { RunReport } from "../core/report.ts";
 import type { TriageResult } from "../core/triage.ts";
@@ -143,6 +147,68 @@ export function warnTelemetry(ctx: ExtensionContext, report: FlushReport): void 
 }
 
 /**
+ * A6/N2: the real (impure) `git rev-parse --show-toplevel` / realpath edge `detectLiveExtensionTree`
+ * (core/live-tree.ts) needs. Kept tiny and inlined here — never exported, never unit-tested
+ * directly — specifically so core/live-tree.ts's own tests never need a real repo: they inject
+ * their own `LiveTreeSeams` fixtures instead. Any failure here (not a git work tree, `git`
+ * missing, permission error) resolves to `null`, which `detectLiveExtensionTree` already treats
+ * as "skip silently".
+ */
+const REAL_LIVE_TREE_SEAMS: LiveTreeSeams = {
+	gitToplevel: (path) => {
+		try {
+			const result = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: path, encoding: "utf-8", timeout: 10_000 });
+			if (result.status !== 0) return null;
+			const top = result.stdout.trim();
+			return top || null;
+		} catch {
+			return null;
+		}
+	},
+	realpath: (path) => {
+		try {
+			return realpathSync(path);
+		} catch {
+			return null;
+		}
+	},
+};
+
+/**
+ * A6/N2: at run start (before any cost is spent), warn — loudly, but never block — when the
+ * orchestrator extension currently executing this run lives inside the very repo the run is
+ * about to dispatch leads against. A lead editing files under the extension's own directory
+ * would be rewriting the code driving this run mid-flight. `cwd` is the run's own working
+ * directory; the extension's own directory is derived from this module's `import.meta.url` (this
+ * file lives at `<extension dir>/pipeline/run-orchestration.ts`). Any git/realpath failure is
+ * swallowed here too, as a second line of defense on top of `detectLiveExtensionTree`'s own
+ * `null`-on-failure contract — this is a warn-only feature, never worth failing (or even noisily
+ * logging) a run over.
+ */
+function warnIfLiveExtensionTree(
+	cwd: string,
+	ctx: ExtensionContext,
+	session: RunSessionLike,
+	runId: string,
+	recordEvent: RunOrchestrationDeps["recordEvent"],
+): void {
+	try {
+		const extensionDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+		const match = detectLiveExtensionTree(cwd, extensionDir, REAL_LIVE_TREE_SEAMS);
+		if (!match) return;
+		const message =
+			`Live extension tree: this run's repo (${match.runRoot}) contains the orchestrator extension ` +
+			`currently executing it (${match.extensionRoot}). A dispatched lead editing files under the ` +
+			"extension's own directory can rewrite the code driving this very run. Continuing — this is a warning, not a block.";
+		session.log(message);
+		safeUi(() => ctx.ui.notify(message, "warning"));
+		recordEvent("live_extension_tree", { run_id: runId, repo_root: match.runRoot, extension_dir: match.extensionRoot });
+	} catch {
+		// Warn-only feature; any unexpected failure skips silently.
+	}
+}
+
+/**
  * Write the run's lead reports to `lead-report.md` and return whether the write actually
  * landed on disk. `RunReport.hasLeadReports`/`leadReportPath` must reflect this, not merely
  * "there was something to write": a write that throws or is rejected (diagnostics sealed) used
@@ -186,6 +252,10 @@ export async function runOrchestration(
 	claimed: RunContext<RunSessionLike>,
 	deps: RunOrchestrationDeps,
 ): Promise<RunOrchestrationResult> {
+	// A6/N2: warn (never block) when this run's own repo contains the orchestrator extension
+	// currently executing it — before any cost is spent, alongside the other run-start setup below.
+	warnIfLiveExtensionTree(cwd, ctx, session, runId, deps.recordEvent);
+
 	// -----------------------------------------------------------------
 	// A1 review fix: `scoped_leads`/`file_ownership`/`recon_before_architect` are efficiency
 	// switches this modular pipeline does not implement (core/records.ts's `scopedPhaseReports`
@@ -459,6 +529,30 @@ export async function runOrchestration(
 		return changed;
 	};
 	let allFiles = changedSince("lead phase", leadResults);
+
+	// A6/N2: leads claimed changing files, but this run's own git tree shows none of them — most
+	// often because a lead worked in a different git worktree/repo instead of this run's own tree.
+	// Warn-only: never blocks, never alters `allFiles`/QA scope. Reuses `allFiles` (just computed
+	// above) as the "observed" side rather than recomputing anything, and the union of every lead's
+	// own `filesChanged` (via `candidateOwnedFilesForLiveQa`, already used the same way below for
+	// the live-QA stage) as the "claimed" side.
+	const leadClaimedFiles = candidateOwnedFilesForLiveQa(leadResults);
+	const outOfTreeChanges = detectOutOfTreeChanges({
+		claimedFiles: leadClaimedFiles,
+		observedFiles: allFiles,
+		leadTexts: leadResults.map((r) => r.stdout),
+		runRoot: repoRoot,
+	});
+	if (outOfTreeChanges.detected) {
+		const line = outOfTreeChangesSummaryLine(outOfTreeChanges) ?? "changes outside run tree: (unknown)";
+		session.log(`out-of-tree changes: ${line}`);
+		safeUi(() => ctx.ui.notify(`Warning: ${line} — lead(s) reported file changes not visible in this run's own repo.`, "warning"));
+		deps.recordEvent("out_of_tree_changes", {
+			run_id: runId,
+			foreign_path: outOfTreeChanges.foreignPath,
+			claimed_files: outOfTreeChanges.claimedFiles,
+		});
+	}
 
 	// Run outcome from the leads' own STATUS lines. All leads blocked =>
 	// BLOCKED: no QA, no PASS. Files git shows as changed while every
@@ -873,6 +967,7 @@ export async function runOrchestration(
 		runLogPath: describeRunArtifact(session.file("run.log")),
 		stateRoot: deps.stateRoot,
 		telemetryReport: telemetry,
+		outOfTreeChangesLine: outOfTreeChangesSummaryLine(outOfTreeChanges),
 		...(parsed.liveQa ? { liveQa: { stage: liveQaStageResult, notRunReason: liveQaNotRunReason, hasUnknownCost: liveQaHasUnknownCost } } : {}),
 	};
 	return { kind: "completed", report };
