@@ -58,7 +58,19 @@ export interface OrchestrateArgs {
 	withLastReply: boolean;
 	/** `--force`: skip the C7 "goal refers to missing context" pre-triage check. */
 	force: boolean;
-	/** Flags we did not recognize — reported instead of silently swallowed. */
+	/**
+	 * Final resolved live-QA request: true when `--live-qa` was given, or implied by
+	 * `--live-qa-scope` -- unless `--no-live-qa` was also given, which always wins regardless of
+	 * flag order. Never heuristically inferred from the goal text.
+	 */
+	liveQa: boolean;
+	/** Internal: `--no-live-qa` was given. Folded into `liveQa` at the end of `parseArgs`. */
+	liveQaOff: boolean;
+	/** `--live-qa-adapter <id>`, when given. */
+	liveQaAdapterId?: string;
+	/** `--live-qa-scope <scope>`; may be a double-quoted, multi-word value. */
+	liveQaScope?: string;
+	/** Flags we did not recognize -- reported instead of silently swallowed. */
 	unknownFlags: string[];
 }
 
@@ -95,6 +107,9 @@ export function parseArgs(args: string): OrchestrateArgs {
 		else goalTokens.push(...tokens.slice(span.start, span.end));
 	});
 	out.goal = goalTokens.join(" ");
+	// `--no-live-qa` always wins, regardless of flag order or how many times `--live-qa`/
+	// `--live-qa-scope` appeared.
+	if (out.liveQaOff) out.liveQa = false;
 	return out;
 }
 
@@ -112,6 +127,8 @@ function newOrchestrateArgs(): OrchestrateArgs {
 		contextFiles: [],
 		withLastReply: false,
 		force: false,
+		liveQa: false,
+		liveQaOff: false,
 		unknownFlags: [],
 	};
 }
@@ -141,6 +158,40 @@ function consumeFlag(tokens: string[], start: number, out: OrchestrateArgs): num
 			}
 			case "--with-last-reply": out.withLastReply = true; break;
 			case "--force": out.force = true; break;
+			case "--live-qa": out.liveQa = true; break;
+			case "--no-live-qa": out.liveQaOff = true; break;
+			case "--live-qa-adapter": if (next) { out.liveQaAdapterId = next; i++; } break;
+			case "--live-qa-scope": {
+				if (next === undefined) {
+					out.unknownFlags.push("--live-qa-scope (missing value)");
+					break;
+				}
+				if (next.startsWith('"')) {
+					// A double-quoted value may span multiple whitespace-split tokens ("a b c"). Scan
+					// forward for the token that ends with the closing quote; the opening token alone
+					// closing itself (length > 1, e.g. `"solo"`) is handled by starting the scan at `next`.
+					let j = i + 1;
+					let closed = tokens[j].length > 1 && tokens[j].endsWith('"');
+					while (!closed && j < tokens.length - 1) {
+						j++;
+						closed = tokens[j].endsWith('"');
+					}
+					if (!closed) {
+						out.unknownFlags.push(`--live-qa-scope ${tokens.slice(i + 1).join(" ")} (unterminated quoted value)`);
+						i = tokens.length - 1;
+						break;
+					}
+					const raw = tokens.slice(i + 1, j + 1).join(" ");
+					out.liveQaScope = raw.slice(1, -1);
+					out.liveQa = true;
+					i = j;
+					break;
+				}
+				out.liveQaScope = next;
+				out.liveQa = true;
+				i++;
+				break;
+			}
 			// Kept as a no-op for existing scripts: auto-approval is now the default.
 			case "--yes": case "-y": break;
 			case "--check": case "--live": out.check = true; break;
@@ -194,6 +245,7 @@ export function usageText(profilesPath: string): string {
 		"       [--profile NAME] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--frontier ALIAS] [--model <capability>=ALIAS] [--effort LEVEL]\n" +
 		"       [--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--interactive]\n" +
 		"       [--context FILE ...] [--with-last-reply] [--force]\n" +
+		"       [--live-qa | --no-live-qa] [--live-qa-adapter ID] [--live-qa-scope SCOPE]\n" +
 		"ALIAS is a short name (fable-5-1, opus-5-5, sonnet-5, gpt-6-sol, gpt-6-luna, astra) or provider/model. Profiles: " + profilesPath + "  (see /orchestrator-models)\n" +
 		"--context FILE (repeatable) and --with-last-reply attach material the goal refers to; goals that look like they refer to outside context without either are stopped before triage unless --force is given."
 	);

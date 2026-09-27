@@ -16,6 +16,7 @@
  * `commands/orchestrate.ts`'s catch block (B4.6 architecture-review note).
  */
 import { telemetryHealthy, telemetryWarning, type FlushReport } from "../record-queue.ts";
+import { composeVerificationVerdict, liveQaSummaryLines, type RunLiveQaStageResult } from "../live-qa-stage.ts";
 import { fmtElapsed } from "../run-ui.ts";
 
 export interface VerificationVerdictInput {
@@ -114,6 +115,15 @@ export interface RunReport {
 	stateRoot: string;
 	/** `completeRun`'s drain report, for `telemetryWarning`/`telemetryHealthy`. */
 	telemetryReport: FlushReport;
+	/**
+	 * Phase 3 opt-in Forge live-QA stage (T1): present only when `--live-qa`/`--live-qa-scope` was
+	 * given, so its verdict/summary stay byte-identical to a run that never requested it.
+	 */
+	liveQa?: {
+		stage: RunLiveQaStageResult | null;
+		notRunReason: string | null;
+		hasUnknownCost: boolean;
+	};
 }
 
 /**
@@ -123,7 +133,7 @@ export interface RunReport {
  * by the time this runs.
  */
 export function buildRunSummary(report: RunReport): { text: string; succeeded: boolean } {
-	const verdict = verificationVerdictFor({
+	let verdict = verificationVerdictFor({
 		blocked: report.blocked,
 		dispatchOk: report.dispatchOk,
 		verificationSkipped: report.verificationSkipped,
@@ -132,6 +142,22 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		verificationTimedOut: report.verificationTimedOut,
 		failedChecks: report.failedChecks,
 	});
+	let passedVerification = report.passedVerification;
+	// Phase 3 opt-in Forge live-QA stage (T1): never escalated/retried on, only ever reported —
+	// see `composeVerificationVerdict`'s own doc comment for the exact composition rules. Absent
+	// (`report.liveQa` undefined) on every run that never requested it, in which case `verdict`/
+	// `passedVerification` above are used completely unchanged.
+	if (report.liveQa) {
+		const stage = report.liveQa.stage;
+		const composed = composeVerificationVerdict(verdict, passedVerification, {
+			verdict: stage ? (stage.verdict === "not_requested" ? null : stage.verdict) : null,
+			required: stage?.required ?? false,
+			reasons: stage?.reasons ?? [],
+			sessionId: (stage?.outcomeRow?.session_id as string | null | undefined) ?? null,
+		});
+		verdict = composed.verdict;
+		passedVerification = composed.passedVerification;
+	}
 	const summary = [
 		`Orchestration ${report.blocked ? "BLOCKED" : report.dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(report.elapsedMs)}.`,
 		`run_id: ${report.runId}`,
@@ -141,6 +167,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		`verification: ${verdict}`,
 		`total cost: $${report.totalCostUsd.toFixed(4)} (${report.dispatchCount} dispatches${report.nestedCostUsd > 0 ? `; $${report.nestedCostUsd.toFixed(4)} of it in lead subagents` : ""})`,
 		...(report.dispatchOk ? [] : [`first failure: ${report.firstFailureLine}`]),
+		...(report.liveQa ? liveQaSummaryLines(report.liveQa.stage, report.liveQa.notRunReason, report.liveQa.hasUnknownCost) : []),
 		...(report.reportLines.length > 0
 			? ["", report.showFullReport ? "lead report:" : "open items from lead:", ...report.reportLines, ...(report.reportTruncated && report.hasLeadReports ? [`… full report: ${report.leadReportPath}`] : [])]
 			: report.hasLeadReports
@@ -153,6 +180,6 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 	const text = summary.join("\n");
 	// Whether the run is reported as a success in the notify and in chat must agree:
 	// a run whose verification failed is not "completed" just because dispatch succeeded.
-	const succeeded = (report.passedVerification || (report.dispatchOk && report.verificationSkipped)) && telemetryHealthy(report.telemetryReport);
+	const succeeded = (passedVerification || (report.dispatchOk && report.verificationSkipped)) && telemetryHealthy(report.telemetryReport);
 	return { text, succeeded };
 }

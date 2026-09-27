@@ -17,10 +17,75 @@
 import type { ExtensionContext } from "@humain/terminal";
 
 import type { Adapter } from "../adapters/adapter-resolver.ts";
+import { testedRevisionFor } from "../adapters/git-changes.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import { QA_SCOPE_RULES, repoRootGuardrail, type DispatchTask } from "../core/prompts.ts";
-import type { RunContext } from "../run/context.ts";
-import type { RunSession } from "../run/session.ts";
+import type { RunContext, RunSessionLike } from "../run/context.ts";
+
+export type CheckOutcome = "pass" | "fail" | "skipped" | "unavailable";
+
+export interface CheckResult {
+	id: string;
+	result: CheckOutcome;
+}
+
+/** Factual verification evidence attachable to a verification outcome row (Phase 1 item 5).
+ *  Every field defaults to "not observed" (empty/null), never a guess. */
+export interface VerificationEvidencePayload {
+	checks?: CheckResult[];
+	tested_revision?: string | null;
+	tested_revision_dirty?: boolean | null;
+	tested_revision_unavailable_reason?: string;
+	review_verdicts?: { role: string; verdict: string }[];
+	artifacts?: string[];
+	outcome_finality?: "immediate" | "delayed";
+}
+
+const CHECK_STATUS_WORDS: Record<string, CheckOutcome> = {
+	pass: "pass", passed: "pass", ok: "pass", "\u2713": "pass", "\u2714": "pass",
+	fail: "fail", failed: "fail", "\u2717": "fail", error: "fail",
+	skip: "skipped", skipped: "skipped", "n/a": "skipped", na: "skipped",
+	unavailable: "unavailable", blocked: "unavailable",
+};
+
+/**
+ * Every check the QA agent reported a status for -- pass, fail, skipped, or unavailable -- not
+ * just the failures `parseFailedChecks` extracts. Factual verification evidence (Phase 1 item 5)
+ * needs the full set, including checks the QA agent explicitly could not run, so a missing check
+ * reads as "not reported" rather than silently absent. The `environment` check name is special:
+ * `QA_SCOPE_RULES` tells the QA agent to report it as FAIL when a test command cannot run at all
+ * (missing interpreter/dependency/service) -- that is evidence the check was unavailable, not that
+ * the code under test failed, so it is normalized to `unavailable` here rather than left as `fail`.
+ */
+export function parseCheckResults(text: string): CheckResult[] {
+	const byId = new Map<string, CheckOutcome>();
+	const record = (idRaw: string, wordRaw: string) => {
+		const id = idRaw.trim();
+		if (!id) return;
+		const word = CHECK_STATUS_WORDS[wordRaw.trim().toLowerCase()];
+		if (!word) return;
+		byId.set(id, id.toLowerCase() === "environment" && word === "fail" ? "unavailable" : word);
+	};
+	const statusAlt = "pass(?:ed)?|fail(?:ed)?|skip(?:ped)?|unavailable|blocked|error|n\\/?a|\u2713|\u2714|\u2717";
+	const rowRe = new RegExp(`\\|\\s*([^|]+?)\\s*\\|\\s*[^|]*?\\b(${statusAlt})\\b[^|]*?\\|`, "gi");
+	let m: RegExpExecArray | null;
+	while ((m = rowRe.exec(text)) !== null) record(m[1], m[2]);
+	const bulletRe = new RegExp(`^[-*]\\s+(.+?):\\s*(${statusAlt})\\b`, "gim");
+	while ((m = bulletRe.exec(text)) !== null) record(m[1], m[2]);
+	return Array.from(byId, ([id, result]) => ({ id, result }));
+}
+
+/**
+ * T8: a claim recorded ALONGSIDE the gate verdict, never a replacement for it -- `passed` is
+ * computed exactly as before (`qaResult.exitCode === 0 && failedChecks.length === 0`), so an
+ * all-skipped QA run still passes the gate. `evidence_status` exists so a downstream reader never
+ * has to mistake "exited 0" for "something was actually checked".
+ */
+export function evidenceStatusFor(checks: CheckResult[]): "verified" | "unverified_checks_unavailable" {
+	return checks.length > 0 && checks.some((c) => c.result === "pass" || c.result === "fail")
+		? "verified"
+		: "unverified_checks_unavailable";
+}
 
 export interface VerificationResult {
 	passed: boolean;
@@ -39,12 +104,19 @@ export interface VerifyDeps {
 	captureDispatchCost: (
 		opts: CaptureOpts,
 		result: DispatchResult,
-		run: RunContext<RunSession> | null,
+		run: RunContext<RunSessionLike> | null,
 	) => Promise<void>;
 	recordOutcome: (outcome: Record<string, unknown>) => void;
 }
 
-export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality: number, note: string): Record<string, unknown> {
+export function qaVerificationOutcomeFor(
+	runId: string,
+	passed: boolean,
+	quality: number,
+	note: string,
+	evidence: VerificationEvidencePayload = {},
+): Record<string, unknown> {
+	const checks = evidence.checks ?? [];
 	return {
 		run_id: runId,
 		task_id: `${runId}-qa`,
@@ -52,6 +124,36 @@ export function qaVerificationOutcomeFor(runId: string, passed: boolean, quality
 		verification_scope: "run",
 		quality,
 		note,
+		// Factual verification evidence (Phase 1 item 5) -- additive fields alongside the existing
+		// pass/fail `outcome`/`quality`. Never a manufactured score: `checks` is exactly what the QA
+		// agent's own output reported, `tested_revision` is read from git, and anything not actually
+		// observed is recorded as null/empty plus an explicit reason, never guessed.
+		checks,
+		// Checks the QA agent could not evaluate at all (environment failures) or explicitly
+		// skipped, listed by id so a consumer never has to infer "unavailable" from a missing row.
+		checks_unavailable: checks.filter((c) => c.result === "unavailable" || c.result === "skipped").map((c) => c.id),
+		// T8: `outcome`/`quality`/`verification_scope` above are the GATE verdict and are deliberately
+		// UNCHANGED by this field -- an exit-0 QA dispatch whose checks are all `skipped`/`unavailable`
+		// (or that reported none at all) still passes the gate exactly as it did before.
+		// `evidence_status` records, alongside that verdict, whether any of it is backed by a check
+		// that actually ran to a pass/fail result.
+		evidence_status: evidenceStatusFor(checks),
+		// The QA agent's own free-text output has no structured field for the literal shell command
+		// each check ran -- only a check name and a pass/fail/skip word (see `parseCheckResults`).
+		// Recording a guessed command would be a fabrication; this stays explicitly null with a
+		// reason until the QA output format itself is extended to report commands.
+		check_commands: null,
+		check_commands_unavailable_reason: "QA agent output has no structured command field; only check name + pass/fail/skip status is parsed",
+		tested_revision: evidence.tested_revision ?? null,
+		tested_revision_dirty: evidence.tested_revision_dirty ?? null,
+		...(evidence.tested_revision_unavailable_reason ? { tested_revision_unavailable_reason: evidence.tested_revision_unavailable_reason } : {}),
+		review_verdicts: evidence.review_verdicts ?? [],
+		artifacts: evidence.artifacts ?? [],
+		// This row is the immediate verdict from the QA dispatch itself. A later signal about the
+		// same task (`reopened`/`regression`/`rollback`/`human_correction` on a subsequent outcomes
+		// row) is a separate row, not a rewrite of this one -- `outcome_finality` names which kind
+		// this is.
+		outcome_finality: evidence.outcome_finality ?? "immediate",
 	};
 }
 
@@ -245,7 +347,7 @@ export async function runVerification(
 	ctx: ExtensionContext,
 	/** The run this QA pass belongs to; threaded through to `deps.dispatch` and
 	 *  `deps.captureDispatchCost` instead of an implicit "active run" read (B4.4). */
-	run: RunContext<RunSession> | null,
+	run: RunContext<RunSessionLike> | null,
 	captureOpts: CaptureOpts,
 	deps: VerifyDeps,
 	/** The run's cwd, resolved absolute (docs/architecture-review.md C4): grounds the QA prompt in
@@ -294,7 +396,19 @@ export async function runVerification(
 	}
 	const passed = qaResult.exitCode === 0 && failedChecks.length === 0;
 
-	deps.recordOutcome(qaVerificationOutcomeFor(runId, passed, passed ? 0.95 : 0.0, out.slice(0, 2000)));
+	// Factual verification evidence (Phase 1 item 5): every check the QA agent reported a status
+	// for, plus the exact revision/working-tree state verification actually ran against -- both
+	// recorded alongside (never instead of) the pass/fail gate verdict above.
+	const checks = parseCheckResults(out);
+	const revision = testedRevisionFor(repoRoot);
+	deps.recordOutcome(qaVerificationOutcomeFor(runId, passed, passed ? 0.95 : 0.0, out.slice(0, 2000), {
+		checks,
+		tested_revision: revision.revision,
+		tested_revision_dirty: revision.dirty,
+		...(revision.unavailable_reason ? { tested_revision_unavailable_reason: revision.unavailable_reason } : {}),
+		review_verdicts: [{ role: "qa_agent", verdict: passed ? "pass" : "fail" }],
+		artifacts: [],
+	}));
 
 	return {
 		passed,

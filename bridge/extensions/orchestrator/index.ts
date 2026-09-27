@@ -29,6 +29,8 @@
 
 import { RunDiagnostics, type DiagnosticWriter } from "./run-diagnostics.ts";
 import { runLiveQaStage, type RunLiveQaStageResult } from "./live-qa-stage.ts";
+import { registerOrchestrateCommand, type OrchestrateDeps } from "./commands/orchestrate.ts";
+import { RunRegistry, type RunContext, type RunSessionLike } from "./run/context.ts";
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
 	appendFileSync,
@@ -1531,6 +1533,59 @@ export function activeRunForTest(): RunSession | null {
  *  by production code, which only ever assigns `ACTIVE_RUN` via the guarded paths above. */
 export function setActiveRunForTest(run: RunSession | null): void {
 	ACTIVE_RUN = run;
+}
+
+/**
+ * `/orchestrate`'s `RunRegistry` (A1 unification): `registerOrchestrateCommand`
+ * (commands/orchestrate.ts) claims/releases this registry instead of assigning `ACTIVE_RUN`
+ * directly, but every OTHER ACTIVE_RUN-reading seam in this file (`dispatchParallel`'s message
+ * draining, `checkModels`'s mutual-exclusion guard, the signal handler, `/orchestrate-cancel`,
+ * `/omsg`, the `orchestrator_status` tool) still reads the legacy module-scope singletons
+ * (`ACTIVE_RUN`/`CURRENT_RUN_TAGS`/`CURRENT_ALIAS_TABLE`) directly, unchanged. This subclass
+ * keeps both in sync: claiming/releasing through the registry also assigns/clears those
+ * singletons, exactly as the pre-unification inline handler did inline, so every legacy seam
+ * keeps working without having to be threaded onto `RunContext` itself in this pass. Every
+ * session this registry ever claims is, in practice, one of THIS file's own `RunSession`
+ * instances (via `deps.createSession` below) — the `as RunSession` cast reflects that invariant,
+ * not a runtime guess. */
+class SyncedRunRegistry extends RunRegistry<RunSessionLike> {
+	override claim(
+		session: RunSessionLike,
+		tags: RunTags = {},
+		aliasTable: AliasTable | null = null,
+		modelSources: Record<string, BindingSource> | null = null,
+	): RunContext<RunSessionLike> | null {
+		const claimed = super.claim(session, tags, aliasTable, modelSources);
+		if (claimed) {
+			ACTIVE_RUN = session as RunSession;
+			CURRENT_RUN_TAGS = tags;
+			CURRENT_ALIAS_TABLE = aliasTable;
+			CURRENT_MODEL_SOURCES = modelSources ?? {};
+		}
+		return claimed;
+	}
+	override release(context: RunContext<RunSessionLike>): void {
+		super.release(context);
+		if (ACTIVE_RUN === context.session) {
+			ACTIVE_RUN = null;
+			CURRENT_RUN_TAGS = {};
+			CURRENT_ALIAS_TABLE = null;
+			CURRENT_MODEL_SOURCES = {};
+		}
+	}
+}
+
+/** The one `RunRegistry` instance `/orchestrate` (commands/orchestrate.ts, via
+ *  `registerOrchestrateCommand`) claims for the run it is managing. */
+const runRegistry = new SyncedRunRegistry();
+
+/** Test seam: exposes the module's one production `RunRegistry` instance so a test can exercise
+ *  the mutual-exclusion guarantee `/orchestrate` and `checkModels` (`/orchestrator-models check`)
+ *  share — claiming it directly (standing in for "the other side is holding it") and then invoking
+ *  the other side's real handler/function, without having to run either one's full pipeline just
+ *  to reach its own claim boundary. Not used by production code. */
+export function runRegistryForTest(): RunRegistry<RunSessionLike> {
+	return runRegistry;
 }
 
 /** Render an `OrchestratorStatus` snapshot as plain text for chat/tool output. */
@@ -5592,10 +5647,23 @@ function goalExpectsInteraction(goal: string): boolean {
  * an unauthenticated provider or wrong-region alias fails here for cents
  * instead of mid-run for dollars. Judged on "the model answered as itself", not
  * on reply text: personas rewrite replies into report formats.
+ *
+ * Claims/releases through `runRegistry` — the SAME registry `/orchestrate`
+ * (commands/orchestrate.ts, via `registerOrchestrateCommand`) claims — rather than reading/
+ * writing `ACTIVE_RUN` directly (A1 review fix): before this, a probe here and a `/orchestrate`
+ * claim could race across the `await` in either path (one overwriting `ACTIVE_RUN` while the
+ * other still believed it owned it), and this function's `finally` cleared `ACTIVE_RUN`
+ * unconditionally, clobbering a newer run that had since claimed it. `runRegistry.claim()`
+ * atomically checks-and-sets against the one shared registry, and `release()` only clears state
+ * it still, by identity, owns (see `RunRegistry.release`'s doc) — exactly the guarantee
+ * `/orchestrate`'s own claim/release already had. Exported for direct test coverage of that
+ * mutual exclusion (index.test.ts), since exercising it through the real `/orchestrator-models
+ * check` command would require standing up a whole live-probe fixture just to reach this guard.
  */
-async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Promise<boolean> {
-	if (ACTIVE_RUN) {
-		ctx.ui.notify(`An orchestration is already running (${ACTIVE_RUN.runId}); try again when it finishes.`, "warning");
+export async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Promise<boolean> {
+	const alreadyActive = runRegistry.active();
+	if (alreadyActive) {
+		ctx.ui.notify(`An orchestration is already running (${alreadyActive.session.runId}); try again when it finishes.`, "warning");
 		return false;
 	}
 	const byModel = new Map<string, string[]>();
@@ -5603,7 +5671,18 @@ async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Pr
 		byModel.set(b.model, [...(byModel.get(b.model) ?? []), cap]);
 	}
 	const session = new RunSession(`model-check-${Date.now()}`, ctx, "model check");
-	ACTIVE_RUN = session;
+	// Re-check, same reasoning as /orchestrate's own claim (commands/orchestrate.ts): the guard
+	// above ran before `new RunSession` (no `await` in between today, but `claim()` re-checks
+	// regardless so this stays correct if that ever changes) — losing this race must not let two
+	// runs both believe they own the registry.
+	const claimed = runRegistry.claim(session);
+	if (!claimed) {
+		ctx.ui.notify(`An orchestration is already running (${runRegistry.active()!.session.runId}); try again when it finishes.`, "warning");
+		session.close();
+		await session.sealDiagnostics();
+		session.finish();
+		return false;
+	}
 	session.setPhase(`probing ${byModel.size} distinct model(s)`);
 	try {
 		const probes = await mapWithConcurrency([...byModel.entries()], MAX_CONCURRENT_DISPATCHES, async ([model, caps]) => {
@@ -5651,7 +5730,7 @@ async function checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Pr
 			session.close();
 			await session.sealDiagnostics(); // bounded drain; no terminal outcome means no seal
 		} finally {
-			ACTIVE_RUN = null;
+			runRegistry.release(claimed);
 			session.finish();
 		}
 	}
@@ -5821,29 +5900,6 @@ function installTelemetryDrain(pi: ExtensionAPI): void {
 	});
 }
 
-/**
- * Post a run's terminal outcome to the chat as a custom message, so the user sees it
- * even though `/orchestrate` returned long before the run settled. `sendMessage` can
- * throw after the session has moved on (e.g. a later shutdown); that failure is not
- * this run's problem to surface, so it is swallowed and logged instead.
- */
-function postRunMessage(
-	pi: ExtensionAPI,
-	runId: string,
-	outcome: "completed" | "failed" | "cancelled",
-	content: string,
-	costUsd: number,
-): void {
-	try {
-		pi.sendMessage(
-			{ customType: "orchestrator-run", content, display: true, details: { runId, outcome, costUsd } },
-			{ triggerTurn: false },
-		);
-	} catch (err) {
-		console.warn(`[orchestrator] could not post run ${runId} summary to chat: ${(err as Error)?.message ?? err}`);
-	}
-}
-
 export default function (pi: ExtensionAPI) {
 	reapOrphanedPersonaDirs();
 	installDispatchReaper();
@@ -5851,726 +5907,37 @@ export default function (pi: ExtensionAPI) {
 	installSessionIngest(pi);
 	registerOrchestratorStatusTool(pi);
 
-	pi.registerCommand("orchestrate", {
-		description:
-			"Plan and dispatch a hierarchical agent run. " +
-			"Args: <goal> [--task-class T] [--complexity N] [--risk low|medium|high|critical] " +
-			"[--profile NAME] [--lead-size small|standard|large] [--cheap ALIAS] [--mid ALIAS] [--premium ALIAS] [--frontier ALIAS] [--model <capability>=ALIAS] [--effort LEVEL] " +
-			"[--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--interactive]\n\n" +
-			"With no triage flags, an LLM triage call (cheapest configured model) " +
-			"auto-fills task_class, complexity, and risk from the goal text. " +
-			"Models: flags > profile (orchestrator-profiles.json) > cost-tier resolver. See /orchestrator-models.",
-		handler: async (args, ctx) => {
-			const parsed = parseArgs(args);
-			if (!parsed.goal) {
-				ctx.ui.notify(USAGE, "warning");
-				return;
-			}
-			if (parsed.unknownFlags.length > 0) {
-				ctx.ui.notify(`Unknown flag(s): ${parsed.unknownFlags.join(", ")}\n${USAGE}`, "error");
-				return;
-			}
-			if (ACTIVE_RUN) {
-				ctx.ui.notify(
-					`An orchestration is already running (${ACTIVE_RUN.runId}). Wait for it to finish; its log is ${ACTIVE_RUN.file("run.log")}.`,
-					"warning",
-				);
-				return;
-			}
-
-			// -----------------------------------------------------------------
-			// Step 0: resolve models. Done before anything is spent so a typo in
-			// --premium or the override file stops the run here, not after a
-			// 10-minute architect pass on the wrong model.
-			// -----------------------------------------------------------------
-			const resolved = await resolveAdapter(ctx, parsed.models);
-			const adapter = resolved.adapter;
-			const hasUserOverride = Object.values(resolved.sources).some((s) => s !== "dynamic" && s !== "fallback");
-			const overrideErrors = userLayerWarnings(resolved);
-			if (overrideErrors.length > 0 || resolved.profiles.problems.length > 0) {
-				ctx.ui.notify(
-					`Model configuration is invalid — nothing was dispatched:\n${[...resolved.profiles.problems, ...overrideErrors].map((w) => `- ${w}`).join("\n")}\n\nFix with /orchestrator-models set <capability|tier> <alias>, or /orchestrator-models list to see aliases.`,
-					"error",
-				);
-				return;
-			}
-			for (const w of resolved.warnings) ctx.ui.notify(w, "warning");
-			for (const n of resolved.profiles.notes) ctx.ui.notify(n, "info");
-
-			if (goalExpectsInteraction(parsed.goal)) {
-				ctx.ui.notify(
-					"Heads-up: dispatched agents run non-interactively and cannot ask you questions mid-run. " +
-						"They are instructed to make the conservative choice and list open questions in their final report, which is shown when the run completes.",
-					"warning",
-				);
-			}
-
-			const runId = `ht-orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-			const session = new RunSession(runId, ctx, parsed.goal);
-			// Re-check: the first guard above ran before the `await resolveAdapter` a few lines up,
-			// so a second /orchestrate invocation could have raced through that same window and
-			// already claimed ACTIVE_RUN by the time we get here. Losing this race must not let two
-			// sessions both believe they own ACTIVE_RUN, so re-check immediately before the write.
-			if (getActiveRun()) {
-				ctx.ui.notify(
-					`An orchestration is already running (${ACTIVE_RUN!.runId}). Wait for it to finish; its log is ${ACTIVE_RUN!.file("run.log")}.`,
-					"warning",
-				);
-				session.close();
-				await session.sealDiagnostics();
-				session.finish();
-				return;
-			}
-			ACTIVE_RUN = session;
-			CURRENT_RUN_TAGS = { profile: resolved.profileName, policy_id: policyIdFor(resolved.profileName, adapter) };
-			CURRENT_ALIAS_TABLE = resolved.table;
-			CURRENT_MODEL_SOURCES = resolved.sources;
-			recordRunStarted(runId, ctx.sessionManager?.getSessionFile?.() ?? null);
-			session.log(`policy: ${CURRENT_RUN_TAGS.policy_id}`);
-			session.log(`models (profile "${resolved.profileName}"):\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
-			for (const n of resolved.notes) session.log(`note: ${n}`);
-
-			// Everything from here on (triage, plan, dispatch, verification, completion)
-			// runs detached from the command handler: /orchestrate returns as soon as this
-			// promise is started, so the session stays responsive (queueing /omsg, checking
-			// orchestrator_status, issuing /orchestrate-cancel) while children run. The
-			// try/catch/finally below is the run's single cleanup point regardless of how
-			// it ends — success, failure, cancellation, or shutdown.
-			const runPromise = (async () => {
-			const cwd = process.cwd();
-			try {
-				// -----------------------------------------------------------------
-				// LLM triage: auto-fill missing task_class / complexity / risk via
-				// the cheapest available model. Skip when the user supplied all
-				// three explicitly; skip silently on any failure and use defaults.
-				// -----------------------------------------------------------------
-				const missingTriage =
-					parsed.taskClass === "implementation" && parsed.complexity === 5 && parsed.risk === "medium";
-				let effectiveTaskClass = parsed.taskClass;
-				let effectiveComplexity = parsed.complexity;
-				let effectiveRisk = parsed.risk;
-				let triageResult: TriageResult | null = null;
-				const triageCost = { usd: 0 };
-
-				if (missingTriage) {
-					session.setPhase(`triage on ${shortName(adapter.implementation_fast?.model ?? "?")}`);
-					triageResult = await triageTask(runId, parsed.goal, cwd, ctx, triageCost, adapter);
-					session.cancellation.throwIfCancelled();
-					if (triageResult) {
-						effectiveTaskClass = triageResult.task_class;
-						effectiveComplexity = triageResult.complexity;
-						effectiveRisk = triageResult.risk;
-						const proceed = await Promise.race([session.cancellation.wait(), confirmStep(
-							ctx,
-							"Triage filled in missing values",
-							`task_class: ${effectiveTaskClass}\n` +
-								`complexity:  ${effectiveComplexity}\n` +
-								`risk:        ${effectiveRisk}\n\n` +
-								`Reasoning: ${triageResult.reasoning}\n\n` +
-								`OK to plan with these values? (Cancel to abort)`,
-							parsed.interactive,
-						)]);
-						if (!proceed) {
-							const reason = parsed.interactive && !ctx.hasUI
-								? "interactive confirmation unavailable after triage"
-								: "cancelled by user after triage";
-							session.log(reason);
-							warnTelemetry(ctx, await failRun(runId, reason, session.terminalTiming(), session.telemetryBaseline));
-							ctx.ui.notify("Cancelled.", "info");
-							return;
-						}
-					} else {
-						ctx.ui.notify(
-							"Triage unavailable; using defaults task_class=implementation complexity=5 risk=medium. " +
-								`Details: ${session.file("triage.stderr.log")}`,
-							"warning",
-						);
-					}
-				}
-
-				// Step 1: Plan.
-				session.setPhase("planning topology + route", false);
-				let plan: PlanResponse;
-				try {
-					// Plan from the EFFECTIVE values. Passing `parsed.*` here threw away
-					// the triage verdict the operator had just confirmed, so every
-					// auto-triaged run planned as implementation/5/medium regardless.
-					plan = await planRun(runId, {
-						goal: parsed.goal,
-						taskClass: effectiveTaskClass,
-						complexity: effectiveComplexity,
-						risk: effectiveRisk,
-						qualityFloor: parsed.qualityFloor,
-						costAggressiveness: parsed.costAggressiveness,
-					});
-					session.cancellation.throwIfCancelled();
-				} catch (err) {
-					if (session.cancellation.isCancelled) throw err;
-					session.log(`plan failed: ${(err as Error).message}`);
-					warnTelemetry(ctx, await failRun(runId, `plan failed: ${(err as Error).message}`, session.terminalTiming(), session.telemetryBaseline));
-					ctx.ui.notify(`Plan failed: ${(err as Error).message}`, "error");
-					return;
-				}
-
-				// Lead sizing (method.json rules.lead_sizing): triage's complexity and
-				// risk pick lead_small / lead / lead_large; the profile binds each to
-				// a model through its tier. --lead-size overrides.
-				const leadDecision: LeadSizeDecision = sizeLead({
-					complexity: effectiveComplexity,
-					risk: effectiveRisk,
-					override: parsed.leadSize,
-					source: parsed.leadSize ? "flag" : triageResult ? "triage" : missingTriage ? "heuristic" : "flag",
-				});
-				const leadModel = adapter[leadDecision.capability]?.model ?? adapter.lead?.model ?? "unknown";
-				CURRENT_RUN_TAGS.lead_size = leadDecision.size;
-				recordEvent("lead_sized", {
-					run_id: runId,
-					complexity: effectiveComplexity,
-					risk: effectiveRisk,
-					band_size: leadDecision.bandSize,
-					risk_floor_size: leadDecision.riskFloorSize,
-					size: leadDecision.size,
-					capability: leadDecision.capability,
-					model: leadModel,
-					source: leadDecision.source,
-				});
-				session.log(`lead size: ${leadDecision.size} → ${leadDecision.capability} on ${leadModel} (source: ${leadDecision.source})`);
-
-				const needsArchitect = plan.topology.depth >= 2 && complexityNeedsArchitect(plan.complexity);
-				const leadCount = Number.isFinite(plan.topology.leads)
-					? Math.min(MAX_LEADS, Math.max(1, Math.trunc(plan.topology.leads)))
-					: 1;
-				const pipeline = [
-					...(needsArchitect ? [`architect (${shortName(adapter.architect?.model ?? "?")})`] : []),
-					`${leadCount} lead${leadCount > 1 ? "s" : ""} (${leadDecision.size}: ${shortName(leadModel)}) → workers (${shortName(adapter.worker?.model ?? "?")})`,
-					`qa (${shortName(adapter.qa_agent?.model ?? "?")})`,
-				].join(" → ");
-
-				const planSummary = [
-					`Plan ${plan.plan_id.slice(0, 12)} — "${parsed.goal.slice(0, 60)}${parsed.goal.length > 60 ? "…" : ""}"`,
-					`triage:   ${effectiveTaskClass} / complexity ${effectiveComplexity} / risk ${effectiveRisk}`,
-					`lead:     ${leadDecision.size} → ${shortName(leadModel)} (${leadDecision.source}; band ${leadDecision.bandSize}, risk floor ${leadDecision.riskFloorSize})`,
-					`topology: ${plan.topology.shape} depth=${plan.topology.depth} leads=${plan.topology.leads} workers=${plan.topology.workers}`,
-					`route:    ${plan.route.selected.capability} @ ${plan.route.selected.effort} (${plan.route.mode}); quality floor ${plan.effective_quality_floor}`,
-					`pipeline: ${pipeline}`,
-					`models (profile "${resolved.profileName}"${hasUserOverride ? "" : " is empty — cost-tier defaults; set with /orchestrator-models set"}):`,
-					...formatAdapterTable(resolved).map((l) => `  ${l}`),
-					`log:      ${session.file("run.log")}`,
-				];
-				ctx.ui.notify(planSummary.join("\n"), "info");
-				session.log(planSummary.join("\n"));
-
-				const proceed = await Promise.race([session.cancellation.wait(), confirmStep(
-					ctx,
-					"Dispatch this plan?",
-					`${pipeline}\n\nOrchestrating stages use an inactivity limit plus an absolute ceiling (leaf dispatches use a fixed timeout); live progress shows above the editor.`,
-					parsed.interactive,
-				)]);
-				session.cancellation.throwIfCancelled();
-				if (!proceed) {
-					const reason = parsed.interactive && !ctx.hasUI
-						? "interactive confirmation unavailable before dispatch"
-						: "cancelled by user at plan confirmation";
-					session.log(reason);
-					warnTelemetry(ctx, await failRun(runId, reason, session.terminalTiming(), session.telemetryBaseline));
-					ctx.ui.notify("Cancelled.", "info");
-					return;
-				}
-
-				// Step 2: Dispatch.
-				const captureOpts: CaptureOpts = {
-					runId,
-					planId: plan.plan_id,
-					taskClass: effectiveTaskClass,
-					complexity: effectiveComplexity,
-					risk: effectiveRisk,
-					recommended: {
-						capability: plan.route.recommended.capability,
-						effort: plan.route.recommended.effort,
-						verification_depth: plan.route.recommended.verification_depth,
-					},
-					mode: plan.route.mode,
-				};
-
-				recordEvent("dispatch_plan_confirmed", {
-					run_id: runId,
-					plan_id: plan.plan_id,
-					models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
-					model_sources: resolved.sources,
-					profile: resolved.profileName,
-					log_dir: session.dir,
-				});
-
-				const dirtyBefore = gitDirtySnapshot(cwd);
-				const headBefore = gitHead(cwd);
-				// `workerResults` carries the parent-owned recon dispatches; they must stay
-				// destructured here or the run stops billing them (plan Task 3).
-				const { leadResults, workerResults, architectResult, escalationResults, skippedLeads, leadTasks, scopedLeadPhaseResults } = await dispatchHierarchical(
-
-					cwd,
-					runId,
-					plan.plan_id,
-					parsed.goal,
-					plan,
-					adapter,
-					ctx,
-					leadDecision.capability,
-				);
-				session.cancellation.throwIfCancelled();
-
-				for (const r of leadResults) {
-					if (r.exitCode !== 0) {
-						ctx.ui.notify(
-							`Lead ${r.taskId.replace(`${runId}-`, "")} failed (exit ${r.exitCode}): ${summarizeStderr(r.stderr, 300) || "(no output)"}\nSee ${session.file(`${r.taskId}.stderr.log`)}`,
-							"warning",
-						);
-					}
-				}
-
-				// Step 3: Verification + escalation. We run QA against whatever files
-				// were touched so far. If QA fails, escalate per policy Rule 1. The loop
-				// is bounded by maxRetries.
-				// `filesChanged` is scraped from dispatch prose, so a report that merely
-				// MENTIONS README.md counted it as changed and sent QA after a phantom.
-				// In a Git workspace, include both commits made since the run began and
-				// dirty files whose content differs from the pre-run snapshot. Pre-existing
-				// untracked scratch files a report merely names are not sent to QA. Every
-				// round diffs against the same pre-run snapshot so the list is the
-				// cumulative set QA must cover. `roundResults` are the dispatches that
-				// just ran (used for the phantom log); `priorResults` widen the prose
-				// fallback when git is unavailable so lead files aren't dropped on retry.
-				let snapshotWarned = false;
-				const changedSince = (
-					label: string,
-					roundResults: DispatchResult[],
-					priorResults: DispatchResult[] = [],
-				): string[] => {
-					const roundClaimed = new Set(roundResults.flatMap((r) => r.filesChanged));
-					const claimed = new Set([...priorResults.flatMap((r) => r.filesChanged), ...roundClaimed]);
-					const dirtyAfter = gitDirtySnapshot(cwd);
-					if ((!dirtyBefore || !dirtyAfter) && !snapshotWarned) {
-						snapshotWarned = true;
-						session.log(
-							`git snapshot unavailable (${!dirtyBefore ? "before" : "after"} ${label}); falling back to file paths scraped from dispatch prose`,
-						);
-					}
-					const { changed, phantom, historyUnavailable } = changedFilesSinceRunStart(cwd, headBefore, dirtyBefore, claimed, dirtyAfter);
-					if (historyUnavailable) session.log(`${label}: git history unavailable; using claimed file paths`);
-					const roundPhantom = phantom.filter((f) => roundClaimed.has(f));
-					if (roundPhantom.length > 0) {
-						session.log(
-							`${label} named ${roundPhantom.length} file(s) not modified during this run; ignored: ${roundPhantom.join(", ")}`,
-						);
-					}
-					return changed;
-				};
-				let allFiles = changedSince("lead phase", leadResults);
-
-				// Run outcome from the leads' own STATUS lines. All leads blocked =>
-				// BLOCKED: no QA, no PASS. Files git shows as changed while every
-				// lead reports "Files Changed: None" belong to someone else (a
-				// concurrent session) and are excluded from this run's QA scope.
-				const leadStatuses = leadResults.map((r) => parseLeadStatus(r.stdout));
-				const runOutcome = classifyRunOutcome({
-					leadStatuses,
-					succeededLeads: leadResults.filter((r) => r.exitCode === 0).length,
-					leads: leadResults.length,
-				});
-				// Only when EVERY lead exited 0 and says it changed nothing: a lead that
-				// failed, timed out or hit the spend cap may have edited files it never
-				// got to report, and those must still be verified.
-				// `qaScopeEvidenceFor`: a scoped lead's final result may be a REPORT phase that
-				// correctly says "Files Changed: None" for itself while an earlier plan/integrate
-				// phase in the same chain made real edits (already unioned into `filesChanged`,
-				// see `finalizeScopedLeadResult`); classify from that union rather than only the
-				// final phase's prose, or those files are wrongly treated as changed by someone
-				// else and dropped from QA.
-				const externalFiles = runOutcome === "blocked"
-					? [...allFiles]
-					: externalChangeFiles(allFiles, qaScopeEvidenceFor(leadResults));
-				if (externalFiles.length > 0) {
-					session.log(
-						`${externalFiles.length} file(s) changed during the run but no lead reported changing them (likely a concurrent session); excluded from QA: ${externalFiles.join(", ")}`,
-					);
-					recordEvent("external_changes_detected", { run_id: runId, files: externalFiles, lead_statuses: leadStatuses });
-					allFiles = allFiles.filter((f) => !externalFiles.includes(f));
-				}
-				if (runOutcome === "blocked") {
-					session.log(`all ${leadResults.length} lead(s) reported STATUS: blocked; skipping QA`);
-					recordEvent("run_blocked", { run_id: runId, leads: leadResults.length });
-				}
-
-				let retries = 0;
-				let lastVerification: VerificationResult | null = null;
-				const verificationResults: DispatchResult[] = [];
-				while (runOutcome !== "blocked" && retries <= parsed.maxRetries) {
-					if (allFiles.length > 0) {
-						session.setPhase(
-							retries === 0
-								? `QA on ${allFiles.length} changed file(s) via ${shortName(adapter.qa_agent?.model ?? "?")}`
-								: `QA retry ${retries + 1}/${parsed.maxRetries + 1} on ${allFiles.length} changed file(s)`,
-						);
-					}
-					lastVerification = await runVerification(
-						cwd,
-						runId,
-						plan.plan_id,
-						allFiles,
-						adapter,
-						ctx,
-						captureOpts,
-					);
-					session.cancellation.throwIfCancelled();
-					if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
-					if (lastVerification.passed) break;
-
-					session.log(`verification failed: ${lastVerification.failedChecks.join(", ") || "(unparsed)"}`);
-					// Pair each lead's ORIGINAL dispatch task (goal/scope/model-routing
-					// prompt) with its own outcome so planEscalation can retry with the
-					// real prompt instead of the failed report (BUG 2), and can decide
-					// per-lead whether a retry is warranted instead of only ever
-					// retrying lead 0.
-					const leadsForEscalation: EscalationLeadInput[] = leadResults.map((r) => {
-						// A scoped-lead's final result may carry a `-plan`/`-integrate`/`-report` suffix
-						// instead of the bare lead task id; either form recovers the original prompt.
-						const task = leadTasks.find((t) => t.taskId === r.taskId || r.taskId.startsWith(`${t.taskId}-`)) ?? { capability: r.capability, task: r.stdout, taskId: r.taskId };
-						return { task, result: { exitCode: r.exitCode, stdout: r.stdout, filesChanged: r.filesChanged } };
-					});
-					const escalationTasks = planEscalation(
-						lastVerification.failedChecks,
-						leadsForEscalation,
-						plan.complexity,
-						plan.risk,
-						retries,
-						parsed.maxRetries,
-					);
-					if (escalationTasks.length === 0) break;
-
-					// Re-run escalations with bumped models (handled by pickModel when
-					// retryCount > 0 via adapter override). One or many retry tasks (one
-					// per retried lead) run sequentially here; each still gets its own
-					// adapter override for its own capability.
-					const roundStart = escalationResults.length;
-					for (const t of escalationTasks) {
-						const binding = adapter[t.capability] ?? adapter.worker;
-						const escalatedModel = pickModel(
-							t.capability,
-							adapter,
-							t.retryCount ?? 0,
-							plan.risk,
-						);
-						session.setPhase(
-							`escalation retry ${retries + 1}: ${t.capability} on ${shortName(escalatedModel)} — failed checks: ${lastVerification.failedChecks.slice(0, 3).join(", ")}`,
-						);
-						const escalatedSize = leadSizeOf(t.capability);
-						if (escalatedSize) {
-							CURRENT_RUN_TAGS.lead_size = escalatedSize;
-							recordEvent("lead_sized", {
-								run_id: runId,
-								complexity: effectiveComplexity,
-								risk: effectiveRisk,
-								band_size: leadDecision.bandSize,
-								risk_floor_size: leadDecision.riskFloorSize,
-								size: escalatedSize,
-								capability: t.capability,
-								model: escalatedModel,
-								source: "escalation",
-								retry: t.retryCount ?? 1,
-							});
-						}
-						const [retryResult] = await dispatchParallel(
-							cwd,
-							runId,
-							[t],
-							{
-								...adapter,
-								[t.capability]: { ...binding, model: escalatedModel },
-							},
-							ctx,
-						);
-						// Capture settled usage before cancellation unwinds this round, just
-						// as the architect, lead and QA paths do.
-						// dispatchParallel returns [] for an empty task list; billing an
-						// absent result wrote an all-"unknown" model_call for a dispatch
-						// that never happened.
-						if (retryResult) {
-							await captureDispatchCost(captureOpts, retryResult);
-							escalationResults.push(retryResult);
-						}
-						session.cancellation.throwIfCancelled();
-					}
-					retries++;
-					// The retry may have touched different files than the first lead
-					// pass (or reverted some). Re-QA against the tree as it stands now
-					// rather than the list computed before the loop, so escalation edits
-					// are verified and a stale list can't fail the run forever. This also
-					// runs after the final retry: finalize reports `allFiles`, and the
-					// post-escalation tree is the state worth reporting.
-					const thisRound = escalationResults.slice(roundStart);
-					allFiles = changedSince(`escalation retry ${retries}`, thisRound, [
-						...leadResults,
-						...escalationResults.slice(0, roundStart),
-					]).filter((f) => !externalFiles.includes(f));
-					if (allFiles.length === 0) {
-						// Nothing left to verify, but QA already failed this run. Re-running
-						// against an empty list would return `skipped: true` and record the
-						// run as passed; keep the failed verdict instead.
-						session.log(
-							`escalation retry ${retries} left no files differing from the pre-run tree; keeping the failed verification verdict`,
-						);
-						break;
-					}
-				}
-
-				// Step 4: Finalize.
-				// Total cost must cover EVERY dispatch this run paid for — architect,
-				// parent-owned recon workers, and escalations included. Summing leads
-				// alone under-reported spend, which is the one number the
-				// cost-optimisation policy is judged on.
-				const billedResults = collectBilledResults({
-					architectResult,
-					workerResults,
-					leadResults,
-					verificationResults,
-					escalationResults,
-					scopedLeadPhaseResults,
-				});
-				// Leads' own subagent calls are billed too: they were the bulk of real spend
-				// (ht-orch-1790256789245-1a3fms: $13.22 nested vs $1.56 reported).
-				const nestedCost = billedResults.reduce((s, r) => s + (r.nestedCostUsd ?? 0), 0);
-				let totalCost =
-					triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0) + nestedCost;
-				const succeededLeads = leadResults.filter((r) => r.exitCode === 0).length;
-				// A run that dispatched nothing, or whose every lead failed, has not
-				// verified anything — reporting the empty verification suite as PASS is
-				// how phantom runs looked green.
-				const dispatchOk = leadResults.length > 0 && succeededLeads > 0;
-				const verificationSkipped = lastVerification?.skipped ?? false;
-				let passedVerification = dispatchOk && (lastVerification?.passed ?? false);
-
-				// The generic gate's own verdict label, computed here (before the Phase 3 live-QA
-				// stage below) so `composeVerificationVerdict` has it to fall back to/extend.
-				const genericVerdictLabel = runOutcome === "blocked"
-					? "NOT RUN (blocked: every lead stopped at a stop condition or precondition)"
-					: !dispatchOk
-					? "NOT RUN (no lead succeeded)"
-					: verificationSkipped
-						? allFiles.length === 0
-							? "N/A (no files changed — report-only goal)"
-							: "SKIPPED (no files changed)"
-						: passedVerification
-							? "PASS"
-							: "FAIL";
-
-				// -----------------------------------------------------------------
-				// Step 3.5: Phase 3 opt-in Forge live-QA stage. Runs at most once, only when
-				// explicitly requested (--live-qa / --live-qa-scope), and only once the run is
-				// not blocked, dispatch succeeded, and the generic QA gate above passed — a
-				// live-QA runner is never spawned against a candidate whose generic
-				// verification already failed, was skipped, or never ran. Never escalated or
-				// retried on failure; only recorded.
-				//
-				// `changedFiles` handed to the live-QA checkpoint is deliberately the CANDIDATE-OWNED
-				// set (files this run's own leads/implementers claimed changing, `filesChanged`) --
-				// never `allFiles` (the broader git-dirty-detection set the generic QA gate above
-				// uses, which can also include a dirty path nobody in this run claimed touching, e.g.
-				// a concurrent process's own scratch file). `escalationResults` is included too: a
-				// retried lead's own claimed files are just as much this run's own work as the first
-				// pass's.
-				// -----------------------------------------------------------------
-				let liveQaStageResult: RunLiveQaStageResult | null = null;
-				let liveQaNotRunReason: string | null = null;
-				if (parsed.liveQa) {
-					if (runOutcome === "blocked") {
-						liveQaNotRunReason = "run was blocked";
-					} else if (!dispatchOk) {
-						liveQaNotRunReason = "dispatch did not succeed";
-					} else if (!passedVerification) {
-						liveQaNotRunReason = verificationSkipped
-							? "generic verification was skipped (no files changed)"
-							: "generic verification failed";
-					} else {
-						session.setPhase(
-							`live QA: requesting Forge focused run${parsed.liveQaAdapterId ? ` (adapter ${parsed.liveQaAdapterId})` : ""}`,
-						);
-						liveQaStageResult = await runLiveQaStage({
-							request: { requested: true, adapterId: parsed.liveQaAdapterId, scope: parsed.liveQaScope },
-							env: process.env,
-							cwd,
-							runId,
-							changedFiles: candidateOwnedFilesForLiveQa([...leadResults, ...escalationResults]),
-							cancellation: session.cancellation,
-							onLine: (line) => session.log(`[live-qa] ${line}`),
-						});
-						// The settled runner's own outcome/cost rows must be recorded BEFORE cancellation
-						// unwinds -- see `recordLiveQaStageResult`'s doc comment.
-						recordLiveQaStageResult(liveQaStageResult, {
-							recordOutcome, recordModelCall,
-							throwIfCancelled: () => session.cancellation.throwIfCancelled(),
-						});
-					}
-				}
-				const liveQaCostRowsForRun = liveQaStageResult?.costRows ?? [];
-				// Added exactly once here; `recordModelCall` above feeds the Python-side economics
-				// ledger independently (its own `record_id`-keyed dedup, see live-qa.ts's
-				// `liveQaCostRows` doc comment) — this JS-side `totalCost` never reads from that
-				// ledger, so adding the same number here is not a double count of anything.
-				totalCost += liveQaKnownCostUsd(liveQaCostRowsForRun);
-				const liveQaHasUnknownCost = liveQaCostRowsHaveUnknownCost(liveQaCostRowsForRun);
-
-				const composedVerdict = composeVerificationVerdict(genericVerdictLabel, passedVerification, {
-					verdict: liveQaStageResult ? (liveQaStageResult.verdict === "not_requested" ? null : liveQaStageResult.verdict) : null,
-					required: liveQaStageResult?.required ?? false,
-					reasons: liveQaStageResult?.reasons ?? [],
-					sessionId: (liveQaStageResult?.outcomeRow?.session_id as string | null | undefined) ?? null,
-				});
-				passedVerification = composedVerdict.passedVerification;
-
-				session.cancellation.throwIfCancelled();
-				const telemetry = await completeRun(runId, {
-					success_rate: succeededLeads / Math.max(1, leadResults.length),
-					verification_passed: passedVerification,
-					blocked: runOutcome === "blocked",
-					lead_statuses: leadStatuses,
-					external_changes: externalFiles.length,
-					total_cost_usd: totalCost,
-					files_changed: allFiles,
-					retries,
-					models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
-					log_dir: session.dir,
-					// Observational only (Phase 2 telemetry): distinguishes wall time from the
-					// summed billed duration of every dispatch this run paid for, so the two are
-					// never conflated when reading the run outcome.
-					summed_dispatch_ms: billedResults.reduce((s, r) => s + (r.durationMs ?? 0), 0),
-					run_wall_ms: session.terminalTiming().elapsed_ms,
-					// Phase 3 opt-in Forge live-QA stage (T1): the `live_qa` key itself is present ONLY
-					// when `--live-qa`/`--live-qa-scope` was given -- a run that never requested it gets
-					// the exact pre-Phase-3 summary shape, not a `{requested: false}` placeholder key.
-					...buildLiveQaSummaryField(parsed.liveQa, liveQaStageResult, liveQaNotRunReason),
-				}, session.terminalTiming(), session.telemetryBaseline);
-
-				// The lead's final report is the only place its reasoning, open
-				// questions, and non-file results (audits, package lists, verdicts)
-				// live. Always write it to disk; show it inline when there are no file
-				// edits to speak for the run, or when the lead raised open items.
-				const leadReports = leadResults
-					.filter((r) => r.stdout.trim() || r.outcome === "timed_out" || r.outcome === "cancelled")
-					.map((r) => {
-						const interrupted = r.outcome === "timed_out" || r.outcome === "cancelled";
-						const reason = r.outcome === "cancelled"
-							? "cancelled"
-							: r.timeoutReason ?? "unknown";
-						const marker = interrupted ? `> UNVERIFIED PARTIAL WORK — ${reason}\n\n` : "";
-						const report = r.stdout.trim() || r.interruption?.partialText || "(no assistant text captured)";
-						return `${marker}### ${r.taskId.replace(`${runId}-`, "")}\n\n${report}`;
-					});
-				if (leadReports.length > 0) {
-					try {
-						session.writeDiagnostic("lead-report.md", leadReports.join("\n\n---\n\n"));
-					} catch {
-						/* best-effort */
-					}
-				}
-				const firstReport = leadResults.find((r) => r.exitCode === 0)?.stdout.trim() ?? "";
-				const openItems = /##\s*Open items\s*\n([\s\S]*?)(?=\n##\s|$)/i.exec(firstReport)?.[1]?.trim();
-				const showFullReport = allFiles.length === 0 && firstReport;
-				const reportLines = showFullReport
-					? firstReport.split("\n").slice(0, 40)
-					: openItems && !/^(none|n\/a|-\s*none)/i.test(openItems)
-						? openItems.split("\n").slice(0, 15)
-						: [];
-				const reportTruncated = showFullReport && firstReport.split("\n").length > 40;
-
-				const verdict = composedVerdict.verdict;
-
-				const summary = [
-					`Orchestration ${runOutcome === "blocked" ? "BLOCKED" : dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(Date.now() - Number(runId.split("-")[2]))}.`,
-					`run_id: ${runId}`,
-					`leads: ${succeededLeads}/${leadResults.length} ${runOutcome === "blocked" ? "blocked" : "succeeded"}${skippedLeads > 0 ? ` (+${skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${retries} · files: ${allFiles.length} changed${externalFiles.length > 0 ? ` (+${externalFiles.length} changed by someone else, not verified)` : ""}`,
-					summarizeReconWorkers(workerResults),
-					`verification: ${verdict}`,
-					`total cost: $${totalCost.toFixed(4)} (${billedResults.length + (triageCost.usd > 0 ? 1 : 0)} dispatches${nestedCost > 0 ? `; $${nestedCost.toFixed(4)} of it in lead subagents` : ""})`,
-					...(dispatchOk
-						? []
-						: [
-								`first failure: ${(() => {
-									// The run FAILED because no lead succeeded, so name a lead first;
-									// recon/architect failures are reported on their own lines.
-									const failed = leadResults.find((r) => r.exitCode !== 0) ?? billedResults.find((r) => r.exitCode !== 0);
-									if (!failed) return "(no dispatch attempted)";
-									return `${failed.taskId.replace(`${runId}-`, "")} exit ${failed.exitCode}: ${summarizeStderr(failed.stderr, 300) || "(no output)"}`;
-								})()}`,
-							]),
-					...(parsed.liveQa ? liveQaSummaryLines(liveQaStageResult, liveQaNotRunReason, liveQaHasUnknownCost) : []),
-					...(reportLines.length > 0
-						? ["", showFullReport ? "lead report:" : "open items from lead:", ...reportLines, ...(reportTruncated ? [`… full report: ${describeRunArtifact(session.file("lead-report.md"))}`] : [])]
-						: leadReports.length > 0
-							? [`lead report: ${describeRunArtifact(session.file("lead-report.md"))}`]
-							: []),
-					`run log: ${describeRunArtifact(session.file("run.log"))}`,
-					`ledger: ${STATE_ROOT}/metrics.jsonl`,
-					...telemetryWarning(telemetry),
-				];
-				session.log(summary.join("\n"));
-				const summaryText = summary.join("\n");
-				// Whether the run is reported as a success in the notify and in chat must agree:
-				// a run whose verification failed is not "completed" just because dispatch succeeded.
-				const succeeded = (passedVerification || (dispatchOk && verificationSkipped)) && telemetryHealthy(telemetry);
-				safeUi(() => ctx.ui.notify(summaryText, succeeded ? "info" : "warning"));
-				postRunMessage(pi, runId, succeeded ? "completed" : "failed", summaryText, totalCost);
-			} catch (err) {
-				if (session.cancellation.isCancelled) {
-					const stopped = session.cancelledDispatches();
-					session.log(`run cancelled by user; stopped dispatches: ${stopped.join(", ") || "none active"}`);
-					const cancelReason = session.cancelReason;
-					const cancelNote =
-						cancelReason === "shutdown"
-							? "cancelled (session shutdown)"
-							: cancelReason === "signal"
-								? "cancelled (signal)"
-								: "cancelled by user (/orchestrate-cancel)";
-					warnTelemetry(ctx, await cancelRun(runId, cancelReasonLabel(cancelReason), session.terminalTiming(), session.telemetryBaseline));
-					const cancelText = `Orchestration cancelled. ${stopped.length ? `Stopped: ${stopped.join(", ")}. ` : "No child dispatch was active. "}See ${session.file("run.log")}`;
-					safeUi(() => ctx.ui.notify(cancelText, "info"));
-					// Only a user-initiated cancel (/orchestrate-cancel) has a live session to post
-					// into; a shutdown or signal cancel means the session itself is going away.
-					if (cancelReason === "user") {
-						postRunMessage(pi, runId, "cancelled", cancelText, session.totalCost());
-					}
-				} else {
-					// Any uncaught throw used to leave the run half-recorded (no outcome
-					// row) and the UI stuck on the last notify. Record + surface it.
-					const message = (err as Error).stack ?? String(err);
-					session.log(`run crashed: ${message}`);
-					warnTelemetry(ctx, await failRun(runId, `crashed: ${(err as Error).message}`, session.terminalTiming(), session.telemetryBaseline));
-					const crashText = `Orchestration crashed: ${(err as Error).message}\nSee ${session.file("run.log")}`;
-					safeUi(() => ctx.ui.notify(crashText, "error"));
-					postRunMessage(pi, runId, "failed", crashText, session.totalCost());
-				}
-			} finally {
-				try {
-					safeUi(() => session.close());
-					await session.sealDiagnostics();
-				} finally {
-					// A newer race winner may already have replaced ACTIVE_RUN with its own session
-					// (see the re-check guard above); only clear the run-scoped singletons when they
-					// still belong to this run, so a stale run's finally never nulls out a newer one.
-					if (ACTIVE_RUN === session) {
-						ACTIVE_RUN = null;
-						CURRENT_RUN_TAGS = {};
-						CURRENT_ALIAS_TABLE = null;
-						CURRENT_MODEL_SOURCES = {};
-					}
-					session.finish();
-				}
-			}
-			})();
-			session.runPromise = runPromise;
-			runPromise.catch((err) => {
-				console.error(`[orchestrator] run ${runId} background task rejected unexpectedly: ${(err as Error)?.stack ?? err}`);
-			});
-		},
-	});
+	const orchestrateDeps: OrchestrateDeps = {
+		runRegistry,
+		resolveAdapter,
+		createSession: (runId, ctx, goal) => new RunSession(runId, ctx, goal),
+		// `run` (the claimed `RunContext`) is accepted for interface parity with the modular
+		// pipeline's other callers but not read here: `triageTask` takes no run-scoped state at
+		// all (see its own signature below), same as it did when the inline handler called it
+		// directly with no `run` argument.
+		triageTask: (runId, goal, cwd, ctx, _run, costSink, adapter) => triageTask(runId, goal, cwd, ctx, costSink, adapter),
+		planRun,
+		recordEvent,
+		recordOutcome,
+		// `captureDispatchCost`/`dispatchParallel` read the run they need off the legacy
+		// `ACTIVE_RUN` singleton themselves (message draining, spend-cap bookkeeping, ...);
+		// `SyncedRunRegistry` above keeps that singleton in sync with whatever this registry
+		// claims, so `_run` is accepted (interface parity) but not threaded through here.
+		captureDispatchCost: (opts, result, _run) => captureDispatchCost(opts, result),
+		dispatchParallel: (cwd, runId, tasks, adapter, ctx, _run) => dispatchParallel(cwd, runId, tasks, adapter, ctx),
+		completeRun,
+		failRun,
+		cancelRun: (runId, reason, timing, since) => cancelRun(runId, reason, timing, since),
+		cancelReasonLabel,
+		maxLeads: MAX_LEADS,
+		reconEvidenceMaxChars: RECON_EVIDENCE_MAX_CHARS,
+		stateRoot: STATE_ROOT,
+		profilesPath: PROFILES_PATH,
+		env: process.env,
+		recordModelCall,
+		recordRunStarted,
+	};
+	registerOrchestrateCommand(pi, orchestrateDeps);
 
 	pi.registerCommand("orchestrate-cancel", {
 		description: "Cancel the currently running /orchestrate run, if any.",

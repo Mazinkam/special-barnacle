@@ -30,20 +30,30 @@ import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import { complexityNeedsArchitect, type DispatchTask, type PlanResponse } from "../core/prompts.ts";
 import type { RunReport } from "../core/report.ts";
 import type { TriageResult } from "../core/triage.ts";
+import { loadEfficiencyControls } from "../efficiency-flags.ts";
 import { pickModel } from "../core/routing.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 import { changedFilesSinceRunStart, gitDirtySnapshot, gitHead } from "../adapters/git-changes.ts";
 import { formatAdapterTable, shortName } from "../models.ts";
 import { planEscalation, type EscalationLeadInput } from "../escalation.ts";
 import { leadSizeOf, sizeLead, type LeadSizeDecision } from "../lead-sizing.ts";
-import { classifyRunOutcome, externalChangeFiles, parseLeadStatus } from "../run-outcome.ts";
+import { classifyRunOutcome, externalChangeFiles, parseLeadStatus, qaScopeEvidenceFor } from "../run-outcome.ts";
 import { summarizeStderr } from "../dispatch/stderr-sink.ts";
 import { confirmStep, safeUi } from "../run/ui-sink.ts";
-import { describeRunArtifact, type RunSession, type RunTiming } from "../run/session.ts";
-import type { RunContext } from "../run/context.ts";
+import { describeRunArtifact, type RunTiming } from "../run/session.ts";
+import type { RunContext, RunSessionLike } from "../run/context.ts";
 import { telemetryWarning, type FlushReport, type QueueStats } from "../record-queue.ts";
 import { collectBilledResults, dispatchHierarchical, summarizeReconWorkers } from "./hierarchy.ts";
 import { runVerification, type VerificationResult } from "./verify-loop.ts";
+import {
+	buildLiveQaSummaryField,
+	candidateOwnedFilesForLiveQa,
+	liveQaCostRowsHaveUnknownCost,
+	liveQaKnownCostUsd,
+	recordLiveQaStageResult,
+	runLiveQaStage,
+	type RunLiveQaStageResult,
+} from "../live-qa-stage.ts";
 
 /** `planRun`'s options; structurally identical to index.ts's own (private) `PlanOptions` —
  *  redeclared here rather than imported so this module never has to import index.ts. */
@@ -65,21 +75,21 @@ export interface RunOrchestrationDeps {
 		goal: string,
 		cwd: string,
 		ctx: ExtensionContext,
-		run: RunContext<RunSession> | null,
+		run: RunContext<RunSessionLike> | null,
 		costSink: { usd: number },
 		adapter: Adapter,
 	): Promise<TriageResult | null>;
 	planRun(runId: string, opts: PlanOptions): Promise<PlanResponse>;
 	recordEvent(event: string, payload: Record<string, unknown>): void;
 	recordOutcome(outcome: Record<string, unknown>): void;
-	captureDispatchCost(opts: CaptureOpts, result: DispatchResult, run: RunContext<RunSession> | null): Promise<void>;
+	captureDispatchCost(opts: CaptureOpts, result: DispatchResult, run: RunContext<RunSessionLike> | null): Promise<void>;
 	dispatchParallel(
 		cwd: string,
 		runId: string,
 		tasks: DispatchTask[],
 		adapter: Adapter,
 		ctx: ExtensionContext,
-		run: RunContext<RunSession> | null,
+		run: RunContext<RunSessionLike> | null,
 	): Promise<DispatchResult[]>;
 	completeRun(runId: string, summary: Record<string, unknown>, timing?: RunTiming, since?: QueueStats): Promise<FlushReport>;
 	failRun(runId: string, error: string, timing?: RunTiming, since?: QueueStats): Promise<FlushReport>;
@@ -92,6 +102,15 @@ export interface RunOrchestrationDeps {
 	/** The `## Provided context` block from `--context`/`--with-last-reply` (docs/architecture-review.md C6), built
 	 *  by `commands/orchestrate.ts` from files it already read; `""` when neither flag was given. */
 	providedContext: string;
+	/**
+	 * Phase 3 opt-in Forge live-QA stage: env passed straight to `runLiveQaStage`'s
+	 * `loadLiveQaConfig` (never logged); index.ts's caller supplies `process.env`, tests supply a
+	 * fixture env. Only read when `parsed.liveQa`.
+	 */
+	env: Record<string, string | undefined>;
+	/** Records a single model-usage row (the Python-side economics ledger); used to record the
+	 *  live-QA stage's own cost rows, independent of `recordOutcome`'s outcome row. */
+	recordModelCall: (metric: Record<string, unknown>) => void;
 }
 
 /**
@@ -162,10 +181,31 @@ export async function runOrchestration(
 	adapter: Adapter,
 	resolved: FullResolution,
 	ctx: ExtensionContext,
-	session: RunSession,
-	claimed: RunContext<RunSession>,
+	session: RunSessionLike,
+	claimed: RunContext<RunSessionLike>,
 	deps: RunOrchestrationDeps,
 ): Promise<RunOrchestrationResult> {
+	// -----------------------------------------------------------------
+	// A1 review fix: `scoped_leads`/`file_ownership`/`recon_before_architect` are efficiency
+	// switches this modular pipeline does not implement (core/records.ts's `scopedPhaseReports`
+	// doc; all three default OFF in method.json) — only the pre-unification index.ts hierarchy code
+	// still does. Flip one on and this pipeline silently runs with it disabled instead of doing what
+	// the operator asked; surface that loudly at run start (before any cost is spent) rather than
+	// let the run's behavior quietly not match its own config, and continue with default (switch
+	// disabled) behavior — this is a config mismatch warning, not a reason to abort the run.
+	// -----------------------------------------------------------------
+	const unsupportedSwitchNames = ["scoped_leads", "file_ownership", "recon_before_architect"];
+	const { enabled: enabledSwitches } = loadEfficiencyControls(deps.env);
+	const unsupportedEnabled = enabledSwitches.filter((name) => unsupportedSwitchNames.includes(name));
+	if (unsupportedEnabled.length > 0) {
+		ctx.ui.notify(
+			`Efficiency switch(es) enabled in config but not supported by this pipeline: ${unsupportedEnabled.join(", ")}. ` +
+				"Continuing with default (switch disabled) behavior — the run will NOT get the effect these switches promise.",
+			"warning",
+		);
+		deps.recordEvent("efficiency_switch_unsupported", { run_id: runId, switches: unsupportedEnabled });
+	}
+
 	// -----------------------------------------------------------------
 	// LLM triage: auto-fill missing task_class / complexity / risk via
 	// the cheapest available model. Skip when the user supplied all
@@ -435,7 +475,7 @@ export async function runOrchestration(
 	// Only when EVERY lead exited 0 and says it changed nothing: a lead that
 	// failed, timed out or hit the spend cap may have edited files it never
 	// got to report, and those must still be verified.
-	const externalFiles = runOutcome === "blocked" ? [...allFiles] : externalChangeFiles(allFiles, leadResults);
+	const externalFiles = runOutcome === "blocked" ? [...allFiles] : externalChangeFiles(allFiles, qaScopeEvidenceFor(leadResults));
 	if (externalFiles.length > 0) {
 		session.log(
 			`${externalFiles.length} file(s) changed during the run but no lead reported changing them (likely a concurrent session); excluded from QA: ${externalFiles.join(", ")}`,
@@ -593,7 +633,7 @@ export async function runOrchestration(
 	// Leads' own subagent calls are billed too: they were the bulk of real spend
 	// (ht-orch-1790256789245-1a3fms: $13.22 nested vs $1.56 reported).
 	const nestedCost = billedResults.reduce((s, r) => s + (r.nestedCostUsd ?? 0), 0);
-	const totalCost =
+	let totalCost =
 		triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0) + nestedCost;
 	// `succeededLeads`/`dispatchOk` are computed earlier (before the QA retry
 	// loop) so it can skip QA when no lead succeeded; reused here unchanged.
@@ -604,6 +644,59 @@ export async function runOrchestration(
 	// into a plain FAIL (docs/architecture-review.md C5).
 	const verificationTimedOut = lastVerification?.dispatch?.outcome === "timed_out";
 	const failedChecks = lastVerification?.failedChecks ?? [];
+
+	// -----------------------------------------------------------------
+	// Step 3.5: Phase 3 opt-in Forge live-QA stage. Runs at most once, only when explicitly
+	// requested (--live-qa / --live-qa-scope), and only once the run is not blocked, dispatch
+	// succeeded, and the generic QA gate above passed — a live-QA runner is never spawned against a
+	// candidate whose generic verification already failed, was skipped, or never ran. Never
+	// escalated or retried on failure; only recorded.
+	//
+	// `changedFiles` handed to the live-QA checkpoint is deliberately the CANDIDATE-OWNED set
+	// (files this run's own leads/implementers claimed changing, `filesChanged`) — never `allFiles`
+	// (the broader git-dirty-detection set the generic QA gate above uses, which can also include a
+	// dirty path nobody in this run claimed touching). `escalationResults` is included too: a
+	// retried lead's own claimed files are just as much this run's own work as the first pass's.
+	// -----------------------------------------------------------------
+	let liveQaStageResult: RunLiveQaStageResult | null = null;
+	let liveQaNotRunReason: string | null = null;
+	if (parsed.liveQa) {
+		if (runOutcome === "blocked") {
+			liveQaNotRunReason = "run was blocked";
+		} else if (!dispatchOk) {
+			liveQaNotRunReason = "dispatch did not succeed";
+		} else if (!passedVerification) {
+			liveQaNotRunReason = verificationSkipped
+				? "generic verification was skipped (no files changed)"
+				: "generic verification failed";
+		} else {
+			session.setPhase(
+				`live QA: requesting Forge focused run${parsed.liveQaAdapterId ? ` (adapter ${parsed.liveQaAdapterId})` : ""}`,
+			);
+			liveQaStageResult = await runLiveQaStage({
+				request: { requested: true, adapterId: parsed.liveQaAdapterId, scope: parsed.liveQaScope },
+				env: deps.env,
+				cwd,
+				runId,
+				changedFiles: candidateOwnedFilesForLiveQa([...leadResults, ...escalationResults]),
+				cancellation: session.cancellation,
+				onLine: (line) => session.log(`[live-qa] ${line}`),
+			});
+			// The settled runner's own outcome/cost rows must be recorded BEFORE cancellation unwinds
+			// — see `recordLiveQaStageResult`'s doc comment.
+			recordLiveQaStageResult(liveQaStageResult, {
+				recordOutcome: deps.recordOutcome,
+				recordModelCall: deps.recordModelCall,
+				throwIfCancelled: () => session.cancellation.throwIfCancelled(),
+			});
+		}
+	}
+	const liveQaCostRowsForRun = liveQaStageResult?.costRows ?? [];
+	// Added exactly once here; `recordModelCall` above feeds the Python-side economics ledger
+	// independently (its own `record_id`-keyed dedup) — this JS-side `totalCost` never reads from
+	// that ledger, so adding the same number here is not a double count of anything.
+	totalCost += liveQaKnownCostUsd(liveQaCostRowsForRun);
+	const liveQaHasUnknownCost = liveQaCostRowsHaveUnknownCost(liveQaCostRowsForRun);
 
 	session.cancellation.throwIfCancelled();
 	const telemetry = await deps.completeRun(runId, {
@@ -617,6 +710,10 @@ export async function runOrchestration(
 		retries,
 		models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
 		log_dir: session.dir,
+		// Phase 3 opt-in Forge live-QA stage (T1): the `live_qa` key itself is present ONLY when
+		// `--live-qa`/`--live-qa-scope` was given — a run that never requested it gets the exact
+		// pre-Phase-3 summary shape, not a `{requested: false}` placeholder key.
+		...buildLiveQaSummaryField(parsed.liveQa, liveQaStageResult, liveQaNotRunReason),
 	}, session.terminalTiming(), session.telemetryBaseline);
 	// Elapsed time for the run summary: the session's own monotonic clock (started when the
 	// run's RunSession was constructed), not Date.now() minus a timestamp parsed out of the run
@@ -687,6 +784,7 @@ export async function runOrchestration(
 		runLogPath: describeRunArtifact(session.file("run.log")),
 		stateRoot: deps.stateRoot,
 		telemetryReport: telemetry,
+		...(parsed.liveQa ? { liveQa: { stage: liveQaStageResult, notRunReason: liveQaNotRunReason, hasUnknownCost: liveQaHasUnknownCost } } : {}),
 	};
 	return { kind: "completed", report };
 }

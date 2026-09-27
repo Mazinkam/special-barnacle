@@ -11,10 +11,12 @@ import {
 	MAX_CONTEXT_FILES,
 	readContextFileSafely,
 	registerOrchestrateCommand,
+	setRunOrchestrationForTest,
 	type OrchestrateDeps,
 } from "./orchestrate.ts";
 import { contextFileLabel, CONTEXT_SOURCE_MAX_CHARS, formatContextSource } from "../core/context.ts";
-import { RunRegistry } from "../run/context.ts";
+import { RunRegistry, type RunSessionLike } from "../run/context.ts";
+import { RunCancellation } from "../cancellation.ts";
 import type { RunSession } from "../run/session.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 
@@ -67,6 +69,52 @@ function shortCircuitingResolution(adapter: Adapter): FullResolution {
 	};
 }
 
+/** A resolution with no `profiles.problems`/override errors: the handler proceeds past model
+ *  resolution all the way to claiming the registry, unlike `shortCircuitingResolution` above. */
+function healthyResolution(adapter: Adapter): FullResolution {
+	return {
+		adapter,
+		sources: Object.fromEntries(Object.keys(adapter).map((k) => [k, "fallback"])) as FullResolution["sources"],
+		specs: {},
+		warnings: [],
+		notes: [],
+		profileName: "test-profile",
+		profiles: { active_profile: "test-profile", profiles: {}, problems: [], notes: [] } as unknown as FullResolution["profiles"],
+		table: null as unknown as FullResolution["table"],
+		preference: [],
+	};
+}
+
+/** A minimal `RunSessionLike` fake — no timers, no disk I/O — for tests that need
+ *  `registerOrchestrateCommand`'s handler to actually claim the registry and reach
+ *  `runOrchestrationImpl` (via `setRunOrchestrationForTest`), unlike `baseDeps`' default
+ *  `createSession`, which deliberately throws for tests that must never get this far. */
+function fakeRunSessionLike(runId: string): RunSessionLike {
+	return {
+		runId,
+		dir: "/tmp/run",
+		cancellation: new RunCancellation(),
+		cancelReason: undefined,
+		runPromise: undefined,
+		telemetryBaseline: { enqueued: 0, acknowledged: 0, duplicates: 0, batches: 0, retries: 0, failed: 0, derivedStale: 0 },
+		file: (name: string) => `/tmp/run/${name}`,
+		writeDiagnostic: () => true,
+		log: () => {},
+		setPhase: () => {},
+		terminalTiming: () => ({
+			started_at: "2024-01-01T00:00:00.000Z",
+			finished_at: "2024-01-01T00:00:01.000Z",
+			elapsed_ms: 1000,
+			elapsed_source: "monotonic" as const,
+		}),
+		cancelledDispatches: () => [],
+		totalCost: () => 0,
+		close: () => {},
+		sealDiagnostics: async () => true,
+		finish: () => {},
+	};
+}
+
 function baseDeps(overrides: Partial<OrchestrateDeps> = {}): { deps: OrchestrateDeps; calls: { resolveAdapter: number; dispatchParallel: number; createSession: number } } {
 	const calls = { resolveAdapter: 0, dispatchParallel: 0, createSession: 0 };
 	const adapter = fakeAdapter();
@@ -82,10 +130,15 @@ function baseDeps(overrides: Partial<OrchestrateDeps> = {}): { deps: Orchestrate
 		dispatchParallel: async () => { calls.dispatchParallel++; return []; },
 		completeRun: async () => ({ ok: true, batches: 0, acknowledged: 0, failed: 0, derivedStale: 0 }),
 		failRun: async () => ({ ok: true, batches: 0, acknowledged: 0, failed: 0, derivedStale: 0 }),
+		cancelRun: async () => ({ ok: true, batches: 0, acknowledged: 0, failed: 0, derivedStale: 0 }),
+		cancelReasonLabel: () => "orchestrate_cancel",
 		maxLeads: 4,
 		reconEvidenceMaxChars: 4000,
 		stateRoot: "/tmp/state",
 		profilesPath: "/tmp/profiles.json",
+		env: {},
+		recordModelCall: () => {},
+		recordRunStarted: () => {},
 		...overrides,
 	};
 	return { deps, calls };
@@ -445,5 +498,65 @@ describe("commands/orchestrate.ts readContextFileSafely / loadProvidedContext (d
 		if (!("error" in result)) return;
 		expect(result.error).toContain(String(MAX_CONTEXT_FILES));
 		expect(result.error).not.toContain("could not read");
+	});
+});
+
+describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (A1 review fixes)", () => {
+	afterEach(() => {
+		setRunOrchestrationForTest(null);
+	});
+
+	test("recordRunStarted is called exactly once, right after a successful claim, with the run id and session file", async () => {
+		const { pi, getHandler } = fakePi();
+		const adapter = fakeAdapter();
+		const session = fakeRunSessionLike("placeholder");
+		const recordRunStartedCalls: Array<{ runId: string; sessionId: string | null }> = [];
+		const { deps } = baseDeps({
+			resolveAdapter: async () => healthyResolution(adapter),
+			createSession: (runId) => session,
+			recordRunStarted: (runId, sessionId) => { recordRunStartedCalls.push({ runId, sessionId }); },
+		});
+		registerOrchestrateCommand(pi, deps);
+		const { ctx } = fakeCtx();
+		(ctx as unknown as { sessionManager: { getSessionFile: () => string } }).sessionManager.getSessionFile = () => "/tmp/sessions/abc123.jsonl";
+
+		let runOrchestrationCalls = 0;
+		setRunOrchestrationForTest(async () => {
+			runOrchestrationCalls++;
+			return { kind: "aborted" };
+		});
+
+		await getHandler()("fix the login race condition in the auth module", ctx);
+
+		expect(runOrchestrationCalls).toBe(1);
+		expect(recordRunStartedCalls).toHaveLength(1);
+		expect(recordRunStartedCalls[0].sessionId).toBe("/tmp/sessions/abc123.jsonl");
+		expect(recordRunStartedCalls[0].runId.startsWith("ht-orch-")).toBe(true);
+	});
+
+	test("a valid goal reaches runOrchestration, called with the parsed args (not merely stopped at the C6/C7 preflight checks)", async () => {
+		const { pi, getHandler } = fakePi();
+		const adapter = fakeAdapter();
+		const session = fakeRunSessionLike("placeholder");
+		const { deps } = baseDeps({
+			resolveAdapter: async () => healthyResolution(adapter),
+			createSession: () => session,
+		});
+		registerOrchestrateCommand(pi, deps);
+		const { ctx } = fakeCtx();
+
+		let capturedParsed: { goal: string; taskClass: string; complexity: number; risk: string } | undefined;
+		setRunOrchestrationForTest(async (_runId, _cwd, parsed) => {
+			capturedParsed = parsed;
+			return { kind: "aborted" };
+		});
+
+		await getHandler()("fix the login race condition in the auth module --task-class bugfix --complexity 7 --risk high", ctx);
+
+		expect(capturedParsed).toBeDefined();
+		expect(capturedParsed?.goal).toBe("fix the login race condition in the auth module");
+		expect(capturedParsed?.taskClass).toBe("bugfix");
+		expect(capturedParsed?.complexity).toBe(7);
+		expect(capturedParsed?.risk).toBe("high");
 	});
 });

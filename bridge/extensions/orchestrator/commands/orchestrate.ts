@@ -32,10 +32,10 @@ import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 import { policyIdFor } from "../adapters/adapter-resolver.ts";
 import { formatAdapterTable, userLayerWarnings } from "../models.ts";
 import { safeUi } from "../run/ui-sink.ts";
-import type { RunSession, RunTiming } from "../run/session.ts";
-import type { RunContext, RunRegistry } from "../run/context.ts";
+import type { RunTiming } from "../run/session.ts";
+import type { RunContext, RunRegistry, RunSessionLike } from "../run/context.ts";
 import type { FlushReport, QueueStats } from "../record-queue.ts";
-import { runOrchestration, warnTelemetry, type RunOrchestrationDeps } from "../pipeline/run-orchestration.ts";
+import { runOrchestration as defaultRunOrchestration, warnTelemetry, type RunOrchestrationDeps } from "../pipeline/run-orchestration.ts";
 
 /** `planRun`'s options; structurally identical to index.ts's own (private) `PlanOptions` —
  *  redeclared here rather than imported so this module never has to import index.ts. */
@@ -50,32 +50,40 @@ interface PlanOptions {
 
 /** The seams `registerOrchestrateCommand` needs; index.ts's caller supplies the real ones. */
 export interface OrchestrateDeps {
-	runRegistry: RunRegistry<RunSession>;
+	runRegistry: RunRegistry<RunSessionLike>;
 	resolveAdapter(ctx: ExtensionContext, overrides: ModelOverrides): Promise<FullResolution>;
-	createSession(runId: string, ctx: ExtensionContext, goal: string): RunSession;
+	createSession(runId: string, ctx: ExtensionContext, goal: string): RunSessionLike;
 	triageTask(
 		runId: string,
 		goal: string,
 		cwd: string,
 		ctx: ExtensionContext,
-		run: RunContext<RunSession> | null,
+		run: RunContext<RunSessionLike> | null,
 		costSink: { usd: number },
 		adapter: Adapter,
 	): Promise<TriageResult | null>;
 	planRun(runId: string, opts: PlanOptions): Promise<PlanResponse>;
 	recordEvent(event: string, payload: Record<string, unknown>): void;
 	recordOutcome(outcome: Record<string, unknown>): void;
-	captureDispatchCost(opts: CaptureOpts, result: DispatchResult, run: RunContext<RunSession> | null): Promise<void>;
+	captureDispatchCost(opts: CaptureOpts, result: DispatchResult, run: RunContext<RunSessionLike> | null): Promise<void>;
 	dispatchParallel(
 		cwd: string,
 		runId: string,
 		tasks: DispatchTask[],
 		adapter: Adapter,
 		ctx: ExtensionContext,
-		run: RunContext<RunSession> | null,
+		run: RunContext<RunSessionLike> | null,
 	): Promise<DispatchResult[]>;
 	completeRun(runId: string, summary: Record<string, unknown>, timing?: RunTiming, since?: QueueStats): Promise<FlushReport>;
 	failRun(runId: string, error: string, timing?: RunTiming, since?: QueueStats): Promise<FlushReport>;
+	/**
+	 * Records a run's terminal outcome as CANCELLED (never as failed): distinct from `failRun` so a
+	 * dead-process reconciliation and a dashboard status count can tell a deliberate stop from a
+	 * crash. Same timing/draining contract as `completeRun`/`failRun`.
+	 */
+	cancelRun(runId: string, reason: string, timing?: RunTiming, since?: QueueStats): Promise<FlushReport>;
+	/** Maps a cancellation reason (`session.cancelReason`) onto the string `cancelRun` records. */
+	cancelReasonLabel(reason: "user" | "shutdown" | "signal" | undefined): string;
 	/** Ceiling on the topology's requested lead count (config.ts's `maxLeads`). */
 	maxLeads: number;
 	/** Rule-2 recon evidence packet budget (config.ts's `reconEvidenceMaxChars`). */
@@ -84,6 +92,35 @@ export interface OrchestrateDeps {
 	stateRoot: string;
 	/** Where `orchestrator-profiles.json` lives; used to build the usage text. */
 	profilesPath: string;
+	/**
+	 * Phase 3 opt-in Forge live-QA stage: env passed straight to `runLiveQaStage`'s
+	 * `loadLiveQaConfig` (never logged); production supplies `process.env`. Only read when
+	 * `parsed.liveQa`.
+	 */
+	env: Record<string, string | undefined>;
+	/** Records a single model-usage row (the Python-side economics ledger); used to record the
+	 *  live-QA stage's own cost rows, independent of `recordOutcome`'s outcome row. */
+	recordModelCall: (metric: Record<string, unknown>) => void;
+	/**
+	 * Records durable ownership evidence (`run_started`: pid/hostname/process-start identity plus
+	 * the current session's file, when available) so a later reconciliation can tell "this run's
+	 * owning process is confirmed gone" from "no evidence either way" (index.ts's
+	 * `recordRunStarted`). Called exactly once, right after the registry claim succeeds — the
+	 * same point the pre-unification inline handler called it inline.
+	 */
+	recordRunStarted(runId: string, sessionId: string | null): void;
+}
+
+/**
+ * Test seam: lets a test intercept the call into `runOrchestration` (the triage -> plan ->
+ * dispatch -> verify pipeline) without running it for real — asserting the handler reached this
+ * boundary with the parsed args, without needing a `resolveAdapter`/`triageTask`/`dispatchParallel`
+ * fixture for a whole real run. Not used by production code, which always calls the real
+ * `runOrchestration` from pipeline/run-orchestration.ts.
+ */
+let runOrchestrationImpl: typeof defaultRunOrchestration = defaultRunOrchestration;
+export function setRunOrchestrationForTest(fn: typeof defaultRunOrchestration | null): void {
+	runOrchestrationImpl = fn ?? defaultRunOrchestration;
 }
 
 /** Goals that ask the agents to come back with questions cannot be honored headlessly. */
@@ -618,6 +655,7 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 				session,
 				{ profile: resolved.profileName, policy_id: policyIdFor(resolved.profileName, adapter) },
 				resolved.table,
+				resolved.sources,
 			);
 			if (!claimed) {
 				ctx.ui.notify(
@@ -629,6 +667,7 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 				session.finish();
 				return;
 			}
+			deps.recordRunStarted(runId, ctx.sessionManager?.getSessionFile?.() ?? null);
 			session.log(`policy: ${claimed.tags.policy_id}`);
 			session.log(`models (profile "${resolved.profileName}"):\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
 			for (const n of resolved.notes) session.log(`note: ${n}`);
@@ -655,8 +694,10 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 					reconEvidenceMaxChars: deps.reconEvidenceMaxChars,
 					stateRoot: deps.stateRoot,
 					providedContext,
+					env: deps.env,
+					recordModelCall: deps.recordModelCall,
 				};
-				const result = await runOrchestration(runId, cwd, parsed, adapter, resolved, ctx, session, claimed, orchestrationDeps);
+				const result = await runOrchestrationImpl(runId, cwd, parsed, adapter, resolved, ctx, session, claimed, orchestrationDeps);
 				if (result.kind === "completed") {
 					const { text: summaryText, succeeded } = buildRunSummary(result.report);
 					session.log(summaryText);
@@ -668,13 +709,7 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 					const stopped = session.cancelledDispatches();
 					session.log(`run cancelled by user; stopped dispatches: ${stopped.join(", ") || "none active"}`);
 					const cancelReason = session.cancelReason;
-					const cancelNote =
-						cancelReason === "shutdown"
-							? "cancelled (session shutdown)"
-							: cancelReason === "signal"
-								? "cancelled (signal)"
-								: "cancelled by user (/orchestrate-cancel)";
-					warnTelemetry(ctx, await deps.failRun(runId, cancelNote, session.terminalTiming(), session.telemetryBaseline));
+					warnTelemetry(ctx, await deps.cancelRun(runId, deps.cancelReasonLabel(cancelReason), session.terminalTiming(), session.telemetryBaseline));
 					const cancelText = `Orchestration cancelled. ${stopped.length ? `Stopped: ${stopped.join(", ")}. ` : "No child dispatch was active. "}See ${session.file("run.log")}`;
 					safeUi(() => ctx.ui.notify(cancelText, "info"));
 					// Only a user-initiated cancel (/orchestrate-cancel) has a live session to post

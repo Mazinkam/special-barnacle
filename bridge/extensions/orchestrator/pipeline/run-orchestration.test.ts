@@ -82,6 +82,8 @@ function fakeArgs(overrides: Partial<OrchestrateArgs> = {}): OrchestrateArgs {
 		contextFiles: [],
 		withLastReply: false,
 		force: false,
+		liveQa: false,
+		liveQaOff: false,
 		unknownFlags: [],
 		...overrides,
 	};
@@ -105,6 +107,8 @@ function fakeDeps(overrides: Partial<RunOrchestrationDeps> = {}): RunOrchestrati
 		reconEvidenceMaxChars: 4000,
 		stateRoot: "/tmp/state",
 		providedContext: "",
+		env: {},
+		recordModelCall: () => {},
 		...overrides,
 	};
 }
@@ -499,5 +503,105 @@ describe("pipeline/run-orchestration.ts runOrchestration elapsedMs (B4.7)", () =
 			expect(result.report.elapsedMs).toBe(1000);
 			expect(Number.isNaN(result.report.elapsedMs)).toBe(false);
 		}
+	});
+});
+
+describe("pipeline/run-orchestration.ts runOrchestration: unsupported efficiency switches (A1 review fix)", () => {
+	test("scoped_leads enabled in env warns loudly at run start, records efficiency_switch_unsupported, and still continues (default disabled behavior)", async () => {
+		const session = fakeSession();
+		const { ctx, notifications } = fakeCtx();
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const recordedEvents: Array<{ event: string; payload: Record<string, unknown> }> = [];
+		const deps = fakeDeps({
+			env: { HUMAIN_ORCHESTRATOR_EFFICIENCY_SCOPED_LEADS: "on" },
+			recordEvent: (event, payload) => { recordedEvents.push({ event, payload }); },
+			planRun: async () => {
+				throw new Error("stop here -- the switch check under test runs before this");
+			},
+			failRun: async () => healthyTelemetry,
+		});
+
+		await runOrchestration(
+			"ht-orch-1700000000000-effswitch",
+			"/tmp/cwd",
+			fakeArgs(),
+			adapter,
+			resolved,
+			ctx,
+			session,
+			{ ...claimed, session },
+			deps,
+		);
+
+		expect(notifications.some((n) => n.level === "warning" && n.text.includes("scoped_leads") && n.text.includes("not supported"))).toBe(true);
+		const switchEvent = recordedEvents.find((e) => e.event === "efficiency_switch_unsupported");
+		expect(switchEvent).toBeDefined();
+		expect(switchEvent?.payload.switches).toEqual(["scoped_leads"]);
+	});
+
+	test("file_ownership and recon_before_architect enabled together are both named in one warning/event", async () => {
+		const session = fakeSession();
+		const { ctx, notifications } = fakeCtx();
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const recordedEvents: Array<{ event: string; payload: Record<string, unknown> }> = [];
+		const deps = fakeDeps({
+			env: {
+				HUMAIN_ORCHESTRATOR_EFFICIENCY_FILE_OWNERSHIP: "report",
+				HUMAIN_ORCHESTRATOR_EFFICIENCY_RECON_BEFORE_ARCHITECT: "on",
+			},
+			recordEvent: (event, payload) => { recordedEvents.push({ event, payload }); },
+			planRun: async () => {
+				throw new Error("stop here -- the switch check under test runs before this");
+			},
+			failRun: async () => healthyTelemetry,
+		});
+
+		await runOrchestration(
+			"ht-orch-1700000000000-effswitch2",
+			"/tmp/cwd",
+			fakeArgs(),
+			adapter,
+			resolved,
+			ctx,
+			session,
+			{ ...claimed, session },
+			deps,
+		);
+
+		const switchEvent = recordedEvents.find((e) => e.event === "efficiency_switch_unsupported");
+		expect(switchEvent).toBeDefined();
+		expect(switchEvent?.payload.switches).toEqual(["recon_before_architect", "file_ownership"]);
+	});
+
+	test("no unsupported switch enabled (default env) never warns or records efficiency_switch_unsupported", async () => {
+		const session = fakeSession();
+		const { ctx, notifications } = fakeCtx();
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const recordedEvents: Array<{ event: string; payload: Record<string, unknown> }> = [];
+		const deps = fakeDeps({
+			recordEvent: (event, payload) => { recordedEvents.push({ event, payload }); },
+			planRun: async () => {
+				throw new Error("boom");
+			},
+			failRun: async () => healthyTelemetry,
+		});
+
+		await runOrchestration(
+			"ht-orch-1700000000000-effswitch3",
+			"/tmp/cwd",
+			fakeArgs(),
+			adapter,
+			resolved,
+			ctx,
+			session,
+			{ ...claimed, session },
+			deps,
+		);
+
+		expect(notifications.some((n) => n.text.includes("efficiency_switch_unsupported") || n.text.includes("not supported by this pipeline"))).toBe(false);
+		expect(recordedEvents.some((e) => e.event === "efficiency_switch_unsupported")).toBe(false);
 	});
 });

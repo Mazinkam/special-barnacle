@@ -1144,9 +1144,13 @@ describe("RunSession terminal timing", () => {
 		for (const fn of [complete, fail, cancel]) {
 			expect(fn).toContain("...timing");
 		}
-		// Every terminal call inside the /orchestrate handler must pass the session timing.
-		const handler = source.slice(source.indexOf('pi.registerCommand("orchestrate"'), source.indexOf('pi.registerCommand("orchestrator-models"'));
-		const calls = handler.match(/await (?:completeRun|failRun|cancelRun)\([^;]*?\);/gs) ?? [];
+		// Every terminal call inside /orchestrate's body (commands/orchestrate.ts +
+		// pipeline/run-orchestration.ts, since the A1 unification onto the modular pipeline) must
+		// pass the session timing.
+		const orchestrateSource = readFileSync(new URL("./commands/orchestrate.ts", import.meta.url), "utf8");
+		const pipelineSource = readFileSync(new URL("./pipeline/run-orchestration.ts", import.meta.url), "utf8");
+		const handler = orchestrateSource.slice(orchestrateSource.indexOf('pi.registerCommand("orchestrate"')) + pipelineSource;
+		const calls = handler.match(/await deps\.(?:completeRun|failRun|cancelRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThanOrEqual(6);
 		for (const call of calls) expect(call).toContain("session.terminalTiming()");
 	});
@@ -1422,9 +1426,15 @@ describe("batched telemetry through the Python batch CLI", () => {
 		const fail = source.slice(source.indexOf("async function failRun("), source.indexOf("async function cancelRun("));
 		const cancel = source.slice(source.indexOf("async function cancelRun("), source.indexOf("// Subagent dispatch"));
 		for (const fn of [complete, fail, cancel]) expect(fn).toContain("flush()");
-		// Every terminal call reports telemetry cumulatively since the run started, not just the final drain.
-		const handler = source.slice(source.indexOf('pi.registerCommand("orchestrate"'), source.indexOf('pi.registerCommand("orchestrator-models"'));
-		const calls = handler.match(/await (?:completeRun|failRun|cancelRun)\([^;]*?\);/gs) ?? [];
+		// Every terminal call reports telemetry cumulatively since the run started, not just the final
+		// drain. /orchestrate's own body lives in commands/orchestrate.ts (arg parsing, session/registry
+		// setup, the cancellation/crash catch block) + pipeline/run-orchestration.ts (the triage -> plan ->
+		// dispatch -> verify -> finalize pipeline itself) since the A1 unification onto the modular
+		// pipeline — index.ts no longer registers `/orchestrate` inline.
+		const orchestrateSource = readFileSync(new URL("./commands/orchestrate.ts", import.meta.url), "utf8");
+		const pipelineSource = readFileSync(new URL("./pipeline/run-orchestration.ts", import.meta.url), "utf8");
+		const handler = orchestrateSource.slice(orchestrateSource.indexOf('pi.registerCommand("orchestrate"')) + pipelineSource;
+		const calls = handler.match(/await deps\.(?:completeRun|failRun|cancelRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThanOrEqual(6);
 		for (const call of calls) expect(call).toContain("session.telemetryBaseline");
 		// Non-terminal records must not block dispatch: no awaited single-record spawns remain.
@@ -1445,7 +1455,7 @@ describe("confirmation gates", () => {
 	test.each([false, true])("dispatch call passes separate confirmation arguments (interactive=%s)", async (interactive) => {
 		// Execute the actual call expression after the plan summary, not a copy of it.
 		// This isolates argument construction without planning or dispatching agents.
-		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+		const source = readFileSync(new URL("./pipeline/run-orchestration.ts", import.meta.url), "utf8");
 		const afterSummary = source.slice(source.indexOf("session.log(planSummary.join"));
 		const call = afterSummary.match(/confirmStep\([\s\S]*?\n\s*\)/)?.[0];
 		if (!call) throw new Error("Dispatch confirmation call not found after plan summary");
@@ -6627,5 +6637,126 @@ describe("scoped_leads: treeUnchangedFor sentinel fingerprints", () => {
 		const before = new Map<string, string>();
 		const after = new Map([["src/link", "<unhashable>"]]);
 		expect(orchestrator.treeUnchangedFor(before, after, RELEVANT)).toBeNull();
+	});
+});
+
+
+describe("A1 review fix: /orchestrator-models check and /orchestrate share one RunRegistry (mutual exclusion)", () => {
+	function throwingDeps(overrides: Partial<import("./commands/orchestrate.ts").OrchestrateDeps>): import("./commands/orchestrate.ts").OrchestrateDeps {
+		const notReached = (name: string) => () => { throw new Error(`${name} should not be reached: the registry-held guard must return before this`); };
+		return {
+			runRegistry: orchestrator.runRegistryForTest!(),
+			resolveAdapter: notReached("resolveAdapter") as never,
+			createSession: notReached("createSession") as never,
+			triageTask: notReached("triageTask") as never,
+			planRun: notReached("planRun") as never,
+			recordEvent: () => {},
+			recordOutcome: () => {},
+			captureDispatchCost: notReached("captureDispatchCost") as never,
+			dispatchParallel: notReached("dispatchParallel") as never,
+			completeRun: notReached("completeRun") as never,
+			failRun: notReached("failRun") as never,
+			cancelRun: notReached("cancelRun") as never,
+			cancelReasonLabel: () => "orchestrate_cancel",
+			maxLeads: 4,
+			reconEvidenceMaxChars: 4000,
+			stateRoot: "/tmp/state",
+			profilesPath: "/tmp/profiles.json",
+			env: {},
+			recordModelCall: () => {},
+			recordRunStarted: () => {},
+			...overrides,
+		};
+	}
+
+	test("/orchestrator-models check refuses when the registry is already held (by /orchestrate or anything else), and does not clear that claim", async () => {
+		const registry = orchestrator.runRegistryForTest!();
+		expect(registry.active()).toBeNull();
+		const holderCtx = { ui: { setWidget: () => {}, setStatus: () => {}, notify: mock() } };
+		const holderSession = new orchestrator.RunSession!("held-by-orchestrate", holderCtx as never, "holder goal");
+		const claimed = registry.claim(holderSession as never);
+		expect(claimed).not.toBeNull();
+		try {
+			const notices: Array<{ text: string; level: string }> = [];
+			const ctx = { ui: { notify: (text: string, level: string) => notices.push({ text, level }) } };
+			const resolved = { adapter: {} } as never;
+
+			const result = await orchestrator.checkModels!(ctx as never, resolved);
+
+			expect(result).toBe(false);
+			expect(notices.some((n) => n.text.includes("already running") && n.level === "warning")).toBe(true);
+			// checkModels's failed-claim path must not have cleared the holder's claim.
+			expect(registry.active()).toBe(claimed);
+		} finally {
+			registry.release(claimed!);
+			holderSession.close();
+		}
+	});
+
+	test("/orchestrate refuses when the registry is already held (by the models check or anything else), and does not clear that claim", async () => {
+		const registry = orchestrator.runRegistryForTest!();
+		expect(registry.active()).toBeNull();
+		const holderCtx = { ui: { setWidget: () => {}, setStatus: () => {}, notify: mock() } };
+		const holderSession = new orchestrator.RunSession!("held-by-models-check", holderCtx as never, "holder goal");
+		const claimed = registry.claim(holderSession as never);
+		expect(claimed).not.toBeNull();
+		try {
+			const { registerOrchestrateCommand } = await import("./commands/orchestrate.ts");
+			let handler!: (args: string, ctx: unknown) => Promise<void>;
+			const pi = {
+				registerCommand: (_name: string, def: { handler: typeof handler }) => { handler = def.handler; },
+				sendMessage: () => {},
+			};
+			registerOrchestrateCommand(pi as never, throwingDeps({}));
+			const notices: Array<{ text: string; level: string }> = [];
+			const ctx = { ui: { notify: (text: string, level: string) => notices.push({ text, level }) } };
+
+			await handler("fix the login race condition in the auth module", ctx as never);
+
+			expect(notices.some((n) => n.text.includes("already running") && n.level === "warning")).toBe(true);
+			// /orchestrate's failed-claim guard must not have cleared the holder's claim.
+			expect(registry.active()).toBe(claimed);
+		} finally {
+			registry.release(claimed!);
+			holderSession.close();
+		}
+	});
+});
+describe("A1: /orchestrate is registered through the modular pipeline, never inlined", () => {
+	test("index.ts contains no inline orchestrate pipeline (exact-name registration) and wires commands/orchestrate.ts's registerOrchestrateCommand instead", () => {
+		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+		// Exact-name registration only: "orchestrate-cancel" (a different command) must still
+		// be allowed/present, so the pattern is anchored on the closing quote.
+		expect(source).not.toMatch(/registerCommand\("orchestrate"/);
+		expect(source).toContain('registerCommand("orchestrate-cancel"');
+		expect(source).toContain("registerOrchestrateCommand(pi,");
+	});
+
+	// Placed last in this file (after every other test that exercises a real /orchestrate run
+	// through `orchestrator.default(pi)`, e.g. "terminal cleanup clears the widget/status..."
+	// above) so the module-level `runRegistry` singleton is guaranteed released by the time this
+	// runs: every prior real run's `commands/orchestrate.ts` `finally` block releases it before
+	// that test's own awaited `runPromise` resolves.
+	test("the registered /orchestrate handler is the modular one (commands/orchestrate.ts -> pipeline/run-orchestration.ts's runOrchestration), not a leftover/duplicate inline stub", async () => {
+		let handler!: (args: string, ctx: never) => Promise<void>;
+		orchestrator.default({
+			on: () => {},
+			registerCommand: (name: string, command: { handler: typeof handler }) => {
+				if (name === "orchestrate") handler = command.handler;
+			},
+			registerTool: () => {},
+			sendMessage: () => {},
+		} as never);
+		const notices: Array<{ text: string; level: string }> = [];
+		const ctx = { ui: { notify: (text: string, level: string) => notices.push({ text, level }) } };
+		// C7 ("goal refers to missing context", commands/orchestrate.ts's `loadProvidedContext`/
+		// `goalRefersToMissingContext`) never existed in the pre-A1 inline handler: this exact
+		// stop -- reached before any session/adapter/dispatch call -- is the delegation proof.
+		await handler("do A then C then B", ctx as never);
+		expect(
+			notices.some(
+				(n) => n.text.includes("--context") && n.text.includes("--with-last-reply") && n.text.includes("--force"),
+			),
+		).toBe(true);
 	});
 });

@@ -38,8 +38,7 @@ import { parseLeadStatus } from "../run-outcome.ts";
 import { formatReconEvidence, planReconTasks } from "../recon.ts";
 import { METHOD, shortName } from "../models.ts";
 import { fmtElapsed } from "../run-ui.ts";
-import type { RunContext } from "../run/context.ts";
-import type { RunSession } from "../run/session.ts";
+import type { RunContext, RunSessionLike } from "../run/context.ts";
 
 /**
  * True when a lead's `DispatchResult` ended because of a transient provider
@@ -258,7 +257,7 @@ export interface HierarchyDeps {
 	captureDispatchCost: (
 		opts: CaptureOpts,
 		result: DispatchResult,
-		run: RunContext<RunSession> | null,
+		run: RunContext<RunSessionLike> | null,
 	) => Promise<void>;
 	/** Ceiling on the topology's requested lead count (config.ts's `maxLeads`). */
 	maxLeads: number;
@@ -299,7 +298,7 @@ export async function dispatchHierarchical(
 	/** The run this dispatch belongs to; threaded through to `deps.dispatch`,
 	 *  `deps.captureDispatchCost` and `dispatchReconAndLeads`'s effects instead
 	 *  of an implicit "active run" read (B4.4). */
-	run: RunContext<RunSession> | null,
+	run: RunContext<RunSessionLike> | null,
 	leadCapability: string,
 	deps: HierarchyDeps,
 ): Promise<{

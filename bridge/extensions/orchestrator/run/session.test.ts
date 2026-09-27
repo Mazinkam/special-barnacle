@@ -244,7 +244,7 @@ describe("RunSession terminal timing", () => {
 		const orchestrateSource = readFileSync(new URL("../commands/orchestrate.ts", import.meta.url), "utf8");
 		const pipelineSource = readFileSync(new URL("../pipeline/run-orchestration.ts", import.meta.url), "utf8");
 		const handler = orchestrateSource.slice(orchestrateSource.indexOf('pi.registerCommand("orchestrate"')) + pipelineSource;
-		const calls = handler.match(/await deps\.(?:completeRun|failRun)\([^;]*?\);/gs) ?? [];
+		const calls = handler.match(/await deps\.(?:completeRun|failRun|cancelRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThanOrEqual(6);
 		for (const call of calls) expect(call).toContain("session.terminalTiming()");
 	});
