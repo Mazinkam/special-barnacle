@@ -35,11 +35,11 @@ describe("core/report.ts verificationVerdictFor", () => {
 	});
 
 	test("the QA dispatch timing out reads as TIMED OUT, distinct from a completed FAIL", () => {
-		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true })).toBe("TIMED OUT (QA dispatch did not complete)");
+		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true })).toBe("QA TIMED OUT (QA dispatch did not complete)");
 	});
 
 	test("a timeout still wins over named failed checks (QA never finished judging them)", () => {
-		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true, failedChecks: ["typecheck"] })).toBe("TIMED OUT (QA dispatch did not complete)");
+		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true, failedChecks: ["typecheck"] })).toBe("QA TIMED OUT (QA dispatch did not complete)");
 	});
 
 	test("regression: QA dispatched and failed unparsed must never read as 'NOT RUN (no lead succeeded)' (docs/architecture-review.md C5)", () => {
@@ -65,11 +65,13 @@ function baseReport(): RunReport {
 		elapsedMs: 65_000, // fmtElapsed: 65s -> "1m05s"
 		blocked: false,
 		dispatchOk: true,
+		verificationDispatchOk: true,
 		succeededLeads: 2,
 		totalLeads: 2,
 		skippedLeads: 0,
 		retries: 0,
 		resumedLeadIds: [],
+		leadAttemptLines: [],
 		filesChangedCount: 3,
 		externalFilesCount: 0,
 		reconWorkersLine: "recon: 0 workers dispatched",
@@ -114,6 +116,7 @@ describe("core/report.ts buildRunSummary", () => {
 		const report: RunReport = {
 			...baseReport(),
 			dispatchOk: false,
+			verificationDispatchOk: false,
 			succeededLeads: 0,
 			totalLeads: 2,
 			passedVerification: false,
@@ -188,6 +191,16 @@ describe("core/report.ts buildRunSummary", () => {
 	test("no resumes: the summary is byte-identical to a run with the field omitted (no resumes line at all)", () => {
 		const { text } = buildRunSummary(baseReport());
 		expect(text).not.toContain("resumes:");
+	});
+
+	test("lead attempt lines: rendered right after the recon line, before verification", () => {
+		const { text } = buildRunSummary({ ...baseReport(), leadAttemptLines: ["lead-0: failed (exit 1) \u2192 retry-1 succeeded"] });
+		expect(text).toContain("recon: 0 workers dispatched\nlead-0: failed (exit 1) \u2192 retry-1 succeeded\nverification: PASS");
+	});
+
+	test("no lead attempt lines: nothing extra rendered", () => {
+		const { text } = buildRunSummary(baseReport());
+		expect(text).not.toContain("\u2192");
 	});
 
 	test("full report: shown inline (no files changed) with a 'lead report:' header, no truncation notice", () => {
@@ -300,7 +313,7 @@ describe("core/report.ts buildRunSummary", () => {
 	test("QA dispatch timed out: verification line reads TIMED OUT, distinct from a completed FAIL, and the run is not reported as succeeded", () => {
 		const report = { ...baseReport(), passedVerification: false, verificationTimedOut: true, failedChecks: [] };
 		const { text, succeeded } = buildRunSummary(report);
-		expect(text).toContain("verification: TIMED OUT (QA dispatch did not complete)");
+		expect(text).toContain("verification: QA TIMED OUT (QA dispatch did not complete)");
 		expect(succeeded).toBe(false);
 	});
 
@@ -321,5 +334,14 @@ describe("core/report.ts buildRunSummary", () => {
 		const { text } = buildRunSummary(report);
 		expect(text).toContain("verification: FAIL (unparsed)");
 		expect(text).not.toContain("NOT RUN (no lead succeeded)");
+	});
+
+	test("regression (A2): a lead that succeeded originally but whose escalation retry later failed must not turn a real PASS into NOT RUN", () => {
+		// `dispatchOk` (the run's final dispatch verdict) can read false here even though QA actually
+		// ran and passed — `verificationDispatchOk` is what the verdict must key off instead.
+		const report = { ...baseReport(), dispatchOk: false, verificationDispatchOk: true, passedVerification: true };
+		const { text } = buildRunSummary(report);
+		expect(text).toContain("verification: PASS");
+		expect(text).not.toContain("NOT RUN");
 	});
 });

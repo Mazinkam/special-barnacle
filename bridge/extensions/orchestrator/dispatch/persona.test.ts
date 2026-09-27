@@ -1,7 +1,24 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { resolvePersona } from "./persona.ts";
 
 const NO_PERSONA = "__no_persona__";
+
+describe("lead persona blocking-waits guidance", () => {
+	test("all lead personas forbid blocking waits and define pending-check reporting", () => {
+		for (const file of ["orchestrator-lead.md", "orch-architect.md", "orch-technical-lead.md"]) {
+			const persona = readFileSync(join(import.meta.dir, "..", "..", "..", "agents", file), "utf-8");
+			const headings = persona.split("\n");
+			expect(headings).toContain("## Pending external checks");
+			expect(headings).toContain("## No blocking waits");
+			expect(persona).toContain("No blocking waits");
+			expect(persona).toContain("gh run watch");
+			expect(persona).toContain("glab ci status --live");
+			expect(persona).toContain("## Pending external checks");
+		}
+	});
+});
 
 function discovery(agents: Array<{ name: string; tools?: string[]; systemPrompt: string }>) {
 	return () => ({ agents });

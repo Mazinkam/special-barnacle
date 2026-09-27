@@ -27,10 +27,29 @@ export interface DispatchResult {
 	/** Process disposition after considering terminal JSON events (see index.ts's SubagentProcessResult). */
 	outcome?: "completed" | "completed_after_process_error" | "failed" | "timed_out" | "cancelled";
 	timeoutReason?: "inactivity" | "absolute";
+	/** Tool call in flight at kill time, when the dispatch expired mid-tool-call (see core/wait-stall.ts's classifyTimeout). */
+	toolInFlight?: {
+		name: string;
+		command?: string;
+		/** True when the raw (pre-redaction) in-flight command matched `isWaitCommand` (core/wait-stall.ts). */
+		waitPattern?: boolean;
+		/** CI pipeline/run references extracted from the raw in-flight command (core/wait-stall.ts's `extractCiRefs`).
+		 *  Defined structurally here — not imported from core/wait-stall.ts — so this module never depends on that
+		 *  module's load order/exports; a `CiRef` from there is always assignable to this shape. */
+		ciRefs?: Array<{ provider: "gitlab" | "github"; kind: "pipeline" | "run"; id: string }>;
+	};
 	interruption?: InterruptionReport;
 	filesChanged: string[];
 	/** HT thinking level the dispatch ran at (from the binding), when one was set. */
 	effort?: string;
+	/**
+	 * `scoped_leads` (index.ts-only today; not yet ported to the modular pipeline — see this
+	 * repo's A1 unification notes): the `exitCode`/`stdout` of every phase (plan/integrate/report/
+	 * fallback) a scoped lead's chain ran, attached only by `finalizeScopedLeadResult`. Absent on
+	 * every `DispatchResult` the modular `pipeline/hierarchy.ts` produces today, in which case
+	 * `run-outcome.ts`'s `qaScopeEvidenceFor` passes `exitCode`/`stdout` through unchanged.
+	 */
+	scopedPhaseReports?: Array<{ phase: string; exitCode: number; stdout: string }>;
 }
 
 export interface CaptureOpts {

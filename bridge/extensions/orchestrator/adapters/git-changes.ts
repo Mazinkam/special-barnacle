@@ -213,3 +213,27 @@ export function looksLikeFilePath(s: string): boolean {
 		)
 	);
 }
+
+/**
+ * The exact revision + working-tree state verification actually ran against, captured with the
+ * same cheap `git` calls `gitHead`/`gitDirtySnapshot` already use (short-timeout subprocesses,
+ * no new mechanism). `dirty` distinguishes "verified a clean committed SHA" from "verified an
+ * uncommitted worktree" -- collapsing the two would let a caller believe a dirty run tested a
+ * specific commit it did not. `revision: null` always comes with an explicit
+ * `unavailable_reason` (never a bare, unexplained null) so a non-Git checkout reads as
+ * "not available, here's why" rather than "forgot to record it".
+ */
+export interface TestedRevision {
+	revision: string | null;
+	dirty: boolean | null;
+	unavailable_reason?: string;
+}
+
+export function testedRevisionFor(cwd: string): TestedRevision {
+	const revision = gitHead(cwd);
+	const snapshot = gitDirtySnapshot(cwd);
+	if (revision === null && snapshot === null) {
+		return { revision: null, dirty: null, unavailable_reason: "not a git repository, or git is unavailable in this environment" };
+	}
+	return { revision, dirty: snapshot === null ? null : snapshot.size > 0 };
+}

@@ -16,8 +16,45 @@
  * which requires knowing its shape.
  */
 
-import type { AliasTable } from "../models.ts";
+import type { AliasTable, BindingSource } from "../models.ts";
 import type { RunTags } from "../core/records.ts";
+import type { RunCancellation } from "../cancellation.ts";
+import type { QueueStats } from "../record-queue.ts";
+import type { RunTiming } from "./session.ts";
+
+/**
+ * The `RunSession` surface `pipeline/*` and `commands/orchestrate.ts` actually call, as a
+ * structural interface rather than the concrete `run/session.ts` `RunSession` class
+ * (docs: A1 unification notes). TypeScript's class-to-class assignability requires private
+ * members to originate from the SAME declaration, which the modular `RunSession` and any
+ * caller's own session class (e.g. `index.ts`'s own, pre-B4.4 implementation) never share —
+ * even when their public surfaces are identical. A purely-public structural interface has no
+ * such restriction: ANY class exposing this exact public shape (including one with its own,
+ * unrelated private fields) satisfies `RunSessionLike` and can be threaded through
+ * `RunContext<RunSessionLike>`/`RunRegistry<RunSessionLike>` without either side importing the
+ * other's concrete class. Every `pipeline/*`/`commands/orchestrate.ts` seam that used to read
+ * `RunContext<RunSession>` (`run/session.ts`'s class) is typed against this interface instead;
+ * `run/session.ts`'s own `RunSession` continues to satisfy it structurally, so every existing
+ * caller/test that already uses the concrete class is unaffected.
+ */
+export interface RunSessionLike {
+	readonly runId: string;
+	readonly dir: string;
+	readonly cancellation: RunCancellation;
+	readonly cancelReason: "user" | "shutdown" | "signal" | undefined;
+	runPromise?: Promise<void>;
+	readonly telemetryBaseline: QueueStats;
+	file(name: string): string;
+	writeDiagnostic(name: string, text: string): boolean;
+	log(line: string): void;
+	setPhase(phase: string, notify?: boolean): void;
+	terminalTiming(): RunTiming;
+	cancelledDispatches(): string[];
+	totalCost(): number;
+	close(): void;
+	sealDiagnostics(terminal?: Promise<boolean>): Promise<boolean>;
+	finish(): void;
+}
 
 /**
  * One `/orchestrate` run's state, passed explicitly to every function in the
@@ -36,6 +73,14 @@ export interface RunContext<TSession> {
 	readonly tags: RunTags;
 	/** Alias table for the codex -> Bedrock quota fallback, or `null` when none applies. */
 	readonly aliasTable: AliasTable | null;
+	/**
+	 * Per-capability binding source of this run's resolved adapter (`FullResolution.sources`),
+	 * mirroring the old `CURRENT_MODEL_SOURCES` global (A1 unification notes) — `null`/omitted when
+	 * the claimer has no adapter-resolution sources to report (e.g. the model-check probe, which
+	 * claims with no `modelSources` argument at all). Optional so existing `RunContext` literals
+	 * built by tests before this field existed keep typechecking.
+	 */
+	readonly modelSources?: Record<string, BindingSource> | null;
 }
 
 /**
@@ -68,9 +113,14 @@ export class RunRegistry<TSession> {
 	 * the registry — the guard every `/orchestrate` invocation (and the
 	 * model-check probe) must lose against cleanly.
 	 */
-	claim(session: TSession, tags: RunTags = {}, aliasTable: AliasTable | null = null): RunContext<TSession> | null {
+	claim(
+		session: TSession,
+		tags: RunTags = {},
+		aliasTable: AliasTable | null = null,
+		modelSources: Record<string, BindingSource> | null = null,
+	): RunContext<TSession> | null {
 		if (this.current) return null;
-		this.current = { session, tags, aliasTable };
+		this.current = { session, tags, aliasTable, modelSources };
 		return this.current;
 	}
 

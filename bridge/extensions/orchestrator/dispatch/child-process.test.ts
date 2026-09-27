@@ -169,6 +169,26 @@ describe("runSubagentProcess process/event handling", () => {
 		expect(result.outcome).toBe("timed_out");
 		expect(result.timeoutReason).toBe("inactivity");
 		expect(result.stderr).toContain("UNVERIFIED PARTIAL WORK — inactivity");
+		expect(result.toolInFlight).toBeUndefined();
+	});
+
+	test("a lead killed by inactivity mid-bash-wait-loop carries the in-flight command as toolInFlight", async () => {
+		const result = await runLead(
+			`process.stdout.write(JSON.stringify({type:"tool_execution_start",toolName:"bash",toolCallId:"call-1",args:{command:"for i in $(seq 1 40); do glab ci get -p 219469; sleep 60; done"}})+"\\n");setInterval(()=>{},1000);`,
+			"wait-loop-lead",
+			{ inactivityMs: 600, maxMs: 3000 },
+		);
+
+		expect(result.exitCode).toBe(124);
+		expect(result.outcome).toBe("timed_out");
+		expect(result.timeoutReason).toBe("inactivity");
+		expect(result.toolInFlight).toEqual({
+			name: "bash",
+			command: "for i in $(seq 1 40); do glab ci get -p 219469; sleep 60; done",
+			waitPattern: true,
+			ciRefs: [{ provider: "gitlab", kind: "pipeline", id: "219469" }],
+		});
+		expect(result.stderr).toContain("blocked waiting");
 	});
 
 	test("looping lead reports repeated tool calls before inactivity timeout", async () => {
@@ -1341,6 +1361,105 @@ describe("runSubagentProcess process/event handling", () => {
 			session.close();
 			rmSync(fixtureDir, { recursive: true, force: true });
 		}
+	});
+
+	describe("post-end grace (A5/N1a)", () => {
+		test("an error turn + agent_end + auto_retry_start, then silence, settles after grace as failed — not timed_out", async () => {
+			const session = createSession("post-end-grace-error");
+			try {
+				const result = await runSubagentProcess({
+					cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+					ctx: {} as never, env: () => process.env, capability: "lead", taskId: "post-end-grace-error", session,
+					leadTimeouts: { inactivityMs: 60_000, maxMs: 300_000 },
+					postEndGraceMs: 50,
+					spawnChild: spawnFixtureScript("child-end-no-exit.mjs"),
+				});
+
+				expect(result.postEndGraceExpired).toBe(true);
+				expect(result.timeoutReason).toBeUndefined();
+				expect(result.outcome).toBe("failed");
+				expect(result.stopReason).toBe("error");
+				expect(result.stderr).toContain("ENOTFOUND");
+				expect(result.stderr).toContain("did not exit within");
+			} finally {
+				session.close();
+			}
+		});
+
+		test("agent_end with a final stop turn, then silence, settles as completed with the final text", async () => {
+			const session = createSession("post-end-grace-stop");
+			try {
+				const result = await runSubagentProcess({
+					cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+					ctx: {} as never, env: () => process.env, capability: "lead", taskId: "post-end-grace-stop", session,
+					leadTimeouts: { inactivityMs: 60_000, maxMs: 300_000 },
+					postEndGraceMs: 50,
+					spawnChild: spawnInlineScript(
+						[
+							`for (const e of [{type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:"final answer"}]}},{type:"agent_end"}])`,
+							`process.stdout.write(JSON.stringify(e)+"\\n");`,
+							`setInterval(()=>{},1000);`,
+						].join(" "),
+					),
+				});
+
+				expect(result.postEndGraceExpired).toBe(true);
+				expect(result.outcome).toBe("completed");
+				expect(result.exitCode).toBe(0);
+				expect(result.finalText).toBe("final answer");
+				expect(result.stderr).toContain("did not exit within");
+			} finally {
+				session.close();
+			}
+		});
+
+		test("a new tool_execution_start after an error turn cancels the grace timer — no early settle", async () => {
+			const session = createSession("post-end-grace-cancel");
+			try {
+				const result = await runSubagentProcess({
+					cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+					ctx: {} as never, env: () => process.env, capability: "lead", taskId: "post-end-grace-cancel", session,
+					leadTimeouts: { inactivityMs: 60_000, maxMs: 300_000 },
+					postEndGraceMs: 200,
+					spawnChild: spawnInlineScript(
+						[
+							`process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",stopReason:"error",errorMessage:"boom"}})+"\\n");`,
+							`setTimeout(()=>{`,
+							`  process.stdout.write(JSON.stringify({type:"tool_execution_start",toolName:"read",args:{path:"recovered.ts"}})+"\\n");`,
+							`  setTimeout(()=>{`,
+							`    for (const e of [{type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:"recovered"}]}},{type:"agent_end"},{type:"agent_settled"}])`,
+							`      process.stdout.write(JSON.stringify(e)+"\\n");`,
+							`  }, 30);`,
+							`}, 50);`,
+						].join(" "),
+					),
+				});
+
+				expect(result.postEndGraceExpired).toBeUndefined();
+				expect(result.outcome).toBe("completed");
+				expect(result.finalText).toBe("recovered");
+			} finally {
+				session.close();
+			}
+		});
+
+		test("a normal prompt exit right after agent_end is unaffected by the grace timer", async () => {
+			const session = createSession("post-end-grace-normal-exit");
+			try {
+				const result = await runSubagentProcess({
+					cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+					ctx: {} as never, env: () => process.env, capability: "lead", taskId: "post-end-grace-normal-exit", session,
+					leadTimeouts: { inactivityMs: 60_000, maxMs: 300_000 },
+					postEndGraceMs: 200,
+					spawnChild: spawnFixtureScript("child-exit-after-settle.mjs"),
+				});
+
+				expect(result.postEndGraceExpired).toBeUndefined();
+				expect(result.outcome).toBe("completed_after_process_error");
+			} finally {
+				session.close();
+			}
+		});
 	});
 });
 

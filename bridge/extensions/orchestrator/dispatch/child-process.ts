@@ -162,12 +162,70 @@ export interface SubagentProcessResult {
 	/** Process disposition after considering terminal JSON events. */
 	outcome: "completed" | "completed_after_process_error" | "failed" | "timed_out" | "cancelled";
 	timeoutReason?: "inactivity" | "absolute";
+	/** Tool call in flight at kill time, when the dispatch timed out mid-tool-call. */
+	toolInFlight?: {
+		name: string;
+		command?: string;
+		/** True when the raw (pre-redaction) in-flight command matched `isWaitCommand` (core/wait-stall.ts). */
+		waitPattern?: boolean;
+		/** CI pipeline/run references extracted from the raw in-flight command (core/wait-stall.ts's `extractCiRefs`).
+		 *  Defined structurally here — not imported from core/wait-stall.ts — mirroring core/records.ts's
+		 *  `DispatchResult.toolInFlight` so the two stay in lockstep without either importing `CiRef`. */
+		ciRefs?: Array<{ provider: "gitlab" | "github"; kind: "pipeline" | "run"; id: string }>;
+	};
 	interruption?: InterruptionReport;
 	/** Raw child exit code before terminal-result recovery. */
 	processExitCode: number;
 	/** Teardown error retained alongside a valid settled result. */
 	postCompletionError?: string;
+	/**
+	 * True when the child emitted `agent_end` (or an error-stopReason turn) and
+	 * then never actually exited: the post-end grace timer (A5/N1a) fired,
+	 * this module killed the process group itself, and the outcome below was
+	 * classified from the last JSON event rather than from a real exit. Lets
+	 * later code (retry/escalation, telemetry) tell this apart from a normal
+	 * settle-then-exit.
+	 */
+	postEndGraceExpired?: true;
 }
+
+/** Default grace period (ms) a dispatch is given, after `agent_end` or an
+ *  error-stopReason turn, to actually exit before this module kills its
+ *  process group itself and settles from the last JSON event (A5/N1a). */
+const DEFAULT_POST_END_GRACE_MS = 30_000;
+
+/**
+ * Resolve the post-end grace period: `opts.postEndGraceMs` (test seam) wins
+ * outright when positive; otherwise `HUMAIN_ORCHESTRATOR_POST_END_GRACE_MS`
+ * from the child's env getter, falling back to `DEFAULT_POST_END_GRACE_MS`
+ * when unset, non-numeric, or non-positive (with a note so a typo'd override
+ * is never silently ignored).
+ */
+function resolvePostEndGraceMs(env: NodeJS.ProcessEnv, override?: number): { ms: number; note?: string } {
+	if (typeof override === "number" && Number.isFinite(override) && override > 0) return { ms: override };
+	const raw = env.HUMAIN_ORCHESTRATOR_POST_END_GRACE_MS;
+	if (raw === undefined || raw.trim() === "") return { ms: DEFAULT_POST_END_GRACE_MS };
+	const parsed = Number(raw);
+	if (!Number.isFinite(parsed) || parsed <= 0) {
+		return {
+			ms: DEFAULT_POST_END_GRACE_MS,
+			note: `HUMAIN_ORCHESTRATOR_POST_END_GRACE_MS="${raw}" is invalid; using the default ${DEFAULT_POST_END_GRACE_MS}ms post-end grace`,
+		};
+	}
+	return { ms: parsed };
+}
+
+/** Event types that show the child actually resumed doing something after an
+ *  `agent_end`/error turn — cancel the post-end grace timer on any of these.
+ *  `entry_appended` and heartbeat ticks are deliberately excluded: they fire
+ *  on a hung child too (see the s11yls-lead-0 incident this guards against). */
+const POST_END_GRACE_CANCEL_TYPES = new Set([
+	"tool_execution_start",
+	"message_update",
+	"message_start",
+	"turn_start",
+	"agent_start",
+]);
 
 /**
  * Pick the right binary + args to invoke Pi in --mode json. Mirrors the
@@ -368,6 +426,12 @@ export async function runSubagentProcess(opts: {
 	/** Test seam for deterministic progress/absolute timeout coverage. */
 	leadTimeouts?: { inactivityMs: number; maxMs: number };
 	/**
+	 * Test seam only: overrides the post-end grace period (A5/N1a) so tests do
+	 * not have to wait out the real `HUMAIN_ORCHESTRATOR_POST_END_GRACE_MS`
+	 * default (30s). Production callers never set this.
+	 */
+	postEndGraceMs?: number;
+	/**
 	 * Owning session, so this dispatch's progress/diagnostics land on the run's
 	 * board and log (B4.4: every production caller now passes its RunContext's
 	 * `session` explicitly — dispatchParallel's `runOn`, triageTask, and
@@ -491,6 +555,12 @@ export async function runSubagentProcess(opts: {
 		let timedOut = false;
 		let cancelledByListener = false;
 		let timeoutReason: "inactivity" | "absolute" | undefined;
+		let toolInFlight: {
+			name: string;
+			command?: string;
+			waitPattern?: boolean;
+			ciRefs?: Array<{ provider: "gitlab" | "github"; kind: "pipeline" | "run"; id: string }>;
+		} | undefined;
 		let interruption: InterruptionReport | undefined;
 		let spawnFailed = false;
 		let settled = false;
@@ -505,6 +575,17 @@ export async function runSubagentProcess(opts: {
 		let armTimer: () => void = () => {};
 		let handleExpiry: (reason: "inactivity" | "absolute") => void = () => {};
 		let handleSpendCap: (verdict: Exclude<SpendCapVerdict, "ok">) => void = () => {};
+		// Post-end grace (A5/N1a): armed once the child emits `agent_end` or an
+		// error-stopReason turn, cancelled by any sign the child resumed real work,
+		// re-armed (to delayMs + grace) on an `auto_retry_start`. If it fires with
+		// the process still alive, this module kills it and settles from the last
+		// JSON event itself instead of waiting out the (far longer) inactivity
+		// watchdog. See resolvePostEndGraceMs/handlePostEndGraceExpired below.
+		let postEndGraceTimer: ReturnType<typeof setTimeout> | undefined;
+		let postEndGraceExpired = false;
+		let armPostEndGrace: (delayMs: number) => void = () => {};
+		let cancelPostEndGrace: () => void = () => {};
+		let handlePostEndGraceExpired: () => void = () => {};
 		// `--mode json` writes newline-delimited events, NOT plain prose. Callers
 		// need the assistant's text, so accumulate it here; handing them the raw
 		// event stream made triage's JSON.parse fail every single time.
@@ -570,6 +651,7 @@ export async function runSubagentProcess(opts: {
 			}
 			removeCancellationListener?.();
 			if (typeof proc?.pid === "number") liveDispatchPids.delete(proc.pid);
+			cancelPostEndGrace();
 			cleanupPrompt();
 			// Real child stderr now lands on a file, not a pipe (see openStderrTarget);
 			// nothing streams it into stderrCapture in real time, so read whatever the
@@ -649,8 +731,10 @@ export async function runSubagentProcess(opts: {
 				outcome: outcome.status,
 				processExitCode,
 				timeoutReason,
+				toolInFlight,
 				interruption,
 				postCompletionError: outcome.status === "completed_after_process_error" ? outcome.note : undefined,
+				postEndGraceExpired: postEndGraceExpired ? true : undefined,
 			});
 		};
 
@@ -700,6 +784,21 @@ export async function runSubagentProcess(opts: {
 				session?.setNestedCost(taskId, nestedCost.total());
 				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar()) ?? "ok";
 				if (verdict !== "ok") handleSpendCap(verdict);
+			}
+			// Post-end grace (A5/N1a): agent_end or an error-stopReason turn arms
+			// the grace timer; auto_retry_start re-arms it to cover the retry's own
+			// delay; anything showing the child resumed real work cancels it.
+			// entry_appended/heartbeats fall through untouched — a hung child kept
+			// emitting those in the s11yls-lead-0 incident this guards against.
+			if (delta.ended || (delta.turn && delta.turn.stopReason === "error")) {
+				armPostEndGrace(postEndGraceMs);
+			} else if (event.type === "auto_retry_start") {
+				const delayMsRaw = (event as { delayMs?: unknown }).delayMs;
+				if (typeof delayMsRaw === "number" && Number.isFinite(delayMsRaw) && delayMsRaw > 0) {
+					armPostEndGrace(delayMsRaw + postEndGraceMs);
+				}
+			} else if (event.type && POST_END_GRACE_CANCEL_TYPES.has(event.type)) {
+				cancelPostEndGrace();
 			}
 			if (progressTracker && observation) {
 				if (event.type === "tool_execution_start") toolCalls += 1;
@@ -779,10 +878,52 @@ export async function runSubagentProcess(opts: {
 			session?.log(`dispatch ${taskId} timeout configuration: ${note}`);
 		}
 
+		// Post-end grace (A5/N1a) applies to every dispatch, lead or leaf: a
+		// child that says it is done (agent_end) or hit a provider error
+		// (stopReason "error") but then never actually exits must not be left
+		// to the much longer inactivity watchdog — see s11yls-lead-0.
+		const postEndGrace = resolvePostEndGraceMs(envGetter(), opts.postEndGraceMs);
+		const postEndGraceMs = postEndGrace.ms;
+		if (postEndGrace.note) {
+			stderrCapture.append(`\n[orchestrator] ${postEndGrace.note}`);
+			session?.log(`dispatch ${taskId} ${postEndGrace.note}`);
+		}
+
+		armPostEndGrace = (delayMs: number) => {
+			if (settled || cancelledByListener) return;
+			if (postEndGraceTimer !== undefined) clearTimeout(postEndGraceTimer);
+			postEndGraceTimer = setTimeout(() => {
+				postEndGraceTimer = undefined;
+				handlePostEndGraceExpired();
+			}, delayMs);
+		};
+		cancelPostEndGrace = () => {
+			if (postEndGraceTimer !== undefined) {
+				clearTimeout(postEndGraceTimer);
+				postEndGraceTimer = undefined;
+			}
+		};
+		handlePostEndGraceExpired = () => {
+			if (settled) return;
+			postEndGraceExpired = true;
+			const stopReason = events.stopReason ?? "unknown";
+			stderrCapture.append(
+				`\n[orchestrator] child emitted agent_end (stopReason=${stopReason}) but did not exit within ` +
+					`${Math.round(postEndGraceMs / 1000)}s; killing process group and settling from the final event`,
+			);
+			session?.log(`dispatch ${taskId} did not exit within the post-end grace period (stopReason=${stopReason}); killing it and settling from the last event`);
+			if (proc) killProcessTree(proc);
+			// Deliberately NOT timedOut/124: the outcome must be classified from the
+			// last JSON event (stopReason "stop" -> completed, "error" -> failed),
+			// not folded into the timeout path.
+			finish(0);
+		};
+
 		handleExpiry = (reason) => {
 			if (settled || cancelledByListener) return;
 			timedOut = true;
 			timeoutReason = reason;
+			toolInFlight = progressTracker?.toolInFlight();
 			const explanation = progressTracker?.describeExpiry(reason, opts.capability, Date.now()) ?? reason;
 			stderrCapture.append(`\n[orchestrator] ${reason} timeout: ${explanation}`);
 			const report = recordInterruption(reason === "inactivity" ? "inactivity_timeout" : "absolute_timeout");

@@ -30,16 +30,16 @@ import {
 	effectiveLeadCount,
 	leadPrompt,
 	resumeLeadPrompt,
+	retryLeadPrompt,
 	type DispatchTask,
 	type PlanResponse,
 } from "../core/prompts.ts";
-import { parseLeadAssignments, planLeadWaves } from "../lead-plan.ts";
+import { parseLeadAssignments, planLeadWaves, type LeadAssignment } from "../lead-plan.ts";
 import { parseLeadStatus } from "../run-outcome.ts";
 import { formatReconEvidence, planReconTasks } from "../recon.ts";
 import { METHOD, shortName } from "../models.ts";
 import { fmtElapsed } from "../run-ui.ts";
-import type { RunContext } from "../run/context.ts";
-import type { RunSession } from "../run/session.ts";
+import type { RunContext, RunSessionLike } from "../run/context.ts";
 
 /**
  * True when a lead's `DispatchResult` ended because of a transient provider
@@ -75,6 +75,75 @@ export function isTransientLeadFailure(r: DispatchResult): boolean {
 	return isTransientProviderError(text);
 }
 
+/**
+ * `"completed (STATUS: ...)"`, `"blocked"`, or `"failed (<reason>)"` for one lead's already-settled
+ * `DispatchResult` (A3's truthful `## Other leads` section): never guesses, only describes what
+ * actually happened to this exact result.
+ */
+function leadStatusLine(r: DispatchResult): string {
+	if (parseLeadStatus(r.stdout) === "blocked") return "blocked";
+	if (r.exitCode === 0) {
+		const status = parseLeadStatus(r.stdout);
+		return status ? `completed (STATUS: ${status})` : "completed";
+	}
+	const reason = r.outcome === "cancelled" ? "cancelled" : r.outcome === "timed_out" ? (r.timeoutReason ?? "timed out") : `exit ${r.exitCode}`;
+	return `failed (${reason})`;
+}
+
+/**
+ * The `## Other leads` lines a resume/retry prompt hands to `resumeLeadPrompt`/`retryLeadPrompt`
+ * (A3): built fresh from real state at the moment of the call — every OTHER lead's own settled
+ * result (from an earlier wave, or already-settled within this same wave) reads as its real
+ * completed/failed/blocked state; a lead that has not run yet reads as "not started — depends on a
+ * lead that failed or was blocked" only when that is actually true, otherwise "not started yet —
+ * runs in a later wave after this recovery". Returns `undefined` (section omitted) when there is
+ * only one lead — nothing false is ever said about a lead that doesn't exist.
+ */
+function buildOtherLeadsLines(
+	excludeIndex: number,
+	leadCount: number,
+	completedLeadResults: DispatchResult[],
+	currentWaveResults: Map<number, DispatchResult>,
+	stoppedSoFar: ReadonlySet<number>,
+	assignments: LeadAssignment[] | null,
+): string[] | undefined {
+	if (leadCount <= 1) return undefined;
+	const priorByIndex = new Map<number, DispatchResult>();
+	for (const r of completedLeadResults) {
+		const m = /-lead-(\d+)$/.exec(r.taskId);
+		if (m) priorByIndex.set(Number(m[1]), r);
+	}
+	const isStoppedNow = (idx: number): boolean => {
+		if (idx === excludeIndex) return false; // its outcome is pending on the very recovery this section is written for
+		if (stoppedSoFar.has(idx)) return true;
+		const r = currentWaveResults.get(idx);
+		return r ? r.exitCode !== 0 || parseLeadStatus(r.stdout) === "blocked" : false;
+	};
+	const lines: string[] = [];
+	for (let j = 0; j < leadCount; j++) {
+		if (j === excludeIndex) continue;
+		const r = priorByIndex.get(j) ?? currentWaveResults.get(j);
+		const state = r
+			? leadStatusLine(r)
+			: (assignments?.[j]?.dependsOn ?? []).some((d) => isStoppedNow(d))
+				? "not started — depends on a lead that failed or was blocked"
+				: "not started yet — runs in a later wave after this recovery";
+		lines.push(`Lead ${j + 1}: ${state}`);
+	}
+	return lines;
+}
+
+/**
+ * `"inactivity timeout"` / `"absolute timeout"` / `"exit N"` — the caller-supplied
+ * `failureReason` `retryLeadPrompt` states plainly instead of the resume prompt's blanket
+ * "transient provider error" (A3: the in-wave retry is also eligible for a dispatch's own
+ * inactivity/absolute timeout, which is never a transient provider error).
+ */
+function retryFailureReason(r: DispatchResult): string {
+	if (r.outcome === "timed_out") return `${r.timeoutReason ?? "unknown"} timeout`;
+	return `exit ${r.exitCode}`;
+}
+
 /** Parent-owned recon/lead sequencing; effects are supplied by the bridge. */
 export async function dispatchReconAndLeads(
 	input: {
@@ -93,6 +162,12 @@ export async function dispatchReconAndLeads(
 		repoRoot: string;
 		/** The `## Provided context` block from `--context`/`--with-last-reply` (docs/architecture-review.md C6); `""`/undefined when neither was given. */
 		providedContext?: string;
+		/** A3: recover a lead that still fails after the transient-resume pass, IN-WAVE, when a later
+		 *  wave depends on it — instead of leaving it in `stopped` until the post-QA escalation loop
+		 *  recovers it too late for any dependent wave to ever be dispatched. Default `false`: today's
+		 *  behavior (dependent waves marked "not started", the post-QA escalation loop is the only
+		 *  recovery path) is unchanged unless a caller opts in. */
+		inWaveRecovery?: boolean;
 	},
 	effects: {
 		dispatch: (tasks: DispatchTask[]) => Promise<DispatchResult[]>;
@@ -104,8 +179,8 @@ export async function dispatchReconAndLeads(
 		/** Files changed since `mark` was taken, unioned with `claimed` (files the lead's own report named). Optional: falls back to `claimed` when absent. */
 		filesChangedSince?: (mark: unknown, claimed: string[]) => string[];
 	},
-): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[]; resumedLeadTaskIds: string[]; resumedAttemptResults: DispatchResult[] }> {
-	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars, maxLeads, leadCapability = "lead", repoRoot, providedContext = "" } = input;
+): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[]; resumedLeadTaskIds: string[]; retriedLeadTaskIds: string[]; resumedAttemptResults: DispatchResult[] }> {
+	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars, maxLeads, leadCapability = "lead", repoRoot, providedContext = "", inWaveRecovery = false } = input;
 	const requestedLeadCount = effectiveLeadCount(plan, maxLeads);
 
 	// Rule 2: parent-owned, read-only recon dispatched directly by the bridge
@@ -188,7 +263,11 @@ export async function dispatchReconAndLeads(
 	const leadTasks: DispatchTask[] = [];
 	const stopped = new Set<number>();
 	const resumedLeadTaskIds: string[] = [];
-	// The discarded (failed) attempt of every resumed lead, kept separately from
+	// taskIds recovered via A3's in-wave retry (never the same taskId as resumedLeadTaskIds: a lead
+	// gets at most one recovery in total). Kept separate from resumedLeadTaskIds so run-orchestration.ts
+	// can label them "in-wave retry" instead of "resume" in the run summary.
+	const retriedLeadTaskIds: string[] = [];
+	// The discarded (failed) attempt of every resumed OR in-wave-retried lead, kept separately from
 	// `leadResults` (which only ever holds the ONE result used to classify that
 	// lead's status) so its cost is still counted toward the run's total spend
 	// — both attempts are billed, but only the final attempt speaks for the lead.
@@ -216,6 +295,7 @@ export async function dispatchReconAndLeads(
 		// the work a lead's subagents already left on disk. Never more than once
 		// per lead: the replaced result below is not re-examined for resume.
 		const finalResults = [...results];
+		const currentWaveResults = (): Map<number, DispatchResult> => new Map(runnable.map((idx, kk) => [idx, finalResults[kk]!]));
 		for (const [k, r] of results.entries()) {
 			if (!isTransientLeadFailure(r)) continue;
 			const leadIndex = runnable[k];
@@ -224,8 +304,9 @@ export async function dispatchReconAndLeads(
 				? effects.filesChangedSince(waveStartMark, r.filesChanged)
 				: r.filesChanged;
 			effects.setPhase(`lead ${leadIndex + 1}: transient provider error, resuming once`);
+			const otherLeads = buildOtherLeadsLines(leadIndex, leadCount, leadResults, currentWaveResults(), stopped, assignments);
 			const [resumed] = await effects.dispatch([
-				{ ...originalTask, task: resumeLeadPrompt(originalTask.task, r.stdout, filesChangedSinceStart) },
+				{ ...originalTask, task: resumeLeadPrompt(originalTask.task, r.stdout, filesChangedSinceStart, otherLeads) },
 			]);
 			if (resumed) {
 				await effects.capture(resumed);
@@ -234,6 +315,45 @@ export async function dispatchReconAndLeads(
 				resumedLeadTaskIds.push(originalTask.taskId);
 			}
 			effects.throwIfCancelled();
+		}
+		// A3: in-wave recovery, gated on `inWaveRecovery` and run AFTER the transient-resume pass above,
+		// BEFORE `stopped` is computed for this wave — a lead still failing here, with a dependent lead
+		// in a later wave, gets exactly one more recovery attempt (never a second one on top of a
+		// transient resume: `resumedLeadTaskIds` already used this lead's one recovery). Eligible: still
+		// failed (`exitCode !== 0`), not cancelled, not stopped by the per-dispatch spend cap, not
+		// `STATUS: blocked` (a real precondition failure, not a recoverable one), and has at least one
+		// dependent lead — a lead nobody depends on keeps today's behavior (the post-QA escalation loop
+		// recovers it, if anything does). Timed-out leads ARE eligible here (unlike the transient-resume
+		// pass above): a lead that hit its own inactivity/absolute timeout still blocks every dependent
+		// wave if left in `stopped`.
+		if (inWaveRecovery) {
+			for (const [k, r] of finalResults.entries()) {
+				const leadIndex = runnable[k];
+				const originalTask = tasks[k];
+				if (resumedLeadTaskIds.includes(originalTask.taskId)) continue; // already used this lead's one recovery
+				if (r.exitCode === 0) continue;
+				if (r.outcome === "cancelled") continue;
+				if (r.stopReason === "spend_cap") continue;
+				if (parseLeadStatus(r.stdout) === "blocked") continue;
+				const hasDependent = (assignments ?? []).some((a) => a.dependsOn.includes(leadIndex));
+				if (!hasDependent) continue;
+				const filesChangedSinceStart = effects.filesChangedSince
+					? effects.filesChangedSince(waveStartMark, r.filesChanged)
+					: r.filesChanged;
+				const failureReason = retryFailureReason(r);
+				effects.setPhase(`lead ${leadIndex + 1}: ${failureReason}, retrying in-wave (a later wave depends on it)`);
+				const otherLeads = buildOtherLeadsLines(leadIndex, leadCount, leadResults, currentWaveResults(), stopped, assignments);
+				const [retried] = await effects.dispatch([
+					{ ...originalTask, task: retryLeadPrompt(originalTask.task, r.stdout, filesChangedSinceStart, failureReason, otherLeads) },
+				]);
+				if (retried) {
+					await effects.capture(retried);
+					resumedAttemptResults.push(r);
+					finalResults[k] = retried;
+					retriedLeadTaskIds.push(originalTask.taskId);
+				}
+				effects.throwIfCancelled();
+			}
 		}
 		for (const [k, r] of finalResults.entries()) {
 			if (r.exitCode !== 0 || parseLeadStatus(r.stdout) === "blocked") stopped.add(runnable[k]);
@@ -248,7 +368,7 @@ export async function dispatchReconAndLeads(
 	// not count it as part of this run's authoritative worker accounting.
 	// Leads never started because a lead they depend on failed or was blocked.
 	const skippedLeads = [...stopped].filter((i) => !leadResults.some((r) => r.taskId === `${runId}-lead-${i}`)).length;
-	return { leadResults, workerResults, skippedLeads, leadTasks, resumedLeadTaskIds, resumedAttemptResults };
+	return { leadResults, workerResults, skippedLeads, leadTasks, resumedLeadTaskIds, retriedLeadTaskIds, resumedAttemptResults };
 }
 
 /** Dispatch + billing seams `dispatchHierarchical` needs; index.ts's caller supplies the real ones. */
@@ -258,7 +378,7 @@ export interface HierarchyDeps {
 	captureDispatchCost: (
 		opts: CaptureOpts,
 		result: DispatchResult,
-		run: RunContext<RunSession> | null,
+		run: RunContext<RunSessionLike> | null,
 	) => Promise<void>;
 	/** Ceiling on the topology's requested lead count (config.ts's `maxLeads`). */
 	maxLeads: number;
@@ -273,6 +393,10 @@ export interface HierarchyDeps {
 	markFiles?: () => unknown;
 	/** Files changed since `mark` was taken, unioned with `claimed` (files the lead's own report named). Optional. */
 	filesChangedSince?: (mark: unknown, claimed: string[]) => string[];
+	/** A3: recover an in-wave-dependent lead that still fails after the transient-resume pass, instead
+	 *  of leaving every dependent wave marked "not started" until the post-QA escalation loop recovers
+	 *  it too late to matter. Default `false`. */
+	inWaveRecovery?: boolean;
 }
 
 /**
@@ -299,7 +423,7 @@ export async function dispatchHierarchical(
 	/** The run this dispatch belongs to; threaded through to `deps.dispatch`,
 	 *  `deps.captureDispatchCost` and `dispatchReconAndLeads`'s effects instead
 	 *  of an implicit "active run" read (B4.4). */
-	run: RunContext<RunSession> | null,
+	run: RunContext<RunSessionLike> | null,
 	leadCapability: string,
 	deps: HierarchyDeps,
 ): Promise<{
@@ -313,6 +437,8 @@ export async function dispatchHierarchical(
 	leadTasks: DispatchTask[];
 	/** taskIds of leads re-dispatched once after a transient provider error (C3). */
 	resumedLeadTaskIds: string[];
+	/** taskIds of leads recovered in-wave (A3) because a later wave depended on them. */
+	retriedLeadTaskIds: string[];
 	/** The discarded (failed) attempt of every resumed lead, for billing alongside `leadResults` (C3). */
 	resumedAttemptResults: DispatchResult[];
 }> {
@@ -357,7 +483,7 @@ export async function dispatchHierarchical(
 	}
 
 	const results = await dispatchReconAndLeads(
-		{ runId, goal, plan, adapter, architectResult, leadCapability, evidenceMaxChars: deps.evidenceMaxChars, maxLeads: deps.maxLeads, repoRoot: deps.repoRoot, providedContext: deps.providedContext },
+		{ runId, goal, plan, adapter, architectResult, leadCapability, evidenceMaxChars: deps.evidenceMaxChars, maxLeads: deps.maxLeads, repoRoot: deps.repoRoot, providedContext: deps.providedContext, inWaveRecovery: deps.inWaveRecovery },
 		{
 			dispatch: deps.dispatch,
 			capture: (result) => deps.captureDispatchCost(captureOpts, result, run),

@@ -82,6 +82,8 @@ function fakeArgs(overrides: Partial<OrchestrateArgs> = {}): OrchestrateArgs {
 		contextFiles: [],
 		withLastReply: false,
 		force: false,
+		liveQa: false,
+		liveQaOff: false,
 		unknownFlags: [],
 		...overrides,
 	};
@@ -105,6 +107,8 @@ function fakeDeps(overrides: Partial<RunOrchestrationDeps> = {}): RunOrchestrati
 		reconEvidenceMaxChars: 4000,
 		stateRoot: "/tmp/state",
 		providedContext: "",
+		env: {},
+		recordModelCall: () => {},
 		...overrides,
 	};
 }
@@ -304,8 +308,13 @@ describe("pipeline/run-orchestration.ts runOrchestration lead resume after a tra
 		const adapter = fakeAdapter();
 		const resolved = fakeResolution(adapter);
 		let leadCalls = 0;
+		let completedSummary: Record<string, unknown> | undefined;
 		const deps = fakeDeps({
 			planRun: async () => resumePlan(runId),
+			completeRun: async (_runId, summary) => {
+				completedSummary = summary;
+				return healthyTelemetry;
+			},
 			dispatchParallel: async (_cwd, _runId2, tasks) => {
 				if (tasks[0].capability !== "lead") return tasks.map((t) => ({
 					taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0,
@@ -338,6 +347,7 @@ describe("pipeline/run-orchestration.ts runOrchestration lead resume after a tra
 		expect(result.kind).toBe("completed");
 		if (result.kind !== "completed") return;
 		expect(result.report.dispatchOk).toBe(true);
+		expect(completedSummary?.verification_passed).toBe(true);
 		expect(result.report.resumedLeadIds).toEqual(["lead-0"]);
 		// (e) A resume is not a verification retry: the QA retry counter is untouched.
 		expect(result.report.retries).toBe(0);
@@ -381,6 +391,440 @@ describe("pipeline/run-orchestration.ts runOrchestration lead resume after a tra
 		const { text } = buildRunSummary(result.report);
 		expect(text.startsWith("Orchestration FAILED")).toBe(true);
 		expect(text).toContain("resumes: 1 (lead-0)");
+	});
+});
+
+describe("pipeline/run-orchestration.ts runOrchestration lead escalation retry succeeding (bug fix: final attempt, not first, decides the lead's status)", () => {
+	test("lead-0 fails (exit 1), lead-1 succeeds, QA fails naming checks, escalation retries lead-0 as lead-0-retry-1 which succeeds, QA #2 passes: report shows every lead succeeded, no first-failure line, and an attempt line for lead-0", async () => {
+		const runId = "ht-orch-1700000000000-escalate";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan: PlanResponse = {
+			plan_id: "plan-123456789012",
+			run_id: runId,
+			task_class: "investigation", // exempt from Rule-2 recon (method.json skip_for_task_classes) so the fake dispatcher only has to model architect/lead/qa
+			complexity: 8,
+			risk: "medium",
+			topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto",
+				history_sufficient: true,
+				explanation: {},
+			},
+			effective_quality_floor: 0.5,
+			cost_aggressiveness: 0.5,
+		};
+		const usage = { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 };
+		let qaCalls = 0;
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async (_cwd, _runId2, tasks) => {
+				const cap = tasks[0]?.capability;
+				if (cap === "architect") {
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/architect", exitCode: 0,
+						stdout: "## Lead assignments\nLead 1: backend (depends on: none)\nLead 2: frontend (depends on: none)\n",
+						stderr: "", usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				if (cap === "qa_agent") {
+					qaCalls++;
+					const stdout = qaCalls === 1 ? "## Verdict\nFAIL\n\nnaming checks failed." : "## Verdict\nPASS\n";
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0, stdout, stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				// Lead capability: either the initial 2-lead wave, or the lead-0 escalation retry.
+				if (tasks.some((t) => t.taskId.includes("-retry-"))) {
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+					}));
+				}
+				return tasks.map((t) => {
+					if (t.taskId.endsWith("-lead-0")) {
+						return {
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 1,
+							stdout: "boom mid-way through", stderr: "lead crashed",
+							usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "failed" as const, filesChanged: ["src/a.ts"],
+						};
+					}
+					return {
+						taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "STATUS: completed\n\n## Files Changed\n- `src/b.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/b.ts"],
+					};
+				});
+			},
+		});
+
+		const result = await runOrchestration(
+			runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(qaCalls).toBe(2);
+		expect(result.report.succeededLeads).toBe(result.report.totalLeads);
+		expect(result.report.totalLeads).toBe(2);
+		expect(result.report.dispatchOk).toBe(true);
+		expect(result.report.leadAttemptLines).toEqual(["lead-0: failed (exit 1) \u2192 retry-1 succeeded"]);
+		const { text } = buildRunSummary(result.report);
+		expect(text).toContain("lead-0: failed (exit 1) \u2192 retry-1 succeeded");
+		expect(text).not.toContain("first failure:");
+	});
+
+	test("A2 regression: both leads succeed originally, QA #1 fails with an undeterminable (non-overlapping) check so escalation hedges and retries EVERY lead, lead-1's retry fails but lead-0's retry succeeds, QA #2 passes: verdict is PASS, succeededLeads is 2, no 'NOT RUN' text", async () => {
+		const runId = "ht-orch-1700000000000-escalate-all";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan: PlanResponse = {
+			plan_id: "plan-123456789013",
+			run_id: runId,
+			task_class: "investigation",
+			complexity: 8,
+			risk: "medium",
+			topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto",
+				history_sufficient: true,
+				explanation: {},
+			},
+			effective_quality_floor: 0.5,
+			cost_aggressiveness: 0.5,
+		};
+		const usage = { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 };
+		let qaCalls = 0;
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async (_cwd, _runId2, tasks) => {
+				const cap = tasks[0]?.capability;
+				if (cap === "architect") {
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/architect", exitCode: 0,
+						stdout: "## Lead assignments\nLead 1: backend (depends on: none)\nLead 2: frontend (depends on: none)\n",
+						stderr: "", usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				if (cap === "qa_agent") {
+					qaCalls++;
+					// QA #1 names a generic failing check ("verdict") that overlaps neither lead's files —
+					// undeterminable from the verification output alone, so `leadsToRetry` hedges and
+					// retries EVERY lead, including the two that already succeeded.
+					const stdout = qaCalls === 1 ? "## Verdict\nFAIL\n\nnaming checks failed." : "## Verdict\nPASS\n";
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0, stdout, stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				// Lead capability: either the initial 2-lead wave (both succeed), or the escalation
+				// retry wave (lead-0's retry succeeds, lead-1's retry fails).
+				if (tasks.some((t) => t.taskId.includes("-retry-"))) {
+					return tasks.map((t) => {
+						if (t.taskId.includes("-lead-1-")) {
+							return {
+								taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 1,
+								stdout: "boom during retry", stderr: "lead crashed on retry",
+								usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "failed" as const, filesChanged: [],
+							};
+						}
+						return {
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+							stdout: "STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+							usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+						};
+					});
+				}
+				return tasks.map((t) => {
+					if (t.taskId.endsWith("-lead-0")) {
+						return {
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+							stdout: "STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+							usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+						};
+					}
+					return {
+						taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "STATUS: completed\n\n## Files Changed\n- `src/b.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/b.ts"],
+					};
+				});
+			},
+		});
+
+		const result = await runOrchestration(
+			runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(qaCalls).toBe(2);
+		expect(result.report.succeededLeads).toBe(2);
+		expect(result.report.totalLeads).toBe(2);
+		expect(result.report.passedVerification).toBe(true);
+		const { text } = buildRunSummary(result.report);
+		expect(text).toContain("verification: PASS");
+		expect(text).not.toContain("NOT RUN");
+	});
+});
+
+describe("pipeline/run-orchestration.ts runOrchestration escalation feedback/selection uses the LATEST attempt, not the original leadResults (A2 review fix)", () => {
+	test("QA fails twice with maxRetries 2: retry-2's prompt carries retry-1's stdout as feedback (not the original report), and lead-1 (whose retry-1 succeeded with no overlap) is not re-selected on round 2 when lead-0's retry-1 failed", async () => {
+		const runId = "ht-orch-1700000000000-escalate-latest";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan: PlanResponse = {
+			plan_id: "plan-123456789099",
+			run_id: runId,
+			task_class: "investigation",
+			complexity: 8,
+			risk: "medium",
+			topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto",
+				history_sufficient: true,
+				explanation: {},
+			},
+			effective_quality_floor: 0.5,
+			cost_aggressiveness: 0.5,
+		};
+		const usage = { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 };
+		let qaCalls = 0;
+		const capturedTasks: Array<{ taskId: string; task: string }> = [];
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async (_cwd, _runId2, tasks) => {
+				for (const t of tasks) capturedTasks.push({ taskId: t.taskId, task: t.task });
+				const cap = tasks[0]?.capability;
+				if (cap === "architect") {
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/architect", exitCode: 0,
+						stdout: "## Lead assignments\nLead 1: backend (depends on: none)\nLead 2: frontend (depends on: none)\n",
+						stderr: "", usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				if (cap === "qa_agent") {
+					qaCalls++;
+					// Deliberately generic/undeterminable: names no specific file, so `leadsToRetry`'s
+					// only handle is `failedDispatch` (each lead's latest exit code) -- never `overlap`.
+					const stdout = qaCalls < 3 ? "## Verdict\nFAIL\n\ngeneric failure, no specific files named." : "## Verdict\nPASS\n";
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0, stdout, stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				// Round 2 escalation retry: only lead-0 should ever be dispatched here (lead-1's
+				// retry-1 succeeded with no overlap and must not be re-selected).
+				if (tasks.some((t) => t.taskId.includes("-retry-2"))) {
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "RETRY2_MARKER_XYZ STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+					}));
+				}
+				// Round 1 escalation retry: QA #1's undeterminable failure hedges and retries BOTH
+				// leads. lead-0's retry-1 fails again; lead-1's retry-1 succeeds unchanged.
+				if (tasks.some((t) => t.taskId.includes("-retry-1"))) {
+					return tasks.map((t) => {
+						if (t.taskId.includes("-lead-0-retry-1")) {
+							return {
+								taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 1,
+								stdout: "RETRY1_MARKER_XYZ boom during retry-1", stderr: "lead crashed on retry-1",
+								usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "failed" as const, filesChanged: ["src/a.ts"],
+							};
+						}
+						return {
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+							stdout: "STATUS: completed\n\n## Files Changed\n- `src/b.ts`", stderr: "",
+							usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/b.ts"],
+						};
+					});
+				}
+				// Initial wave: both leads succeed.
+				return tasks.map((t) => {
+					if (t.taskId.endsWith("-lead-0")) {
+						return {
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+							stdout: "ORIGINAL_MARKER_XYZ STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+							usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+						};
+					}
+					return {
+						taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "STATUS: completed\n\n## Files Changed\n- `src/b.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/b.ts"],
+					};
+				});
+			},
+		});
+
+		const result = await runOrchestration(
+			runId, "/tmp/cwd-not-a-git-repo", fakeArgs({ maxRetries: 2 }), adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(qaCalls).toBe(3);
+		expect(result.report.retries).toBe(2);
+		expect(result.report.passedVerification).toBe(true);
+		expect(result.report.succeededLeads).toBe(2);
+		expect(result.report.totalLeads).toBe(2);
+
+		// Round 2 escalation retried ONLY lead-0 -- lead-1's retry-1 (exit 0, no overlap with
+		// QA's generic, non-file-naming failure) must never be re-selected just because QA
+		// failed again.
+		const lead1Retry2Tasks = capturedTasks.filter((t) => t.taskId.includes("-lead-1-retry-2"));
+		expect(lead1Retry2Tasks).toEqual([]);
+		const lead0Retry2Task = capturedTasks.find((t) => t.taskId.includes("-lead-0-retry-2"));
+		expect(lead0Retry2Task).toBeDefined();
+
+		// Retry-2's prompt carries retry-1's own report as feedback, not the ORIGINAL report --
+		// the bug this test guards against fed every later round the stale original report.
+		expect(lead0Retry2Task?.task).toContain("RETRY1_MARKER_XYZ");
+		expect(lead0Retry2Task?.task).not.toContain("ORIGINAL_MARKER_XYZ");
+	});
+});
+
+describe("pipeline/run-orchestration.ts runOrchestration QA dispatch timing out (A4)", () => {
+	function flatPlan(runId: string): PlanResponse {
+		return {
+			plan_id: "plan-123456789012",
+			run_id: runId,
+			task_class: "bugfix",
+			complexity: 3,
+			risk: "medium",
+			topology: { depth: 1, leads: 1, workers: 0, shape: "flat" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto",
+				history_sufficient: true,
+				explanation: {},
+			},
+			effective_quality_floor: 0.5,
+			cost_aggressiveness: 0.5,
+		};
+	}
+	const usage = { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 };
+
+	test("QA #1 times out, re-run passes: run passes, no lead escalation dispatched, retries stay 0", async () => {
+		const runId = "ht-orch-1700000000000-qatimeout1";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan = flatPlan(runId);
+		const dispatchedTaskIds: string[] = [];
+		let qaCalls = 0;
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async (_cwd, _runId2, tasks) => {
+				dispatchedTaskIds.push(...tasks.map((t) => t.taskId));
+				const cap = tasks[0]?.capability;
+				if (cap === "qa_agent") {
+					qaCalls++;
+					if (qaCalls === 1) {
+						return tasks.map((t) => ({
+							taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 1,
+							stdout: "| unit | FAIL |\n(killed by timeout)", stderr: "",
+							usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "timed_out" as const, filesChanged: [],
+						}));
+					}
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0,
+						stdout: "## Verdict\nPASS\n", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+					}));
+				}
+				return tasks.map((t) => ({
+					taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+					stdout: "STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+					usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+				}));
+			},
+		});
+
+		const result = await runOrchestration(
+			runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(qaCalls).toBe(2);
+		expect(dispatchedTaskIds).toContain(`${runId}-qa`);
+		expect(dispatchedTaskIds).toContain(`${runId}-qa-rerun-1`);
+		expect(dispatchedTaskIds.some((id) => id.includes("-retry-"))).toBe(false);
+		expect(result.report.retries).toBe(0);
+		expect(result.report.verificationTimedOut).toBe(false);
+		expect(result.report.passedVerification).toBe(true);
+		expect(result.report.failedChecks).toEqual([]);
+		const { text, succeeded } = buildRunSummary(result.report);
+		expect(succeeded).toBe(true);
+		expect(text).toContain("verification: PASS");
+	});
+
+	test("both QA dispatches time out: report verdict starts with 'QA TIMED OUT', failedChecks is empty, no '-retry-' dispatch, summary never names `unit`", async () => {
+		const runId = "ht-orch-1700000000000-qatimeout2";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan = flatPlan(runId);
+		const dispatchedTaskIds: string[] = [];
+		let qaCalls = 0;
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async (_cwd, _runId2, tasks) => {
+				dispatchedTaskIds.push(...tasks.map((t) => t.taskId));
+				const cap = tasks[0]?.capability;
+				if (cap === "qa_agent") {
+					qaCalls++;
+					return tasks.map((t) => ({
+						taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 1,
+						stdout: "| unit | FAIL |\n(killed by timeout)", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "timed_out" as const, filesChanged: [],
+					}));
+				}
+				return tasks.map((t) => ({
+					taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+					stdout: "STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+					usage, durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"],
+				}));
+			},
+		});
+
+		const result = await runOrchestration(
+			runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(qaCalls).toBe(2);
+		expect(dispatchedTaskIds).toContain(`${runId}-qa`);
+		expect(dispatchedTaskIds).toContain(`${runId}-qa-rerun-1`);
+		expect(dispatchedTaskIds.some((id) => id.includes("-retry-"))).toBe(false);
+		expect(result.report.retries).toBe(0);
+		expect(result.report.verificationTimedOut).toBe(true);
+		expect(result.report.passedVerification).toBe(false);
+		expect(result.report.failedChecks).toEqual([]);
+		const { text, succeeded } = buildRunSummary(result.report);
+		expect(succeeded).toBe(false);
+		expect(text).toContain("verification: QA TIMED OUT");
+		expect(text).not.toContain("unit");
 	});
 });
 
@@ -499,5 +943,105 @@ describe("pipeline/run-orchestration.ts runOrchestration elapsedMs (B4.7)", () =
 			expect(result.report.elapsedMs).toBe(1000);
 			expect(Number.isNaN(result.report.elapsedMs)).toBe(false);
 		}
+	});
+});
+
+describe("pipeline/run-orchestration.ts runOrchestration: unsupported efficiency switches (A1 review fix)", () => {
+	test("scoped_leads enabled in env warns loudly at run start, records efficiency_switch_unsupported, and still continues (default disabled behavior)", async () => {
+		const session = fakeSession();
+		const { ctx, notifications } = fakeCtx();
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const recordedEvents: Array<{ event: string; payload: Record<string, unknown> }> = [];
+		const deps = fakeDeps({
+			env: { HUMAIN_ORCHESTRATOR_EFFICIENCY_SCOPED_LEADS: "on" },
+			recordEvent: (event, payload) => { recordedEvents.push({ event, payload }); },
+			planRun: async () => {
+				throw new Error("stop here -- the switch check under test runs before this");
+			},
+			failRun: async () => healthyTelemetry,
+		});
+
+		await runOrchestration(
+			"ht-orch-1700000000000-effswitch",
+			"/tmp/cwd",
+			fakeArgs(),
+			adapter,
+			resolved,
+			ctx,
+			session,
+			{ ...claimed, session },
+			deps,
+		);
+
+		expect(notifications.some((n) => n.level === "warning" && n.text.includes("scoped_leads") && n.text.includes("not supported"))).toBe(true);
+		const switchEvent = recordedEvents.find((e) => e.event === "efficiency_switch_unsupported");
+		expect(switchEvent).toBeDefined();
+		expect(switchEvent?.payload.switches).toEqual(["scoped_leads"]);
+	});
+
+	test("file_ownership and recon_before_architect enabled together are both named in one warning/event", async () => {
+		const session = fakeSession();
+		const { ctx, notifications } = fakeCtx();
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const recordedEvents: Array<{ event: string; payload: Record<string, unknown> }> = [];
+		const deps = fakeDeps({
+			env: {
+				HUMAIN_ORCHESTRATOR_EFFICIENCY_FILE_OWNERSHIP: "report",
+				HUMAIN_ORCHESTRATOR_EFFICIENCY_RECON_BEFORE_ARCHITECT: "on",
+			},
+			recordEvent: (event, payload) => { recordedEvents.push({ event, payload }); },
+			planRun: async () => {
+				throw new Error("stop here -- the switch check under test runs before this");
+			},
+			failRun: async () => healthyTelemetry,
+		});
+
+		await runOrchestration(
+			"ht-orch-1700000000000-effswitch2",
+			"/tmp/cwd",
+			fakeArgs(),
+			adapter,
+			resolved,
+			ctx,
+			session,
+			{ ...claimed, session },
+			deps,
+		);
+
+		const switchEvent = recordedEvents.find((e) => e.event === "efficiency_switch_unsupported");
+		expect(switchEvent).toBeDefined();
+		expect(switchEvent?.payload.switches).toEqual(["recon_before_architect", "file_ownership"]);
+	});
+
+	test("no unsupported switch enabled (default env) never warns or records efficiency_switch_unsupported", async () => {
+		const session = fakeSession();
+		const { ctx, notifications } = fakeCtx();
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const recordedEvents: Array<{ event: string; payload: Record<string, unknown> }> = [];
+		const deps = fakeDeps({
+			recordEvent: (event, payload) => { recordedEvents.push({ event, payload }); },
+			planRun: async () => {
+				throw new Error("boom");
+			},
+			failRun: async () => healthyTelemetry,
+		});
+
+		await runOrchestration(
+			"ht-orch-1700000000000-effswitch3",
+			"/tmp/cwd",
+			fakeArgs(),
+			adapter,
+			resolved,
+			ctx,
+			session,
+			{ ...claimed, session },
+			deps,
+		);
+
+		expect(notifications.some((n) => n.text.includes("efficiency_switch_unsupported") || n.text.includes("not supported by this pipeline"))).toBe(false);
+		expect(recordedEvents.some((e) => e.event === "efficiency_switch_unsupported")).toBe(false);
 	});
 });

@@ -11,6 +11,8 @@
  *   run's work and must not be sent to QA.
  */
 
+import type { DispatchResult } from "./core/records.ts";
+
 export type LeadStatus = "completed" | "partial" | "blocked" | "unknown";
 
 export function parseLeadStatus(report: string): LeadStatus {
@@ -56,4 +58,68 @@ export function externalChangeFiles(gitChanged: string[], leads: Array<{ exitCod
 	if (leads.length === 0) return [];
 	const allCleanNone = leads.every((l) => l.exitCode === 0 && parseLeadFilesChanged(l.stdout).kind === "none");
 	return allCleanNone ? [...gitChanged] : [];
+}
+
+/**
+ * `scoped_leads`: `externalChangeFiles` above classifies "changed by someone else" purely from
+ * each lead's own report prose (`## Files Changed: None`) — correct for an ordinary long-lived
+ * lead, whose one dispatch's report IS the whole story. A scoped lead's final result is a REPORT
+ * phase that legitimately says "None" for its OWN phase while an earlier plan/integrate phase in
+ * the SAME chain made real edits. The de-duplicated `filesChanged` union `finalizeScopedLeadResult`
+ * (index.ts) attaches is not by itself trustworthy evidence of "no files changed": `parseFilesChanged`
+ * only recognizes backtick-quoted paths with a known extension, so a phase reporting `- Dockerfile`
+ * or `- src/a.ts` (unbackticked, or extensionless) contributes nothing to that union even though
+ * `parseLeadFilesChanged` (this file) — what `externalChangeFiles` itself uses — would read it as a
+ * real listed file. An empty union therefore never proves no edits happened; only every phase's own
+ * prose, reparsed the same way `externalChangeFiles` reparses an ordinary lead's, can prove that.
+ *
+ * So for a lead that ran as a scoped chain (`scopedPhaseReports` present, attached only by
+ * `finalizeScopedLeadResult`): reparse EVERY phase's stdout with `parseLeadFilesChanged` and
+ * combine with the union.
+ *   - `exitCode`: the final phase's exit code if every phase in the chain exited 0, otherwise a
+ *     non-zero code (so `externalChangeFiles`'s exit-code gate never treats a chain with a failed
+ *     phase as "all clean").
+ *   - Evidence is exactly `## Files Changed\nNone` only when every phase exited 0 AND every phase's
+ *     own `parseLeadFilesChanged` reads `"none"` AND the union is empty.
+ *   - Otherwise, if the union is non-empty OR any phase parses as a `"list"`, evidence lists the
+ *     union plus every path any phase's `parseLeadFilesChanged` found.
+ *   - Otherwise (some phase is unparseable and nothing above proved either "none" or "list"): emit
+ *     no `## Files Changed` section at all — `parseLeadFilesChanged` reads that as `"unknown"`, the
+ *     same conservative default `externalChangeFiles` already applies.
+ *
+ * A lead without `scopedPhaseReports` has only one dispatch whose report IS the whole story; this
+ * passes that dispatch's real `stdout` through unchanged. The modular `pipeline/hierarchy.ts` does
+ * not populate `scopedPhaseReports` today (`scoped_leads` has not been ported — see the A1
+ * unification notes), so this is currently an identity transform on every `DispatchResult` it
+ * produces; wiring it in now is forward-compatible and changes nothing at the current defaults.
+ */
+export function qaScopeEvidenceFor(
+	leadResults: Array<Pick<DispatchResult, "exitCode" | "stdout" | "filesChanged" | "scopedPhaseReports">>,
+): Array<{ exitCode: number; stdout: string }> {
+	return leadResults.map((r) => {
+		const phases = r.scopedPhaseReports;
+		if (!phases) return { exitCode: r.exitCode, stdout: r.stdout };
+
+		const allPhasesCleanExit = phases.every((p) => p.exitCode === 0);
+		const firstFailedExit = phases.find((p) => p.exitCode !== 0)?.exitCode;
+		const exitCode = allPhasesCleanExit ? r.exitCode : (firstFailedExit ?? 1);
+
+		const parsedPhases = phases.map((p) => parseLeadFilesChanged(p.stdout));
+		const union = new Set<string>(r.filesChanged);
+		let anyList = false;
+		for (const parsed of parsedPhases) {
+			if (parsed.kind === "list") {
+				anyList = true;
+				for (const f of parsed.files) union.add(f);
+			}
+		}
+
+		if (allPhasesCleanExit && union.size === 0 && parsedPhases.every((p) => p.kind === "none")) {
+			return { exitCode, stdout: "## Files Changed\nNone" };
+		}
+		if (union.size > 0 || anyList) {
+			return { exitCode, stdout: `## Files Changed\n${[...union].map((f) => `- \`${f}\``).join("\n")}` };
+		}
+		return { exitCode, stdout: "" };
+	});
 }

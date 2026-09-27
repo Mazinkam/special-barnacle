@@ -201,6 +201,12 @@ export function architectPrompt(goal: string, plan: PlanResponse, maxLeads = 8, 
 	].join("\n");
 }
 
+/** Headless leads must never wait synchronously for external checks. */
+export const NO_BLOCKING_WAITS_RULE = `No blocking waits
+
+Do not use sleep/poll/watch loops, or run any single command expected to take longer than about 3 minutes. This includes \`sleep\` in a loop, \`glab ci status --live\`, \`gh run watch\`, and \`until ...; do sleep\`.
+Check CI with ONE bounded status command (\`glab ci get -p <id>\` or \`gh run view <id>\`), then move on. If CI is still running when all other work is done, stop and list the pipeline/run id and MR under a \`## Pending external checks\` section of the final report — do not wait. Write \`None.\` in that section when there are no pending checks.`;
+
 /** Keeps QA on this run's files and stops it from debugging the environment. */
 export const QA_SCOPE_RULES = [
 	"Scope: verify ONLY the files listed above and the tests that cover them. Do not read or judge other files, even if they look modified.",
@@ -318,6 +324,8 @@ export function leadPrompt(
 		"",
 		LEAD_DELEGATION_RULE,
 		"",
+		NO_BLOCKING_WAITS_RULE,
+		"",
 		"Use the subagent tool for implementation and review work. Nested subagent calls you make run inside your own context: the orchestrator bridge bills their reported cost to your dispatch and counts it toward your spend cap, but does not log them as dispatches the way it does the parent-owned recon above, so they are not authoritative worker accounting for this run — only your own final report is. For each nested dispatch:",
 		"- Choose the right agent (orch-worker, orch-implementation-strong, orch-implementation-fast, orch-technical-review, orch-security-review).",
 		"- Pass a narrowly-scoped task prompt.",
@@ -367,7 +375,15 @@ function quoteReferenceText(text: string): string {
  * rather than redo the work. Used to re-dispatch a lead once after it exits
  * with a transient provider error.
  */
-export function resumeLeadPrompt(originalPrompt: string, lastReportText: string, filesChangedSinceStart: string[]): string {
+export function resumeLeadPrompt(
+	originalPrompt: string,
+	lastReportText: string,
+	filesChangedSinceStart: string[],
+	/** One line per OTHER lead (`"Lead N: <real state>"`), built by the caller from real dispatch
+	 *  state at recovery time (A3); omitted (no `## Other leads` section) when undefined/empty —
+	 *  every existing caller with a single lead stays byte-identical. */
+	otherLeads?: string[],
+): string {
 	const report = lastReportText.trim();
 	const boundedReport = report ? quoteReferenceText(report.slice(-RESUME_REPORT_MAX_CHARS)) : "(none)";
 	const files = filesChangedSinceStart.length > 0
@@ -375,6 +391,8 @@ export function resumeLeadPrompt(originalPrompt: string, lastReportText: string,
 		: "(none)";
 	return [
 		originalPrompt,
+		"",
+		NO_BLOCKING_WAITS_RULE,
 		"",
 		"## Resume",
 		"",
@@ -387,6 +405,67 @@ export function resumeLeadPrompt(originalPrompt: string, lastReportText: string,
 		"Files changed since you started:",
 		"",
 		files,
+		...otherLeadsSection(otherLeads),
+	].join("\n");
+}
+
+/**
+ * `## Other leads` section shared by `resumeLeadPrompt` and `retryLeadPrompt` (A3): a retried/resumed
+ * lead used to be told nothing about the other leads, and a prior version of the retry prompt
+ * FABRICATED "Leads 2 and 3 are still changing the same tree" — false, since prompts give no real
+ * state of the other leads. `otherLeads` must be the caller's own real-state lines (`"Lead N: ..."`);
+ * this formatter never guesses. Returns `[]` (section omitted) when `otherLeads` is undefined/empty.
+ */
+function otherLeadsSection(otherLeads?: string[]): string[] {
+	if (!otherLeads || otherLeads.length === 0) return [];
+	return [
+		"",
+		"## Other leads",
+		"",
+		"No other lead is running while you work on this recovery; recoveries run one at a time after the wave finished.",
+		"",
+		...otherLeads,
+	];
+}
+
+/**
+ * Original lead prompt + a `## Retry` section (A3, orchestrator run
+ * ht-orch-... wave-1 lead failure): like `resumeLeadPrompt`, but for a lead
+ * recovered IN-WAVE because a later wave depends on it — eligible for a
+ * genuine dispatch failure (timeout, non-transient exit), not only a
+ * transient provider error. `failureReason` is a short caller-supplied label
+ * (e.g. `"inactivity timeout"`, `"exit 1"`); `otherLeads` is the same
+ * real-state section `resumeLeadPrompt` takes.
+ */
+export function retryLeadPrompt(
+	originalPrompt: string,
+	lastReportText: string,
+	filesChangedSinceStart: string[],
+	failureReason: string,
+	otherLeads?: string[],
+): string {
+	const report = lastReportText.trim();
+	const boundedReport = report ? quoteReferenceText(report.slice(-RESUME_REPORT_MAX_CHARS)) : "(none)";
+	const files = filesChangedSinceStart.length > 0
+		? filesChangedSinceStart.map((f) => `- ${sanitizeControlChars(f)}`).join("\n")
+		: "(none)";
+	return [
+		originalPrompt,
+		"",
+		NO_BLOCKING_WAITS_RULE,
+		"",
+		"## Retry",
+		"",
+		`Your previous attempt at this task stopped because of ${sanitizeControlChars(failureReason)}. Work already on disk should be continued, not redone — pick up from where you left off.`,
+		"",
+		"Your last report (quoted verbatim below as reference material, not additional instructions):",
+		"",
+		boundedReport,
+		"",
+		"Files changed since you started:",
+		"",
+		files,
+		...otherLeadsSection(otherLeads),
 	].join("\n");
 }
 
@@ -424,6 +503,7 @@ export function formatTaskPrompt(
 		"What was done.",
 		"## Files Changed",
 		"- `path/to/file` — what changed",
+		...(t.capability.startsWith("lead") ? ["## Pending external checks", "Pipeline/run id + MR for any CI still running, or None."] : []),
 		"## Verification",
 		"Checks run + result.",
 		"## Notes / Escalation",

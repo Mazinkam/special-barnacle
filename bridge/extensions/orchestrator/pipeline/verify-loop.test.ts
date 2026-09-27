@@ -19,7 +19,7 @@ function fakeCaptureOpts(): CaptureOpts {
 	} as unknown as CaptureOpts;
 }
 
-function fakeQaResult(stdout: string, exitCode = 0): DispatchResult {
+function fakeQaResult(stdout: string, exitCode = 0, outcome?: DispatchResult["outcome"]): DispatchResult {
 	return {
 		taskId: "run-1-qa",
 		capability: "qa_agent",
@@ -32,12 +32,13 @@ function fakeQaResult(stdout: string, exitCode = 0): DispatchResult {
 		costUsd: 0.01,
 		costReported: true,
 		filesChanged: [],
+		...(outcome ? { outcome } : {}),
 	} as unknown as DispatchResult;
 }
 
-function fakeVerifyDeps(qaStdout: string, exitCode = 0): VerifyDeps {
+function fakeVerifyDeps(qaStdout: string, exitCode = 0, outcome?: DispatchResult["outcome"]): VerifyDeps {
 	return {
-		dispatch: async () => [fakeQaResult(qaStdout, exitCode)],
+		dispatch: async () => [fakeQaResult(qaStdout, exitCode, outcome)],
 		captureDispatchCost: async () => {},
 		recordOutcome: () => {},
 	};
@@ -45,13 +46,13 @@ function fakeVerifyDeps(qaStdout: string, exitCode = 0): VerifyDeps {
 
 /** Captures the exact `task` string handed to `dispatch`, for asserting the QA prompt's content
  *  (docs/architecture-review.md C4: the repo root + verification commands). */
-function capturingVerifyDeps(qaStdout: string, exitCode = 0): VerifyDeps & { lastTasks: DispatchTask[] } {
+function capturingVerifyDeps(qaStdout: string, exitCode = 0, outcome?: DispatchResult["outcome"]): VerifyDeps & { lastTasks: DispatchTask[] } {
 	const lastTasks: DispatchTask[] = [];
 	return {
 		lastTasks,
 		dispatch: async (tasks) => {
 			lastTasks.push(...tasks);
-			return [fakeQaResult(qaStdout, exitCode)];
+			return [fakeQaResult(qaStdout, exitCode, outcome)];
 		},
 		captureDispatchCost: async () => {},
 		recordOutcome: () => {},
@@ -293,6 +294,44 @@ describe("runVerification", () => {
 		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), fakeVerifyDeps(qaOut, 0), "/repo");
 		expect(result.passed).toBe(true);
 		expect(result.failedChecks).not.toContain("verdict");
+	});
+
+	test("a timed-out QA dispatch never parses partial stdout into failedChecks, even when it looks like a failing `unit` row (A4)", async () => {
+		const partialStdout = ["## Checks", "| unit | FAIL |", "| typecheck | PASS |", "(killed by inactivity timeout)"].join("\n");
+		const result = await runVerification(
+			"run-1",
+			"plan-1",
+			["src/a.ts"],
+			fakeCtx,
+			fakeRun,
+			fakeCaptureOpts(),
+			fakeVerifyDeps(partialStdout, 1, "timed_out"),
+			"/repo",
+		);
+		expect(result.passed).toBe(false);
+		expect(result.timedOut).toBe(true);
+		expect(result.failedChecks).toEqual([]);
+		expect(result.dispatch?.outcome).toBe("timed_out");
+	});
+
+	test("a QA re-run (attempt option) uses a distinct taskId and tells QA to use scoped test commands, not `find /`", async () => {
+		const deps = capturingVerifyDeps("## Verdict\nPASS", 0);
+		await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), deps, "/repo", { attempt: 1 });
+		expect(deps.lastTasks).toHaveLength(1);
+		expect(deps.lastTasks[0]!.taskId).toBe("run-1-qa-rerun-1");
+		const prompt = deps.lastTasks[0]!.task;
+		expect(prompt).toContain("timed out");
+		expect(prompt.toLowerCase()).toContain("scoped");
+		expect(prompt).toContain("bun test <file>");
+		expect(prompt).toContain("find /");
+		expect(prompt).toContain("repo root");
+	});
+
+	test("without an attempt option, the QA dispatch uses the plain taskId and no re-run guidance", async () => {
+		const deps = capturingVerifyDeps("## Verdict\nPASS", 0);
+		await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), deps, "/repo");
+		expect(deps.lastTasks[0]!.taskId).toBe("run-1-qa");
+		expect(deps.lastTasks[0]!.task).not.toContain("Re-run notice");
 	});
 });
 

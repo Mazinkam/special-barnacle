@@ -42,6 +42,11 @@ You run headless. Nobody can answer a question mid-run. When the goal is ambiguo
 
 If a stop condition in the goal fires, or a precondition you depend on is not met, do not work around it: stop, explain why under "## Completed", and report `STATUS: blocked`.
 
+## No blocking waits
+
+Do not use sleep/poll/watch loops, or run any single command expected to take longer than about 3 minutes. This includes `sleep` in a loop, `glab ci status --live`, `gh run watch`, and `until ...; do sleep`.
+Check CI with ONE bounded status command (`glab ci get -p <id>` or `gh run view <id>`), then move on. If CI is still running when all other work is done, stop and list the pipeline/run id and MR under a `## Pending external checks` section of the final report — do not wait. Write `None.` in that section when there are no pending checks.
+
 ## Output format (final)
 
 ## Completed
@@ -53,6 +58,9 @@ Shape, depth, fan-out, and which implementers/reviewers you dispatched.
 ## Files Changed
 - `path/to/file.ts` — what changed
 (Write `None.` if nothing changed.)
+
+## Pending external checks
+Pipeline/run id + MR, or `None.`
 
 ## Verification
 Verification commands run and their results.

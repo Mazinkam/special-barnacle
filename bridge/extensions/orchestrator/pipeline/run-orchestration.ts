@@ -30,20 +30,31 @@ import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import { complexityNeedsArchitect, type DispatchTask, type PlanResponse } from "../core/prompts.ts";
 import type { RunReport } from "../core/report.ts";
 import type { TriageResult } from "../core/triage.ts";
+import { loadEfficiencyControls } from "../efficiency-flags.ts";
 import { pickModel } from "../core/routing.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 import { changedFilesSinceRunStart, gitDirtySnapshot, gitHead } from "../adapters/git-changes.ts";
 import { formatAdapterTable, shortName } from "../models.ts";
 import { planEscalation, type EscalationLeadInput } from "../escalation.ts";
 import { leadSizeOf, sizeLead, type LeadSizeDecision } from "../lead-sizing.ts";
-import { classifyRunOutcome, externalChangeFiles, parseLeadStatus } from "../run-outcome.ts";
+import { classifyRunOutcome, externalChangeFiles, parseLeadStatus, qaScopeEvidenceFor } from "../run-outcome.ts";
 import { summarizeStderr } from "../dispatch/stderr-sink.ts";
 import { confirmStep, safeUi } from "../run/ui-sink.ts";
-import { describeRunArtifact, type RunSession, type RunTiming } from "../run/session.ts";
-import type { RunContext } from "../run/context.ts";
+import { describeRunArtifact, type RunTiming } from "../run/session.ts";
+import type { RunContext, RunSessionLike } from "../run/context.ts";
 import { telemetryWarning, type FlushReport, type QueueStats } from "../record-queue.ts";
 import { collectBilledResults, dispatchHierarchical, summarizeReconWorkers } from "./hierarchy.ts";
+import { collectLeadAttempts, formatLeadAttemptLines } from "./lead-attempts.ts";
 import { runVerification, type VerificationResult } from "./verify-loop.ts";
+import {
+	buildLiveQaSummaryField,
+	candidateOwnedFilesForLiveQa,
+	liveQaCostRowsHaveUnknownCost,
+	liveQaKnownCostUsd,
+	recordLiveQaStageResult,
+	runLiveQaStage,
+	type RunLiveQaStageResult,
+} from "../live-qa-stage.ts";
 
 /** `planRun`'s options; structurally identical to index.ts's own (private) `PlanOptions` —
  *  redeclared here rather than imported so this module never has to import index.ts. */
@@ -65,21 +76,21 @@ export interface RunOrchestrationDeps {
 		goal: string,
 		cwd: string,
 		ctx: ExtensionContext,
-		run: RunContext<RunSession> | null,
+		run: RunContext<RunSessionLike> | null,
 		costSink: { usd: number },
 		adapter: Adapter,
 	): Promise<TriageResult | null>;
 	planRun(runId: string, opts: PlanOptions): Promise<PlanResponse>;
 	recordEvent(event: string, payload: Record<string, unknown>): void;
 	recordOutcome(outcome: Record<string, unknown>): void;
-	captureDispatchCost(opts: CaptureOpts, result: DispatchResult, run: RunContext<RunSession> | null): Promise<void>;
+	captureDispatchCost(opts: CaptureOpts, result: DispatchResult, run: RunContext<RunSessionLike> | null): Promise<void>;
 	dispatchParallel(
 		cwd: string,
 		runId: string,
 		tasks: DispatchTask[],
 		adapter: Adapter,
 		ctx: ExtensionContext,
-		run: RunContext<RunSession> | null,
+		run: RunContext<RunSessionLike> | null,
 	): Promise<DispatchResult[]>;
 	completeRun(runId: string, summary: Record<string, unknown>, timing?: RunTiming, since?: QueueStats): Promise<FlushReport>;
 	failRun(runId: string, error: string, timing?: RunTiming, since?: QueueStats): Promise<FlushReport>;
@@ -92,6 +103,15 @@ export interface RunOrchestrationDeps {
 	/** The `## Provided context` block from `--context`/`--with-last-reply` (docs/architecture-review.md C6), built
 	 *  by `commands/orchestrate.ts` from files it already read; `""` when neither flag was given. */
 	providedContext: string;
+	/**
+	 * Phase 3 opt-in Forge live-QA stage: env passed straight to `runLiveQaStage`'s
+	 * `loadLiveQaConfig` (never logged); index.ts's caller supplies `process.env`, tests supply a
+	 * fixture env. Only read when `parsed.liveQa`.
+	 */
+	env: Record<string, string | undefined>;
+	/** Records a single model-usage row (the Python-side economics ledger); used to record the
+	 *  live-QA stage's own cost rows, independent of `recordOutcome`'s outcome row. */
+	recordModelCall: (metric: Record<string, unknown>) => void;
 }
 
 /**
@@ -162,10 +182,31 @@ export async function runOrchestration(
 	adapter: Adapter,
 	resolved: FullResolution,
 	ctx: ExtensionContext,
-	session: RunSession,
-	claimed: RunContext<RunSession>,
+	session: RunSessionLike,
+	claimed: RunContext<RunSessionLike>,
 	deps: RunOrchestrationDeps,
 ): Promise<RunOrchestrationResult> {
+	// -----------------------------------------------------------------
+	// A1 review fix: `scoped_leads`/`file_ownership`/`recon_before_architect` are efficiency
+	// switches this modular pipeline does not implement (core/records.ts's `scopedPhaseReports`
+	// doc; all three default OFF in method.json) — only the pre-unification index.ts hierarchy code
+	// still does. Flip one on and this pipeline silently runs with it disabled instead of doing what
+	// the operator asked; surface that loudly at run start (before any cost is spent) rather than
+	// let the run's behavior quietly not match its own config, and continue with default (switch
+	// disabled) behavior — this is a config mismatch warning, not a reason to abort the run.
+	// -----------------------------------------------------------------
+	const unsupportedSwitchNames = ["scoped_leads", "file_ownership", "recon_before_architect"];
+	const { enabled: enabledSwitches } = loadEfficiencyControls(deps.env);
+	const unsupportedEnabled = enabledSwitches.filter((name) => unsupportedSwitchNames.includes(name));
+	if (unsupportedEnabled.length > 0) {
+		ctx.ui.notify(
+			`Efficiency switch(es) enabled in config but not supported by this pipeline: ${unsupportedEnabled.join(", ")}. ` +
+				"Continuing with default (switch disabled) behavior — the run will NOT get the effect these switches promise.",
+			"warning",
+		);
+		deps.recordEvent("efficiency_switch_unsupported", { run_id: runId, switches: unsupportedEnabled });
+	}
+
 	// -----------------------------------------------------------------
 	// LLM triage: auto-fill missing task_class / complexity / risk via
 	// the cheapest available model. Skip when the user supplied all
@@ -334,7 +375,7 @@ export async function runOrchestration(
 	// `workerResults` carries the parent-owned recon dispatches; they must stay
 	// destructured here or the run stops billing them (plan Task 3).
 	const repoRoot = resolve(cwd);
-	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks, resumedLeadTaskIds, resumedAttemptResults } = await dispatchHierarchical(
+	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks, resumedLeadTaskIds, retriedLeadTaskIds, resumedAttemptResults } = await dispatchHierarchical(
 		runId,
 		plan.plan_id,
 		parsed.goal,
@@ -350,6 +391,11 @@ export async function runOrchestration(
 			evidenceMaxChars: deps.reconEvidenceMaxChars,
 			repoRoot,
 			providedContext: deps.providedContext,
+			// A3: an in-wave-dependent lead that still fails after C3's transient-resume pass gets one
+			// more in-wave recovery attempt instead of blocking every dependent wave until the post-QA
+			// escalation loop recovers it too late for those waves to ever be dispatched. Gated on
+			// `--max-retries` > 0, the same knob that gates the post-QA escalation loop below.
+			inWaveRecovery: parsed.maxRetries > 0,
 			// C3: a lead's resume prompt needs "files changed since it started", using
 			// the same git dirty-snapshot machinery `changedSince` below uses for QA
 			// scope — a snapshot taken right before the lead's (wave's) dispatch,
@@ -435,7 +481,7 @@ export async function runOrchestration(
 	// Only when EVERY lead exited 0 and says it changed nothing: a lead that
 	// failed, timed out or hit the spend cap may have edited files it never
 	// got to report, and those must still be verified.
-	const externalFiles = runOutcome === "blocked" ? [...allFiles] : externalChangeFiles(allFiles, leadResults);
+	const externalFiles = runOutcome === "blocked" ? [...allFiles] : externalChangeFiles(allFiles, qaScopeEvidenceFor(leadResults));
 	if (externalFiles.length > 0) {
 		session.log(
 			`${externalFiles.length} file(s) changed during the run but no lead reported changing them (likely a concurrent session); excluded from QA: ${externalFiles.join(", ")}`,
@@ -454,6 +500,11 @@ export async function runOrchestration(
 	let retries = 0;
 	let lastVerification: VerificationResult | null = null;
 	const verificationResults: DispatchResult[] = [];
+	// A6/A4: at most ONE QA re-run per run, triggered only by the QA dispatch itself timing out
+	// (never by QA completing and reporting a failing check). Tracked outside the while loop so a
+	// later QA dispatch (after an escalation retry) that also times out does not get a second
+	// re-run — it just ends the run with the TIMED OUT verdict, same as the first re-run failing.
+	let qaRerunUsed = false;
 	while (runOutcome !== "blocked" && dispatchOk && retries <= parsed.maxRetries) {
 		if (allFiles.length > 0) {
 			session.setPhase(
@@ -480,15 +531,62 @@ export async function runOrchestration(
 		if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
 		if (lastVerification.passed) break;
 
+		if (lastVerification.timedOut) {
+			if (qaRerunUsed) {
+				// Already used this run's one re-run and QA timed out again — finish with the
+				// TIMED OUT verdict; a timed-out QA never had a real verdict to escalate on.
+				session.log("QA dispatch timed out again after the re-run; ending the run with QA TIMED OUT (no escalation)");
+				break;
+			}
+			qaRerunUsed = true;
+			session.log("QA dispatch timed out; re-running QA once with scoped-test-command guidance");
+			deps.recordEvent("qa_timed_out_rerun", { run_id: runId, attempt: 1 });
+			session.setPhase(`QA re-run (attempt 1) on ${allFiles.length} changed file(s) after a timeout`);
+			lastVerification = await runVerification(
+				runId,
+				plan.plan_id,
+				allFiles,
+				ctx,
+				claimed,
+				captureOpts,
+				{
+					dispatch: (tasks) => deps.dispatchParallel(cwd, runId, tasks, adapter, ctx, claimed),
+					captureDispatchCost: deps.captureDispatchCost,
+					recordOutcome: deps.recordOutcome,
+				},
+				repoRoot,
+				{ attempt: 1 },
+			);
+			session.cancellation.throwIfCancelled();
+			if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
+			if (lastVerification.passed) break;
+			if (lastVerification.timedOut) {
+				// The re-run also timed out — finish with that verdict now, no escalation.
+				session.log("QA re-run also timed out; ending the run with QA TIMED OUT (no escalation)");
+				break;
+			}
+			// The re-run completed and reported a real (non-timeout) verdict; fall through to the
+			// normal failure/escalation handling below using this re-run's `lastVerification`.
+		}
+
 		session.log(`verification failed: ${lastVerification.failedChecks.join(", ") || "(unparsed)"}`);
 		// Pair each lead's ORIGINAL dispatch task (goal/scope/model-routing
 		// prompt) with its own outcome so planEscalation can retry with the
 		// real prompt instead of the failed report (BUG 2), and can decide
 		// per-lead whether a retry is warranted instead of only ever
-		// retrying lead 0.
+		// retrying lead 0. `task` stays the lead's ORIGINAL prompt/taskId
+		// (from `leadTasks`) so planEscalation keeps building `<lead>-retry-N`
+		// off the original taskId — but `result` must be the lead's LATEST
+		// attempt so far (this round's own `escalationResults`, if any retry
+		// has already run for this lead, else the original `leadResults`
+		// entry), not the stale original exit code/filesChanged/report a
+		// second-round selection or feedback section would otherwise see.
+		const leadAttemptsSoFar = collectLeadAttempts(leadResults, resumedAttemptResults, escalationResults, retriedLeadTaskIds);
+		const latestResultByLeadTaskId = new Map(leadAttemptsSoFar.map((l) => [l.leadTaskId, l.attempts[l.attempts.length - 1]!.result]));
 		const leadsForEscalation: EscalationLeadInput[] = leadResults.map((r) => {
 			const task = leadTasks.find((t) => t.taskId === r.taskId) ?? { capability: r.capability, task: r.stdout, taskId: r.taskId };
-			return { task, result: { exitCode: r.exitCode, stdout: r.stdout, filesChanged: r.filesChanged } };
+			const latest = latestResultByLeadTaskId.get(r.taskId) ?? r;
+			return { task, result: { exitCode: latest.exitCode, stdout: latest.stdout, filesChanged: latest.filesChanged } };
 		});
 		const escalationTasks = planEscalation(
 			lastVerification.failedChecks,
@@ -577,6 +675,24 @@ export async function runOrchestration(
 		}
 	}
 
+	// A lead that failed and was later retried (C3's transient resume, or an escalation retry after
+	// a failed verification, taskId `<lead>-retry-N`) is judged by its FINAL attempt from here on —
+	// `leadResults` alone only ever holds the ONE result used to decide that lead's status, which
+	// for a resumed lead is already its final attempt, but for an escalated lead is still its
+	// FAILED first attempt. `succeededLeads`/`dispatchOk`/`leadStatuses`/`runOutcome` above are
+	// deliberately left as computed (from the initial `leadResults`) for the QA-gating decisions
+	// already made by this point; everything from here on reports the run's actual final outcome.
+	const leadAttempts = collectLeadAttempts(leadResults, resumedAttemptResults, escalationResults, retriedLeadTaskIds);
+	const leadAttemptLines = formatLeadAttemptLines(runId, leadAttempts);
+	const finalSucceededLeads = leadAttempts.filter((l) => l.succeeded).length;
+	const finalDispatchOk = leadAttempts.length > 0 && finalSucceededLeads > 0;
+	const finalLeadStatuses = leadAttempts.map((l) => parseLeadStatus(l.final.stdout));
+	const finalRunOutcome = classifyRunOutcome({
+		leadStatuses: finalLeadStatuses,
+		succeededLeads: finalSucceededLeads,
+		leads: leadAttempts.length,
+	});
+
 	// Step 4: Finalize.
 	// Total cost must cover EVERY dispatch this run paid for — architect,
 	// parent-owned recon workers, and escalations included. Summing leads
@@ -593,30 +709,89 @@ export async function runOrchestration(
 	// Leads' own subagent calls are billed too: they were the bulk of real spend
 	// (ht-orch-1790256789245-1a3fms: $13.22 nested vs $1.56 reported).
 	const nestedCost = billedResults.reduce((s, r) => s + (r.nestedCostUsd ?? 0), 0);
-	const totalCost =
+	let totalCost =
 		triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0) + nestedCost;
-	// `succeededLeads`/`dispatchOk` are computed earlier (before the QA retry
-	// loop) so it can skip QA when no lead succeeded; reused here unchanged.
+	// `passedVerification` accepts EITHER `dispatchOk` (the pre-retry-loop gate QA actually ran
+	// under) or `finalDispatchOk` (a lead that failed initially but succeeded on a later retry): a
+	// lead-attempts accounting quirk in either direction must never make an otherwise-passing QA
+	// verdict read as unverified.
 	const verificationSkipped = lastVerification?.skipped ?? false;
-	const passedVerification = dispatchOk && (lastVerification?.passed ?? false);
+	const passedVerification = (lastVerification?.passed ?? false) && (dispatchOk || finalDispatchOk);
 	// The QA dispatch itself timing out (inactivity/absolute ceiling) is a distinct state from QA
 	// completing and reporting failing checks — the summary must say so instead of folding both
 	// into a plain FAIL (docs/architecture-review.md C5).
 	const verificationTimedOut = lastVerification?.dispatch?.outcome === "timed_out";
 	const failedChecks = lastVerification?.failedChecks ?? [];
 
+	// -----------------------------------------------------------------
+	// Step 3.5: Phase 3 opt-in Forge live-QA stage. Runs at most once, only when explicitly
+	// requested (--live-qa / --live-qa-scope), and only once the run is not blocked, dispatch
+	// succeeded, and the generic QA gate above passed — a live-QA runner is never spawned against a
+	// candidate whose generic verification already failed, was skipped, or never ran. Never
+	// escalated or retried on failure; only recorded.
+	//
+	// `changedFiles` handed to the live-QA checkpoint is deliberately the CANDIDATE-OWNED set
+	// (files this run's own leads/implementers claimed changing, `filesChanged`) — never `allFiles`
+	// (the broader git-dirty-detection set the generic QA gate above uses, which can also include a
+	// dirty path nobody in this run claimed touching). `escalationResults` is included too: a
+	// retried lead's own claimed files are just as much this run's own work as the first pass's.
+	// -----------------------------------------------------------------
+	let liveQaStageResult: RunLiveQaStageResult | null = null;
+	let liveQaNotRunReason: string | null = null;
+	if (parsed.liveQa) {
+		if (finalRunOutcome === "blocked") {
+			liveQaNotRunReason = "run was blocked";
+		} else if (!finalDispatchOk) {
+			liveQaNotRunReason = "dispatch did not succeed";
+		} else if (!passedVerification) {
+			liveQaNotRunReason = verificationSkipped
+				? "generic verification was skipped (no files changed)"
+				: "generic verification failed";
+		} else {
+			session.setPhase(
+				`live QA: requesting Forge focused run${parsed.liveQaAdapterId ? ` (adapter ${parsed.liveQaAdapterId})` : ""}`,
+			);
+			liveQaStageResult = await runLiveQaStage({
+				request: { requested: true, adapterId: parsed.liveQaAdapterId, scope: parsed.liveQaScope },
+				env: deps.env,
+				cwd,
+				runId,
+				changedFiles: candidateOwnedFilesForLiveQa([...leadResults, ...escalationResults]),
+				cancellation: session.cancellation,
+				onLine: (line) => session.log(`[live-qa] ${line}`),
+			});
+			// The settled runner's own outcome/cost rows must be recorded BEFORE cancellation unwinds
+			// — see `recordLiveQaStageResult`'s doc comment.
+			recordLiveQaStageResult(liveQaStageResult, {
+				recordOutcome: deps.recordOutcome,
+				recordModelCall: deps.recordModelCall,
+				throwIfCancelled: () => session.cancellation.throwIfCancelled(),
+			});
+		}
+	}
+	const liveQaCostRowsForRun = liveQaStageResult?.costRows ?? [];
+	// Added exactly once here; `recordModelCall` above feeds the Python-side economics ledger
+	// independently (its own `record_id`-keyed dedup) — this JS-side `totalCost` never reads from
+	// that ledger, so adding the same number here is not a double count of anything.
+	totalCost += liveQaKnownCostUsd(liveQaCostRowsForRun);
+	const liveQaHasUnknownCost = liveQaCostRowsHaveUnknownCost(liveQaCostRowsForRun);
+
 	session.cancellation.throwIfCancelled();
 	const telemetry = await deps.completeRun(runId, {
-		success_rate: succeededLeads / Math.max(1, leadResults.length),
+		success_rate: finalSucceededLeads / Math.max(1, leadAttempts.length),
 		verification_passed: passedVerification,
-		blocked: runOutcome === "blocked",
-		lead_statuses: leadStatuses,
+		blocked: finalRunOutcome === "blocked",
+		lead_statuses: finalLeadStatuses,
 		external_changes: externalFiles.length,
 		total_cost_usd: totalCost,
 		files_changed: allFiles,
 		retries,
 		models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
 		log_dir: session.dir,
+		// Phase 3 opt-in Forge live-QA stage (T1): the `live_qa` key itself is present ONLY when
+		// `--live-qa`/`--live-qa-scope` was given — a run that never requested it gets the exact
+		// pre-Phase-3 summary shape, not a `{requested: false}` placeholder key.
+		...buildLiveQaSummaryField(parsed.liveQa, liveQaStageResult, liveQaNotRunReason),
 	}, session.terminalTiming(), session.telemetryBaseline);
 	// Elapsed time for the run summary: the session's own monotonic clock (started when the
 	// run's RunSession was constructed), not Date.now() minus a timestamp parsed out of the run
@@ -641,7 +816,9 @@ export async function runOrchestration(
 			return `${marker}### ${r.taskId.replace(`${runId}-`, "")}\n\n${report}`;
 		});
 	const leadReportWritten = writeLeadReportsDiagnostic(session, leadReports);
-	const firstReport = leadResults.find((r) => r.exitCode === 0)?.stdout.trim() ?? "";
+	// Prefer the final successful attempt's stdout — a lead retried after a failed dispatch or a
+	// failed verification speaks through its LAST attempt, not a discarded failed one.
+	const firstReport = leadAttempts.find((l) => l.succeeded)?.final.stdout.trim() ?? "";
 	const openItems = /##\s*Open items\s*\n([\s\S]*?)(?=\n##\s|$)/i.exec(firstReport)?.[1]?.trim();
 	const showFullReport = allFiles.length === 0 && firstReport;
 	const reportLines = showFullReport
@@ -651,9 +828,13 @@ export async function runOrchestration(
 			: [];
 	const reportTruncated = showFullReport && firstReport.split("\n").length > 40;
 
-	// The run FAILED because no lead succeeded, so name a lead first;
-	// recon/architect failures are reported on their own lines.
-	const firstFailure = leadResults.find((r) => r.exitCode !== 0) ?? billedResults.find((r) => r.exitCode !== 0);
+	// The run FAILED because no lead succeeded, so name a lead first — but only a lead whose FINAL
+	// attempt failed; a lead retried to success is not a failure to report. If no lead finally
+	// failed, fall back to the existing recon/architect/verification billedResults logic, but only
+	// when the run didn't finally succeed (`!finalDispatchOk`) — a lead-level success must never be
+	// overridden by naming an unrelated billed dispatch as "the" failure.
+	const firstFailedLeadAttempt = leadAttempts.find((l) => !l.succeeded)?.final;
+	const firstFailure = firstFailedLeadAttempt ?? (finalDispatchOk ? undefined : billedResults.find((r) => r.exitCode !== 0));
 	const firstFailureLine = firstFailure
 		? `${firstFailure.taskId.replace(`${runId}-`, "")} exit ${firstFailure.exitCode}: ${summarizeStderr(firstFailure.stderr, 300) || "(no output)"}`
 		: "(no dispatch attempted)";
@@ -661,12 +842,17 @@ export async function runOrchestration(
 	const report: RunReport = {
 		runId,
 		elapsedMs,
-		blocked: runOutcome === "blocked",
-		dispatchOk,
-		succeededLeads,
+		blocked: finalRunOutcome === "blocked",
+		dispatchOk: finalDispatchOk,
+		// The verdict line must not read "NOT RUN (no lead succeeded)" for a run where QA actually
+		// ran (it only ever does while `dispatchOk`, the pre-loop gate, held) even if `finalDispatchOk`
+		// later reads false for an unrelated reason — see `VerificationVerdictInput.dispatchOk`.
+		verificationDispatchOk: dispatchOk || finalDispatchOk,
+		succeededLeads: finalSucceededLeads,
 		totalLeads: leadResults.length,
 		skippedLeads,
 		retries,
+		leadAttemptLines,
 		resumedLeadIds: resumedLeadTaskIds.map((id) => id.replace(`${runId}-`, "")),
 		filesChangedCount: allFiles.length,
 		externalFilesCount: externalFiles.length,
@@ -687,6 +873,7 @@ export async function runOrchestration(
 		runLogPath: describeRunArtifact(session.file("run.log")),
 		stateRoot: deps.stateRoot,
 		telemetryReport: telemetry,
+		...(parsed.liveQa ? { liveQa: { stage: liveQaStageResult, notRunReason: liveQaNotRunReason, hasUnknownCost: liveQaHasUnknownCost } } : {}),
 	};
 	return { kind: "completed", report };
 }

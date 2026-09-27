@@ -1,0 +1,5 @@
+{"type": "message_end", "message": {"role": "assistant", "content": [], "model": "global.anthropic.claude-opus-5-5", "stopReason": "error", "errorMessage": "The pending stream has been canceled (caused by: getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com)"}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [], "stopReason": "error", "errorMessage": "The pending stream has been canceled (caused by: getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com)"}}
+{"type": "agent_end", "willRetry": true}
+{"type": "auto_retry_start", "attempt": 2, "maxAttempts": 3, "delayMs": 4000, "errorMessage": "The pending stream has been canceled (caused by: getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com)"}
+{"type": "entry_appended"}

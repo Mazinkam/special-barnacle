@@ -325,3 +325,179 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 		cancelled: runResult.cancelled,
 	};
 }
+
+/**
+ * T6: sums ONLY known-provenance live-QA cost rows (`cost_source` not starting with `"unknown"`)
+ * -- an unknown-cost row contributes nothing here, it is unmeasured, never assumed to be free
+ * (mirrors `orchestrator/economics.py`'s `cost_class`). Exported so a duplicate-delivery /
+ * mixed known+unknown row set can be exercised directly, without a full run.
+ */
+export function liveQaKnownCostUsd(rows: Record<string, unknown>[]): number {
+	return rows.reduce((s, r) => {
+		const source = typeof r.cost_source === "string" ? r.cost_source : "";
+		if (source.startsWith("unknown")) return s;
+		return s + (typeof r.cost_usd === "number" ? r.cost_usd : 0);
+	}, 0);
+}
+
+/** True when ANY live-QA cost row carries an unmeasured (`cost_source` starting `"unknown"`) provenance. */
+export function liveQaCostRowsHaveUnknownCost(rows: Record<string, unknown>[]): boolean {
+	return rows.some((r) => typeof r.cost_source === "string" && r.cost_source.startsWith("unknown"));
+}
+
+/**
+ * Pure composition of the run's final `verification:` verdict label and `passedVerification`
+ * boolean from (a) the generic QA gate's own already-computed verdict label/boolean and (b) the
+ * Phase 3 opt-in Forge live-QA stage's outcome, when one ran. Never escalates or retries on a
+ * live-QA result -- this only decides how to REPORT it:
+ *
+ *  - not requested, or requested but never actually run (blocked / dispatch failed / generic
+ *    verification failed or was skipped): the generic verdict/boolean pass through unchanged.
+ *  - live QA `fail` (a confirmed finding): always flips `passedVerification` to `false`, verdict
+ *    becomes `FAIL (live QA: <reasons>)`, regardless of what the generic gate said (the generic
+ *    gate already had to pass for live QA to run at all, so this can only make the run's verdict
+ *    stricter, never laxer).
+ *  - live QA `unavailable` and `required`: `passedVerification` becomes `false`, verdict becomes
+ *    `UNVERIFIED (required live QA unavailable: <reason>)` -- unavailable is unverified, never a
+ *    pass, even though the generic gate passed.
+ *  - live QA `unavailable` and NOT required: the generic verdict/boolean are kept exactly as they
+ *    were, with `; live QA unavailable (not required)` appended so the gap is visible without
+ *    changing the run's pass/fail status.
+ *  - live QA `pass`: the generic boolean is kept (it was already `true`), verdict becomes the
+ *    literal `PASS (+ live QA pass, session <id>)`.
+ */
+export function composeVerificationVerdict(
+	genericVerdict: string,
+	genericPassed: boolean,
+	liveQa: {
+		verdict: "pass" | "fail" | "unavailable" | null;
+		required: boolean;
+		reasons: string[];
+		sessionId: string | null;
+	},
+): { verdict: string; passedVerification: boolean } {
+	if (liveQa.verdict === null) return { verdict: genericVerdict, passedVerification: genericPassed };
+	if (liveQa.verdict === "fail") {
+		return {
+			verdict: `FAIL (live QA: ${liveQa.reasons.join("; ") || "confirmed finding"})`,
+			passedVerification: false,
+		};
+	}
+	if (liveQa.verdict === "unavailable") {
+		if (liveQa.required) {
+			return {
+				verdict: `UNVERIFIED (required live QA unavailable: ${liveQa.reasons[0] ?? "unknown reason"})`,
+				passedVerification: false,
+			};
+		}
+		return { verdict: `${genericVerdict}; live QA unavailable (not required)`, passedVerification: genericPassed };
+	}
+	// "pass"
+	return { verdict: `PASS (+ live QA pass, session ${liveQa.sessionId ?? "unknown"})`, passedVerification: genericPassed };
+}
+
+/**
+ * The dedicated `live QA: ...` summary line(s) (task 3): verdict, tested revision, session id,
+ * and artifact paths when the stage actually ran; `not run (<reason>)` when it was requested but
+ * skipped (blocked / dispatch failed / generic verification failed or was skipped); a trailing
+ * "live-QA cost unknown" line whenever any of its cost rows carry an unmeasured `cost_source`.
+ * Only ever called when `--live-qa`/`--live-qa-scope` was given -- the default run's summary is
+ * untouched.
+ */
+export function liveQaSummaryLines(
+	stage: RunLiveQaStageResult | null,
+	notRunReason: string | null,
+	hasUnknownCost: boolean,
+): string[] {
+	if (!stage) {
+		return [`live QA: not run (${notRunReason ?? "unknown reason"})`];
+	}
+	const outcome = stage.outcomeRow ?? {};
+	const revision = typeof outcome.tested_revision === "string" ? outcome.tested_revision.slice(0, 10) : "n/a";
+	const sessionId = typeof outcome.session_id === "string" ? outcome.session_id : "n/a";
+	const artifacts = Array.isArray(outcome.artifacts) ? (outcome.artifacts as string[]) : [];
+	const reasons = stage.reasons.length > 0 ? ` (${stage.reasons.join("; ").slice(0, 300)})` : "";
+	const line = `live QA: ${stage.verdict}${reasons} · tested ${revision} · session ${sessionId} · artifacts: ${artifacts.length > 0 ? artifacts.join(", ") : "none"}`;
+	return hasUnknownCost ? [line, "live-QA cost unknown"] : [line];
+}
+
+/**
+ * T1: the completeRun summary's `live_qa` key exists ONLY when live QA was actually requested
+ * (`--live-qa`/`--live-qa-scope`) -- a run that never requested it gets `{}` here (spread into
+ * the summary object as nothing at all), preserving the exact pre-Phase-3 key set for every
+ * ordinary run, instead of a `{requested: false}` placeholder that changed every run's shape.
+ */
+export function buildLiveQaSummaryField(
+	requested: boolean,
+	stage: RunLiveQaStageResult | null,
+	notRunReason: string | null,
+): { live_qa: Record<string, unknown> } | Record<string, never> {
+	if (!requested) return {};
+	return {
+		live_qa: {
+			requested: true,
+			verdict: stage ? stage.verdict : "not_run",
+			required: stage?.required ?? null,
+			session_id: (stage?.outcomeRow?.session_id as string | null | undefined) ?? null,
+			tested_revision: (stage?.outcomeRow?.tested_revision as string | null | undefined) ?? null,
+			reasons: stage?.reasons ?? (notRunReason ? [notRunReason] : []),
+			findings_count: Array.isArray(stage?.outcomeRow?.findings) ? (stage!.outcomeRow!.findings as unknown[]).length : null,
+			artifacts: (stage?.outcomeRow?.artifacts as string[] | undefined) ?? [],
+		},
+	};
+}
+
+/**
+ * Records a settled live-QA stage's outcome row and cost rows (if any), THEN unwinds
+ * cancellation. A run cancelled while the live-QA runner was in flight still produces a real,
+ * settled `RunLiveQaStageResult` (`runLiveQa`'s cancellation handling always waits for the
+ * child's actual `close` event before resolving -- see live-qa.ts's `runLiveQa` doc comment --
+ * and `parseLiveQaSession` never reports a cancelled/incomplete run as `pass`): that outcome and
+ * any usage/cost rows it produced must be recorded exactly as they would be for an uncancelled
+ * run, never silently dropped merely because cancellation is about to unwind the rest of the run
+ * immediately afterward. Calling `throwIfCancelled` before recording (the previous ordering) let
+ * a cancellation thrown at that point skip the two record calls below entirely.
+ */
+export function recordLiveQaStageResult(
+	result: RunLiveQaStageResult,
+	deps: {
+		recordOutcome: (outcome: Record<string, unknown>) => void;
+		recordModelCall: (metric: Record<string, unknown>) => void;
+		throwIfCancelled: () => void;
+	},
+): void {
+	if (result.outcomeRow) deps.recordOutcome(result.outcomeRow);
+	for (const row of result.costRows) deps.recordModelCall(row);
+	deps.throwIfCancelled();
+}
+
+/**
+ * The files THIS RUN's own leads/implementers claimed changing -- Phase 2's existing
+ * file-ownership/changed-file reporting (`filesChanged`, populated from lead/implementer prose
+ * via `parseFilesChanged`, and already unioned across a scoped lead's full phase chain by
+ * `finalizeScopedLeadResult`) -- independent of `allFiles`/`changedFilesSinceRunStart`'s much
+ * broader git-dirty-detection set (which also includes any OTHER path git shows as changed,
+ * claimed or not, plus history/dirty-snapshot fallbacks).
+ *
+ * This is the ONLY file set the live-QA stage's tested-revision checkpoint (`runLiveQaStage`'s
+ * `changedFiles`, live-qa.ts's `buildCheckpointIndex`) is ever built from: a dirty file nobody in
+ * this run claimed touching -- a concurrent process's scratch file, a stray `.env` dropped by
+ * something else entirely -- must never be swept into a Forge checkpoint commit just because git
+ * happens to see it as dirty at the moment the stage runs. `buildCheckpointIndex` already builds
+ * the checkpoint EXCLUSIVELY from whatever `changedFiles` it is given (never from `git status`/
+ * `git add -A`); this function is what decides which files that guarantee actually protects. When
+ * this returns an EMPTY array against a dirty working tree, `prepareTestedRevision` itself refuses
+ * to checkpoint an "ambiguous/empty candidate set" (fails closed to `unavailable`) -- this function
+ * never needs to special-case that itself.
+ *
+ * Deliberately does not filter by exit code, by whether the path still exists, or by whether git
+ * itself still shows it as dirty -- a claimed path that turns out phantom/reverted is harmless to
+ * include (`buildCheckpointIndex` checkpoints it at its current, unchanged content, or force-
+ * removes it if it is gone; either is a no-op against a base HEAD that already agrees), and
+ * excluding it here would just reintroduce a second, subtly different notion of "changed" that
+ * would need to be kept in sync with `allFiles`/the generic QA gate's own scope, which this
+ * function is not meant to affect at all.
+ */
+export function candidateOwnedFilesForLiveQa(results: Array<{ filesChanged: string[] }>): string[] {
+	return [...new Set(results.flatMap((r) => r.filesChanged))];
+}

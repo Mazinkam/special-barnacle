@@ -16,12 +16,16 @@
  * `commands/orchestrate.ts`'s catch block (B4.6 architecture-review note).
  */
 import { telemetryHealthy, telemetryWarning, type FlushReport } from "../record-queue.ts";
+import { composeVerificationVerdict, liveQaSummaryLines, type RunLiveQaStageResult } from "../live-qa-stage.ts";
 import { fmtElapsed } from "../run-ui.ts";
 
 export interface VerificationVerdictInput {
 	/** True when every dispatched lead stopped at a stop condition or precondition. */
 	blocked: boolean;
-	/** True when at least one lead succeeded (dispatch produced usable work). */
+	/** True whenever QA actually got dispatched (i.e. the pre-loop `dispatchOk` gate that decides
+	 *  whether QA runs at all held true) — NOT necessarily the run's own final dispatch verdict. A
+	 *  lead that succeeded initially but whose escalation retry later failed must not turn an
+	 *  otherwise-real QA verdict into "NOT RUN (no lead succeeded)"; see `RunReport.verificationDispatchOk`. */
 	dispatchOk: boolean;
 	/** True when QA was skipped (e.g. no files changed). */
 	verificationSkipped: boolean;
@@ -49,7 +53,7 @@ export function verificationVerdictFor(input: VerificationVerdictInput): string 
 			? "N/A (no files changed — report-only goal)"
 			: "SKIPPED (no files changed)";
 	}
-	if (input.verificationTimedOut) return "TIMED OUT (QA dispatch did not complete)";
+	if (input.verificationTimedOut) return "QA TIMED OUT (QA dispatch did not complete)";
 	if (input.passedVerification) return "PASS";
 	const checks = input.failedChecks ?? [];
 	return checks.length > 0 ? `FAIL (${checks.join(", ")})` : "FAIL (unparsed)";
@@ -69,6 +73,11 @@ export interface RunReport {
 	blocked: boolean;
 	/** True when at least one lead succeeded. */
 	dispatchOk: boolean;
+	/** True whenever QA actually got dispatched — fed to `verificationVerdictFor` instead of
+	 *  `dispatchOk` above, which is the run's own final success/failure verdict (used for the
+	 *  "complete"/"FAILED" label and `firstFailureLine`) and can read false even when QA ran and
+	 *  produced a real, reportable verdict (`pipeline/run-orchestration.ts`'s `dispatchOk || finalDispatchOk`). */
+	verificationDispatchOk: boolean;
 	succeededLeads: number;
 	totalLeads: number;
 	/** Leads never started because a dependency failed or was blocked. */
@@ -78,6 +87,10 @@ export interface RunReport {
 	 *  provider error (docs/architecture-review.md C3); empty on every run with no resume, so
 	 *  existing summary output is byte-identical when this feature never fires. */
 	resumedLeadIds: string[];
+	/** One line per lead that took more than one attempt or still failed on its final attempt
+	 *  (`pipeline/lead-attempts.ts`'s `formatLeadAttemptLines`), e.g. `lead-0: failed (inactivity) →
+	 *  retry-1 succeeded`. Empty when every lead succeeded on its first (only) attempt. */
+	leadAttemptLines: string[];
 	/** Files verified this run (after excluding files changed by someone else). */
 	filesChangedCount: number;
 	/** Files changed during the run that no lead reported changing (excluded from QA). */
@@ -114,6 +127,15 @@ export interface RunReport {
 	stateRoot: string;
 	/** `completeRun`'s drain report, for `telemetryWarning`/`telemetryHealthy`. */
 	telemetryReport: FlushReport;
+	/**
+	 * Phase 3 opt-in Forge live-QA stage (T1): present only when `--live-qa`/`--live-qa-scope` was
+	 * given, so its verdict/summary stay byte-identical to a run that never requested it.
+	 */
+	liveQa?: {
+		stage: RunLiveQaStageResult | null;
+		notRunReason: string | null;
+		hasUnknownCost: boolean;
+	};
 }
 
 /**
@@ -123,24 +145,42 @@ export interface RunReport {
  * by the time this runs.
  */
 export function buildRunSummary(report: RunReport): { text: string; succeeded: boolean } {
-	const verdict = verificationVerdictFor({
+	let verdict = verificationVerdictFor({
 		blocked: report.blocked,
-		dispatchOk: report.dispatchOk,
+		dispatchOk: report.verificationDispatchOk,
 		verificationSkipped: report.verificationSkipped,
 		filesChangedCount: report.filesChangedCount,
 		passedVerification: report.passedVerification,
 		verificationTimedOut: report.verificationTimedOut,
 		failedChecks: report.failedChecks,
 	});
+	let passedVerification = report.passedVerification;
+	// Phase 3 opt-in Forge live-QA stage (T1): never escalated/retried on, only ever reported —
+	// see `composeVerificationVerdict`'s own doc comment for the exact composition rules. Absent
+	// (`report.liveQa` undefined) on every run that never requested it, in which case `verdict`/
+	// `passedVerification` above are used completely unchanged.
+	if (report.liveQa) {
+		const stage = report.liveQa.stage;
+		const composed = composeVerificationVerdict(verdict, passedVerification, {
+			verdict: stage ? (stage.verdict === "not_requested" ? null : stage.verdict) : null,
+			required: stage?.required ?? false,
+			reasons: stage?.reasons ?? [],
+			sessionId: (stage?.outcomeRow?.session_id as string | null | undefined) ?? null,
+		});
+		verdict = composed.verdict;
+		passedVerification = composed.passedVerification;
+	}
 	const summary = [
 		`Orchestration ${report.blocked ? "BLOCKED" : report.dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(report.elapsedMs)}.`,
 		`run_id: ${report.runId}`,
 		`leads: ${report.succeededLeads}/${report.totalLeads} ${report.blocked ? "blocked" : "succeeded"}${report.skippedLeads > 0 ? ` (+${report.skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${report.retries} · files: ${report.filesChangedCount} changed${report.externalFilesCount > 0 ? ` (+${report.externalFilesCount} changed by someone else, not verified)` : ""}`,
 		report.reconWorkersLine,
 		...(report.resumedLeadIds.length > 0 ? [`resumes: ${report.resumedLeadIds.length} (${report.resumedLeadIds.join(", ")})`] : []),
+		...report.leadAttemptLines,
 		`verification: ${verdict}`,
 		`total cost: $${report.totalCostUsd.toFixed(4)} (${report.dispatchCount} dispatches${report.nestedCostUsd > 0 ? `; $${report.nestedCostUsd.toFixed(4)} of it in lead subagents` : ""})`,
 		...(report.dispatchOk ? [] : [`first failure: ${report.firstFailureLine}`]),
+		...(report.liveQa ? liveQaSummaryLines(report.liveQa.stage, report.liveQa.notRunReason, report.liveQa.hasUnknownCost) : []),
 		...(report.reportLines.length > 0
 			? ["", report.showFullReport ? "lead report:" : "open items from lead:", ...report.reportLines, ...(report.reportTruncated && report.hasLeadReports ? [`… full report: ${report.leadReportPath}`] : [])]
 			: report.hasLeadReports
@@ -153,6 +193,6 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 	const text = summary.join("\n");
 	// Whether the run is reported as a success in the notify and in chat must agree:
 	// a run whose verification failed is not "completed" just because dispatch succeeded.
-	const succeeded = (report.passedVerification || (report.dispatchOk && report.verificationSkipped)) && telemetryHealthy(report.telemetryReport);
+	const succeeded = (passedVerification || (report.dispatchOk && report.verificationSkipped)) && telemetryHealthy(report.telemetryReport);
 	return { text, succeeded };
 }
