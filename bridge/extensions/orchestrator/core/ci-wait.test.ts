@@ -50,14 +50,57 @@ describe("core/ci-wait polling", () => {
    expect((await pollCiCheck(github, state, options(fake(data).spawn, 1000, { expectedRepo: ghRepo }))).outcome).toBe("unverified");
   }
  });
- test("GitHub probes scoped API data and sanitizes malicious failed logs", async () => {
-  const f = fake([gh("completed", "failure"), ok("a".repeat(20000) + "\nAuthorization: Bearer ghp_abcdef123456\u001b[31m\n")]);
+ test("GitHub selects a bound failed job and sanitizes its job-specific log", async () => {
+  const f = fake([gh("completed", "failure"), ok(JSON.stringify({ jobs: [{ id: 456, run_id: 123, head_sha: sha, html_url: `${ghRepo}/actions/runs/123/job/456`, conclusion: "failure" }] })), ok("a".repeat(20000) + "\nAuthorization: Bearer ghp_abcdef123456\u001b[31m\n")]);
   const result = await pollCiCheck(github, state, options(f.spawn, 1000, { expectedRepo: ghRepo }));
-  expect(result.outcome).toBe("failure");
+  expect(result).toMatchObject({ outcome: "failure", jobId: "456" });
   expect(result.logTail).not.toContain("\u001b");
   expect(result.logTail).not.toContain("ghp_abcdef123456");
   expect(result.logTail!.length).toBeLessThanOrEqual(4096);
-  expect(f.calls.map(c => c.args)).toEqual([["api", "--hostname", "github.com", "repos/acme/project/actions/runs/123"], ["run", "view", "123", "-R", "acme/project", "--log-failed"]]);
+  expect(f.calls.map(c => c.args)).toEqual([["api", "--hostname", "github.com", "repos/acme/project/actions/runs/123"], ["api", "--hostname", "github.com", "repos/acme/project/actions/runs/123/jobs?per_page=100"], ["api", "--hostname", "github.com", "repos/acme/project/actions/jobs/456/logs"]]);
+ });
+ test("GitLab selects a bound failed job and returns its redacted trace", async () => {
+  const f = fake([gl("failed"), ok(JSON.stringify([{ id: 987, status: "failed", web_url: `${repo}/-/jobs/987`, pipeline: { id: 219469, sha } }])), ok("trace\u001b[31m\nAuthorization: Bearer glpat_secret123")]);
+  const result = await pollCiCheck(gitlab, state, options(f.spawn));
+  expect(result).toMatchObject({ outcome: "failure", jobId: "987" });
+  expect(result.logTail).toContain("trace");
+  expect(result.logTail).not.toContain("glpat_secret123");
+  expect(result.logTail).not.toContain("\u001b");
+  expect(f.calls.map(c => c.args)).toEqual([["api", "--hostname", "gitlab.example", "projects/group%2Fproject/pipelines/219469"], ["api", "--hostname", "gitlab.example", "projects/group%2Fproject/pipelines/219469/jobs?per_page=100"], ["api", "--hostname", "gitlab.example", "projects/group%2Fproject/jobs/987/trace"]]);
+ });
+ test("malicious or unbound job IDs cannot reach a log endpoint", async () => {
+  for (const [check, identity, response] of [
+   [gitlab, repo, ok(JSON.stringify([{ id: "987;echo bad", status: "failed", web_url: `${repo}/-/jobs/987;echo bad`, pipeline: { id: 219469, sha } }]))],
+   [github, ghRepo, ok(JSON.stringify({ jobs: [{ id: "456/../7", run_id: 123, head_sha: sha, html_url: `${ghRepo}/actions/runs/123/job/456/../7`, conclusion: "failure" }] }))],
+  ] as const) {
+   const f = fake([check.provider === "gitlab" ? gl("failed") : gh("completed", "failure"), response]);
+   expect(await pollCiCheck(check, state, options(f.spawn, 1000, { expectedRepo: identity }))).toEqual({ outcome: "failure" });
+   expect(f.calls).toHaveLength(2);
+  }
+ });
+ test("optional job or trace failures and exhausted deadline preserve verified failure", async () => {
+  for (const provider of ["gitlab", "github"] as const) {
+   const check = provider === "gitlab" ? gitlab : github;
+   const identity = provider === "gitlab" ? repo : ghRepo;
+   const status = provider === "gitlab" ? gl("failed") : gh("completed", "failure");
+   const f = fake([status, { exitCode: 1, stdout: "", stderr: "auth required" }]);
+   expect(await pollCiCheck(check, state, options(f.spawn, 1000, { expectedRepo: identity }))).toEqual({ outcome: "failure" });
+   let now = 1000;
+   const calls: string[][] = [];
+   const spawn: CiPollSpawn = async (_cmd, args) => { calls.push(args); now = 1100; return status; };
+   expect(await pollCiCheck(check, state, options(spawn, 1000, { expectedRepo: identity, maxWaitMs: 100, now: () => now }))).toEqual({ outcome: "unverified", reason: "ceiling" });
+   expect(calls).toHaveLength(1);
+  }
+ });
+ test("trace errors and expired optional job lookup retain verified failure and job identity", async () => {
+  const jobs = ok(JSON.stringify([{ id: 987, status: "failed", web_url: `${repo}/-/jobs/987`, pipeline: { id: 219469, sha } }]));
+  const f = fake([gl("failed"), jobs, { exitCode: 1, stdout: "", stderr: "trace unavailable" }]);
+  expect(await pollCiCheck(gitlab, state, options(f.spawn))).toEqual({ outcome: "failure", jobId: "987" });
+  let now = 1000;
+  let count = 0;
+  const spawn: CiPollSpawn = async () => { count++; if (count === 2) now = 1100; return count === 1 ? gl("failed") : jobs; };
+  expect(await pollCiCheck(gitlab, state, options(spawn, 1000, { maxWaitMs: 100, now: () => now }))).toEqual({ outcome: "failure" });
+  expect(count).toBe(2);
  });
  test("plaintext pretending to be a successful status or logs cannot verify a run", async () => {
   expect((await pollCiCheck(gitlab, state, options(fake(ok("Status: success\n" )).spawn))).outcome).toBe("unverified");
@@ -78,10 +121,12 @@ describe("core/ci-wait polling", () => {
   const spawn: CiPollSpawn = async (_cmd, _args, opts) => {
    calls.push(opts.timeoutMs);
    if (calls.length === 1) { now = 1055; return gh("completed", "failure"); }
+   if (calls.length === 2) { now = 1099; return ok(JSON.stringify({ jobs: [{ id: 456, run_id: 123, head_sha: sha, html_url: `${ghRepo}/actions/runs/123/job/456`, conclusion: "failure" }] })); }
+   now = 1100;
    return ok("log");
   };
   expect((await pollCiCheck(github, state, options(spawn, 1000, { expectedRepo: ghRepo, maxWaitMs: 100, now: () => now }))).outcome).toBe("failure");
-  expect(calls).toEqual([100, 45]);
+  expect(calls).toEqual([100, 45, 1]);
   now = 1000;
   calls.length = 0;
   const expired: CiPollSpawn = async () => { calls.push(1); now = 1100; return gh("completed", "success"); };

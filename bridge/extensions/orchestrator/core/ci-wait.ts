@@ -81,6 +81,28 @@ function parseStatus(check: PendingCheck, stdout: string, expectedSha: string, r
  } catch { return "unverified"; }
 }
 
+function failedJobId(check: PendingCheck, stdout: string, expectedSha: string, repo: RepoIdentity): string | undefined {
+ try {
+  const data: unknown = JSON.parse(stdout);
+  const jobs: unknown = check.provider === "gitlab" ? data : data && typeof data === "object" && !Array.isArray(data) ? (data as Record<string, unknown>).jobs : undefined;
+  if (!Array.isArray(jobs)) return undefined;
+  for (const entry of jobs) {
+   if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+   const job = entry as Record<string, unknown>;
+   if (typeof job.id !== "number" || !Number.isSafeInteger(job.id) || job.id <= 0) continue;
+   const id = String(job.id);
+   if (check.provider === "gitlab") {
+    const pipeline = job.pipeline;
+    if (job.status !== "failed" || job.web_url !== `${repo.url}/-/jobs/${id}` || !pipeline || typeof pipeline !== "object" || Array.isArray(pipeline)) continue;
+    const bound = pipeline as Record<string, unknown>;
+    if (bound.id !== Number(check.id) || bound.sha !== expectedSha) continue;
+   } else if (job.conclusion !== "failure" || job.run_id !== Number(check.id) || job.head_sha !== expectedSha || job.html_url !== `${repo.url}/actions/runs/${check.id}/job/${id}`) continue;
+   return id;
+  }
+ } catch { /* Malformed optional metadata cannot invalidate a verified failure. */ }
+ return undefined;
+}
+
 export interface CiPollOptions {
  cwd: string;
  /** Current candidate commit and canonical HTTPS repository URL, resolved by the caller. */
@@ -138,18 +160,29 @@ export async function pollCiCheck(check: PendingCheck, state: CiWaitState, optio
    return { outcome: "pending", state: { startedAt: state.startedAt, nextPollAt: now + (Number.isSafeInteger(interval) && interval > 0 ? interval : DEFAULT_POLL_INTERVAL_MS) } };
   }
   if (parsed !== "failure") return parsed === "success" ? { outcome: "success" } : { outcome: "unverified", reason: "unknown_status" };
+  let jobId: string | undefined;
   let logTail: string | undefined;
-  if (check.provider === "github" && repo.host === "github.com" && !controller.signal.aborted) {
-   try {
-    const request = execute(command, ["run", "view", check.id, "-R", repo.path, "--log-failed"]);
-    if (!request) return { outcome: "unverified", reason: "ceiling" };
-    const log = await request;
-    if (log.exitCode === 0) logTail = safeTail(log.stdout);
-   } catch { /* Verified failure stands even when logs are unavailable. */ }
-  }
+  try {
+   const root = check.provider === "gitlab" ? `projects/${encodeURIComponent(repo.path)}` : `repos/${repo.path}/actions`;
+   const jobsPath = check.provider === "gitlab" ? `${root}/pipelines/${check.id}/jobs?per_page=100` : `${root}/runs/${check.id}/jobs?per_page=100`;
+   const jobsRequest = execute(command, ["api", "--hostname", repo.host, jobsPath]);
+   if (jobsRequest) {
+    const jobs = await jobsRequest;
+    if (jobs.exitCode === 0 && (options.now ?? Date.now)() < deadline && !controller.signal.aborted) {
+     jobId = failedJobId(check, jobs.stdout, options.expectedSha, repo);
+     if (jobId) {
+      const tracePath = check.provider === "gitlab" ? `${root}/jobs/${jobId}/trace` : `${root}/jobs/${jobId}/logs`;
+      const traceRequest = execute(command, ["api", "--hostname", repo.host, tracePath]);
+      if (traceRequest) {
+       const trace = await traceRequest;
+       if (trace.exitCode === 0 && (options.now ?? Date.now)() < deadline) logTail = safeTail(trace.stdout);
+      }
+     }
+    }
+   }
+  } catch { /* Verified failure stands even when optional job metadata or trace is unavailable. */ }
   if (controller.signal.aborted) return { outcome: "cancelled" };
-  if ((options.now ?? Date.now)() >= deadline) return { outcome: "unverified", reason: "ceiling" };
-  return { outcome: "failure", ...(logTail ? { logTail } : {}) };
+  return { outcome: "failure", ...(jobId ? { jobId } : {}), ...(logTail ? { logTail } : {}) };
  } catch {
   return controller.signal.aborted ? { outcome: "cancelled" } : { outcome: "unverified", reason: "cli_unavailable" };
  } finally {
