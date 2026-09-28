@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
-from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from orchestrator.core.env import default_state_root
 from orchestrator.record_batch import write_batch
@@ -22,7 +22,29 @@ CODES = (
     ('http_5xx', re.compile(r'\b(?:HTTP|status(?: code)?|error|code)[\s:=#/-]+5\d\d\b', re.I)),
 )
 STAMP = re.compile(r'\b\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)\b')
-MODEL = re.compile(r'\b([a-zA-Z0-9_-]{1,48})/[a-zA-Z0-9._/-]{1,120}\b')
+# Only known provider endpoint syntax is evidence of provider identity. Never infer
+# identity from arbitrary path-like diagnostic text (which may contain secrets).
+BEDROCK_HOST = re.compile(r'bedrock-runtime\.[a-z]{2}(?:-[a-z]+)+-\d\.amazonaws\.com', re.I)
+URL = re.compile(r'https?://[^\s\"\'<>]{1,512}', re.I)
+DNS = re.compile(r'\bgetaddrinfo\s+ENOTFOUND\s+([^\s\"\'<>]{1,253})(?=\s|$)', re.I)
+
+
+def provider_endpoint(line: str) -> str | None:
+    """Return a bounded, exact known endpoint host, never URL credentials/path."""
+    for match in URL.finditer(line):
+        try:
+            parsed = urlsplit(match.group())
+            host = parsed.hostname
+            _ = parsed.port  # Reject malformed ports, not just malformed hosts.
+            if parsed.username is None and parsed.password is None and host and BEDROCK_HOST.fullmatch(host):
+                return host.lower()
+        except ValueError:
+            continue
+    for match in DNS.finditer(line):
+        host = match.group(1)
+        if BEDROCK_HOST.fullmatch(host):
+            return host.lower()
+    return None
 
 
 def backfill(root: Path, *, write: bool = False) -> dict[str, int]:
@@ -44,7 +66,6 @@ def backfill(root: Path, *, write: bool = False) -> dict[str, int]:
                 if path.is_symlink() or not path.is_file() or (path.name != 'run.log' and not path.name.endswith('.stderr.log')):
                     continue
                 relative = path.relative_to(root).as_posix()
-                fallback_ts = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
                 with path.open(encoding='utf-8', errors='replace') as source:
                     for line_number, line in enumerate(source, 1):
                         bounded = line[:16384]
@@ -53,13 +74,15 @@ def backfill(root: Path, *, write: bool = False) -> dict[str, int]:
                             continue
                         code = match[0]
                         stamp = STAMP.search(bounded)
-                        ts = stamp.group() if stamp else fallback_ts
-                        model = MODEL.search(bounded)
+                        host = provider_endpoint(bounded)
                         identity = f'{relative}:{line_number}:{code}'
                         record_id = 'provider-backfill-' + hashlib.sha256(identity.encode()).hexdigest()
                         records.append({'stream': 'event', 'event': 'provider_error', 'record_id': record_id,
-                                        'run_id': run.name, 'provider': model.group(1) if model else 'unknown',
-                                        'error_code': code, 'count': 1, 'ts': ts, 'first_ts': ts, 'last_ts': ts,
+                                        'run_id': run.name, 'provider': 'amazon-bedrock' if host else 'unknown',
+                                        'error_code': code, 'count': 1,
+                                        **({'endpoint_host': host} if host else {}),
+                                        **({'ts': stamp.group(), 'first_ts': stamp.group(), 'last_ts': stamp.group()}
+                                           if stamp else {'timestamp_precision': 'unknown'}),
                                         'source': 'legacy_provider_backfill'})
     persisted = 0
     if write:

@@ -10,9 +10,9 @@
       "_note": "Existing model remains the full dispatch model id; provider_model is its short normalized component. Optional failure_class only applies to non-successful dispositions."
     },
     "provider_error": {
-      "fields": ["run_id", "task_id", "dispatch_attempt", "provider", "model", "error_code", "endpoint_host", "nested", "count", "first_ts", "last_ts"],
+      "fields": ["run_id", "task_id", "dispatch_attempt", "provider", "model", "error_code", "endpoint_host", "nested", "count", "first_ts", "last_ts", "timestamp_precision"],
       "error_code_values": ["ENOTFOUND", "ECONNRESET", "ETIMEDOUT", "fetch_failed", "stream_canceled", "stream_no_stop_reason", "http_5xx", "quota"],
-      "_note": "Only normalized evidence; endpoint_host is an optional hostname without scheme, path, or credentials. No raw stderr or error message. Repeated evidence is aggregated within a dispatch attempt and origin (nested=true for worker errors, false for the dispatch's own stderr)."
+      "_note": "Only normalized evidence; endpoint_host is an optional hostname without scheme, path, or credentials. No raw stderr or error message. timestamp_precision=unknown marks legacy lines without an evidence timestamp; ingestion ts is not evidence of outage timing. Repeated evidence is aggregated within a dispatch attempt and origin (nested=true for worker errors, false for the dispatch's own stderr)."
     }
   },
 

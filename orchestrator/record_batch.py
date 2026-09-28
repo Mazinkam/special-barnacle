@@ -120,6 +120,10 @@ def validate_batch(records: Any) -> list[dict[str, Any]]:
                     raise BatchValidationError(f'{where} has unsupported provider_error fields: {sorted(unexpected)}')
                 if 'source' in record and record['source'] != 'legacy_provider_backfill':
                     raise BatchValidationError(f'{where} has invalid provider_error source')
+                if 'timestamp_precision' in record and (record['timestamp_precision'] != 'unknown'
+                        or record.get('source') != 'legacy_provider_backfill'
+                        or 'first_ts' in record or 'last_ts' in record or 'ts' in record):
+                    raise BatchValidationError(f'{where} has invalid timestamp_precision')
                 for name, pattern in (('provider', _PROVIDER_TOKEN), ('model', _MODEL_TOKEN)):
                     value = record.get(name)
                     if value is not None and (not isinstance(value, str) or not pattern.fullmatch(value)):

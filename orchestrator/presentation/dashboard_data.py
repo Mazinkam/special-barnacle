@@ -390,7 +390,7 @@ def provider_health(events: list[dict], *, now: datetime) -> dict[str, Any]:
     now = now.astimezone(timezone.utc)
     cutoff = now - timedelta(days=7)
     hours: dict[tuple[str, str], int] = defaultdict(int)
-    errors: dict[tuple[str, str], list[tuple[datetime, datetime, int, str | None]]] = defaultdict(list)
+    errors: dict[tuple[str, str], list[tuple[datetime, datetime, int, str | None, str | None]]] = defaultdict(list)
     failed = []
     first_by_run: dict[str, dict] = {}
     for row in events:
@@ -410,6 +410,9 @@ def provider_health(events: list[dict], *, now: datetime) -> dict[str, Any]:
                     and row.get('failure_class') in ('provider_stall', 'transient', 'quota')):
                 failed.append(row)
             continue
+        # Ingestion time for an undated legacy line is not observation time.
+        if row.get('timestamp_precision') == 'unknown':
+            continue
         start = _parse_row_ts(row.get('first_ts')) or ts
         end = _parse_row_ts(row.get('last_ts')) or start
         start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
@@ -424,25 +427,31 @@ def provider_health(events: list[dict], *, now: datetime) -> dict[str, Any]:
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             continue
         hours[(str(provider), start.replace(minute=0, second=0, microsecond=0).isoformat())] += count
-        errors[(str(provider), str(code))].append((start, end, count, str(row['run_id']) if row.get('run_id') is not None else None))
+        errors[(str(provider), str(code))].append((start, end, count, str(row['run_id']) if row.get('run_id') is not None else None,
+                                                  str(row['endpoint_host']) if row.get('endpoint_host') else None))
     windows = []
     for (provider, code), group in sorted(errors.items()):
         active = None
-        for start, end, count, rid in sorted(group):
+        for start, end, count, rid, host in sorted(group, key=lambda item: (item[0], item[1])):
             if active is None or (start - active['end_dt']) >= timedelta(minutes=10):
                 if active:
                     windows.append(active)
                 active = {'provider': provider, 'error_code': code, 'start': start.isoformat(),
-                          'end_dt': end, 'count': count, '_runs': {rid} if rid else set()}
+                          'end_dt': end, 'count': count, '_runs': {rid} if rid else set(),
+                          '_hosts': {host} if host else set()}
             else:
                 active['end_dt'] = max(active['end_dt'], end)
                 active['count'] += count
+                if host:
+                    active['_hosts'].add(host)
                 if rid:
                     active['_runs'].add(rid)
         if active:
             windows.append(active)
     outages = [{'provider': w['provider'], 'error_code': w['error_code'], 'start': w['start'],
-                'end': w['end_dt'].isoformat(), 'count': w['count'], 'runs': len(w['_runs'])}
+                'end': w['end_dt'].isoformat(), 'count': w['count'], 'runs': len(w['_runs']),
+                **({'endpoint_host': next(iter(w['_hosts']))} if len(w['_hosts']) == 1 else
+                   {'endpoint_hosts': sorted(w['_hosts'])} if w['_hosts'] else {})}
                for w in windows]
     ids = sorted(rid for rid, entry in first_by_run.items()
                  if cutoff <= entry['_ts'] <= now and entry['row'].get('outcome') in ('failed', 'timed_out')

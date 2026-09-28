@@ -64,6 +64,17 @@ def test_provider_error_rejects_leak_in_normalized_fields_before_append(tmp_path
     assert not (tmp_path / 'events.jsonl').exists()
 
 
+def test_undated_precision_requires_legacy_source_and_no_evidence_timestamps():
+    base = {'stream': 'event', 'record_id': 'e', 'event': 'provider_error',
+            'provider': 'unknown', 'error_code': 'quota', 'count': 1,
+            'timestamp_precision': 'unknown'}
+    with pytest.raises(BatchValidationError, match='invalid timestamp_precision'):
+        validate_batch([base])
+    with pytest.raises(BatchValidationError, match='invalid timestamp_precision'):
+        validate_batch([{**base, 'source': 'legacy_provider_backfill', 'first_ts': '2026-09-26T00:00:00Z'}])
+    assert validate_batch([{**base, 'source': 'legacy_provider_backfill'}])
+
+
 def test_provider_error_accepts_bridge_normalized_values_and_legacy_unknown(tmp_path: Path):
     rows = [
         {'stream': 'event', 'record_id': 'e1', 'event': 'provider_error',
@@ -154,6 +165,53 @@ def test_backfill_dry_run_default_and_repeat_write_is_idempotent(tmp_path: Path)
     assert len((root / 'events.jsonl').read_text().splitlines()) == 2
 
 
+def test_backfill_bedrock_host_and_undated_evidence_never_create_precise_windows(tmp_path: Path):
+    from orchestrator.presentation.dashboard_data import provider_health
+    root = tmp_path / 'state'
+    run = root / 'runs' / 'r1'
+    run.mkdir(parents=True)
+    (run / 'task.stderr.log').write_text(
+        'getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com feat/secret token=private\n'
+        '2026-09-26T10:00:00Z fetch failed https://bedrock-runtime.eu-west-2.amazonaws.com/model?key=private\n'
+        '2026-09-26T10:01:00Z ECONNRESET https://user:secret@bedrock-runtime.eu-west-2.amazonaws.com/path\n'
+        '2026-09-26T10:02:00Z fetch failed https://bedrock-runtime.eu-west-2.amazonaws.com.evil.test/path\n'
+    )
+    assert backfill(root, write=True)['persisted'] == 4
+    assert backfill(root, write=True)['persisted'] == 0
+    rows = [json.loads(line) for line in (root / 'events.jsonl').read_text().splitlines()]
+    assert rows[0]['provider'] == 'amazon-bedrock'
+    assert rows[0]['endpoint_host'] == 'bedrock-runtime.eu-west-2.amazonaws.com'
+    assert rows[0]['timestamp_precision'] == 'unknown'
+    assert 'first_ts' not in rows[0] and 'last_ts' not in rows[0]
+    assert rows[1]['provider'] == 'amazon-bedrock'
+    assert rows[1]['first_ts'] == '2026-09-26T10:00:00Z'
+    assert rows[2]['provider'] == rows[3]['provider'] == 'unknown'
+    assert all('private' not in str(row) and 'secret' not in str(row) and 'evil.test' not in str(row) for row in rows)
+    panel = provider_health(rows, now=datetime(2026, 9, 27, tzinfo=timezone.utc))
+    assert panel['outage_windows'] == [{
+        'provider': 'amazon-bedrock', 'error_code': 'fetch_failed',
+        'start': '2026-09-26T10:00:00+00:00', 'end': '2026-09-26T10:00:00+00:00',
+        'count': 1, 'runs': 1, 'endpoint_host': 'bedrock-runtime.eu-west-2.amazonaws.com',
+    }, {'provider': 'unknown', 'error_code': 'ECONNRESET',
+        'start': '2026-09-26T10:01:00+00:00', 'end': '2026-09-26T10:01:00+00:00',
+        'count': 1, 'runs': 1}, {'provider': 'unknown', 'error_code': 'fetch_failed',
+        'start': '2026-09-26T10:02:00+00:00', 'end': '2026-09-26T10:02:00+00:00',
+        'count': 1, 'runs': 1}]
+    assert sum(item['count'] for item in panel['errors_by_hour']) == 3
+
+
+def test_provider_windows_group_by_provider_code_not_endpoint():
+    from orchestrator.presentation.dashboard_data import provider_health
+    rows = [{'event': 'provider_error', 'ts': f'2026-09-26T10:0{i}:00Z',
+             'provider': 'amazon-bedrock', 'error_code': 'ENOTFOUND', 'count': 1,
+             'endpoint_host': f'bedrock-runtime.{region}.amazonaws.com'}
+            for i, region in enumerate(('eu-west-2', 'us-east-1'))]
+    window, = provider_health(rows, now=datetime(2026, 9, 27, tzinfo=timezone.utc))['outage_windows']
+    assert window['count'] == 2
+    assert window['endpoint_hosts'] == ['bedrock-runtime.eu-west-2.amazonaws.com',
+                                        'bedrock-runtime.us-east-1.amazonaws.com']
+
+
 def test_backfill_matches_pending_stream_has_been_canceled(tmp_path: Path):
     root = tmp_path / 'state'
     run = root / 'runs' / 'r1'
@@ -163,6 +221,8 @@ def test_backfill_matches_pending_stream_has_been_canceled(tmp_path: Path):
     assert backfill(root, write=True)['persisted'] == 1
     record = json.loads((root / 'events.jsonl').read_text().splitlines()[0])
     assert record['error_code'] == 'stream_canceled'
+    assert record['timestamp_precision'] == 'unknown'
+    assert 'first_ts' not in record and 'last_ts' not in record
 
 
 def test_backfill_refuses_resolved_live_root_alias_before_read_or_write(tmp_path: Path, monkeypatch):
