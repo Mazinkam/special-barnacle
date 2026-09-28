@@ -145,18 +145,7 @@ import contract from "./contract.ts";
 import { formatReconEvidence, planReconTasks } from "./recon.ts";
 import { DispatchTelemetryTracker, type DispatchTelemetryFields } from "./dispatch-telemetry.ts";
 import { loadEfficiencyControls, type EfficiencyControls } from "./efficiency-flags.ts";
-import { canonicalizePath, findOwnershipOverlaps, observedEditConflicts, pathsOverlap, serializeWaves, type OwnershipInput } from "./file-ownership.ts";
 import { assignCanary, canaryTelemetryFields, parseModelCanaries, type CanaryAssignment } from "./model-canary.ts";
-import {
-	boundHandoff,
-	decideContinuation,
-	extractHandoff,
-	handoffStaleness,
-	scopedPhasePrompt,
-	validateHandoff,
-	type ExpectedHandoff,
-	type LeadHandoff,
-} from "./lead-handoff.ts";
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -3028,12 +3017,7 @@ export interface DispatchResult {
 	canary?: Record<string, unknown>;
 	/** `loadEfficiencyControls().enabled` at dispatch time — which efficiency switches were on. */
 	experimentFlags?: string[];
-	/** `scoped_leads`: set ONLY by `finalizeScopedLeadResult`, on the copy it returns for a
-	 *  scoped lead's chain — every plan/integrate/report/fallback phase that chain actually ran,
-	 *  in order. Not billed (the phases themselves are billed individually via `capture()`/
-	 *  `scopedLeadPhaseResults`); read only by `qaScopeEvidenceFor` to build synthetic QA-scope
-	 *  evidence across the whole chain instead of trusting the final phase's own prose. Absent
-	 *  on every ordinary (non-scoped, or scoped_leads-off) `DispatchResult`. */
+	/** Legacy phase evidence, if supplied, for conservative QA scope. */
 	scopedPhaseReports?: Array<{ phase: string; exitCode: number; stdout: string }>;
 }
 
@@ -4010,44 +3994,7 @@ interface VerificationResult {
 	dispatch?: DispatchResult;
 }
 
-/**
- * `scoped_leads`: `externalChangeFiles` (run-outcome.ts) classifies "changed by someone
- * else" purely from each lead's own report prose (`## Files Changed: None`) — correct for
- * an ordinary long-lived lead, whose one dispatch's report IS the whole story. A scoped
- * lead's final result is a REPORT phase that legitimately says "None" for its OWN phase
- * while an earlier plan/integrate phase in the SAME chain made real edits. The de-duplicated
- * `filesChanged` union `finalizeScopedLeadResult` attaches is not by itself trustworthy
- * evidence of "no files changed": `parseFilesChanged` (index.ts) only recognizes backtick-
- * quoted paths with a known extension, so a phase reporting `- Dockerfile` or `- src/a.ts`
- * (unbackticked, or extensionless) contributes nothing to that union even though
- * `parseLeadFilesChanged` (run-outcome.ts) — what `externalChangeFiles` itself uses — would
- * read it as a real listed file. An empty union therefore never proves no edits happened;
- * only every phase's own prose, reparsed the same way `externalChangeFiles` reparses an
- * ordinary lead's, can prove that.
- *
- * So for a lead that ran as a scoped chain (`scopedPhaseReports` present, attached only by
- * `finalizeScopedLeadResult`): reparse EVERY phase's stdout with `parseLeadFilesChanged` and
- * combine with the union.
- *   - `exitCode`: the final phase's exit code if every phase in the chain exited 0,
- *     otherwise a non-zero code (so `externalChangeFiles`'s exit-code gate never treats a
- *     chain with a failed phase as "all clean").
- *   - Evidence is exactly `## Files Changed\nNone` only when every phase exited 0 AND every
- *     phase's own `parseLeadFilesChanged` reads `"none"` AND the union is empty — the only
- *     configuration in which no phase, anywhere in the chain, could have changed anything.
- *   - Otherwise, if the union is non-empty OR any phase parses as a `"list"`, evidence lists
- *     the union plus every path any phase's `parseLeadFilesChanged` found — a real edit
- *     somewhere in the chain, so QA must scope it in.
- *   - Otherwise (some phase is unparseable — no `## Files Changed` section at all — and
- *     nothing above proved either "none" or "list"): emit no `## Files Changed` section at
- *     all. `parseLeadFilesChanged` reads that as `"unknown"`, the same conservative default
- *     `externalChangeFiles` already applies to an ordinary lead whose report never mentions
- *     files changed — QA keeps ownership of whatever git shows changed.
- *
- * A lead without `scopedPhaseReports` has only one dispatch whose report IS the whole
- * story; this passes that dispatch's real `stdout` through unchanged, byte-identical to
- * before this function existed. The metadata itself records whether scoped finalization
- * occurred, so classification does not depend on a later read of the feature switch.
- */
+/** Preserve conservative QA scope for legacy phase evidence, when supplied. */
 export function qaScopeEvidenceFor(
 	leadResults: Array<Pick<DispatchResult, "exitCode" | "stdout" | "filesChanged" | "scopedPhaseReports">>,
 ): Array<{ exitCode: number; stdout: string }> {

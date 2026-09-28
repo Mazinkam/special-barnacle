@@ -404,7 +404,7 @@ export interface CiRef {
 }
 
 /** Cap on the number of distinct CI refs `extractCiRefs` will return, mirroring the
- *  defensive array caps used elsewhere (e.g. `HANDOFF_MAX_ARRAY_LEN` in lead-handoff.ts). */
+ *  defensive array caps used elsewhere in the pipeline. */
 const MAX_CI_REFS = 20;
 
 /**

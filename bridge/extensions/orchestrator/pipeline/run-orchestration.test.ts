@@ -1186,8 +1186,8 @@ describe("pipeline/run-orchestration.ts runOrchestration elapsedMs (B4.7)", () =
 	});
 });
 
-describe("pipeline/run-orchestration.ts runOrchestration: unsupported efficiency switches (A1 review fix)", () => {
-	test("scoped_leads enabled in env warns loudly at run start, records efficiency_switch_unsupported, and still continues (default disabled behavior)", async () => {
+describe("pipeline/run-orchestration.ts runOrchestration: efficiency warnings", () => {
+	test("removed scoped_leads env warns at run start", async () => {
 		const session = fakeSession();
 		const { ctx, notifications } = fakeCtx();
 		const adapter = fakeAdapter();
@@ -1214,13 +1214,11 @@ describe("pipeline/run-orchestration.ts runOrchestration: unsupported efficiency
 			deps,
 		);
 
-		expect(notifications.some((n) => n.level === "warning" && n.text.includes("scoped_leads") && n.text.includes("not supported"))).toBe(true);
-		const switchEvent = recordedEvents.find((e) => e.event === "efficiency_switch_unsupported");
-		expect(switchEvent).toBeDefined();
-		expect(switchEvent?.payload.switches).toEqual(["scoped_leads"]);
+		expect(notifications).toContainEqual({ text: "HUMAIN_ORCHESTRATOR_EFFICIENCY_SCOPED_LEADS was removed; ignoring", level: "warning" });
+		expect(recordedEvents.some((e) => e.event === "efficiency_switch_unsupported")).toBe(false);
 	});
 
-	test("file_ownership and recon_before_architect enabled together are both named in one warning/event", async () => {
+	test("report mode is supported; removed recon switch warns", async () => {
 		const session = fakeSession();
 		const { ctx, notifications } = fakeCtx();
 		const adapter = fakeAdapter();
@@ -1250,9 +1248,9 @@ describe("pipeline/run-orchestration.ts runOrchestration: unsupported efficiency
 			deps,
 		);
 
-		const switchEvent = recordedEvents.find((e) => e.event === "efficiency_switch_unsupported");
-		expect(switchEvent).toBeDefined();
-		expect(switchEvent?.payload.switches).toEqual(["recon_before_architect", "file_ownership"]);
+		expect(notifications.some((n) => n.text.includes("RECON_BEFORE_ARCHITECT") && n.text.includes("removed"))).toBe(true);
+		expect(notifications.some((n) => n.text.includes("file_ownership"))).toBe(false);
+		expect(recordedEvents.some((e) => e.event === "efficiency_switch_unsupported")).toBe(false);
 	});
 
 	test("no unsupported switch enabled (default env) never warns or records efficiency_switch_unsupported", async () => {
@@ -1281,7 +1279,7 @@ describe("pipeline/run-orchestration.ts runOrchestration: unsupported efficiency
 			deps,
 		);
 
-		expect(notifications.some((n) => n.text.includes("efficiency_switch_unsupported") || n.text.includes("not supported by this pipeline"))).toBe(false);
+		expect(notifications.some((n) => n.text.includes("efficiency_switch_unsupported") || n.text.includes("not supported"))).toBe(false);
 		expect(recordedEvents.some((e) => e.event === "efficiency_switch_unsupported")).toBe(false);
 	});
 });

@@ -1,27 +1,21 @@
 import { METHOD } from "./models";
 
 export interface EfficiencyControls {
-	recon_before_architect: { enabled: boolean };
 	delegation_guidance: { enabled: boolean; own_tool_budget: { architect: number; lead: number }; targeted_reads_allowed: number };
 	event_waiting_guidance: { enabled: boolean };
-	scoped_leads: { enabled: boolean; max_handoff_chars: number };
-	file_ownership: { mode: "off" | "report" | "serialize" };
+	file_ownership: { mode: "off" | "report" };
 	model_canaries: { enabled: boolean; activation_available: false };
 }
 
-const SWITCHES = ["recon_before_architect", "delegation_guidance", "event_waiting_guidance", "scoped_leads"] as const;
+const SWITCHES = ["delegation_guidance", "event_waiting_guidance"] as const;
 type SwitchName = (typeof SWITCHES)[number];
 const ENV_NAMES: Record<SwitchName, string> = {
-	recon_before_architect: "HUMAIN_ORCHESTRATOR_EFFICIENCY_RECON_BEFORE_ARCHITECT",
 	delegation_guidance: "HUMAIN_ORCHESTRATOR_EFFICIENCY_DELEGATION_GUIDANCE",
 	event_waiting_guidance: "HUMAIN_ORCHESTRATOR_EFFICIENCY_EVENT_WAITING_GUIDANCE",
-	scoped_leads: "HUMAIN_ORCHESTRATOR_EFFICIENCY_SCOPED_LEADS",
 };
 const defaults: EfficiencyControls = {
-	recon_before_architect: { enabled: false },
 	delegation_guidance: { enabled: false, own_tool_budget: { architect: 12, lead: 25 }, targeted_reads_allowed: 8 },
 	event_waiting_guidance: { enabled: false },
-	scoped_leads: { enabled: false, max_handoff_chars: 12000 },
 	file_ownership: { mode: "off" },
 	model_canaries: { enabled: false, activation_available: false },
 };
@@ -31,6 +25,10 @@ export function resolveEfficiencyControls(raw: unknown, env: Record<string, stri
 	const controls: EfficiencyControls = structuredClone(defaults);
 	const config = record(raw);
 	if (!config) problems.push("efficiency_controls config is missing or malformed");
+	for (const name of ["scoped_leads", "recon_before_architect"] as const) {
+		if (config?.[name] !== undefined) problems.push(`efficiency_controls.${name} was removed; ignoring`);
+		if (env[`HUMAIN_ORCHESTRATOR_EFFICIENCY_${name.toUpperCase()}`] !== undefined) problems.push(`HUMAIN_ORCHESTRATOR_EFFICIENCY_${name.toUpperCase()} was removed; ignoring`);
+	}
 	for (const name of SWITCHES) {
 		const item = record(config?.[name]);
 		if (!item || typeof item.enabled !== "boolean") problems.push(`efficiency_controls.${name} is malformed; using OFF`);
@@ -41,7 +39,6 @@ export function resolveEfficiencyControls(raw: unknown, env: Record<string, stri
 			controls.delegation_guidance.own_tool_budget.lead = positiveInt(budgets?.lead, 25, "delegation_guidance.own_tool_budget.lead", problems);
 			controls.delegation_guidance.targeted_reads_allowed = positiveInt(item.targeted_reads_allowed, 8, "delegation_guidance.targeted_reads_allowed", problems);
 		}
-		if (name === "scoped_leads" && item) controls.scoped_leads.max_handoff_chars = positiveInt(item.max_handoff_chars, 12000, "scoped_leads.max_handoff_chars", problems);
 		const value = env[ENV_NAMES[name]];
 		if (value !== undefined) {
 			const normalized = value.toLowerCase();
@@ -52,12 +49,13 @@ export function resolveEfficiencyControls(raw: unknown, env: Record<string, stri
 	}
 	const file = record(config?.file_ownership);
 	const fileMode = file?.mode;
-	if (fileMode === "off" || fileMode === "report" || fileMode === "serialize") controls.file_ownership.mode = fileMode;
-	else problems.push("efficiency_controls.file_ownership is malformed; using OFF");
+	if (fileMode === "off" || fileMode === "report") controls.file_ownership.mode = fileMode;
+	else problems.push(fileMode === "serialize" ? "efficiency_controls.file_ownership=serialize is not supported; using OFF" : "efficiency_controls.file_ownership is malformed; using OFF");
 	const override = env.HUMAIN_ORCHESTRATOR_EFFICIENCY_FILE_OWNERSHIP;
 	if (override !== undefined) {
-		if (override === "off" || override === "report" || override === "serialize") controls.file_ownership.mode = override;
-		else problems.push("Invalid HUMAIN_ORCHESTRATOR_EFFICIENCY_FILE_OWNERSHIP value; config value kept");
+		if (override === "off" || override === "report") controls.file_ownership.mode = override;
+		else problems.push(override === "serialize" ? "HUMAIN_ORCHESTRATOR_EFFICIENCY_FILE_OWNERSHIP=serialize is not supported; using OFF" : "Invalid HUMAIN_ORCHESTRATOR_EFFICIENCY_FILE_OWNERSHIP value; config value kept");
+		if (override === "serialize") controls.file_ownership.mode = "off";
 	}
 	const canary = record(config?.model_canaries);
 	if (!canary || typeof canary.enabled !== "boolean" || canary.activation_available !== false) problems.push("model_canaries config is malformed; using OFF");

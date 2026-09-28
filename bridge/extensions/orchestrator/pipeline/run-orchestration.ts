@@ -386,26 +386,8 @@ export async function runOrchestration(
 	// currently executing it — before any cost is spent, alongside the other run-start setup below.
 	warnIfLiveExtensionTree(cwd, ctx, session, runId, deps.recordEvent);
 
-	// -----------------------------------------------------------------
-	// A1 review fix: `scoped_leads`/`file_ownership`/`recon_before_architect` are efficiency
-	// switches this modular pipeline does not implement (core/records.ts's `scopedPhaseReports`
-	// doc; all three default OFF in method.json) — only the pre-unification index.ts hierarchy code
-	// still does. Flip one on and this pipeline silently runs with it disabled instead of doing what
-	// the operator asked; surface that loudly at run start (before any cost is spent) rather than
-	// let the run's behavior quietly not match its own config, and continue with default (switch
-	// disabled) behavior — this is a config mismatch warning, not a reason to abort the run.
-	// -----------------------------------------------------------------
-	const unsupportedSwitchNames = ["scoped_leads", "file_ownership", "recon_before_architect"];
-	const { enabled: enabledSwitches } = loadEfficiencyControls(deps.env);
-	const unsupportedEnabled = enabledSwitches.filter((name) => unsupportedSwitchNames.includes(name));
-	if (unsupportedEnabled.length > 0) {
-		ctx.ui.notify(
-			`Efficiency switch(es) enabled in config but not supported by this pipeline: ${unsupportedEnabled.join(", ")}. ` +
-				"Continuing with default (switch disabled) behavior — the run will NOT get the effect these switches promise.",
-			"warning",
-		);
-		deps.recordEvent("efficiency_switch_unsupported", { run_id: runId, switches: unsupportedEnabled });
-	}
+	const efficiency = loadEfficiencyControls(deps.env);
+	for (const problem of efficiency.problems) ctx.ui.notify(problem, "warning");
 
 	// -----------------------------------------------------------------
 	// LLM triage: auto-fill missing task_class / complexity / risk via
@@ -597,6 +579,8 @@ export async function runOrchestration(
 			// escalation loop recovers it too late for those waves to ever be dispatched. Gated on
 			// `--max-retries` > 0, the same knob that gates the post-QA escalation loop below.
 			inWaveRecovery: parsed.maxRetries > 0,
+			fileOwnershipMode: efficiency.controls.file_ownership.mode,
+			recordEvent: deps.recordEvent,
 			writeCheckDiagnostic: (_name, text) => writeCheckFailureDiagnostic(session, text, deps.env),
 			waitForChecks: (checks) => waitForPendingChecks(checks, {
 				cwd, cancellation: session.cancellation, ...deps.ciWait,

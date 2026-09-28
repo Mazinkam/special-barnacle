@@ -138,10 +138,8 @@
     "efficiency_controls": {
       "summary": "Phase-2 opt-in efficiency switches. Every switch defaults OFF; each is independent. Off = byte-identical baseline behaviour.",
       "config_version": "2026-09-25.1",
-      "recon_before_architect": { "enabled": false },
       "delegation_guidance": { "enabled": false, "own_tool_budget": { "architect": 12, "lead": 25 }, "targeted_reads_allowed": 8 },
       "event_waiting_guidance": { "enabled": false },
-      "scoped_leads": { "enabled": false, "max_handoff_chars": 12000 },
       "file_ownership": { "mode": "off" }
     },
     "model_canaries": {

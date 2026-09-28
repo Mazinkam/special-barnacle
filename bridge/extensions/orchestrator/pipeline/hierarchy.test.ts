@@ -433,6 +433,20 @@ describe("pipeline/hierarchy.ts isTransientLeadFailure (docs/architecture-review
 	});
 });
 
+test("report ownership emits overlap and observed conflicts without splitting parallel leads", async () => {
+	const events: Array<{ event: string; payload: Record<string, unknown> }> = [];
+	const waves: string[][] = [];
+	const architectResult = { ...twoIndependentLeads, stdout: "## Lead assignments\nLead 1: backend (owns: src/shared.ts; depends on: none)\nLead 2: frontend (owns: src/shared.ts; depends on: none)\n" };
+	await dispatchReconAndLeads({ ...baseInput(), plan: { ...plan, topology: { ...plan.topology, leads: 2 } }, architectResult, fileOwnershipMode: "report" }, {
+		dispatch: async (tasks) => { waves.push(tasks.map((t) => t.taskId)); return tasks.map((t) => ({ ...dispatchResult(t), filesChanged: ["src/shared.ts"] })); },
+		capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+		recordEvent: (event, payload) => { events.push({ event, payload }); },
+	});
+	expect(waves).toEqual([["run-lead-0", "run-lead-1"]]);
+	expect(events.some((e) => e.event === "lead_ownership" && e.payload.kind === "ownership_overlap")).toBe(true);
+	expect(events.some((e) => e.event === "lead_edit_conflict" && e.payload.file === "src/shared.ts")).toBe(true);
+});
+
 /** Two independent leads, as the architect must now declare them (one wave). */
 const twoIndependentLeads = {
 	taskId: "run-architect", capability: "architect", model: "m", exitCode: 0, stderr: "",

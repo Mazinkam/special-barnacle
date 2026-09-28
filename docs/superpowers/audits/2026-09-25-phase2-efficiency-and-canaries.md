@@ -30,15 +30,11 @@ Each named efficiency control also accepts `HUMAIN_ORCHESTRATOR_EFFICIENCY_<NAME
 
 | Name | Default | Behaviour when enabled | Safety / fallback | Tests |
 |---|---|---|---|---|
-| `recon_before_architect` | `false` | Gather existing recon evidence before architect dispatch, where applicable. | Does not redefine recon eligibility; unavailable evidence must not be fabricated. | `efficiency-flags.test.ts`; dispatch-order tests in `index.test.ts`. |
 | `delegation_guidance` | `false`; architect own-tool budget 12, lead 25; targeted reads allowed 8 | Adds bounded own-tool/delegation guidance. | Guidance only; does not change model, verification, or tool behavior. | `efficiency-flags.test.ts`, bridge prompt/dispatch tests. |
 | `event_waiting_guidance` | `false` | Guides event-oriented waiting rather than unnecessary polling. | Polling remains counted, not rewritten or blocked by telemetry. | `dispatch-telemetry.test.ts` and bridge tests. |
-| `scoped_leads` | `false`; max handoff chars 12,000 | One lead proceeds plan → integrate → report using bounded, validated structured handoffs. | Identity/schema/size validation; fixed-code diagnostics; freshness requires known git `HEAD` plus unchanged bridge-observed dirty-tree snapshot. Any invalid, stale, unknown or changed state falls back to a long-lived lead. | `lead-handoff.test.ts` and scoped-lead tests in `index.test.ts`. |
-| `file_ownership` | `off` | `report` emits overlap/undeclared evidence without changing waves. `serialize` splits conflicting parallel waves. | Ownership is parsed from `(owns: path, ...)` on Lead lines. Undeclared/unsafe ownership is conservatively serialized; unsafe paths cannot be considered disjoint. Emits `lead_ownership` and post-run `lead_edit_conflict` evidence. `off` leaves scheduling untouched. | `file-ownership.test.ts`, lead-plan and bridge tests. |
+| `file_ownership` | `off` | `report` emits overlap/undeclared and observed edit-conflict evidence without changing waves. | Ownership is parsed from `(owns: path, ...)` on Lead lines. `serialize` is rejected with a warning; `off` leaves scheduling untouched. | `file-ownership.test.ts`, `pipeline/hierarchy.test.ts`. |
 
-`file_ownership` uses `HUMAIN_ORCHESTRATOR_EFFICIENCY_FILE_OWNERSHIP=off|report|serialize` rather than a boolean. Handoff data is treated as untrusted; diagnostics do not echo model-supplied content. Overlap checks conservatively handle absolute, escaping, empty, NUL-containing, and glob paths.
-
-`scoped_leads`: each of a lead's plan/integrate/report phases is dispatched as its own fresh subprocess (a new HT process with no shared in-memory state with the phase before it); the ONLY continuity between phases is the validated, size-bounded `## Handoff` block carried forward explicitly — nothing else about a prior phase's context, tool state, or reasoning survives to the next one. A scoped lead's final result carries the de-duplicated union of `filesChanged` across every phase it ran (plan, integrate, report, and any fallback dispatch), not just its last phase, because a report phase legitimately says "Files Changed: None" for itself while an earlier phase in the same chain made the real edits; QA scope and the run's external-change classification are computed from that union so those files are never silently dropped.
+`file_ownership` uses `HUMAIN_ORCHESTRATOR_EFFICIENCY_FILE_OWNERSHIP=off|report` rather than a boolean. Overlap checks conservatively handle absolute, escaping, empty, NUL-containing, and glob paths. `scoped_leads` and `recon_before_architect` were removed: their config and env overrides are rejected, not silently activated.
 
 ## 4. Telemetry
 
@@ -84,13 +80,13 @@ The storage loader is intentionally not guessed in this example: inspect the cop
 
 ## 7. Staged activation plan
 
-Experiments are separate and sequential. **Never combine model and scoped-lead experiments** in one comparison. Any paid/live run requires explicit approval and a defined budget; none is implied here.
+Experiments are separate and sequential. **Never combine model and efficiency experiments** in one comparison. Any paid/live run requires explicit approval and a defined budget; none is implied here.
 
 1. Establish prerequisites: canary activation requires merging supported catalog qualification (tool/context/reasoning requirements), tests, and confirmation that candidate identifiers resolve. Efficiency experiments require baseline telemetry and a scoped, reversible hypothesis.
 2. Select one control and one bounded task population. Keep all other controls off. Record config, code revision, task class, risk, repo, expected sample/budget, verification gates, fallback threshold, and rollback owner before any live run.
 3. Start with observation/report-only where available (`file_ownership=report`); for behavior-changing controls, obtain explicit approval before setting a single switch. For a canary only after qualification is available, start at a small approved non-zero percentage, with explicit overrides excluded and all assignment/deviation fields checked.
 4. Review each run's verification evidence, cost completeness, fallback/deviation rate, telemetry coverage, delayed outcomes, and run-wall versus dispatch timing. Do not infer success from tool-count reduction alone.
-5. Stop on any verification regression, spend-cap hit, fallback rate above the predeclared threshold, material telemetry gap, unsafe/stale handoff, unexpected model/provider substitution, or budget limit. Do not progress to another stage until the isolated experiment is reviewed.
+5. Stop on any verification regression, spend-cap hit, fallback rate above the predeclared threshold, material telemetry gap, unexpected model/provider substitution, or budget limit. Do not progress to another stage until the isolated experiment is reviewed.
 
 Rollback is immediate: unset the relevant environment override or set its config `enabled` false; set ownership mode to `off`; set canary enabled false and percentage to zero. Existing records remain observational history; no data migration is needed.
 

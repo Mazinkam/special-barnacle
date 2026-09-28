@@ -44,6 +44,13 @@ def load_method(path: Path | None = None) -> dict[str, Any]:
 
 
 def _validate(m: dict[str, Any]) -> None:
+    controls = m["rules"].get("efficiency_controls", {})
+    for removed in ("scoped_leads", "recon_before_architect"):
+        if removed in controls:
+            raise ValueError(f"method.json: efficiency_controls.{removed} was removed")
+    mode = controls.get("file_ownership", {}).get("mode", "off")
+    if mode not in ("off", "report"):
+        raise ValueError(f"method.json: file_ownership mode {mode!r} is unsupported")
     tiers = set(m["tiers"])
     efforts = set(m["effort_levels"])
     for cap, spec in m["capabilities"].items():

@@ -8,7 +8,7 @@
  * instead of the orchestrator only ever learning about pending CI from a
  * timeout classification.
  *
- * Like `lead-handoff.ts`/`run-outcome.ts`, this parses untrusted,
+ * Like `run-outcome.ts`, this parses untrusted,
  * model-supplied report text: extraction never throws, and every failure
  * mode becomes a FIXED-CODE entry in `problems` — optionally with a
  * 1-based line number, but NEVER any of the line's own text, sanitized or
@@ -34,7 +34,7 @@ export interface PendingCheck {
 export const PENDING_CHECKS_HEADING = "## Pending external checks";
 
 /** Cap on the number of distinct checks either function will return, mirroring
- *  `MAX_CI_REFS` in wait-stall.ts and `HANDOFF_MAX_ARRAY_LEN` in lead-handoff.ts. */
+ *  `MAX_CI_REFS` in wait-stall.ts. */
 const MAX_PENDING_CHECKS = 20;
 
 /** Longest a single report line is trusted to be before it is skipped outright rather than

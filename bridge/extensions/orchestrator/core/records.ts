@@ -42,13 +42,7 @@ export interface DispatchResult {
 	filesChanged: string[];
 	/** HT thinking level the dispatch ran at (from the binding), when one was set. */
 	effort?: string;
-	/**
-	 * `scoped_leads` (index.ts-only today; not yet ported to the modular pipeline — see this
-	 * repo's A1 unification notes): the `exitCode`/`stdout` of every phase (plan/integrate/report/
-	 * fallback) a scoped lead's chain ran, attached only by `finalizeScopedLeadResult`. Absent on
-	 * every `DispatchResult` the modular `pipeline/hierarchy.ts` produces today, in which case
-	 * `run-outcome.ts`'s `qaScopeEvidenceFor` passes `exitCode`/`stdout` through unchanged.
-	 */
+	/** Legacy phase evidence, if supplied, for conservative QA scope. */
 	scopedPhaseReports?: Array<{ phase: string; exitCode: number; stdout: string }>;
 }
 

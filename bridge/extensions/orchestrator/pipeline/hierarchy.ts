@@ -36,6 +36,8 @@ import {
 	type PlanResponse,
 } from "../core/prompts.ts";
 import { parseLeadAssignments, planLeadWaves, type LeadAssignment } from "../lead-plan.ts";
+import { findOwnershipOverlaps, observedEditConflicts } from "../file-ownership.ts";
+import type { EfficiencyControls } from "../efficiency-flags.ts";
 import { parseLeadStatus } from "../run-outcome.ts";
 import { mergePendingChecks, parsePendingChecks, type PendingCheck } from "../core/pending-checks.ts";
 import { CI_ID_RE, classifyTimeout, extractCiRefs } from "../core/wait-stall.ts";
@@ -223,6 +225,7 @@ export async function dispatchReconAndLeads(
 		 *  behavior (dependent waves marked "not started", the post-QA escalation loop is the only
 		 *  recovery path) is unchanged unless a caller opts in. */
 		inWaveRecovery?: boolean;
+		fileOwnershipMode?: EfficiencyControls["file_ownership"]["mode"];
 	},
 	effects: {
 		dispatch: (tasks: DispatchTask[]) => Promise<DispatchResult[]>;
@@ -238,6 +241,7 @@ export async function dispatchReconAndLeads(
 		currentCandidateSha?: () => string | null;
 		/** Persist untrusted failed CI output outside prompts; returns an owned diagnostic path only on success. */
 		writeCheckDiagnostic?: (name: string, text: string) => string | null;
+		recordEvent?: (event: string, payload: Record<string, unknown>) => void;
 	},
 ): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[]; resumedLeadTaskIds: string[]; retriedLeadTaskIds: string[]; resumedAttemptResults: DispatchResult[]; pendingChecks: ResolvedCheck[] }> {
 	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars, maxLeads, leadCapability = "lead", repoRoot, providedContext = "", inWaveRecovery = false } = input;
@@ -299,6 +303,19 @@ export async function dispatchReconAndLeads(
 		effects.setPhase(`topology asked for ${requestedLeadCount} leads but the architect gave no valid Lead assignments; running a single lead`);
 	}
 	const waves = assignments ? planLeadWaves(assignments) : [[0]];
+	if (input.fileOwnershipMode === "report" && assignments) {
+		const { overlaps, undeclared, unsafe } = findOwnershipOverlaps(assignments.map((a, lead) => ({ lead, owns: a.owns })));
+		for (const [waveIndex, wave] of waves.entries()) {
+			if (wave.length < 2) continue;
+			for (const overlap of overlaps) if (wave.includes(overlap.a) && wave.includes(overlap.b)) {
+				effects.recordEvent?.("lead_ownership", { run_id: runId, kind: "ownership_overlap", wave: waveIndex, ...overlap });
+			}
+			for (const lead of wave) {
+				if (undeclared.includes(lead)) effects.recordEvent?.("lead_ownership", { run_id: runId, kind: "ownership_undeclared", wave: waveIndex, lead });
+				if (unsafe.includes(lead)) effects.recordEvent?.("lead_ownership", { run_id: runId, kind: "ownership_unsafe", wave: waveIndex, lead });
+			}
+		}
+	}
 	const leadTaskFor = (i: number): DispatchTask => ({
 		capability: leadCapability,
 		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter, repoRoot, assignments?.[i], providedContext),
@@ -499,6 +516,11 @@ export async function dispatchReconAndLeads(
 
 	}
 
+	if (input.fileOwnershipMode === "report") {
+		const edits = leadResults.map((result) => ({ lead: Number(result.taskId.match(/-lead-(\d+)$/)?.[1]), files: result.filesChanged }));
+		for (const conflict of observedEditConflicts(edits)) effects.recordEvent?.("lead_edit_conflict", { run_id: runId, ...conflict });
+	}
+
 	// Recon is parent-owned and returned for billing/reporting. Any further
 	// fan-out a lead performs via HT's own subagent tool happens inside that
 	// lead's own context window; the bridge has no visibility into it and does
@@ -537,6 +559,8 @@ export interface HierarchyDeps {
 	waitForChecks?: (checks: PendingCheck[]) => Promise<ResolvedCheck[]>;
 	currentCandidateSha?: () => string | null;
 	writeCheckDiagnostic?: (name: string, text: string) => string | null;
+	fileOwnershipMode?: EfficiencyControls["file_ownership"]["mode"];
+	recordEvent?: (event: string, payload: Record<string, unknown>) => void;
 }
 
 /**
@@ -624,7 +648,7 @@ export async function dispatchHierarchical(
 	}
 
 	const results = await dispatchReconAndLeads(
-		{ runId, goal, plan, adapter, architectResult, leadCapability, evidenceMaxChars: deps.evidenceMaxChars, maxLeads: deps.maxLeads, repoRoot: deps.repoRoot, providedContext: deps.providedContext, inWaveRecovery: deps.inWaveRecovery },
+		{ runId, goal, plan, adapter, architectResult, leadCapability, evidenceMaxChars: deps.evidenceMaxChars, maxLeads: deps.maxLeads, repoRoot: deps.repoRoot, providedContext: deps.providedContext, inWaveRecovery: deps.inWaveRecovery, fileOwnershipMode: deps.fileOwnershipMode },
 		{
 			dispatch: deps.dispatch,
 			capture: (result) => deps.captureDispatchCost(captureOpts, result, run),
@@ -635,6 +659,7 @@ export async function dispatchHierarchical(
 			waitForChecks: deps.waitForChecks,
 			currentCandidateSha: deps.currentCandidateSha,
 			writeCheckDiagnostic: deps.writeCheckDiagnostic,
+			recordEvent: deps.recordEvent,
 		},
 	);
 	return { ...results, architectResult };
