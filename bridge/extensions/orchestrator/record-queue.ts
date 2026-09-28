@@ -41,7 +41,7 @@
  * The queue is pure (the runner is injected) so it can be tested without Python.
  */
 
-import contract from "./contract.json";
+import contract from "./contract.ts";
 
 export type Stream = "event" | "metric" | "outcome";
 

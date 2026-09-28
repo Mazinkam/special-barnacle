@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import contract from "./contract.json";
+import contract from "./contract.ts";
 import { OWNER_FILE, protectedNames, RunDiagnostics, SEAL_FILE } from "./run-diagnostics.ts";
 
 function freshRunDir(): { root: string; runId: string; dir: string } {

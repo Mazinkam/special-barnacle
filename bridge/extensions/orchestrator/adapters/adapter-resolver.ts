@@ -34,7 +34,8 @@ import {
 } from "../models.ts";
 import { emptyOverrides, type ModelOverrides } from "../core/args.ts";
 import type { LoadedProfiles } from "./profiles-store.ts";
-import profilesFile from "../orchestrator-profiles.json";
+// Use the canonical file; Bun --isolate can load the bridge symlink as an empty JSON module.
+import profilesFile from "../../../orchestrator-profiles.json";
 
 export type Adapter = Record<string, Binding>;
 

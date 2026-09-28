@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { expandHome, loadBridgeConfig } from "./config.ts";
-import contract from "./contract.json";
+import contract from "./contract.ts";
 
 const HOME = "/home/test-user";
 

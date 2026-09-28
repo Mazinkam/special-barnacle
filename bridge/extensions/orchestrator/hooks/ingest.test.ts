@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import contract from "../contract.json";
+import contract from "../contract.ts";
 import { SessionIngestScheduler } from "../ingest.ts";
 import { recordHookFailure, redactPaths, registerSessionIngestHooks } from "./ingest.ts";
 

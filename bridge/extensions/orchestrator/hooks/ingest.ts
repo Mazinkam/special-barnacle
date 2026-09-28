@@ -16,7 +16,7 @@ import { dirname, join } from "node:path";
 
 import type { ExtensionAPI } from "@humain/terminal";
 
-import contract from "../contract.json";
+import contract from "../contract.ts";
 import { ingestArgs, SessionIngestScheduler } from "../ingest.ts";
 
 // Match absolute paths under common user homes so the bounded Status Contract

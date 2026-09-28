@@ -9,7 +9,7 @@ import {
 	mkdirSync, openSync, readSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import contract from "./contract.json";
+import contract from "./contract.ts";
 
 export const OWNER_FILE = ".diagnostics-owner.json";
 export const SEAL_FILE = ".diagnostics-sealed.json";

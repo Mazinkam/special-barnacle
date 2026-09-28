@@ -3,7 +3,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import contract from "./contract.json";
+import contract from "./contract.ts";
 import { EXIT_INVALID, EXIT_OK, PYTHON_MAX_BATCH_RECORDS, STATUS_INVALID, STREAMS } from "./record-queue.ts";
 import { protectedNames } from "./run-diagnostics.ts";
 
@@ -18,6 +18,11 @@ describe("contract.json parity", () => {
 		expect(JSON.parse(readFileSync(bridgePath, "utf8"))).toEqual(
 			JSON.parse(readFileSync(canonicalPath, "utf8")),
 		);
+	});
+
+	test("the bridge loader reads the canonical contract rather than the symlinked import", () => {
+		const canonicalPath = join(HERE, "..", "..", "..", "orchestrator", "contract.json");
+		expect(contract).toEqual(JSON.parse(readFileSync(canonicalPath, "utf8")));
 	});
 
 	test("record-queue's STREAMS matches contract.streams", () => {

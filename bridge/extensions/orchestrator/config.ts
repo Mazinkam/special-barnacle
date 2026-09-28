@@ -17,7 +17,7 @@ import { realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { METHOD } from "./models.ts";
-import contract from "./contract.json";
+import contract from "./contract.ts";
 
 export type BridgeEnv = NodeJS.ProcessEnv | Record<string, string | undefined>;
 

@@ -192,7 +192,11 @@ describe("session ingest hook wiring", () => {
 			await handlers.agent_settled({}, context);
 			const firstStatus = await waitForMaterialization();
 			const metricsPath = join(testStateRoot, "metrics.jsonl");
-			const metricRows = readFileSync(metricsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+			// Other randomized tests may write to the module's shared state root first.
+			// Assert only on this session's rows, not unrelated telemetry.
+			const sessionMetrics = () => readFileSync(metricsPath, "utf8").trim().split("\n")
+				.map((line) => JSON.parse(line)).filter((row) => row.session_id === "event-session");
+			const metricRows = sessionMetrics();
 			expect(metricRows).toHaveLength(1);
 			expect(metricRows[0].covers_calls).toBe(1);
 			expect(firstStatus.emitted).toBe(1);
@@ -206,7 +210,7 @@ describe("session ingest hook wiring", () => {
 			expect(replayStatus.emitted).toBe(0);
 			expect(replayStatus.status).toBe("ok");
 			expect(statSync(join(testStateRoot, "dashboard.html")).mtimeMs).toBeGreaterThan(beforeReplayDashboard);
-			expect(readFileSync(metricsPath, "utf8").trim().split("\n")).toHaveLength(1);
+			expect(sessionMetrics()).toHaveLength(1);
 			for (const output of [readFileSync(metricsPath, "utf8"),
 				readFileSync(join(testStateRoot, "ingest_status.json"), "utf8"), dashboardText]) {
 				expect(output).not.toContain(marker);
@@ -1863,7 +1867,7 @@ describe("runSubagentProcess process/event handling", () => {
 		} catch (err) {
 			const stderr = (err as { stderr?: Buffer | string }).stderr;
 			throw new Error(
-				`Node driver failed: ${(err as Error).message}${stderr ? `\n--- driver stderr ---\n${stderr}` : ""}`,
+				`Node driver failed: ${(err as Error).message}${err instanceof AggregateError ? `\n--- build errors ---\n${err.errors.map((e: unknown) => String(e)).join("\n")}` : ""}${stderr ? `\n--- driver stderr ---\n${stderr}` : ""}`,
 			);
 		} finally {
 			rmSync(fixtureDir, { recursive: true, force: true });
@@ -2384,7 +2388,7 @@ describe("runSubagentProcess process/event handling", () => {
 		writeFileSync(scriptPath, [
 			"import { spawn } from \"node:child_process\";",
 			"const grandchild = spawn(process.execPath, [\"-e\",",
-			"  \"setTimeout(()=>{try{require('fs').writeSync(2,'grandchild wrote after settle\\\\n');}catch{}process.exit(0);},500);\"",
+			"  \"setTimeout(()=>{try{require('fs').writeSync(2,'grandchild wrote after settle\\\\n');}catch{}process.exit(0);},1200);\"",
 			"], { stdio: [\"ignore\", \"ignore\", 2], detached: true });",
 			"grandchild.unref();",
 			"setInterval(() => {}, 1000);",
@@ -2393,14 +2397,15 @@ describe("runSubagentProcess process/event handling", () => {
 			const result = await orchestrator.runSubagentProcess({
 				cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
 				ctx: {} as never, capability: "lead", taskId: "escaped-grandchild", session,
-				leadTimeouts: { inactivityMs: 100, maxMs: 5000 },
+				leadTimeouts: { inactivityMs: 400, maxMs: 5000 },
 				spawnChild: (_command, _args, options) => nodeSpawn(process.execPath, [scriptPath], options as never),
 			});
 			expect(result.outcome).toBe("timed_out");
 			const beforeGrandchild = readFileSync(session.file("escaped-grandchild.stderr.log"), "utf8");
 			expect(beforeGrandchild).toContain("UNVERIFIED PARTIAL WORK");
-			// Give the detached grandchild time to write after settle/close/release.
-			await new Promise((resolve) => setTimeout(resolve, 900));
+			// Allow Node startup under suite load before the inactivity kill, then
+			// give the detached grandchild time to write after settle/close/release.
+			await new Promise((resolve) => setTimeout(resolve, 1800));
 			const afterGrandchild = readFileSync(session.file("escaped-grandchild.stderr.log"), "utf8");
 			// Earlier content must not have been overwritten at offset 0.
 			expect(afterGrandchild.startsWith(beforeGrandchild)).toBe(true);
