@@ -134,6 +134,7 @@ import { applyObservation, applyWarnings, createProgressView, formatNestedWorker
 import type { DispatchProgressView } from "./run-ui.ts";
 import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
 import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.ts";
+import contract from "./contract.ts";
 // Rule-2 recon planning/evidence helpers (pure; see recon.ts). `dispatchHierarchical()`
 // dispatches these as ordinary parent-owned tasks through the existing
 // `dispatchParallel()` path. `DispatchTask` below is declared independently;
@@ -3858,9 +3859,12 @@ export function roleForAgentName(agentName: string | null | undefined): string {
  * the runtime reported one (`cost_source: "reported"`); an unknown cost omits `cost_usd`
  * entirely so `meter()` (orchestrator/record_batch.py) can estimate it from tokens — or leave it
  * explicitly unmetered — exactly as it does for a dispatch's own row. `record_id` is a pure
- * function of stable identity (run, parent dispatch, DISPATCH attempt, nested key) so re-emitting
- * the same nested call (crash replay, backfill) is deduplicated by `unique_records`
- * (orchestrator/economics.py) instead of double-booked.
+ * function of stable identity (run, parent dispatch, DISPATCH attempt, nested key). The queue
+ * retries unacknowledged payloads with the same ID; there is no opt-in historical nested-row
+ * re-emission path for rejected rows yet. Open item: align the opt-in copy-only
+ * scripts/backfill_nested_costs.py with this bounded ID scheme (it currently builds legacy
+ * unbounded IDs) before using it to recover old rejected rows. Python's `unique_records`
+ * deduplicates acknowledged retries.
  *
  * `opts.dispatchAttempt` (default 0) is the codex -> Bedrock quota-fallback attempt index (0 =
  * original, 1 = the retry) — see the `dispatchAttempt` comment in `dispatchParallel`. It is folded
@@ -3869,6 +3873,16 @@ export function roleForAgentName(agentName: string | null | undefined): string {
  * `(toolCallId, taskId, attempt)` collision across the two attempts would dedup away a paid nested
  * call from one of them (Phase 1 review finding T2).
  */
+function nestedRecordId(runId: string, parentTaskId: string, dispatchAttempt: number, key: string): string {
+	const legacy = `nested:${runId}:${parentTaskId}:${dispatchAttempt}:${key}`;
+	const limit = contract.batch.max_record_id_length;
+	if (legacy.length <= limit) return legacy;
+	// Hash the entire legacy identity (not only the nested key) so even a long parent
+	// or two keys with identical leading characters retain distinct stable identities.
+	const digest = createHash("sha256").update(legacy).digest("hex").slice(0, 40);
+	return `${legacy.slice(0, limit - 1 - digest.length)}:${digest}`;
+}
+
 export function nestedModelCallRowsFor(
 	opts: {
 		runId: string;
@@ -3920,7 +3934,7 @@ export function nestedModelCallRowsFor(
 			dispatch_attempt: dispatchAttempt,
 			plan_id: opts.planId,
 			...runTagFields(),
-			record_id: `nested:${opts.runId}:${opts.parentTaskId}:${dispatchAttempt}:${c.key}`,
+			record_id: nestedRecordId(opts.runId, opts.parentTaskId, dispatchAttempt, c.key),
 		};
 	});
 }

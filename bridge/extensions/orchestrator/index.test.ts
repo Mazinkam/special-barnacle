@@ -12,6 +12,7 @@ import { planReconTasks } from "./recon.ts";
 import { METHOD, TIER_CAPABILITIES, buildAliasTable } from "./models.ts";
 import type { DispatchResult, DispatchTask } from "./index.ts";
 import { RunCancellation } from "./cancellation.ts";
+import { RecordQueue } from "./record-queue.ts";
 import { liveQaCostRows, prepareTestedRevision, type LiveQaVerdict } from "./live-qa.ts";
 import { MAX_CHILD_STDERR_DISK_BYTES } from "./dispatch/stderr-sink.ts";
 import { loadEfficiencyControls, type EfficiencyControls } from "./efficiency-flags.ts";
@@ -4222,6 +4223,52 @@ describe("model canary telemetry through dispatchParallel (Phase 2 item 2)", () 
 			});
 		expect(result.experimentFlags).toEqual(["scoped_leads"]);
 	});
+});
+
+describe("nested record IDs at the Python batch boundary", () => {
+	const opts = { runId: "run", parentTaskId: "run-lead", dispatchAttempt: 0 };
+	const call = (key: string) => ({
+		key, toolCallId: key, taskId: "impl-0", agent: "orch-implementation-fast",
+		model: "provider/model", usage: { input: 3, output: 2, cost: 0.01 },
+		costReported: true, exitCode: 0,
+	});
+
+	test("short keys keep their exact legacy IDs, including the 200-character boundary", () => {
+		const prefix = "nested:run:run-lead:0:";
+		const rows = orchestrator.nestedModelCallRowsFor(opts, [call("tc1:impl-0:0"), call("x".repeat(200 - prefix.length))]);
+		expect(rows.map(row => row.record_id)).toEqual([`${prefix}tc1:impl-0:0`, `${prefix}${"x".repeat(200 - prefix.length)}`]);
+		expect(rows[1].nested_call_id).toBe("x".repeat(200 - prefix.length));
+	});
+
+	test("long Codex keys have bounded, deterministic, distinct IDs without losing nested_call_id", () => {
+		const keyA = `tc:${"a".repeat(230)}:impl-0:0`;
+		const keyB = `tc:${"a".repeat(230)}:impl-0:1`;
+		const rows = orchestrator.nestedModelCallRowsFor(opts, [call(keyA), call(keyB)]);
+		expect(rows[0].record_id).toBe(orchestrator.nestedModelCallRowsFor(opts, [call(keyA)])[0].record_id);
+		expect(rows[0].record_id).not.toBe(rows[1].record_id);
+		expect(rows[0].record_id).toBe(`nested:run:run-lead:0:${keyA}`.slice(0, 159) + ":5c2b2853f8603eece5ce5ba04845c45ff129811c");
+		for (const [index, key] of [keyA, keyB].entries()) {
+			expect((rows[index].record_id as string).length).toBeLessThanOrEqual(200);
+			expect(rows[index].nested_call_id).toBe(key);
+		}
+	});
+
+	test("long nested calls cross the real bridge queue to Python and replay with the same ID", async () => {
+		const key = `codex:${"z".repeat(240)}:impl-0:0`;
+		const row = orchestrator.nestedModelCallRowsFor({ ...opts, runId: "nested-id-python-boundary" }, [call(key)])[0];
+		const queue = new RecordQueue({
+			run: records => orchestrator.runModule("orchestrator.cli", ["batch", "-"], JSON.stringify(records)),
+			flushDelayMs: 60_000,
+		});
+		queue.enqueue("metric", row);
+		expect(await queue.flush()).toMatchObject({ ok: true, failed: 0, acknowledged: 1 });
+		queue.enqueue("metric", row);
+		expect(await queue.flush()).toMatchObject({ ok: true, failed: 0, acknowledged: 1 });
+		const stored = readFileSync(join(testStateRoot, "metrics.jsonl"), "utf8").split("\n").filter(Boolean)
+			.map(line => JSON.parse(line)).filter(r => r.run_id === "nested-id-python-boundary");
+		expect(stored).toHaveLength(1);
+		expect(stored[0]).toMatchObject({ record_id: row.record_id, nested_call_id: key });
+	}, 30_000);
 });
 
 describe("nested subagent cost rows (Phase 1 item 2)", () => {
