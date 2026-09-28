@@ -534,6 +534,55 @@ describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (
 		expect(recordRunStartedCalls[0].runId.startsWith("ht-orch-")).toBe(true);
 	});
 
+	test("nested command prefixes apply boundary flags and log effective settings without goal text", async () => {
+		const { pi, getHandler } = fakePi();
+		const logs: string[] = [];
+		const session = { ...fakeRunSessionLike("placeholder"), log: (line: string) => { logs.push(line); } };
+		const { deps } = baseDeps({
+			resolveAdapter: async (_ctx, overrides) => ({ ...healthyResolution(fakeAdapter()), profileName: overrides.profile ?? "test-profile" }),
+			createSession: () => session,
+		});
+		registerOrchestrateCommand(pi, deps);
+		const { ctx } = fakeCtx();
+		let captured: { goal: string; complexity: number; risk: string; leadSize?: string; models: { profile?: string } } | undefined;
+		setRunOrchestrationForTest(async (_id, _cwd, parsed) => {
+			captured = parsed;
+			return { kind: "aborted" };
+		});
+
+		await getHandler()("/orchestrate /orchestrate --profile lean --complexity 8 --risk high --lead-size large repair confidential auth flow", ctx);
+
+		expect(captured?.goal).toBe("repair confidential auth flow");
+		expect(captured?.models.profile).toBe("lean");
+		expect(captured?.complexity).toBe(8);
+		expect(captured?.risk).toBe("high");
+		expect(captured?.leadSize).toBe("large");
+		expect(logs.some((line) => line.includes("profile=lean") && line.includes("complexity=8") && line.includes("risk=high") && line.includes("lead-size=large"))).toBe(true);
+		expect(logs.join("\n")).not.toContain("confidential auth flow");
+	});
+
+	test("mid-prose flags remain goal text and cannot inject overrides, even with --force", async () => {
+		const { pi, getHandler } = fakePi();
+		const { deps } = baseDeps({
+			resolveAdapter: async () => healthyResolution(fakeAdapter()),
+			createSession: (runId) => fakeRunSessionLike(runId),
+		});
+		registerOrchestrateCommand(pi, deps);
+		const { ctx } = fakeCtx();
+		let captured: { goal: string; risk: string; force: boolean; models: { profile?: string } } | undefined;
+		setRunOrchestrationForTest(async (_id, _cwd, parsed) => {
+			captured = parsed;
+			return { kind: "aborted" };
+		});
+
+		await getHandler()("repair --risk high the --profile secret flow --force", ctx);
+
+		expect(captured?.goal).toBe("repair --risk high the --profile secret flow");
+		expect(captured?.risk).toBe("medium");
+		expect(captured?.models.profile).toBeUndefined();
+		expect(captured?.force).toBe(true);
+	});
+
 	test("a valid goal reaches runOrchestration, called with the parsed args (not merely stopped at the C6/C7 preflight checks)", async () => {
 		const { pi, getHandler } = fakePi();
 		const adapter = fakeAdapter();

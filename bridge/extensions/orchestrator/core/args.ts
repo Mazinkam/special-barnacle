@@ -82,6 +82,7 @@ export interface OrchestrateArgs {
  */
 export function parseArgs(args: string): OrchestrateArgs {
 	const tokens = args.trim().split(/\s+/).filter(Boolean);
+	while (tokens[0] === "/orchestrate") tokens.shift();
 	// Pass 1 on a scratch result: find which tokens are flag spans and which are goal words.
 	const spans: Array<{ start: number; end: number; flag: boolean }> = [];
 	const scratch = newOrchestrateArgs();
@@ -111,6 +112,34 @@ export function parseArgs(args: string): OrchestrateArgs {
 	// `--live-qa-scope` appeared.
 	if (out.liveQaOff) out.liveQa = false;
 	return out;
+}
+
+const KNOWN_FLAGS = new Set([
+	"--task-class", "--complexity", "--risk", "--quality-floor", "--cost-aggressiveness",
+	"--fan-out", "--max-retries", "--interactive", "--context", "--with-last-reply",
+	"--force", "--live-qa", "--no-live-qa", "--live-qa-adapter", "--live-qa-scope",
+	"--yes", "-y", "--check", "--live", "--profile", "--lead-size", "--effort",
+	"--cheap", "--mid", "--premium", "--frontier", "--model",
+]);
+
+/** Literal parser-known flags at the very start of a goal, not inside its prose or quotes. */
+export function leadingUnappliedFlags(goal: string): string[] {
+	const tokens = goal.trimStart().split(/\s+/).filter(Boolean);
+	const flags: string[] = [];
+	const scratch = newOrchestrateArgs();
+	for (let i = 0; i < tokens.length && KNOWN_FLAGS.has(tokens[i]); ) {
+		flags.push(tokens[i]);
+		i = consumeFlag(tokens, i, scratch) ?? i + 1;
+	}
+	return flags;
+}
+
+/** Refuse a goal that opens with flags the parser did not apply, unless explicitly forced. */
+export function unappliedGoalFlagError(goal: string, force: boolean): string | null {
+	if (force) return null;
+	const flags = leadingUnappliedFlags(goal);
+	if (flags.length === 0) return null;
+	return `Ignored leading goal flag(s): ${flags.join(", ")}. Move these flags to the start or end of the command, or use --force to run with the goal unchanged.`;
 }
 
 function newOrchestrateArgs(): OrchestrateArgs {

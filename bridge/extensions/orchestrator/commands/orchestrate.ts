@@ -20,7 +20,7 @@ import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, re
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { parseArgs, usageText, type ModelOverrides } from "../core/args.ts";
+import { parseArgs, unappliedGoalFlagError, usageText, type ModelOverrides } from "../core/args.ts";
 import { assembleProvidedContextBlock, contextFileLabel, CONTEXT_SOURCE_MAX_CHARS, formatContextSource, lastAssistantReplyText, LAST_REPLY_LABEL, providedContextAssemblyOverhead, providedContextSeparatorLength, type ContextSource } from "../core/context.ts";
 import { goalRefersToMissingContext } from "../core/context-detector.ts";
 import { redactPaths } from "../hooks/ingest.ts";
@@ -573,6 +573,11 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 			"Models: flags > profile (orchestrator-profiles.json) > cost-tier resolver. See /orchestrator-models.",
 		handler: async (args, ctx) => {
 			const parsed = parseArgs(args);
+			const flagError = unappliedGoalFlagError(parsed.goal, parsed.force);
+			if (flagError) {
+				ctx.ui.notify(flagError, "error");
+				return;
+			}
 			if (!parsed.goal) {
 				ctx.ui.notify(usage, "warning");
 				return;
@@ -668,6 +673,7 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 				return;
 			}
 			deps.recordRunStarted(runId, ctx.sessionManager?.getSessionFile?.() ?? null);
+			session.log(`run settings: profile=${resolved.profileName} complexity=${parsed.complexity} risk=${parsed.risk} lead-size=${parsed.leadSize ?? "auto"}`);
 			session.log(`policy: ${claimed.tags.policy_id}`);
 			session.log(`models (profile "${resolved.profileName}"):\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
 			for (const n of resolved.notes) session.log(`note: ${n}`);

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { planReconTasks } from "../recon.ts";
 import { METHOD } from "../models.ts";
-import { emptyOverrides, parseArgs, usageText } from "./args.ts";
+import { emptyOverrides, leadingUnappliedFlags, parseArgs, unappliedGoalFlagError, usageText } from "./args.ts";
 
 describe("core/args.ts parseArgs", () => {
 	test("parses a bare goal with defaults", () => {
@@ -12,6 +12,22 @@ describe("core/args.ts parseArgs", () => {
 		expect(parsed.risk).toBe("medium");
 		expect(parsed.interactive).toBe(false);
 		expect(parsed.unknownFlags).toEqual([]);
+	});
+
+	test("removes repeated leading command tokens before parsing boundary flags", () => {
+		const parsed = parseArgs("/orchestrate /orchestrate --profile lean --task-class bugfix --complexity 8 --risk high --lead-size large repair the race");
+		expect(parsed.goal).toBe("repair the race");
+		expect(parsed.models.profile).toBe("lean");
+		expect(parsed.taskClass).toBe("bugfix");
+		expect(parsed.complexity).toBe(8);
+		expect(parsed.risk).toBe("high");
+		expect(parsed.leadSize).toBe("large");
+	});
+
+	test("does not treat mid-prose flags or a non-leading command token as overrides", () => {
+		const parsed = parseArgs("repair /orchestrate --profile secret the race");
+		expect(parsed.goal).toBe("repair /orchestrate --profile secret the race");
+		expect(parsed.models.profile).toBeUndefined();
 	});
 
 	test("honours leading flags and clamps --complexity onto 1-10", () => {
@@ -67,6 +83,30 @@ describe("core/args.ts parseArgs", () => {
 		expect(flagged.withLastReply).toBe(true);
 		expect(flagged.force).toBe(true);
 		expect(flagged.goal).toBe("do the thing");
+	});
+});
+
+describe("core/args.ts leading unapplied flag guard", () => {
+	test("identifies an initial run of parser-known flags, including value flags", () => {
+		expect(leadingUnappliedFlags("--profile lean --complexity 8 --lead-size large repair the race"))
+			.toEqual(["--profile", "--complexity", "--lead-size"]);
+		expect(leadingUnappliedFlags("--context notes.md --interactive repair the race"))
+			.toEqual(["--context", "--interactive"]);
+	});
+
+	test("stops on leading ignored flags unless force is set", () => {
+		const goal = "--profile lean --complexity 8 repair the race";
+		expect(unappliedGoalFlagError(goal, false)).toContain("Ignored leading goal flag(s): --profile, --complexity");
+		expect(unappliedGoalFlagError(goal, false)).toContain("--force");
+		expect(unappliedGoalFlagError(goal, true)).toBeNull();
+		expect(unappliedGoalFlagError("repair --profile lean the race", false)).toBeNull();
+	});
+
+	test("does not inspect mid-prose, quoted, or unknown flags", () => {
+		expect(leadingUnappliedFlags("repair --risk high the race")).toEqual([]);
+		expect(leadingUnappliedFlags('"--risk high" repair the race')).toEqual([]);
+		expect(leadingUnappliedFlags("'--profile' lean repair the race")).toEqual([]);
+		expect(leadingUnappliedFlags("--not-a-flag --risk high repair the race")).toEqual([]);
 	});
 });
 
