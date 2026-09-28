@@ -45,6 +45,39 @@ def test_provider_error_rejects_arbitrary_evidence_before_any_append(tmp_path: P
                             'first_ts': '2026-01-08T11:00:00Z'}])
 
 
+@pytest.mark.parametrize(('field', 'value'), [
+    ('provider', 'api_key=secret'), ('provider', 'vendor\nsecret'),
+    ('provider', 'x' * 49), ('provider', 'vendor/model'),
+    ('model', 'token=secret'), ('model', 'model with spaces'),
+    ('model', 'https://user:pass@example.com'), ('model', 'x' * 121),
+    ('endpoint_host', 'user:pass@api.example.com'), ('endpoint_host', 'bad..host'),
+    ('endpoint_host', '-bad.example.com'), ('endpoint_host', 'host\nsecret'),
+    ('error_code', 'ECONNRESET\nsecret'), ('error_code', 'quota token=secret'),
+])
+def test_provider_error_rejects_leak_in_normalized_fields_before_append(tmp_path: Path, field: str, value: str):
+    row = {'stream': 'event', 'record_id': 'e1', 'event': 'provider_error',
+           'provider': 'openai-codex', 'model': 'gpt-6', 'error_code': 'ECONNRESET',
+           'endpoint_host': 'api.example.com', 'count': 1, field: value}
+    with pytest.raises(BatchValidationError) as exc:
+        write_batch(tmp_path, [row], refresh=False)
+    assert value not in str(exc.value)
+    assert not (tmp_path / 'events.jsonl').exists()
+
+
+def test_provider_error_accepts_bridge_normalized_values_and_legacy_unknown(tmp_path: Path):
+    rows = [
+        {'stream': 'event', 'record_id': 'e1', 'event': 'provider_error',
+         'provider': 'openai-codex', 'model': 'gpt-6.1/mini_v2', 'error_code': 'ENOTFOUND',
+         'endpoint_host': 'bedrock-runtime.us-east-1.amazonaws.com', 'nested': False, 'count': 1},
+        {'stream': 'event', 'record_id': 'e2', 'event': 'provider_error',
+         'provider': 'unknown', 'error_code': 'stream_canceled', 'count': 1,
+         'source': 'legacy_provider_backfill'},
+    ]
+    assert write_batch(tmp_path, rows, refresh=False)['persisted']['event'] == 2
+    persisted = [json.loads(line) for line in (tmp_path / 'events.jsonl').read_text().splitlines()]
+    assert [row.get('model') for row in persisted] == ['gpt-6.1/mini_v2', None]
+
+
 def test_provider_panel_excludes_non_provider_failures_and_cancellations():
     from orchestrator.presentation.dashboard_data import provider_health
     rows = [{'event': 'dispatch_finished', 'ts': '2026-01-08T11:00:00Z',
@@ -67,6 +100,18 @@ def test_provider_panel_excludes_pre_cutoff_hours_and_aggregate_counts():
     panel = provider_health(rows, now=datetime(2026, 1, 8, 12, tzinfo=timezone.utc))
     assert panel['errors_by_hour'] == [{'hour': '2026-01-01T12:00:00+00:00', 'provider': 'acme', 'count': 3}]
     assert sum(w['count'] for w in panel['outage_windows']) == 3
+
+
+def test_provider_panel_excludes_aggregates_crossing_future_boundary():
+    from orchestrator.presentation.dashboard_data import provider_health
+    rows = [{'event': 'provider_error', 'ts': '2026-01-08T11:59:00Z',
+             'first_ts': '2026-01-08T11:59:00Z', 'last_ts': last,
+             'provider': 'acme', 'error_code': 'quota', 'count': count}
+            for last, count in [('2026-01-08T12:01:00Z', 20),
+                                ('2026-01-08T12:00:00Z', 2)]]
+    panel = provider_health(rows, now=datetime(2026, 1, 8, 12, tzinfo=timezone.utc))
+    assert panel['errors_by_hour'] == [{'hour': '2026-01-08T11:00:00+00:00', 'provider': 'acme', 'count': 2}]
+    assert sum(window['count'] for window in panel['outage_windows']) == 2
 
 
 def test_provider_panel_groups_outage_and_keeps_first_failure_separate(tmp_path: Path):

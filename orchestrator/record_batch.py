@@ -52,6 +52,11 @@ FORMAT_VERSION = 1
 CHECKPOINT_FILE = RECORD_INDEX_FILE
 RESERVED_KEYS = {'stream'}
 
+# Mirror the normalized identity/hostname shapes emitted by bridge provider-health.ts.
+_PROVIDER_TOKEN = re.compile(r'[A-Za-z0-9_-]{1,48}')
+_MODEL_TOKEN = re.compile(r'[A-Za-z0-9._/-]{1,120}')
+_HOST_LABEL = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?')
+
 
 class BatchValidationError(ValueError):
     """The batch was rejected before any byte was written."""
@@ -115,10 +120,15 @@ def validate_batch(records: Any) -> list[dict[str, Any]]:
                     raise BatchValidationError(f'{where} has unsupported provider_error fields: {sorted(unexpected)}')
                 if 'source' in record and record['source'] != 'legacy_provider_backfill':
                     raise BatchValidationError(f'{where} has invalid provider_error source')
+                for name, pattern in (('provider', _PROVIDER_TOKEN), ('model', _MODEL_TOKEN)):
+                    value = record.get(name)
+                    if value is not None and (not isinstance(value, str) or not pattern.fullmatch(value)):
+                        raise BatchValidationError(f'{where} has invalid {name}')
                 if record.get('error_code') not in spec['error_code_values']:
                     raise BatchValidationError(f'{where} has invalid error_code')
                 host = record.get('endpoint_host')
-                if host is not None and (not isinstance(host, str) or not re.fullmatch(r'[a-z0-9.-]{1,253}', host)):
+                if host is not None and (not isinstance(host, str) or len(host) > 253
+                                         or not all(_HOST_LABEL.fullmatch(label) for label in host.split('.'))):
                     raise BatchValidationError(f'{where} has invalid endpoint_host')
                 count = record.get('count')
                 if not isinstance(count, int) or isinstance(count, bool) or count < 1:

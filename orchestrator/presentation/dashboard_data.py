@@ -413,9 +413,9 @@ def provider_health(events: list[dict], *, now: datetime) -> dict[str, Any]:
         start = _parse_row_ts(row.get('first_ts')) or ts
         end = _parse_row_ts(row.get('last_ts')) or start
         start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
-        # An aggregate straddling the cutoff has no per-observation timestamps: its full
-        # count cannot be assigned to the 7d window without inventing pre-cutoff data.
-        if start < cutoff or start > now or end < start:
+        # An aggregate straddling either boundary has no per-observation timestamps:
+        # its full count cannot be assigned to the 7d window without inventing data.
+        if start < cutoff or start > now or end < start or end > now:
             continue
         provider, code = row.get('provider'), row.get('error_code')
         if not provider or not code:
