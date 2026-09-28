@@ -21,6 +21,7 @@
 import type { ExtensionContext } from "@humain/terminal";
 
 import type { Adapter } from "../adapters/adapter-resolver.ts";
+import { gitHead } from "../adapters/git-changes.ts";
 import { summarizeStderr } from "../dispatch/stderr-sink.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import { isTransientProviderError } from "../core/transient-error.ts";
@@ -96,7 +97,13 @@ function checksToPoll(report: string, killed: PendingCheck[]): { checks: Pending
 	const kept = new Set(checks.map((c) => `${c.provider}:${c.kind}:${c.id}`));
 	const unpolled = [...killed, ...parsed.checks].find((c) => !kept.has(`${c.provider}:${c.kind}:${c.id}`));
 	const overflow = unpolled ?? (parsed.problems.includes("truncated:max_checks") ? parsed.checks.at(-1) : undefined);
-	return { checks, overflow: overflow ? { check: overflow, outcome: "unverified", reason: "truncated_checks" } : undefined };
+	// The parser only scans the first 256 KiB. A missing heading in that prefix does
+	// not prove there are no checks later in an oversized report.
+	const truncatedReport = report.length > 256 * 1024;
+	return { checks, overflow: overflow || truncatedReport ? {
+		check: overflow ?? checks.at(-1) ?? { provider: "github", kind: "run", id: "unknown", source: "report" },
+		outcome: "unverified", reason: "truncated_checks",
+	} : undefined };
 }
 
 function isProviderStall(r: DispatchResult): boolean {
@@ -227,6 +234,8 @@ export async function dispatchReconAndLeads(
 		/** Files changed since `mark` was taken, unioned with `claimed` (files the lead's own report named). Optional: falls back to `claimed` when absent. */
 		filesChangedSince?: (mark: unknown, claimed: string[]) => string[];
 		waitForChecks?: (checks: PendingCheck[]) => Promise<ResolvedCheck[]>;
+		/** Read HEAD after polling, at the gate boundary. Defaults to the run's repo. */
+		currentCandidateSha?: () => string | null;
 		/** Persist untrusted failed CI output outside prompts; returns an owned diagnostic path only on success. */
 		writeCheckDiagnostic?: (name: string, text: string) => string | null;
 	},
@@ -423,8 +432,8 @@ export async function dispatchReconAndLeads(
 			let r = initial;
 			if (r.exitCode === 0 && effects.waitForChecks) {
 				const { checks, overflow } = checksToPoll(r.stdout, killedChecks.get(k) ?? []);
-				if (checks.length) {
-					const resolved = [...await effects.waitForChecks(checks), ...(overflow ? [overflow] : [])];
+				if (checks.length || overflow) {
+					const resolved = [...(checks.length ? await effects.waitForChecks(checks) : []), ...(overflow ? [overflow] : [])];
 					effects.throwIfCancelled();
 					const failures = resolved.filter((c) => c.outcome === "failure");
 					let gatePassed = resolved.every((c) => c.outcome === "success");
@@ -452,14 +461,26 @@ export async function dispatchReconAndLeads(
 							retriedLeadTaskIds.push(originalTask.taskId);
 							if (fixed.exitCode === 0) {
 								const { checks: nextChecks, overflow: nextOverflow } = checksToPoll(fixed.stdout, killedChecks.get(k) ?? []);
-								if (nextChecks.length) {
-									const next = [...await effects.waitForChecks(nextChecks), ...(nextOverflow ? [nextOverflow] : [])];
+								if (nextChecks.length || nextOverflow) {
+									const next = [...(nextChecks.length ? await effects.waitForChecks(nextChecks) : []), ...(nextOverflow ? [nextOverflow] : [])];
 									replacementChecks = next;
 									gatePassed = !overflow && next.every((c) => c.outcome === "success");
 								}
 							}
 						}
 						effects.throwIfCancelled();
+					}
+					// Polls validate the SHA captured before waiting. Recheck HEAD immediately
+					// before opening the gate: a green old candidate cannot release dependents.
+					if (gatePassed) {
+						const head = (effects.currentCandidateSha ?? (() => gitHead(repoRoot)))();
+						const passingChecks = replacementChecks.length ? replacementChecks : resolved;
+						if (!head || passingChecks.some((c) => !c.candidateSha || c.candidateSha !== head)) {
+							gatePassed = false;
+							const changed = passingChecks.map((c): ResolvedCheck => ({ ...c, outcome: "unverified", reason: "candidate_changed" }));
+							if (replacementChecks.length) replacementChecks = changed;
+							else resolved.splice(0, resolved.length, ...changed);
+						}
 					}
 					if (!gatePassed) stopped.add(leadIndex);
 					// Only a fully successful replacement supersedes the failed batch. Otherwise the
@@ -514,6 +535,7 @@ export interface HierarchyDeps {
 	 *  it too late to matter. Default `false`. */
 	inWaveRecovery?: boolean;
 	waitForChecks?: (checks: PendingCheck[]) => Promise<ResolvedCheck[]>;
+	currentCandidateSha?: () => string | null;
 	writeCheckDiagnostic?: (name: string, text: string) => string | null;
 }
 
@@ -611,6 +633,7 @@ export async function dispatchHierarchical(
 			markFiles: deps.markFiles,
 			filesChangedSince: deps.filesChangedSince,
 			waitForChecks: deps.waitForChecks,
+			currentCandidateSha: deps.currentCandidateSha,
 			writeCheckDiagnostic: deps.writeCheckDiagnostic,
 		},
 	);
