@@ -968,7 +968,7 @@ describe("pipeline/run-orchestration.ts runOrchestration QA dispatch timing out 
 		} else expect(result.report.passedVerification).toBe(true);
 	});
 
-	test("both QA dispatches time out: report verdict starts with 'QA TIMED OUT', failedChecks is empty, no '-retry-' dispatch, summary never names `unit`", async () => {
+	test("injected QA timeout seam (not fixture replay): two timed-out QA attempts are counted, but unit is not a failed check", async () => {
 		const runId = "ht-orch-1700000000000-qatimeout2";
 		const session = fakeSession();
 		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
@@ -1008,6 +1008,9 @@ describe("pipeline/run-orchestration.ts runOrchestration QA dispatch timing out 
 		expect(dispatchedTaskIds).toContain(`${runId}-qa`);
 		expect(dispatchedTaskIds).toContain(`${runId}-qa-rerun-1`);
 		expect(dispatchedTaskIds.some((id) => id.includes("-retry-"))).toBe(false);
+		// The QA re-run is counted as a dispatch, not as a lead escalation retry.
+		expect(result.report.dispatchCount).toBe(3); // one lead + two QA attempts
+		expect(dispatchedTaskIds).toEqual([`${runId}-lead-0`, `${runId}-qa`, `${runId}-qa-rerun-1`]);
 		expect(result.report.retries).toBe(0);
 		expect(result.report.verificationTimedOut).toBe(true);
 		expect(result.report.passedVerification).toBe(false);

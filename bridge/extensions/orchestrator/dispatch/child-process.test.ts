@@ -8,8 +8,10 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { MAX_CHILD_STDERR_DISK_BYTES } from "./stderr-sink.ts";
-import { isTransientLeadFailure } from "../pipeline/hierarchy.ts";
+import { dispatchReconAndLeads, isTransientLeadFailure } from "../pipeline/hierarchy.ts";
+import { pollCiCheck } from "../core/ci-wait.ts";
 import type { DispatchResult } from "../core/records.ts";
+import type { DispatchTask, PlanResponse } from "../core/prompts.ts";
 
 // `child-process.ts` imports real bindings (not just types) from `@humain/terminal`, which has
 // no `node_modules` entry in this standalone bridge checkout (see scripts/typecheck-bridge.sh's
@@ -1559,12 +1561,13 @@ describe("B4 fixture replay with injected child and manually advanced timers", (
    proc.emit("close", 0); session.close();
   }
  });
- test("u25qe4 last bash CI poll stays in flight at simulated inactivity expiry", async () => {
+ // Unlike a direct hierarchy fake, the timeout result here is produced by the actual child
+ // event parser + progress watchdog; only later attempts and external CI responses are injected.
+ async function timedOutFixture(name: string, taskId: string) {
   const proc = child();
-  const session = createSession("b4-u25-ci-wait");
+  const session = createSession(`b4-${name.split("-")[0]}-${taskId}`);
   const realSetTimeout = globalThis.setTimeout;
-  const originalNow = Date.now;
-  let now = originalNow();
+  let now = Date.now();
   let watchdog: (() => void) | undefined;
   const timers: ReturnType<typeof setTimeout>[] = [];
   const clockSpy = spyOn(Date, "now").mockImplementation(() => now);
@@ -1576,23 +1579,130 @@ describe("B4 fixture replay with injected child and manually advanced timers", (
   }) as typeof setTimeout);
   try {
    const pending = runSubagentProcess({ cwd: repoDir, agentName: NO_PERSONA, task: "fixture", model: "p/m", ctx: {} as never,
-    env: () => ({}), capability: "lead", taskId: "b4-u25", session,
+    env: () => ({}), capability: "lead", taskId, session,
     leadTimeouts: { inactivityMs: 60_000, maxMs: 300_000 }, spawnChild: () => proc as never });
-   const [event] = events("u25qe4-lead-0-wait.jsonl");
-   proc.stdout.write(`${JSON.stringify(event)}\n`);
+   for (const event of events(name)) proc.stdout.write(`${JSON.stringify(event)}\n`);
    expect(watchdog).toBeDefined();
    now += 61_000;
    watchdog?.();
    const result = await pending;
    expect(result.outcome).toBe("timed_out");
    expect(result.timeoutReason).toBe("inactivity");
-   expect(result.toolInFlight?.command).toContain("pipelines/219469");
-   expect(result.toolInFlight?.waitPattern).toBe(true);
+   return result;
   } finally {
    timerSpy.mockRestore(); clockSpy.mockRestore();
    for (const handle of timers) clearTimeout(handle);
    proc.emit("close", 124); session.close();
   }
+ }
+ const plan: PlanResponse = {
+  plan_id: "plan-b4", run_id: "run", task_class: "investigation", complexity: 3, risk: "medium",
+  topology: { depth: 2, leads: 2, workers: 0, shape: "multi_lead" },
+  route: { selected: { capability: "lead", effort: "standard", verification_depth: "targeted" },
+   recommended: { capability: "lead", effort: "standard", verification_depth: "targeted" },
+   mode: "adaptive", history_sufficient: true, explanation: {} },
+  effective_quality_floor: 0.8, cost_aggressiveness: 0.5,
+ };
+ const leadChain = (first: string) => ({ ...success({ taskId: "run-architect", capability: "architect", task: "" }),
+  stdout: `## Lead assignments\nLead 1: ${first} (depends on: none)\nLead 2: dependent (depends on: 1)\n` });
+ function success(task: DispatchTask): DispatchResult {
+  return { taskId: task.taskId, capability: task.capability, model: "p/m", exitCode: 0,
+   stdout: "STATUS: completed", stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+   durationMs: 1, costUsd: 0, costReported: true, filesChanged: [] };
+ }
+ function asDispatch(task: DispatchTask, result: Awaited<ReturnType<typeof runSubagentProcess>>): DispatchResult {
+  return { taskId: task.taskId, capability: task.capability, model: result.model ?? "p/m", exitCode: result.exitCode,
+   stdout: result.stdout, stderr: result.stderr, usage: result.usage, durationMs: result.durationMs,
+   costUsd: result.costUsd, costReported: result.costReported, filesChanged: [], outcome: result.outcome,
+   timeoutReason: result.timeoutReason, toolInFlight: result.toolInFlight, interruption: result.interruption, stopReason: result.stopReason };
+ }
+ test("u25qe4 fixture event -> watchdog result -> wait resume -> injected pending CI check gates dependent until checked pass", async () => {
+  const killed = await timedOutFixture("u25qe4-lead-0-wait.jsonl", "run-lead-0");
+  expect(killed.toolInFlight?.command).toContain("pipelines/219469");
+  expect(killed.toolInFlight?.waitPattern).toBe(true);
+  expect(killed.toolInFlight?.ciRefs).toEqual([{ provider: "gitlab", kind: "pipeline", id: "219469" }]);
+  const batches: DispatchTask[][] = [];
+  const billed: DispatchResult[] = [];
+  let checkingStarted = false;
+  let releaseCheck!: (result: Awaited<ReturnType<typeof pollCiCheck>>) => void;
+  const checked = new Promise<Awaited<ReturnType<typeof pollCiCheck>>>(resolve => { releaseCheck = resolve; });
+  const run = dispatchReconAndLeads({ runId: "run", goal: "repair", plan, adapter: { lead: { model: "p/m" } },
+   architectResult: leadChain("check pipeline"), evidenceMaxChars: 4000, maxLeads: 4, repoRoot: "/repo", inWaveRecovery: true }, {
+   dispatch: async tasks => {
+    batches.push(tasks);
+    return tasks.map(task => batches.length === 1 ? asDispatch(task, killed) : success(task));
+   }, capture: async result => { billed.push(result); }, setPhase: () => {}, throwIfCancelled: () => {},
+   waitForChecks: async checks => {
+    expect(checks).toEqual([{ provider: "gitlab", kind: "pipeline", id: "219469", source: "killed_command" }]);
+    checkingStarted = true;
+    return [{ check: checks[0], ...await checked }];
+   },
+  });
+  // Let the synchronous/async dispatch chain reach the pending-check seam without
+  // hanging the test if a regression omits that seam entirely.
+  for (let i = 0; i < 50 && !checkingStarted; i++) await Promise.resolve();
+  expect(checkingStarted).toBe(true);
+  expect(batches.map(batch => batch.map(t => t.taskId))).toEqual([["run-lead-0"], ["run-lead-0"]]);
+  expect(batches[1][0].task).toContain("do not wait for it again");
+  // No real GitLab/API access: the CLI runner is injected below; results retain the
+  // pollCiCheck identity and SHA validation rather than trusting a lead's prose.
+  let ciNow = 1000;
+  let status = "running";
+  const calls: string[][] = [];
+  const check = { provider: "gitlab" as const, kind: "pipeline" as const, id: "219469", source: "killed_command" as const };
+  const state = { startedAt: ciNow, nextPollAt: ciNow };
+  const poll = (s: typeof state) => pollCiCheck(check, s, { cwd: "/repo", expectedSha: "a".repeat(40), expectedRepo: "https://gitlab.example/forge/project", now: () => ciNow,
+   spawn: async (cmd, args) => {
+    expect(cmd).toBe("glab");
+    calls.push(args);
+    return { exitCode: 0, stderr: "", stdout: JSON.stringify({ id: 219469, sha: "a".repeat(40), web_url: "https://gitlab.example/forge/project/-/pipelines/219469", status }) };
+   },
+  });
+  const pending = await poll(state);
+  expect(pending.outcome).toBe("pending");
+  expect(batches).toHaveLength(2); // no dependent dispatch while the check is pending
+  ciNow = pending.state!.nextPollAt;
+  status = "success";
+  const passed = await poll(pending.state!);
+  expect(passed.outcome).toBe("success");
+  expect(batches).toHaveLength(2); // no dispatch even after checking, until the gate receives the checked pass
+  releaseCheck(passed);
+  const output = await run;
+  expect(calls).toEqual([
+   ["api", "--hostname", "gitlab.example", "projects/forge%2Fproject/pipelines/219469"],
+   ["api", "--hostname", "gitlab.example", "projects/forge%2Fproject/pipelines/219469"],
+  ]);
+  expect(batches.map(batch => batch.map(t => t.taskId))).toEqual([["run-lead-0"], ["run-lead-0"], ["run-lead-1"]]);
+  expect(batches[2][0].task).toContain("gitlab 219469: external check success");
+  expect(output.resumedLeadTaskIds).toEqual(["run-lead-0"]);
+  expect(output.pendingChecks.map(c => c.outcome)).toEqual(["success"]);
+  expect(billed.map(r => r.taskId)).toEqual(["run-lead-0", "run-lead-0", "run-lead-1"]);
+ });
+ test("vcy00z all 12 nested update events -> watchdog result -> one counted provider resume unblocks dependent wave", async () => {
+  const fixture = events("vcy00z-lead-0-tail.jsonl");
+  expect(fixture).toHaveLength(12);
+  expect(fixture[0].partialResult.details.results[0].errorMessage).toContain("ENOTFOUND");
+  expect(fixture.at(-1).partialResult.details.results[0].usage.turns).toBe(16);
+  const killed = await timedOutFixture("vcy00z-lead-0-tail.jsonl", "run-lead-0");
+  expect(killed.interruption?.nestedWorkers[0].turns).toBe(16);
+  expect(killed.interruption?.nestedWorkers[0].errorMessage).toContain("Bedrock stream ended without a stop reason");
+  expect(isTransientLeadFailure(asDispatch({ taskId: "run-lead-0", capability: "lead", task: "" }, killed))).toBe(true);
+  const batches: DispatchTask[][] = [];
+  const billed: DispatchResult[] = [];
+  const phases: string[] = [];
+  const output = await dispatchReconAndLeads({ runId: "run", goal: "repair", plan, adapter: { lead: { model: "p/m" } },
+   architectResult: leadChain("repair"), evidenceMaxChars: 4000, maxLeads: 4, repoRoot: "/repo", inWaveRecovery: true }, {
+   dispatch: async tasks => { batches.push(tasks); return tasks.map(task => batches.length === 1 ? asDispatch(task, killed) : success(task)); },
+   capture: async result => { billed.push(result); }, setPhase: phase => { phases.push(phase); }, throwIfCancelled: () => {},
+  });
+  expect(batches.map(batch => batch.map(t => t.taskId))).toEqual([["run-lead-0"], ["run-lead-0"], ["run-lead-1"]]);
+  expect(phases.join("\n")).toContain("provider_stall");
+  expect(output.resumedLeadTaskIds).toEqual(["run-lead-0"]);
+  expect(output.retriedLeadTaskIds).toEqual([]);
+  expect(output.resumedAttemptResults).toHaveLength(1);
+  expect(output.resumedAttemptResults[0].interruption?.nestedWorkers[0].turns).toBe(16);
+  expect(output.skippedLeads).toBe(0);
+  expect(billed.map(r => r.taskId)).toEqual(["run-lead-0", "run-lead-0", "run-lead-1"]);
  });
 });
 

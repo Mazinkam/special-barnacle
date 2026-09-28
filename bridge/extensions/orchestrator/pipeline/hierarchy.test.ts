@@ -274,59 +274,10 @@ describe("pipeline/hierarchy.ts dispatchReconAndLeads lead resume after a transi
 
 const fixtureEvent = (name: string) => JSON.parse(readFileSync(new URL(`../fixtures/${name}`, import.meta.url), "utf8"));
 
-describe("B4 incident fixture replay at the hierarchy seam", () => {
- test("u25qe4: the recorded in-flight CI wait resumes once, then checks CI before its dependent wave", async () => {
-  const event = fixtureEvent("u25qe4-lead-0-wait.jsonl");
-  expect(event.type).toBe("tool_execution_start");
-  expect(event.args.command).toContain("pipelines/219469");
-  const batches: DispatchTask[][] = [];
-  const billed: DispatchResult[] = [];
-  const architect = dispatchResult({ taskId: "run-architect", capability: "architect", task: "" });
-  architect.stdout = "## Lead assignments\nLead 1: check pipeline (depends on: none)\nLead 2: dependent (depends on: 1)\n";
-  const output = await dispatchReconAndLeads({ ...baseInput(), plan: { ...plan, topology: { depth: 2, leads: 2, workers: 0, shape: "multi_lead" } }, architectResult: architect, inWaveRecovery: true }, {
-   dispatch: async tasks => {
-    batches.push(tasks);
-    return tasks.map(task => batches.length === 1 ? transientFailure(task, {
-     outcome: "timed_out", timeoutReason: "inactivity", stderr: "[orchestrator] inactivity timeout",
-     toolInFlight: { name: event.toolName, command: event.args.command, waitPattern: true, ciRefs: [{ provider: "gitlab", kind: "pipeline", id: "219469" }] },
-    }) : { ...dispatchResult(task), stdout: task.taskId === "run-lead-0" ? "Checked CI once: glab ci get -p 219469; STATUS: completed" : "STATUS: completed" });
-   },
-   capture: async result => { billed.push(result); }, setPhase: () => {}, throwIfCancelled: () => {},
-  });
-  expect(batches.map(batch => batch.map(task => task.taskId))).toEqual([["run-lead-0"], ["run-lead-0"], ["run-lead-1"]]);
-  expect(batches[1][0].task).toContain("ONE bounded status command");
-  expect(billed[1].stdout).toContain("glab ci get -p 219469");
-  expect(batches[1][0].task).toContain("do not wait for it again");
-  expect(output.resumedLeadTaskIds).toEqual(["run-lead-0"]);
-  expect(output.skippedLeads).toBe(0);
-  expect(billed.map(result => result.taskId)).toEqual(["run-lead-0", "run-lead-0", "run-lead-1"]);
- });
- test("vcy00z: nested errorMessage triggers one counted provider resume and dispatches dependent wave", async () => {
-  const nestedEvent = JSON.parse(readFileSync(new URL("../fixtures/vcy00z-lead-0-tail.jsonl", import.meta.url), "utf8").split("\n")[0]);
-  const nested = nestedEvent.partialResult.details.results[0];
-  expect(nested.errorMessage).toContain("ENOTFOUND");
-  const architect = dispatchResult({ taskId: "run-architect", capability: "architect", task: "" });
-  architect.stdout = "## Lead assignments\nLead 1: repair (depends on: none)\nLead 2: verify (depends on: 1)\n";
-  const batches: DispatchTask[][] = [];
-  const billed: DispatchResult[] = [];
-  const phases: string[] = [];
-  const output = await dispatchReconAndLeads({ ...baseInput(), plan: { ...plan, topology: { depth: 2, leads: 2, workers: 0, shape: "multi_lead" } }, architectResult: architect, inWaveRecovery: true }, {
-   dispatch: async tasks => {
-    batches.push(tasks);
-    return tasks.map(task => batches.length === 1 ? transientFailure(task, {
-     stderr: "[orchestrator] inactivity timeout", outcome: "timed_out", timeoutReason: "inactivity",
-     interruption: { taskId: task.taskId, reason: "inactivity_timeout", elapsedMs: 1, sinceLastProgressMs: 1, turns: 1, toolCalls: 1, repeatedToolCalls: 0, lastProgress: "nested worker", nestedWorkers: [{ id: nested.taskId, turns: nested.usage.turns, finished: false, latestText: nested.latestText, errorMessage: nested.errorMessage }], partialText: "", verified: false },
-    }) : dispatchResult(task));
-   }, capture: async r => { billed.push(r); }, setPhase: p => { phases.push(p); }, throwIfCancelled: () => {},
-  });
-  expect(batches.map(batch => batch.map(task => task.taskId))).toEqual([["run-lead-0"], ["run-lead-0"], ["run-lead-1"]]);
-  expect(output.resumedLeadTaskIds).toEqual(["run-lead-0"]);
-  expect(output.retriedLeadTaskIds).toEqual([]);
-  expect(output.resumedAttemptResults).toHaveLength(1);
-  expect(billed.map(r => r.taskId)).toEqual(["run-lead-0", "run-lead-0", "run-lead-1"]);
-  expect(phases.join("\n")).toContain("provider_stall");
- });
- test("hv4i5g: original line 2455 snapshot has no nested provider error; tail cannot prove a provider resume", () => {
+describe("B4 incident fixture evidence at the hierarchy seam", () => {
+ // u25qe4/vcy00z child-event -> result -> hierarchy paths live in dispatch/child-process.test.ts.
+ // hv4i5g lead-1 remains explicitly open: original stderr and line 2455 do not prove a provider failure.
+ test("hv4i5g lead-1 remains OPEN: original stderr and line 2455 cannot establish provider failure", () => {
   const snapshot = fixtureEvent("hv4i5g-lead-1-nested-snapshot.jsonl");
   const tail = readFileSync(new URL("../fixtures/hv4i5g-lead-1-tail.jsonl", import.meta.url), "utf8");
   expect(snapshot._fixture.truncation).toContain("no nested errorMessage");
