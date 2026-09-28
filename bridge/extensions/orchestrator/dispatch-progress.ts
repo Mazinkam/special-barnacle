@@ -257,7 +257,7 @@ function detailForTool(toolName: string, args: unknown): string {
 	// spanning a key name and its value), then escape any control byte
 	// (ESC/CR/LF) before this text is retained as `progressDetail` or surfaced
 	// in a warning/expiry message (core/text-safety.ts).
-	const detail = sanitizeControlChars(redactCredentials(raw));
+	const detail = sanitizeControlChars(redactCredentials(raw)).replace(/\s+/g, " ").trim();
 	return detail.length > 200 ? `${detail.slice(0, 197)}…` : detail;
 }
 
@@ -475,7 +475,7 @@ export class DispatchProgressTracker {
 					const hash = textHash(text);
 					if (hash === this.previousAssistantHash) return { kind: "duplicate", detail: "repeated assistant text" };
 					this.previousAssistantHash = hash;
-					const detail = text.trim();
+					const detail = sanitizeControlChars(text).replace(/\s+/g, " ").trim();
 					return this.progress(detail.length > 160 ? `${detail.slice(0, 157)}…` : detail, now);
 				}
 				case "tool_execution_update": {

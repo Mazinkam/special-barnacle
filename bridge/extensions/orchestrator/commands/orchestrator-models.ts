@@ -13,6 +13,7 @@ import type { ExtensionAPI, ExtensionContext } from "@humain/terminal";
 
 import { emptyOverrides, type ModelOverrides, parseArgs } from "../core/args.ts";
 import type { FullResolution } from "../adapters/adapter-resolver.ts";
+import { formatCandidateGroups } from "../adapters/model-router.ts";
 import type { LoadedProfiles } from "../adapters/profiles-store.ts";
 import {
 	ALL_CAPABILITIES,
@@ -284,6 +285,7 @@ export function registerOrchestratorModelsCommand(pi: ExtensionAPI, deps: Orches
 					`Profile "${resolved.profileName}"${resolved.profileName === p.file.active_profile ? " (active)" : ""}${p.file.profiles[resolved.profileName]?.description ? ` — ${p.file.profiles[resolved.profileName].description}` : ""}`,
 					"precedence: --flags > profile capabilities > profile tiers > cost-tier resolver > fallback",
 					...formatAdapterTable(resolved).map((l) => `  ${l}`),
+					...(resolved.candidates ? ["", "backup candidates:", ...formatCandidateGroups(resolved.candidates).map((l) => `  ${l}`)] : []),
 					...(resolved.notes.length > 0 ? ["", ...resolved.notes.map((n) => `  note: ${n}`)] : []),
 					...(resolved.warnings.length > 0 ? ["", "warnings:", ...resolved.warnings.map((w) => `  - ${w}`)] : []),
 					...(p.notes.length > 0 ? ["", ...p.notes.map((n) => `  ${n}`)] : []),

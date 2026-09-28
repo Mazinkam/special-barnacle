@@ -114,7 +114,7 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 		expect(result.taskId).toBe("run-sec");
 		const degraded = events.filter(([e]) => e === "route_degraded");
 		expect(degraded).toHaveLength(1);
-		expect(degraded[0][1]).toMatchObject({ from_model: "openai-codex/gpt-6-astra", to_model: "amazon-bedrock/global.openai.gpt-6-astra", reason: "provider_quota" });
+		expect(degraded[0][1]).toMatchObject({ from_model: "openai-codex/gpt-6-astra", to_model: "amazon-bedrock/global.openai.gpt-6-astra", class: "quota" });
 	});
 
 	test("no Bedrock twin: the original failure is returned, no redispatch", async () => {
@@ -132,7 +132,7 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 		expect(events).not.toContain("route_degraded");
 	});
 
-	test("non-quota failure is not retried", async () => {
+	test("non-quota task failure is not retried", async () => {
 		let calls = 0;
 		await dispatchParallel(process.cwd(), "run", task(""),
 			{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, null, 0, {
@@ -141,6 +141,28 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 				runProcess: async () => { calls++; return proc({ exitCode: 1, stderr: "TypeError: boom" }); },
 			});
 		expect(calls).toBe(1);
+	});
+
+	test("transient provider failure switches to a qualified profile backup", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const models: string[] = [];
+		const [result] = await dispatchParallel(process.cwd(), "run", task(""),
+			{ security_review: { model: "amazon-bedrock/global.anthropic.claude-opus-5-5" } }, {} as never, null, 0, {
+				recordEvent: (event, payload) => { events.push([event, payload]); },
+				maxConcurrentDispatches: 1,
+				candidates: { security_review: [
+					{ model: "amazon-bedrock/global.anthropic.claude-opus-5-5", spec: "primary", source: "primary", qualified: true, reasons: [], effortControl: true },
+					{ model: "openai-codex/gpt-6-astra", spec: "backup", source: "backup", qualified: true, reasons: [], effortControl: true },
+				] },
+				sleep: async () => {},
+				runProcess: async (opts) => {
+					models.push(opts.model);
+					return models.length === 1 ? proc({ exitCode: 1, stderr: "Service unavailable (503)" }) : proc({ model: opts.model });
+				},
+			});
+		expect(models).toEqual(["amazon-bedrock/global.anthropic.claude-opus-5-5", "openai-codex/gpt-6-astra"]);
+		expect(result.model).toBe("openai-codex/gpt-6-astra");
+		expect(events.some(([name, payload]) => name === "route_degraded" && payload.class === "transient")).toBe(true);
 	});
 });
 
