@@ -1520,6 +1520,82 @@ describe("runSubagentProcess process/event handling", () => {
 });
 
 
+describe("B4 fixture replay with injected child and manually advanced timers", () => {
+ const fixturesDir = fileURLToPath(new URL("../fixtures/", import.meta.url));
+ const events = (name: string) => readFileSync(join(fixturesDir, name), "utf8").trim().split("\n").map(line => JSON.parse(line));
+ function child() {
+  return Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: mock(() => true) });
+ }
+ test("s11yls agent_end without process exit settles by post-end grace, not inactivity", async () => {
+  const proc = child();
+  const session = createSession("b4-s11-no-exit");
+  const realSetTimeout = globalThis.setTimeout;
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  let grace: (() => void) | undefined;
+  const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms: number) => {
+   if (ms === 4050) grace = callback;
+   const handle = realSetTimeout(() => {}, 60_000);
+   timers.push(handle);
+   return handle;
+  }) as typeof setTimeout);
+  try {
+   const pending = runSubagentProcess({ cwd: repoDir, agentName: NO_PERSONA, task: "fixture", model: "p/m", ctx: {} as never,
+    env: () => ({}), capability: "lead", taskId: "b4-s11", session,
+    leadTimeouts: { inactivityMs: 60_000, maxMs: 300_000 }, postEndGraceMs: 50, spawnChild: () => proc as never });
+   const replay = events("s11yls-lead-0-tail.jsonl");
+   expect(replay.map(event => event.type)).toEqual(["message_end", "turn_end", "agent_end", "auto_retry_start", "entry_appended"]);
+   for (const event of replay) proc.stdout.write(`${JSON.stringify(event)}\n`);
+   expect(grace).toBeDefined();
+   grace?.();
+   const result = await pending;
+   expect(result.postEndGraceExpired).toBe(true);
+   expect(result.outcome).toBe("failed");
+   expect(result.timeoutReason).toBeUndefined();
+   expect(result.stderr).toContain("ENOTFOUND");
+   expect(proc.kill).toHaveBeenCalled();
+  } finally {
+   timerSpy.mockRestore();
+   for (const handle of timers) clearTimeout(handle);
+   proc.emit("close", 0); session.close();
+  }
+ });
+ test("u25qe4 last bash CI poll stays in flight at simulated inactivity expiry", async () => {
+  const proc = child();
+  const session = createSession("b4-u25-ci-wait");
+  const realSetTimeout = globalThis.setTimeout;
+  const originalNow = Date.now;
+  let now = originalNow();
+  let watchdog: (() => void) | undefined;
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const clockSpy = spyOn(Date, "now").mockImplementation(() => now);
+  const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms: number) => {
+   if (ms >= 50 && ms <= 30_000) watchdog = callback;
+   const handle = realSetTimeout(() => {}, 60_000);
+   timers.push(handle);
+   return handle;
+  }) as typeof setTimeout);
+  try {
+   const pending = runSubagentProcess({ cwd: repoDir, agentName: NO_PERSONA, task: "fixture", model: "p/m", ctx: {} as never,
+    env: () => ({}), capability: "lead", taskId: "b4-u25", session,
+    leadTimeouts: { inactivityMs: 60_000, maxMs: 300_000 }, spawnChild: () => proc as never });
+   const [event] = events("u25qe4-lead-0-wait.jsonl");
+   proc.stdout.write(`${JSON.stringify(event)}\n`);
+   expect(watchdog).toBeDefined();
+   now += 61_000;
+   watchdog?.();
+   const result = await pending;
+   expect(result.outcome).toBe("timed_out");
+   expect(result.timeoutReason).toBe("inactivity");
+   expect(result.toolInFlight?.command).toContain("pipelines/219469");
+   expect(result.toolInFlight?.waitPattern).toBe(true);
+  } finally {
+   timerSpy.mockRestore(); clockSpy.mockRestore();
+   for (const handle of timers) clearTimeout(handle);
+   proc.emit("close", 124); session.close();
+  }
+ });
+});
+
 describe("child stream handler safety", () => {
 	test("converts a stdout handler throw into a failed dispatch", async () => {
 		let stderr = "";

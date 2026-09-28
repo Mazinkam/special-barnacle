@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionContext } from "@humain/terminal";
@@ -923,6 +923,13 @@ describe("pipeline/run-orchestration.ts runOrchestration QA dispatch timing out 
 		const dispatchedTaskIds: string[] = [];
 		let qaCalls = 0;
 		const outcomes: Record<string, unknown>[] = [];
+		// hv4i5g QA event 9: zero-tool provider failure; the stderr from that run
+		// repeats this same ENOTFOUND diagnostic, not a test/check failure.
+		const qaEvent = JSON.parse(readFileSync(new URL("../fixtures/hv4i5g-qa-provider-error.jsonl", import.meta.url), "utf8"));
+		expect(qaEvent._fixture.source).toContain("qa.events.jsonl:9");
+		expect(qaEvent.message.usage.input).toBe(0);
+		const qaStderr = readFileSync(new URL("../fixtures/hv4i5g-qa-provider-error.stderr.log", import.meta.url), "utf8");
+		expect(qaStderr).toContain(qaEvent.message.errorMessage);
 		const deps = fakeDeps({
 			planRun: async () => plan,
 			recordOutcome: (row) => { outcomes.push(row); },
@@ -933,7 +940,7 @@ describe("pipeline/run-orchestration.ts runOrchestration QA dispatch timing out 
 						qaCalls++;
 						const failed = qaCalls === 1 || secondFails;
 						return { taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: failed ? 1 : 0,
-							stdout: failed ? "| unit | FAIL |" : "## Verdict\nPASS", stderr: failed ? "TypeError: fetch failed" : "",
+							stdout: failed ? "" : "## Verdict\nPASS", stderr: failed ? qaStderr : "",
 							usage, durationMs: 1, costUsd: 0.01, costReported: true, outcome: failed ? "failed" as const : "completed" as const, filesChanged: [] };
 					}
 					return { taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
