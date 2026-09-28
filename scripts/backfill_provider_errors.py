@@ -26,7 +26,7 @@ STAMP = re.compile(r'\b\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\
 # identity from arbitrary path-like diagnostic text (which may contain secrets).
 BEDROCK_HOST = re.compile(r'bedrock-runtime\.[a-z]{2}(?:-[a-z]+)+-\d\.amazonaws\.com', re.I)
 URL = re.compile(r'https?://[^\s\"\'<>]{1,512}', re.I)
-DNS = re.compile(r'\bgetaddrinfo\s+ENOTFOUND\s+([^\s\"\'<>]{1,253})(?=\s|$)', re.I)
+DNS = re.compile(r'\bgetaddrinfo\s+ENOTFOUND\s+([^\s\"\'<>\)]{1,253})(?=\)(?=\s|$)|\s|$)', re.I)
 
 
 def provider_endpoint(line: str) -> str | None:

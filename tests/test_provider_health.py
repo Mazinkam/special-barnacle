@@ -171,21 +171,23 @@ def test_backfill_bedrock_host_and_undated_evidence_never_create_precise_windows
     run = root / 'runs' / 'r1'
     run.mkdir(parents=True)
     (run / 'task.stderr.log').write_text(
-        'getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com feat/secret token=private\n'
+        'getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com)\n'
+        'getaddrinfo ENOTFOUND user:secret@bedrock-runtime.eu-west-2.amazonaws.com)\n'
+        'getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com).evil.test\n'
         '2026-09-26T10:00:00Z fetch failed https://bedrock-runtime.eu-west-2.amazonaws.com/model?key=private\n'
         '2026-09-26T10:01:00Z ECONNRESET https://user:secret@bedrock-runtime.eu-west-2.amazonaws.com/path\n'
         '2026-09-26T10:02:00Z fetch failed https://bedrock-runtime.eu-west-2.amazonaws.com.evil.test/path\n'
     )
-    assert backfill(root, write=True)['persisted'] == 4
+    assert backfill(root, write=True)['persisted'] == 6
     assert backfill(root, write=True)['persisted'] == 0
     rows = [json.loads(line) for line in (root / 'events.jsonl').read_text().splitlines()]
     assert rows[0]['provider'] == 'amazon-bedrock'
     assert rows[0]['endpoint_host'] == 'bedrock-runtime.eu-west-2.amazonaws.com'
     assert rows[0]['timestamp_precision'] == 'unknown'
     assert 'first_ts' not in rows[0] and 'last_ts' not in rows[0]
-    assert rows[1]['provider'] == 'amazon-bedrock'
-    assert rows[1]['first_ts'] == '2026-09-26T10:00:00Z'
-    assert rows[2]['provider'] == rows[3]['provider'] == 'unknown'
+    assert rows[3]['provider'] == 'amazon-bedrock'
+    assert rows[3]['first_ts'] == '2026-09-26T10:00:00Z'
+    assert rows[1]['provider'] == rows[2]['provider'] == rows[4]['provider'] == rows[5]['provider'] == 'unknown'
     assert all('private' not in str(row) and 'secret' not in str(row) and 'evil.test' not in str(row) for row in rows)
     panel = provider_health(rows, now=datetime(2026, 9, 27, tzinfo=timezone.utc))
     assert panel['outage_windows'] == [{
