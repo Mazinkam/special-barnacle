@@ -144,10 +144,10 @@ describe("pipeline/run-orchestration.ts runOrchestration", () => {
 		const result = await runOrchestration("run", "/tmp/cwd", fakeArgs({ goal: "confidential auth flow", interactive: true, ...args }), adapter, resolved, ctx, session, { ...claimed, session }, deps);
 		expect(result.kind).toBe("aborted");
 		const settings = logs.filter((line) => line.startsWith("run settings:"));
-		expect(settings).toEqual([`run settings: profile=lean complexity=${triage?.complexity ?? args.complexity} risk=${triage?.risk ?? args.risk} lead-size=${expected}`]);
+		expect(settings).toEqual([`run settings: profile=lean complexity=${triage?.complexity ?? args.complexity} risk=${triage?.risk ?? args.risk} lead-size=${expected} lead-count=1`]);
 		expect(settings[0]).not.toContain("confidential auth flow");
 		const leadIndex = logs.findIndex((line) => line.startsWith("lead size:"));
-		expect(leadIndex).toBeGreaterThan(logs.indexOf(settings[0]));
+		expect(logs.indexOf(settings[0])).toBeGreaterThan(leadIndex);
 	});
 	test("plan failing outright aborts the run: failRun'd, notified, no RunReport", async () => {
 		const session = fakeSession();

@@ -484,13 +484,13 @@ export async function runOrchestration(
 		model: leadModel,
 		source: leadDecision.source,
 	});
-	session.log(`run settings: profile=${resolved.profileName} complexity=${effectiveComplexity} risk=${effectiveRisk} lead-size=${leadDecision.size}`);
 	session.log(`lead size: ${leadDecision.size} → ${leadDecision.capability} on ${leadModel} (source: ${leadDecision.source})`);
 
 	const needsArchitect = plan.topology.depth >= 2 && complexityNeedsArchitect(plan.complexity);
 	const leadCount = Number.isFinite(plan.topology.leads)
 		? Math.min(deps.maxLeads, Math.max(1, Math.trunc(plan.topology.leads)))
 		: 1;
+	session.log(`run settings: profile=${resolved.profileName} complexity=${effectiveComplexity} risk=${effectiveRisk} lead-size=${leadDecision.size} lead-count=${leadCount}`);
 	const pipeline = [
 		...(needsArchitect ? [`architect (${shortName(adapter.architect?.model ?? "?")})`] : []),
 		`${leadCount} lead${leadCount > 1 ? "s" : ""} (${leadDecision.size}: ${shortName(leadModel)}) → workers (${shortName(adapter.worker?.model ?? "?")})`,
