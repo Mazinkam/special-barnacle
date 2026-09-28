@@ -6,7 +6,16 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { RunCancellation } from "./cancellation.ts";
-import { runLiveQaStage, type RunLiveQaStageOptions } from "./live-qa-stage.ts";
+import { buildRunSummary, type RunReport } from "./core/report.ts";
+import {
+	buildLiveQaSummaryField,
+	liveQaCostRowsHaveUnknownCost,
+	liveQaKnownCostUsd,
+	recordLiveQaStageResult,
+	runLiveQaStage,
+	type RunLiveQaStageOptions,
+} from "./live-qa-stage.ts";
+import { liveQaCostRows, type LiveQaVerdict } from "./live-qa.ts";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-forge-qa.mjs", import.meta.url));
 
@@ -500,7 +509,130 @@ describe("cancellation", () => {
 		const agentRow = result.costRows.find((r) => r.live_qa_component === "agent");
 		expect(agentRow).toBeDefined();
 		expect(agentRow?.cost_usd).toBeGreaterThan(0);
+
+		// Persist the real cancelled stage's evidence before cancellation unwinds the caller.
+		const recorded: Array<{ kind: string; row?: Record<string, unknown> }> = [];
+		expect(() => recordLiveQaStageResult(result, {
+			recordOutcome: (row) => recorded.push({ kind: "outcome", row }),
+			recordModelCall: (row) => recorded.push({ kind: "cost", row }),
+			throwIfCancelled: () => { recorded.push({ kind: "unwind" }); cancellation.throwIfCancelled(); },
+		})).toThrow();
+		expect(recorded.map((entry) => entry.kind)).toEqual(["outcome", ...result.costRows.map(() => "cost"), "unwind"]);
+		expect(recorded[0]?.row).toEqual(result.outcomeRow ?? undefined);
+		expect(recorded[0]?.row?.live_qa_verdict).not.toBe("pass");
+		expect(recorded.slice(1, -1).map((entry) => entry.row)).toEqual(result.costRows);
 	});
+});
+
+// -----------------------------------------------------------------------------
+// Final report composition: exercise the actual modular report builder, not dead index helpers
+// -----------------------------------------------------------------------------
+
+function reportWithLiveQa(stage: RunReport["liveQa"]): RunReport {
+	return {
+		runId: "run-1", elapsedMs: 1000, blocked: false, dispatchOk: true,
+		verificationDispatchOk: true, succeededLeads: 1, totalLeads: 1, skippedLeads: 0,
+		retries: 0, resumedLeadIds: [], leadAttemptLines: [], filesChangedCount: 1,
+		externalFilesCount: 0, reconWorkersLine: "recon: none", verificationSkipped: false,
+		passedVerification: true, verificationTimedOut: false, failedChecks: [], totalCostUsd: 0,
+		dispatchCount: 1, nestedCostUsd: 0, firstFailureLine: "", reportLines: [],
+		showFullReport: false, reportTruncated: false, hasLeadReports: false,
+		leadReportPath: "", runLogPath: "/tmp/run.log", stateRoot: "/tmp/state",
+		telemetryReport: { ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 0 },
+		outOfTreeChangesLine: null, liveQa: stage,
+	};
+}
+
+describe("live-QA final report", () => {
+	test("confirmed finding and required unavailable override generic PASS; optional unavailable does not", () => {
+		for (const { verdict, required, reason, expected, succeeded } of [
+			{ verdict: "fail", required: true, reason: "broken login", expected: "FAIL (live QA: broken login)", succeeded: false },
+			{ verdict: "unavailable", required: true, reason: "no adapter", expected: "UNVERIFIED (required live QA unavailable: no adapter)", succeeded: false },
+			{ verdict: "unavailable", required: false, reason: "no adapter", expected: "PASS; live QA unavailable (not required)", succeeded: true },
+		] as const) {
+			const stage: NonNullable<RunReport["liveQa"]>["stage"] = {
+				stage: null, verdict, required, reasons: [reason], cancelled: false, costRows: [],
+				outcomeRow: { session_id: "s1", tested_revision: "deadbeef1234567890", artifacts: ["report.md"] },
+			};
+			const { text, succeeded: actual } = buildRunSummary(reportWithLiveQa({ stage, notRunReason: null, hasUnknownCost: false }));
+			expect(text).toContain(`verification: ${expected}`);
+			expect(text).toContain(`live QA: ${verdict}`);
+			expect(text).toContain("tested deadbeef12 · session s1 · artifacts: report.md");
+			expect(actual).toBe(succeeded);
+		}
+	});
+
+	test("pass includes session, while unrequested and skipped runs do not fabricate a live-QA verdict", () => {
+		const stage: NonNullable<RunReport["liveQa"]>["stage"] = {
+			stage: null, verdict: "pass", required: true, reasons: [], cancelled: false, costRows: [],
+			outcomeRow: { session_id: "s1" },
+		};
+		const passed = buildRunSummary(reportWithLiveQa({ stage, notRunReason: null, hasUnknownCost: false }));
+		expect(passed.text).toContain("verification: PASS (+ live QA pass, session s1)");
+		expect(passed.succeeded).toBe(true);
+		const skipped = buildRunSummary({
+			...reportWithLiveQa({ stage: null, notRunReason: "generic verification failed", hasUnknownCost: false }),
+			passedVerification: false,
+		});
+		expect(skipped.text).toContain("live QA: not run (generic verification failed)");
+		expect(skipped.text).toContain("verification: FAIL (unparsed)\n");
+		expect(skipped.succeeded).toBe(false);
+		const unrequested = buildRunSummary(reportWithLiveQa(undefined));
+		expect(unrequested.text).not.toContain("live QA:");
+		expect(unrequested.text).toContain("verification: PASS\n");
+		expect(buildLiveQaSummaryField(false, null, null)).toEqual({});
+		expect(buildLiveQaSummaryField(true, null, "generic verification failed")).toMatchObject({ live_qa: { verdict: "not_run", reasons: ["generic verification failed"] } });
+	});
+});
+
+// -----------------------------------------------------------------------------
+// JS known cost (once per stage) versus Python record-id deduplication
+// -----------------------------------------------------------------------------
+
+test("Forge live-QA known spend matches Python after duplicate ledger delivery; unknown app usage stays unmetered", () => {
+	const verdict: LiveQaVerdict = {
+		verdict: "pass", reasons: [], session_id: "s1", session_dir: "qa/sessions/s1",
+		findings: [], observations_count: 0, artifacts: [], exit_code: 0,
+		usage: {
+			version: 2,
+			agent: {
+				status: "recorded", runtime: "codex", model: "gpt-5.6-terra", provider: "openai-codex",
+				effort: "medium", inputTokens: 1000, outputTokens: 200, cacheReadInputTokens: 0,
+				cacheCreationInputTokens: 0, costMicrocents: 250_000, costSource: "reported", elapsedMs: 60_000,
+			},
+			humainCode: { status: "unavailable" },
+		},
+	};
+	const rows = liveQaCostRows({ runId: "run-1", taskId: "run-1-live-qa-stage", adapterId: "forge-focused", verdict });
+	expect(rows.map((row) => row.live_qa_component)).toEqual(["agent", "app_under_test"]);
+	expect(liveQaKnownCostUsd(rows)).toBeCloseTo(0.0025);
+	expect(liveQaCostRowsHaveUnknownCost(rows)).toBe(true);
+	const { text } = buildRunSummary({
+		...reportWithLiveQa({
+			stage: { stage: null, verdict: "pass", required: true, reasons: [], cancelled: false, costRows: rows, outcomeRow: { session_id: "s1" } },
+			notRunReason: null, hasUnknownCost: liveQaCostRowsHaveUnknownCost(rows),
+		}),
+		totalCostUsd: liveQaKnownCostUsd(rows),
+	});
+	expect(text).toContain("total cost: $0.0025");
+	expect(text).toContain("live-QA cost unknown");
+
+	// JS receives the settled stage once; Python ingests at-least-once deliveries keyed by record_id.
+	const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
+	const output = execFileSync(process.env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3", ["-B", "-c", `
+import json, sys
+from orchestrator.economics import unique_records, cost_attribution, REPORTED, ESTIMATED, UNMETERED
+rows = list(unique_records(json.load(sys.stdin)))
+a = cost_attribution(rows)
+print(json.dumps({'rows': len(rows), 'known': a[REPORTED]['cost'] + a[ESTIMATED]['cost'], 'unmetered': a[UNMETERED]['calls']}))
+`], {
+		cwd: repoRoot, env: { ...process.env, PYTHONPATH: repoRoot, PYTHONDONTWRITEBYTECODE: "1" },
+		input: JSON.stringify([...rows, ...rows]), encoding: "utf8",
+	});
+	const python: { rows: number; known: number; unmetered: number } = JSON.parse(output);
+	expect(python.rows).toBe(2);
+	expect(python.known).toBeCloseTo(liveQaKnownCostUsd(rows));
+	expect(python.unmetered).toBe(1);
 });
 
 // -----------------------------------------------------------------------------
