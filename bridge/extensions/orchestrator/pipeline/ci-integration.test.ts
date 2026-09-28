@@ -39,6 +39,57 @@ for (const status of ["success", "failure", "unverified"] as const) {
  });
 }
 
+test("killed bash wait refs survive an omitted resumed report and gate dependent waves on a real CI poll", async () => {
+ const batches: DispatchTask[][] = [];
+ const requests: string[] = [];
+ let now = 0;
+ let polls = 0;
+ const output = await dispatchReconAndLeads({ runId: "r", goal: "g", plan, adapter: { lead: { model: "m" } }, architectResult: architect, evidenceMaxChars: 1000, maxLeads: 2, repoRoot: "/repo", inWaveRecovery: true }, {
+  dispatch: async (tasks) => {
+   batches.push(tasks);
+   return tasks.map((task) => batches.length === 1 ? {
+    ...result(task, "partial work\nSTATUS: partial"), exitCode: 124, outcome: "timed_out" as const, timeoutReason: "inactivity" as const,
+    toolInFlight: { name: "bash", command: "for i in $(seq 1 40); do glab ci get -p 219469; sleep 60; done", waitPattern: true,
+     ciRefs: [{ provider: "gitlab" as const, kind: "pipeline" as const, id: "219469" }] },
+   } : result(task, "STATUS: completed"));
+  },
+  capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+  waitForChecks: async (checks) => {
+   requests.push(...checks.map((check) => `${check.id}:${check.source}`));
+   return waitForPendingChecks(checks, {
+    cwd: "/repo", cancellation: new RunCancellation(), expectedSha: "a".repeat(40), expectedRepo: "https://gitlab.com/owner/repo",
+    now: () => now, scheduleTick: (ms, tick) => { now += ms; queueMicrotask(tick); return () => {}; },
+    spawn: async () => { polls++; return { exitCode: 0, stdout: JSON.stringify({ id: 219469, sha: "a".repeat(40), web_url: "https://gitlab.com/owner/repo/-/pipelines/219469", status: polls === 1 ? "running" : "success" }), stderr: "" }; },
+   });
+  },
+ });
+ expect(batches.map((batch) => batch.map((task) => task.taskId))).toEqual([["r-lead-0"], ["r-lead-0"], ["r-lead-1"]]);
+ expect(batches[1][0].task).toContain("## Resume");
+ expect(batches[2][0].task).toContain("gitlab 219469: external check success");
+ expect(requests).toEqual(["219469:killed_command"]);
+ expect(polls).toBe(2);
+ expect(output.resumedLeadTaskIds).toEqual(["r-lead-0"]);
+ expect(output.retriedLeadTaskIds).toEqual([]);
+ expect(output.pendingChecks[0]).toMatchObject({ check: { id: "219469", source: "killed_command" }, outcome: "success" });
+});
+
+test("killed-command refs merge with report checks, rejecting invalid raw ids", async () => {
+ const observed: string[][] = [];
+ let leadCalls = 0;
+ const output = await dispatchReconAndLeads({ runId: "r", goal: "g", plan, adapter: { lead: { model: "m" } }, architectResult: architect, evidenceMaxChars: 1000, maxLeads: 2, repoRoot: "/repo" }, {
+  dispatch: async (tasks) => tasks.map((task) => task.taskId !== "r-lead-0" ? result(task, "STATUS: completed") : leadCalls++ === 0
+   ? { ...result(task, "partial"), exitCode: 124, outcome: "timed_out" as const, timeoutReason: "inactivity" as const,
+    toolInFlight: { name: "bash", command: "gh run watch 999", waitPattern: true, ciRefs: [
+     { provider: "github" as const, kind: "run" as const, id: "789" },
+     { provider: "github" as const, kind: "run" as const, id: "999," },
+    ] } } : result(task, "## Pending external checks\n- gh run view 123\n- gh run view 456\nSTATUS: completed")),
+  capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+  waitForChecks: async (checks) => { observed.push(checks.map((check) => `${check.id}:${check.source}`)); return checks.map((check) => ({ check, outcome: "success" as const })); },
+ });
+ expect(observed).toEqual([["123:report", "456:report", "789:killed_command"]]);
+ expect(output.skippedLeads).toBe(0);
+});
+
 test("a check failure gets one fix handoff but never starts ordinary dependents without a verified replacement", async () => {
  const batches: DispatchTask[][] = [];
  const output = await dispatchReconAndLeads({ runId: "r", goal: "g", plan, adapter: { lead: { model: "m" } }, architectResult: architect, evidenceMaxChars: 1000, maxLeads: 2, repoRoot: "/repo", inWaveRecovery: true }, {

@@ -271,6 +271,46 @@ describe("pipeline/hierarchy.ts dispatchReconAndLeads lead resume after a transi
 	});
 });
 
+describe("wait-stall recovery through the single lead resume budget", () => {
+ const waitCommand = "for i in $(seq 1 40); do glab ci get -p 219469; sleep 60; done";
+ const interrupted = (task: DispatchTask, overrides: Partial<DispatchResult> = {}): DispatchResult => transientFailure(task, {
+  outcome: "timed_out", timeoutReason: "inactivity", stderr: "[orchestrator] inactivity timeout",
+  toolInFlight: { name: "bash", command: waitCommand, waitPattern: true, ciRefs: [{ provider: "gitlab", kind: "pipeline", id: "219469" }] },
+  ...overrides,
+ });
+ test("inactivity bash wait resumes once, even when the resumed attempt times out again", async () => {
+  const batches: DispatchTask[][] = [];
+  const phases: string[] = [];
+  const output = await dispatchReconAndLeads(baseInput(), {
+   dispatch: async (tasks) => { batches.push(tasks); return [interrupted(tasks[0])]; },
+   capture: async () => {}, setPhase: (phase) => phases.push(phase), throwIfCancelled: () => {},
+  });
+  expect(batches).toHaveLength(2);
+  expect(batches[1][0].task).toContain("## Resume");
+  expect(batches[1][0].task).toContain("inactivity watchdog");
+  expect(batches[1][0].task).toContain("do not wait for it again");
+  expect(output.resumedLeadTaskIds).toEqual(["run-lead-0"]);
+  expect(output.retriedLeadTaskIds).toEqual([]);
+  expect(phases.some((phase) => phase.includes("wait_stall"))).toBe(true);
+ });
+ test.each([
+  ["absolute", { timeoutReason: "absolute" }],
+  ["cancelled", { outcome: "cancelled" }],
+  ["spend cap", { stopReason: "spend_cap" }],
+  ["non-bash", { toolInFlight: { name: "write", command: waitCommand } }],
+  ["non-wait", { toolInFlight: { name: "bash", command: "tail -500 log" } }],
+  ["prose only", { toolInFlight: undefined, stdout: `I ran ${waitCommand}` }],
+ ] as const)("%s is not a wait-stall resume", async (_label, overrides) => {
+  const batches: DispatchTask[][] = [];
+  const output = await dispatchReconAndLeads(baseInput(), {
+   dispatch: async (tasks) => { batches.push(tasks); return [interrupted(tasks[0], overrides)]; },
+   capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+  });
+  expect(batches).toHaveLength(1);
+  expect(output.resumedLeadTaskIds).toEqual([]);
+ });
+});
+
 describe("pipeline/hierarchy.ts isTransientLeadFailure (docs/architecture-review.md C3)", () => {
 	function baseResult(opts: Partial<DispatchResult> = {}): DispatchResult {
 		return {
@@ -804,7 +844,18 @@ describe("pipeline/hierarchy.ts dispatchReconAndLeads in-wave recovery (A3)", ()
 		expect(phases.some((p) => p.includes("provider_stall"))).toBe(true);
 	});
 
-	test("provider_stall on error-end resumes only once even when the resumed attempt also fails", async () => {
+	test("wait_stall with a dependent lead shares the A3 budget: failed resume cannot get a third attempt", async () => {
+  const { result, batches } = await runTwoLeadChain(true, (_call, task) => leadResult(task, {
+   exitCode: 124, outcome: "timed_out", timeoutReason: "inactivity", stderr: "",
+   toolInFlight: { name: "bash", command: "gh run watch 123" },
+  }));
+  expect(batches).toEqual([["r-lead-0"], ["r-lead-0"]]);
+  expect(result.resumedLeadTaskIds).toEqual(["r-lead-0"]);
+  expect(result.retriedLeadTaskIds).toEqual([]);
+  expect(result.skippedLeads).toBe(1);
+ });
+
+ test("provider_stall on error-end resumes only once even when the resumed attempt also fails", async () => {
 		const { result, batches } = await runTwoLeadChain(true, (_call, task) => leadResult(task, {
 			exitCode: 1, outcome: "failed", stopReason: "error", stderr: "[provider error] fetch failed",
 		}));

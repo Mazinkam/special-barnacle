@@ -36,7 +36,8 @@ import {
 } from "../core/prompts.ts";
 import { parseLeadAssignments, planLeadWaves, type LeadAssignment } from "../lead-plan.ts";
 import { parseLeadStatus } from "../run-outcome.ts";
-import { parsePendingChecks, type PendingCheck } from "../core/pending-checks.ts";
+import { mergePendingChecks, parsePendingChecks, type PendingCheck } from "../core/pending-checks.ts";
+import { CI_ID_RE, classifyTimeout, extractCiRefs } from "../core/wait-stall.ts";
 import type { CiPollResult } from "../core/ci-wait.ts";
 
 export interface ResolvedCheck extends Omit<CiPollResult, "reason"> { check: PendingCheck; candidateSha?: string | null; reason?: CiPollResult["reason"] | "candidate_changed" }
@@ -69,6 +70,23 @@ function providerEvidenceStderr(stderr: string): string {
 	).join("\n");
 }
 
+function isWaitStall(r: DispatchResult): boolean {
+	return r.exitCode !== 0 && r.outcome === "timed_out" && r.stopReason !== "spend_cap" && parseLeadStatus(r.stdout) !== "blocked"
+		&& classifyTimeout({ outcome: r.outcome, timeoutReason: r.timeoutReason, toolInFlight: r.toolInFlight }) === "wait_stall";
+}
+
+/** Raw kill-time refs are retained by dispatch-progress even when the displayed command is redacted/truncated. */
+function killedCommandChecks(r: DispatchResult): PendingCheck[] {
+	if (!isWaitStall(r)) return [];
+	const tool = r.toolInFlight;
+	// ciRefs came from the raw command before display redaction/truncation. Only fall back to
+	// parsing the displayed command when raw evidence was not supplied at all.
+	const refs = tool?.ciRefs ?? extractCiRefs(tool?.command);
+	return mergePendingChecks([], refs.filter((ref) =>
+		(ref.provider === "gitlab" && ref.kind === "pipeline" || ref.provider === "github" && ref.kind === "run") && CI_ID_RE.test(ref.id),
+	).map((ref) => ({ ...ref, source: "killed_command" as const })));
+}
+
 function isProviderStall(r: DispatchResult): boolean {
 	if (r.exitCode === 0 || r.outcome === "cancelled" || r.stopReason === "spend_cap" || parseLeadStatus(r.stdout) === "blocked") return false;
 	if (r.outcome === "timed_out" && r.timeoutReason !== "inactivity") return false;
@@ -83,7 +101,7 @@ function isProviderStall(r: DispatchResult): boolean {
 export function isTransientLeadFailure(r: DispatchResult): boolean {
 	if (r.exitCode === 0) return false;
 	if (r.outcome === "cancelled") return false;
-	if (isProviderStall(r)) return true;
+	if (isProviderStall(r) || isWaitStall(r)) return true;
 	// Other timeouts remain A3 retry candidates only when a dependent wave
 	// needs recovery. Never resume a spend-cap stop.
 	if (r.outcome === "timed_out") return false;
@@ -322,6 +340,8 @@ export async function dispatchReconAndLeads(
 		// the work a lead's subagents already left on disk. Never more than once
 		// per lead: the replaced result below is not re-examined for resume.
 		const finalResults = [...results];
+		const killedChecks = new Map<number, PendingCheck[]>();
+		for (const [k, r] of results.entries()) killedChecks.set(k, killedCommandChecks(r));
 		const currentWaveResults = (): Map<number, DispatchResult> => new Map(runnable.map((idx, kk) => [idx, finalResults[kk]!]));
 		for (const [k, r] of results.entries()) {
 			if (!isTransientLeadFailure(r)) continue;
@@ -330,10 +350,14 @@ export async function dispatchReconAndLeads(
 			const filesChangedSinceStart = effects.filesChangedSince
 				? effects.filesChangedSince(waveStartMark, r.filesChanged)
 				: r.filesChanged;
-			effects.setPhase(`lead ${leadIndex + 1}: ${isProviderStall(r) ? "provider_stall" : "transient provider error"}, resuming once`);
+			effects.setPhase(`lead ${leadIndex + 1}: ${isWaitStall(r) ? "wait_stall" : isProviderStall(r) ? "provider_stall" : "transient provider error"}, resuming once`);
 			const otherLeads = buildOtherLeadsLines(leadIndex, leadCount, leadResults, currentWaveResults(), stopped, assignments);
+			const resumeTask = resumeLeadPrompt(originalTask.task, r.stdout, filesChangedSinceStart, otherLeads);
+			const waitStallNote = isWaitStall(r)
+				? "\n\nWait-stall correction: your previous attempt was stopped by the inactivity watchdog while a bash wait was in flight, not a provider error. Continue completed work; do not wait for it again. Report still-running CI in ## Pending external checks."
+				: "";
 			const [resumed] = await effects.dispatch([
-				{ ...originalTask, task: resumeLeadPrompt(originalTask.task, r.stdout, filesChangedSinceStart, otherLeads) },
+				{ ...originalTask, task: resumeTask + waitStallNote },
 			]);
 			if (resumed) {
 				await effects.capture(resumed);
@@ -386,7 +410,7 @@ export async function dispatchReconAndLeads(
 			const leadIndex = runnable[k];
 			let r = initial;
 			if (r.exitCode === 0 && effects.waitForChecks) {
-				const { checks } = parsePendingChecks(r.stdout);
+				const checks = mergePendingChecks(parsePendingChecks(r.stdout).checks, killedChecks.get(k) ?? []);
 				if (checks.length) {
 					const resolved = await effects.waitForChecks(checks);
 					effects.throwIfCancelled();
@@ -415,7 +439,7 @@ export async function dispatchReconAndLeads(
 							r = fixed;
 							retriedLeadTaskIds.push(originalTask.taskId);
 							if (fixed.exitCode === 0) {
-								const nextChecks = parsePendingChecks(fixed.stdout).checks;
+								const nextChecks = mergePendingChecks(parsePendingChecks(fixed.stdout).checks, killedChecks.get(k) ?? []);
 								if (nextChecks.length) {
 									const next = await effects.waitForChecks(nextChecks);
 									replacementChecks = next;
