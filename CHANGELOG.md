@@ -1,5 +1,14 @@
 ## Unreleased
 
+### Run 9 — CI evidence, replay, telemetry and guardrails
+
+- B1 parent-owned GitHub/GitLab CI gates require validated repository/check IDs, candidate SHA and bounded failed-job logs; truncated or stale check evidence fails closed. A bounded cancellable timer remains in place of RunSession ticks. CLI/auth and live-provider behavior remain unverified.
+- B4 fixture replay now exercises parent wait → poll → dependent wave and QA timeout → retry. Historical hv4i5g lead-1 lacks nested provider-error evidence; that replay remains deferred, not a verified provider stall.
+- Run 8 Item 3 isolated canonical JSON imports and randomized telemetry assertions to reduce test pollution. Item 1 bounds nested model-call record IDs at Python's batch limit with stable replay IDs; this closes a replay-length gap, not historical outage verification.
+- Item 4 added normalized dispatch-health/provider-error telemetry, recurring nested-error accounting, bounded seven-day provider health on the dashboard, and a guarded legacy log backfill. Backfill defaults to dry-run, requires explicit `--state-dir` and `--write` to append, and rejects writing the live default state root. No real-outage dashboard result is claimed until a copied-state backfill and regenerated dashboard are inspected.
+- Item 2 removed unsupported `scoped_leads`/`recon_before_architect` switches. File ownership is `off`/`report` only: reported overlaps require explicit lead file claims plus run-wide Git change evidence; they cannot attribute a write to a lead or serialize execution.
+- Item 5 strips duplicate leading `/orchestrate` tokens, guards unapplied leading flags (with `--force` escape), preserves mid-prose flags, and logs effective post-triage profile, task class, complexity, risk and lead size/count. See `bridge/README.md` for verification commands and copy-only operator backfill instructions.
+
 ### orchestration reliability and parent-owned CI (A1–A6, N1–N2, B1–B2)
 
 - `/orchestrate` now uses the modular pipeline as its single execution path (A1); recovered lead attempts count toward the final result and escalation uses each lead's latest attempt (A2), with failed leads recovered in-wave before dependents are gated (A3).
