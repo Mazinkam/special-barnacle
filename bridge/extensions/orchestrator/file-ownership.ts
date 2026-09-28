@@ -10,6 +10,8 @@
  */
 
 import { posix } from "node:path";
+import { looksLikeFilePath } from "./adapters/git-changes.ts";
+import { parseLeadFilesChanged } from "./run-outcome.ts";
 
 export interface OwnershipInput {
 	lead: number;
@@ -247,9 +249,15 @@ export function serializeWaves(waves: number[][], owners: OwnershipInput[], mode
 }
 
 export interface ObservedEditConflict {
-	kind: "observed_edit_overlap";
+	kind: "reported_overlap_with_run_change";
 	file: string;
 	leads: number[];
+}
+
+/** Conflict-only extraction: require explicit Files Changed bullets, never prose tokens. */
+export function conflictReportedFiles(report: string): string[] {
+	const parsed = parseLeadFilesChanged(report);
+	return parsed.kind === "list" ? parsed.files.filter(looksLikeFilePath) : [];
 }
 
 /**
@@ -267,7 +275,7 @@ export function observedEditConflicts(changed: Array<{ lead: number; files: stri
 	}
 	const out: ObservedEditConflict[] = [];
 	for (const [file, leads] of byFile) {
-		if (leads.size >= 2) out.push({ kind: "observed_edit_overlap", file, leads: [...leads].sort((a, b) => a - b) });
+		if (leads.size >= 2) out.push({ kind: "reported_overlap_with_run_change", file, leads: [...leads].sort((a, b) => a - b) });
 	}
 	return out;
 }

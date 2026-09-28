@@ -36,7 +36,7 @@ import {
 	type PlanResponse,
 } from "../core/prompts.ts";
 import { parseLeadAssignments, planLeadWaves, type LeadAssignment } from "../lead-plan.ts";
-import { findOwnershipOverlaps, observedEditConflicts } from "../file-ownership.ts";
+import { conflictReportedFiles, findOwnershipOverlaps, observedEditConflicts } from "../file-ownership.ts";
 import type { EfficiencyControls } from "../efficiency-flags.ts";
 import { parseLeadStatus } from "../run-outcome.ts";
 import { mergePendingChecks, parsePendingChecks, type PendingCheck } from "../core/pending-checks.ts";
@@ -520,9 +520,11 @@ export async function dispatchReconAndLeads(
 
 	if (input.fileOwnershipMode === "report") {
 		const observed = effects.observedChangedFiles?.();
-		const observedSet = observed == null ? null : new Set(observed);
-		const edits = leadResults.map((result) => ({ lead: Number(result.taskId.match(/-lead-(\d+)$/)?.[1]), files: result.filesChanged.filter((file) => !observedSet || observedSet.has(file)) }));
-		for (const conflict of observedEditConflicts(edits)) effects.recordEvent?.("lead_edit_conflict", { run_id: runId, ...conflict });
+		if (observed != null) {
+			const observedSet = new Set(observed);
+			const edits = leadResults.map((result) => ({ lead: Number(result.taskId.match(/-lead-(\d+)$/)?.[1]), files: conflictReportedFiles(result.stdout).filter((file) => observedSet.has(file)) }));
+			for (const conflict of observedEditConflicts(edits)) effects.recordEvent?.("lead_edit_conflict", { run_id: runId, ...conflict });
+		}
 	}
 
 	// Recon is parent-owned and returned for billing/reporting. Any further

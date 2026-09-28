@@ -443,7 +443,8 @@ test("report ownership emits overlap and observed conflicts without splitting pa
 	const waves: string[][] = [];
 	const architectResult = { ...twoIndependentLeads, stdout: "## Lead assignments\nLead 1: backend (owns: src/shared.ts; depends on: none)\nLead 2: frontend (owns: src/shared.ts; depends on: none)\n" };
 	await dispatchReconAndLeads({ ...baseInput(), plan: { ...plan, topology: { ...plan.topology, leads: 2 } }, architectResult, fileOwnershipMode: "report" }, {
-		dispatch: async (tasks) => { waves.push(tasks.map((t) => t.taskId)); return tasks.map((t) => ({ ...dispatchResult(t), filesChanged: ["src/shared.ts"] })); },
+		dispatch: async (tasks) => { waves.push(tasks.map((t) => t.taskId)); return tasks.map((t) => ({ ...dispatchResult(t), stdout: "## Files Changed\n- `src/shared.ts`", filesChanged: ["src/shared.ts"] })); },
+		observedChangedFiles: () => ["src/shared.ts"],
 		capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
 		recordEvent: (event, payload) => { events.push({ event, payload }); },
 	});
@@ -452,7 +453,29 @@ test("report ownership emits overlap and observed conflicts without splitting pa
 	expect(events.some((e) => e.event === "lead_edit_conflict" && e.payload.file === "src/shared.ts")).toBe(true);
 });
 
-test("plain Files Changed entries travel through real dispatch parsing to observed conflicts, but phantom reports do not", async () => {
+test("missing git evidence skips reported conflicts even when both leads report a file", async () => {
+	const events: Array<{ event: string; payload: Record<string, unknown> }> = [];
+	await dispatchReconAndLeads({ ...baseInput(), plan: { ...plan, topology: { ...plan.topology, leads: 2 } }, architectResult: twoIndependentLeads, fileOwnershipMode: "report" }, {
+		dispatch: async (tasks) => tasks.map((t) => ({ ...dispatchResult(t), stdout: "## Files Changed\n- `src/shared.ts`", filesChanged: ["src/shared.ts"] })),
+		capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+		observedChangedFiles: () => null,
+		recordEvent: (event, payload) => { events.push({ event, payload }); },
+	});
+	expect(events.filter((e) => e.event === "lead_edit_conflict")).toEqual([]);
+});
+
+test("mention-only prose does not count as a reported conflict even when git changed", async () => {
+	const events: Array<{ event: string; payload: Record<string, unknown> }> = [];
+	await dispatchReconAndLeads({ ...baseInput(), plan: { ...plan, topology: { ...plan.topology, leads: 2 } }, architectResult: twoIndependentLeads, fileOwnershipMode: "report" }, {
+		dispatch: async (tasks) => tasks.map((t) => ({ ...dispatchResult(t), stdout: "Discussed `src/shared.ts` in notes.\nSTATUS: completed", filesChanged: ["src/shared.ts"] })),
+		capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+		observedChangedFiles: () => ["src/shared.ts"],
+		recordEvent: (event, payload) => { events.push({ event, payload }); },
+	});
+	expect(events.filter((e) => e.event === "lead_edit_conflict")).toEqual([]);
+});
+
+test("plain Files Changed entries travel through real dispatch parsing to reported conflicts, but phantom reports do not", async () => {
 	const cwd = mkdtempSync(join(tmpdir(), "lead-conflict-"));
 	try {
 		execFileSync("git", ["init", "-q", cwd]);
@@ -483,7 +506,7 @@ test("plain Files Changed entries travel through real dispatch parsing to observ
 		writeFileSync(join(cwd, "src/shared.ts"), "after\n");
 		const result = await run();
 		expect(result.leadResults.map((r) => r.filesChanged)).toEqual([["src/shared.ts"], ["src/shared.ts"]]);
-		expect(events.filter((e) => e.event === "lead_edit_conflict").map((e) => e.payload.file)).toEqual(["src/shared.ts"]);
+		expect(events.filter((e) => e.event === "lead_edit_conflict").map((e) => [e.payload.kind, e.payload.file])).toEqual([["reported_overlap_with_run_change", "src/shared.ts"]]);
 	} finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 

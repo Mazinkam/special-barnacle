@@ -207,13 +207,13 @@ describe("observedEditConflicts", () => {
 	test("a single lead touching a file is not a conflict", () => {
 		expect(observedEditConflicts([{ lead: 0, files: ["src/a.ts"] }])).toEqual([]);
 	});
-	test("two leads actually changing the same file is reported", () => {
+	test("two leads reporting the same file produce a reported overlap", () => {
 		const result = observedEditConflicts([
 			{ lead: 0, files: ["src/a.ts", "src/shared.ts"] },
 			{ lead: 1, files: ["src/shared.ts"] },
 			{ lead: 2, files: ["src/b.ts"] },
 		]);
-		expect(result).toEqual([{ kind: "observed_edit_overlap", file: "src/shared.ts", leads: [0, 1] }]);
+		expect(result).toEqual([{ kind: "reported_overlap_with_run_change", file: "src/shared.ts", leads: [0, 1] }]);
 	});
 	test("never fabricates a zero-rate row", () => {
 		const result = observedEditConflicts([{ lead: 0, files: ["src/a.ts"] }, { lead: 1, files: ["src/b.ts"] }]);
