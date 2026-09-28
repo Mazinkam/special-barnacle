@@ -117,6 +117,7 @@ describe("core/report.ts buildRunSummary", () => {
 			expect(succeeded).toBe(false);
 			expect(text).not.toContain("verification: PASS");
 			expect(text).toContain(`external check: github 123 ${outcome}`);
+			expect(text).toContain("Orchestration BLOCKED");
 		}
 	});
 

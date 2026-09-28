@@ -52,6 +52,7 @@ import { describeRunArtifact, type RunTiming } from "../run/session.ts";
 import type { RunContext, RunSessionLike, PendingCheckRow } from "../run/context.ts";
 import { telemetryWarning, type FlushReport, type QueueStats } from "../record-queue.ts";
 import { collectBilledResults, dispatchHierarchical, summarizeReconWorkers } from "./hierarchy.ts";
+import { redactSecrets } from "../live-qa.ts";
 import { collectLeadAttempts, formatLeadAttemptLines } from "./lead-attempts.ts";
 import { runVerification, type VerificationResult } from "./verify-loop.ts";
 import {
@@ -102,7 +103,7 @@ export async function waitForPendingChecks(checks: PendingCheck[], options: {
     options.cancellation.throwIfCancelled();
     if (outcome.outcome === "pending") states[i] = outcome.state!;
     else {
-     const resolved: ResolvedCheck = { check: checks[i], ...outcome };
+     const resolved: ResolvedCheck = { check: checks[i], ...outcome, candidateSha: options.expectedSha ?? null };
      results[i] = resolved;
      options.onOutcome?.(resolved);
     }
@@ -120,6 +121,20 @@ export async function waitForPendingChecks(checks: PendingCheck[], options: {
   if (checks.length) await tick();
   return results as ResolvedCheck[];
  } finally { offCancel(); }
+}
+
+/** Persist bounded CI diagnostics in the session's owned artifact, never in a dispatch prompt. */
+export function writeCheckFailureDiagnostic(session: Pick<RunSessionLike, "writeDiagnostic" | "file">, text: string, env: Record<string, string | undefined>): string | null {
+ const name = "external-check-failure.log";
+ try {
+  return session.writeDiagnostic(name, redactSecrets(text, env)) ? session.file(name) : null;
+ } catch { return null; }
+}
+
+export function terminalCandidateChecks(checks: ResolvedCheck[], head: string | null): ResolvedCheck[] {
+ return checks.map((result) => result.outcome === "success" && (!head || result.candidateSha !== head)
+  ? { ...result, outcome: "unverified", reason: "candidate_changed" }
+  : result);
 }
 
 /** Resolve origin without a shell; reject ambiguous/untrusted remotes rather than checking a different repo. */
@@ -582,6 +597,7 @@ export async function runOrchestration(
 			// escalation loop recovers it too late for those waves to ever be dispatched. Gated on
 			// `--max-retries` > 0, the same knob that gates the post-QA escalation loop below.
 			inWaveRecovery: parsed.maxRetries > 0,
+			writeCheckDiagnostic: (_name, text) => writeCheckFailureDiagnostic(session, text, deps.env),
 			waitForChecks: (checks) => waitForPendingChecks(checks, {
 				cwd, cancellation: session.cancellation, ...deps.ciWait,
 				// Resolve at each poll batch, after the owning lead has committed its candidate.
@@ -1012,10 +1028,17 @@ export async function runOrchestration(
 	const liveQaHasUnknownCost = liveQaCostRowsHaveUnknownCost(liveQaCostRowsForRun);
 
 	session.cancellation.throwIfCancelled();
+	const finalChecks = terminalCandidateChecks(pendingChecks, gitHead(cwd));
+	for (const check of finalChecks) {
+		if (check.reason !== "candidate_changed") continue;
+		deps.recordEvent("external_check_candidate_changed", { run_id: runId, provider: check.check.provider, id: check.check.id, outcome: "unverified", reason: check.reason });
+		deps.recordOutcome({ run_id: runId, stage: "external_check", provider: check.check.provider, check_id: check.check.id, outcome: "unverified", reason: check.reason });
+	}
+	if (finalChecks.length) session.setPendingChecks?.(finalChecks.map(({ check, outcome }) => ({ provider: check.provider, id: check.id, outcome: outcome === "cancelled" ? "unverified" : outcome, ...(check.mr ? { mr: check.mr } : {}) })));
 	const telemetry = await deps.completeRun(runId, {
 		success_rate: finalSucceededLeads / Math.max(1, leadAttempts.length),
 		verification_passed: passedVerification,
-		external_checks: pendingChecks.map(({ check, outcome, reason, jobId }) => ({ provider: check.provider, id: check.id, outcome, reason, job_id: jobId })),
+		external_checks: finalChecks.map(({ check, outcome, reason, jobId }) => ({ provider: check.provider, id: check.id, outcome, reason, job_id: jobId })),
 		blocked: finalRunOutcome === "blocked",
 		lead_statuses: finalLeadStatuses,
 		external_changes: externalFiles.length,
@@ -1098,7 +1121,7 @@ export async function runOrchestration(
 		verificationTimedOut,
 		verificationProviderStall,
 		failedChecks,
-		externalChecks: pendingChecks.map(({ check, outcome }) => ({ provider: check.provider, id: check.id, outcome: outcome === "cancelled" ? "unverified" as const : outcome })),
+		externalChecks: finalChecks.map(({ check, outcome }) => ({ provider: check.provider, id: check.id, outcome: outcome === "cancelled" ? "unverified" as const : outcome })),
 		totalCostUsd: totalCost,
 		dispatchCount: billedResults.length + (triageCost.usd > 0 ? 1 : 0),
 		nestedCostUsd: nestedCost,

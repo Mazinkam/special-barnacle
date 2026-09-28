@@ -188,7 +188,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 	// External CI is an independent gate, never a rewrite of QA's own verdict.
 	const externalChecks = report.externalChecks ?? [];
 	const summary = [
-		`Orchestration ${report.blocked ? "BLOCKED" : report.dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(report.elapsedMs)}.`,
+		`Orchestration ${report.blocked || externalChecks.some((check) => check.outcome !== "success") ? "BLOCKED" : report.dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(report.elapsedMs)}.`,
 		`run_id: ${report.runId}`,
 		`leads: ${report.succeededLeads}/${report.totalLeads} ${report.blocked ? "blocked" : "succeeded"}${report.skippedLeads > 0 ? ` (+${report.skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${report.retries} · files: ${report.filesChangedCount} changed${report.externalFilesCount > 0 ? ` (+${report.externalFilesCount} changed by someone else, not verified)` : ""}`,
 		report.reconWorkersLine,
