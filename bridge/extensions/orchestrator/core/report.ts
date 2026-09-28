@@ -110,6 +110,8 @@ export interface RunReport {
 	/** Named checks QA's report identified as failing; empty when it failed without the parser
 	 *  recognizing any specific check (`FAIL (unparsed)`). */
 	failedChecks: string[];
+	/** Parent-owned external CI results; unverified/failure never implies PASS. */
+	externalChecks?: Array<{ provider: "gitlab" | "github"; id: string; outcome: "pending" | "success" | "failure" | "unverified" }>;
 	totalCostUsd: number;
 	/** Number of billed dispatches (architect/workers/leads/verification/escalation + triage, when triage spent anything). */
 	dispatchCount: number;
@@ -183,6 +185,13 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		verdict = composed.verdict;
 		passedVerification = composed.passedVerification;
 	}
+	const externalChecks = report.externalChecks ?? [];
+	if (externalChecks.some((check) => check.outcome !== "success")) {
+		if (passedVerification || report.verificationSkipped) {
+			verdict = `${externalChecks.some((check) => check.outcome === "failure") ? "FAIL" : "UNVERIFIED"} external check (${externalChecks.filter((check) => check.outcome !== "success").map((check) => `${check.provider} ${check.id}: ${check.outcome}`).join(", ")})`;
+		}
+		passedVerification = false;
+	}
 	const summary = [
 		`Orchestration ${report.blocked ? "BLOCKED" : report.dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(report.elapsedMs)}.`,
 		`run_id: ${report.runId}`,
@@ -192,6 +201,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		...(report.resumedLeadIds.length > 0 ? [`resumes: ${report.resumedLeadIds.length} (${report.resumedLeadIds.join(", ")})`] : []),
 		...report.leadAttemptLines,
 		`verification: ${verdict}`,
+		...externalChecks.map((check) => `external check: ${check.provider} ${check.id} ${check.outcome}`),
 		`total cost: $${report.totalCostUsd.toFixed(4)} (${report.dispatchCount} dispatches${report.nestedCostUsd > 0 ? `; $${report.nestedCostUsd.toFixed(4)} of it in lead subagents` : ""})`,
 		...(report.dispatchOk ? [] : [`first failure: ${report.firstFailureLine}`]),
 		...(report.liveQa ? liveQaSummaryLines(report.liveQa.stage, report.liveQa.notRunReason, report.liveQa.hasUnknownCost) : []),
@@ -207,6 +217,6 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 	const text = summary.join("\n");
 	// Whether the run is reported as a success in the notify and in chat must agree:
 	// a run whose verification failed is not "completed" just because dispatch succeeded.
-	const succeeded = (passedVerification || (report.dispatchOk && report.verificationSkipped)) && telemetryHealthy(report.telemetryReport);
+	const succeeded = (passedVerification || (report.dispatchOk && report.verificationSkipped)) && externalChecks.every((check) => check.outcome === "success") && telemetryHealthy(report.telemetryReport);
 	return { text, succeeded };
 }

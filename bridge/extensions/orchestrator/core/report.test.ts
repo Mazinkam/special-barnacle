@@ -101,6 +101,15 @@ function baseReport(): RunReport {
 }
 
 describe("core/report.ts buildRunSummary", () => {
+	test("external check without a successful verdict prevents PASS, including report-only runs", () => {
+		for (const outcome of ["failure", "unverified", "pending"] as const) {
+			const { text, succeeded } = buildRunSummary({ ...baseReport(), verificationSkipped: true, filesChangedCount: 0, externalChecks: [{ provider: "github", id: "123", outcome }] });
+			expect(succeeded).toBe(false);
+			expect(text).not.toContain("verification: PASS");
+			expect(text).toContain(`external check: github 123 ${outcome}`);
+		}
+	});
+
 	test("complete: passed verification, reported as succeeded", () => {
 		const { text, succeeded } = buildRunSummary(baseReport());
 		expect(text).toBe(

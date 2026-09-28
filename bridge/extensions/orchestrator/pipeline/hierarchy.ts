@@ -36,6 +36,10 @@ import {
 } from "../core/prompts.ts";
 import { parseLeadAssignments, planLeadWaves, type LeadAssignment } from "../lead-plan.ts";
 import { parseLeadStatus } from "../run-outcome.ts";
+import { parsePendingChecks, type PendingCheck } from "../core/pending-checks.ts";
+import type { CiPollResult } from "../core/ci-wait.ts";
+
+export interface ResolvedCheck extends CiPollResult { check: PendingCheck }
 import { formatReconEvidence, planReconTasks } from "../recon.ts";
 import { METHOD, shortName } from "../models.ts";
 import { fmtElapsed } from "../run-ui.ts";
@@ -192,8 +196,9 @@ export async function dispatchReconAndLeads(
 		markFiles?: () => unknown;
 		/** Files changed since `mark` was taken, unioned with `claimed` (files the lead's own report named). Optional: falls back to `claimed` when absent. */
 		filesChangedSince?: (mark: unknown, claimed: string[]) => string[];
+		waitForChecks?: (checks: PendingCheck[]) => Promise<ResolvedCheck[]>;
 	},
-): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[]; resumedLeadTaskIds: string[]; retriedLeadTaskIds: string[]; resumedAttemptResults: DispatchResult[] }> {
+): Promise<{ leadResults: DispatchResult[]; workerResults: DispatchResult[]; skippedLeads: number; leadTasks: DispatchTask[]; resumedLeadTaskIds: string[]; retriedLeadTaskIds: string[]; resumedAttemptResults: DispatchResult[]; pendingChecks: ResolvedCheck[] }> {
 	const { runId, goal, plan, adapter, architectResult, evidenceMaxChars, maxLeads, leadCapability = "lead", repoRoot, providedContext = "", inWaveRecovery = false } = input;
 	const requestedLeadCount = effectiveLeadCount(plan, maxLeads);
 
@@ -276,6 +281,8 @@ export async function dispatchReconAndLeads(
 	// to recover the lead's original goal/scope/model-routing prompt on retry.
 	const leadTasks: DispatchTask[] = [];
 	const stopped = new Set<number>();
+	const pendingChecks: ResolvedCheck[] = [];
+	const checkFeedback = new Map<number, string>();
 	const resumedLeadTaskIds: string[] = [];
 	// taskIds recovered via A3's in-wave retry (never the same taskId as resumedLeadTaskIds: a lead
 	// gets at most one recovery in total). Kept separate from resumedLeadTaskIds so run-orchestration.ts
@@ -296,7 +303,11 @@ export async function dispatchReconAndLeads(
 		}
 		if (runnable.length === 0) continue;
 		if (waves.length > 1) effects.setPhase(`wave ${w + 1}/${waves.length}: lead(s) ${runnable.map((i) => i + 1).join(", ")}`);
-		const tasks = runnable.map(leadTaskFor);
+		const tasks = runnable.map((i) => {
+			const original = leadTaskFor(i);
+			const feedback = (assignments?.[i]?.dependsOn ?? []).map((d) => checkFeedback.get(d)).filter(Boolean);
+			return feedback.length ? { ...original, task: `${original.task}\n\n## External check results from dependencies\n${feedback.join("\n")}` } : original;
+		});
 		const waveStartMark = effects.markFiles ? effects.markFiles() : undefined;
 		const results = await effects.dispatch(tasks);
 		for (const r of results) await effects.capture(r);
@@ -374,6 +385,18 @@ export async function dispatchReconAndLeads(
 		}
 		leadResults.push(...finalResults);
 		leadTasks.push(...tasks);
+		for (const [k, r] of finalResults.entries()) {
+			if (r.exitCode !== 0) continue;
+			const { checks } = parsePendingChecks(r.stdout);
+			if (!checks.length || !effects.waitForChecks) continue;
+			const resolved = await effects.waitForChecks(checks);
+			effects.throwIfCancelled();
+			pendingChecks.push(...resolved);
+			checkFeedback.set(runnable[k], resolved.map(({ check, outcome, jobId, logTail }) =>
+				`- ${check.provider} ${check.id}: ${outcome === "unverified" ? "unverified external check" : `external check ${outcome}`}${jobId ? `; failed job ${jobId}` : ""}${logTail ? `\n  log tail: ${logTail}` : ""}`,
+			).join("\n"));
+		}
+
 	}
 
 	// Recon is parent-owned and returned for billing/reporting. Any further
@@ -382,7 +405,7 @@ export async function dispatchReconAndLeads(
 	// not count it as part of this run's authoritative worker accounting.
 	// Leads never started because a lead they depend on failed or was blocked.
 	const skippedLeads = [...stopped].filter((i) => !leadResults.some((r) => r.taskId === `${runId}-lead-${i}`)).length;
-	return { leadResults, workerResults, skippedLeads, leadTasks, resumedLeadTaskIds, retriedLeadTaskIds, resumedAttemptResults };
+	return { leadResults, workerResults, skippedLeads, leadTasks, resumedLeadTaskIds, retriedLeadTaskIds, resumedAttemptResults, pendingChecks };
 }
 
 /** Dispatch + billing seams `dispatchHierarchical` needs; index.ts's caller supplies the real ones. */
@@ -411,6 +434,7 @@ export interface HierarchyDeps {
 	 *  of leaving every dependent wave marked "not started" until the post-QA escalation loop recovers
 	 *  it too late to matter. Default `false`. */
 	inWaveRecovery?: boolean;
+	waitForChecks?: (checks: PendingCheck[]) => Promise<ResolvedCheck[]>;
 }
 
 /**
@@ -455,6 +479,7 @@ export async function dispatchHierarchical(
 	retriedLeadTaskIds: string[];
 	/** The discarded (failed) attempt of every resumed lead, for billing alongside `leadResults` (C3). */
 	resumedAttemptResults: DispatchResult[];
+	pendingChecks: ResolvedCheck[];
 }> {
 	const { depth } = plan.topology;
 	const captureOpts: CaptureOpts = {
@@ -505,6 +530,7 @@ export async function dispatchHierarchical(
 			throwIfCancelled: () => run?.session.cancellation.throwIfCancelled(),
 			markFiles: deps.markFiles,
 			filesChangedSince: deps.filesChangedSince,
+			waitForChecks: deps.waitForChecks,
 		},
 	);
 	return { ...results, architectResult };

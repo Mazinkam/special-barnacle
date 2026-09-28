@@ -32,6 +32,10 @@ import type { OrchestrateArgs } from "../core/args.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import { detectLiveExtensionTree, detectOutOfTreeChanges, outOfTreeChangesSummaryLine, type LiveTreeSeams } from "../core/live-tree.ts";
 import { complexityNeedsArchitect, type DispatchTask, type PlanResponse } from "../core/prompts.ts";
+import { pollCiCheck, type CiPollSpawn, type CiWaitState } from "../core/ci-wait.ts";
+import type { PendingCheck } from "../core/pending-checks.ts";
+import type { ResolvedCheck } from "./hierarchy.ts";
+import type { RunCancellation } from "../cancellation.ts";
 import type { RunReport } from "../core/report.ts";
 import type { TriageResult } from "../core/triage.ts";
 import { loadEfficiencyControls } from "../efficiency-flags.ts";
@@ -45,7 +49,7 @@ import { classifyRunOutcome, externalChangeFiles, parseLeadStatus, qaScopeEviden
 import { summarizeStderr } from "../dispatch/stderr-sink.ts";
 import { confirmStep, safeUi } from "../run/ui-sink.ts";
 import { describeRunArtifact, type RunTiming } from "../run/session.ts";
-import type { RunContext, RunSessionLike } from "../run/context.ts";
+import type { RunContext, RunSessionLike, PendingCheckRow } from "../run/context.ts";
 import { telemetryWarning, type FlushReport, type QueueStats } from "../record-queue.ts";
 import { collectBilledResults, dispatchHierarchical, summarizeReconWorkers } from "./hierarchy.ts";
 import { collectLeadAttempts, formatLeadAttemptLines } from "./lead-attempts.ts";
@@ -59,6 +63,62 @@ import {
 	runLiveQaStage,
 	type RunLiveQaStageResult,
 } from "../live-qa-stage.ts";
+
+type CheckRow = PendingCheckRow;
+
+/** One cancellable session tick at a time; injectable clock/scheduler and spawn keep tests deterministic. */
+export async function waitForPendingChecks(checks: PendingCheck[], options: {
+ cwd: string;
+ cancellation: RunCancellation;
+ now?: () => number;
+ spawn?: CiPollSpawn;
+ scheduleTick?: (delayMs: number, tick: () => void) => () => void;
+ setPendingChecks?: (rows: CheckRow[]) => void;
+ onOutcome?: (result: ResolvedCheck) => void;
+}): Promise<ResolvedCheck[]> {
+ const now = options.now ?? Date.now;
+ const schedule = options.scheduleTick ?? ((delay: number, tick: () => void) => {
+  const timer = setTimeout(tick, delay);
+  return () => clearTimeout(timer);
+ });
+ const controller = new AbortController();
+ const offCancel = options.cancellation.onCancel(() => controller.abort());
+ const states: CiWaitState[] = checks.map(() => ({ startedAt: now(), nextPollAt: now() }));
+ const results: Array<ResolvedCheck | undefined> = checks.map(() => undefined);
+ const publish = () => options.setPendingChecks?.(checks.map((check, index) => ({
+  provider: check.provider, id: check.id, outcome: results[index]?.outcome === "cancelled" ? "unverified" : results[index]?.outcome ?? "pending",
+  ...(check.mr ? { mr: check.mr } : {}),
+ })));
+ publish();
+ try {
+  // Continuations are scheduled by one session tick, not by a blocking poll/sleep loop.
+  const tick = async (): Promise<void> => {
+   options.cancellation.throwIfCancelled();
+   for (let i = 0; i < checks.length; i++) {
+    if (results[i]) continue;
+    const outcome = await pollCiCheck(checks[i], states[i], { cwd: options.cwd, signal: controller.signal, now, spawn: options.spawn });
+    options.cancellation.throwIfCancelled();
+    if (outcome.outcome === "pending") states[i] = outcome.state!;
+    else {
+     const resolved: ResolvedCheck = { check: checks[i], ...outcome };
+     results[i] = resolved;
+     options.onOutcome?.(resolved);
+    }
+   }
+   publish();
+   if (results.every(Boolean)) return;
+   const delay = Math.max(0, Math.min(...states.filter((_, i) => !results[i]).map((s) => s.nextPollAt)) - now());
+   await new Promise<void>((resolve, reject) => {
+    let off = () => {};
+    const cancelTimer = schedule(delay, () => { off(); resolve(); });
+    off = options.cancellation.onCancel(() => { cancelTimer(); off(); reject(new Error("Orchestration cancelled")); });
+   });
+   return tick();
+  };
+  if (checks.length) await tick();
+  return results as ResolvedCheck[];
+ } finally { offCancel(); }
+}
 
 /** `planRun`'s options; structurally identical to index.ts's own (private) `PlanOptions` —
  *  redeclared here rather than imported so this module never has to import index.ts. */
@@ -116,6 +176,7 @@ export interface RunOrchestrationDeps {
 	/** Records a single model-usage row (the Python-side economics ledger); used to record the
 	 *  live-QA stage's own cost rows, independent of `recordOutcome`'s outcome row. */
 	recordModelCall: (metric: Record<string, unknown>) => void;
+	ciWait?: { now?: () => number; spawn?: CiPollSpawn; scheduleTick?: (delayMs: number, tick: () => void) => () => void };
 }
 
 /**
@@ -482,7 +543,8 @@ export async function runOrchestration(
 	// `workerResults` carries the parent-owned recon dispatches; they must stay
 	// destructured here or the run stops billing them (plan Task 3).
 	const repoRoot = resolve(cwd);
-	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks, resumedLeadTaskIds, retriedLeadTaskIds, resumedAttemptResults } = await dispatchHierarchical(
+	const checkRows = new Map<string, PendingCheckRow>();
+	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks, resumedLeadTaskIds, retriedLeadTaskIds, resumedAttemptResults, pendingChecks } = await dispatchHierarchical(
 		runId,
 		plan.plan_id,
 		parsed.goal,
@@ -503,6 +565,17 @@ export async function runOrchestration(
 			// escalation loop recovers it too late for those waves to ever be dispatched. Gated on
 			// `--max-retries` > 0, the same knob that gates the post-QA escalation loop below.
 			inWaveRecovery: parsed.maxRetries > 0,
+			waitForChecks: (checks) => waitForPendingChecks(checks, {
+				cwd, cancellation: session.cancellation, ...deps.ciWait,
+				setPendingChecks: (rows) => {
+					for (const row of rows) checkRows.set(`${row.provider}:${row.id}`, row);
+					session.setPendingChecks?.([...checkRows.values()]);
+				},
+				onOutcome: ({ check, outcome, reason, jobId }) => {
+					deps.recordEvent("external_check", { run_id: runId, provider: check.provider, id: check.id, outcome, reason, job_id: jobId });
+					deps.recordOutcome({ run_id: runId, stage: "external_check", provider: check.provider, check_id: check.id, outcome, reason, job_id: jobId });
+				},
+			}),
 			// C3: a lead's resume prompt needs "files changed since it started", using
 			// the same git dirty-snapshot machinery `changedSince` below uses for QA
 			// scope — a snapshot taken right before the lead's (wave's) dispatch,
@@ -855,7 +928,7 @@ export async function runOrchestration(
 	// lead-attempts accounting quirk in either direction must never make an otherwise-passing QA
 	// verdict read as unverified.
 	const verificationSkipped = lastVerification?.skipped ?? false;
-	const passedVerification = (lastVerification?.passed ?? false) && (dispatchOk || finalDispatchOk);
+	const passedVerification = (lastVerification?.passed ?? false) && (dispatchOk || finalDispatchOk) && pendingChecks.every((r) => r.outcome === "success");
 	// The QA dispatch itself timing out (inactivity/absolute ceiling) is a distinct state from QA
 	// completing and reporting failing checks — the summary must say so instead of folding both
 	// into a plain FAIL (docs/architecture-review.md C5).
@@ -922,6 +995,7 @@ export async function runOrchestration(
 	const telemetry = await deps.completeRun(runId, {
 		success_rate: finalSucceededLeads / Math.max(1, leadAttempts.length),
 		verification_passed: passedVerification,
+		external_checks: pendingChecks.map(({ check, outcome, reason, jobId }) => ({ provider: check.provider, id: check.id, outcome, reason, job_id: jobId })),
 		blocked: finalRunOutcome === "blocked",
 		lead_statuses: finalLeadStatuses,
 		external_changes: externalFiles.length,
@@ -1004,6 +1078,7 @@ export async function runOrchestration(
 		verificationTimedOut,
 		verificationProviderStall,
 		failedChecks,
+		externalChecks: pendingChecks.map(({ check, outcome }) => ({ provider: check.provider, id: check.id, outcome: outcome === "cancelled" ? "unverified" as const : outcome })),
 		totalCostUsd: totalCost,
 		dispatchCount: billedResults.length + (triageCost.usd > 0 ? 1 : 0),
 		nestedCostUsd: nestedCost,
