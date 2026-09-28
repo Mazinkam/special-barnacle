@@ -249,19 +249,35 @@ describe("pipeline/run-orchestration.ts out-of-tree warning (A6/N2)", () => {
 				},
 				effective_quality_floor: 0.5, cost_aggressiveness: 0.5,
 			};
-			for (const claims of [[], ["a.ts"]]) {
+			for (const { claims, localEdit } of [
+				{ claims: [] as string[], localEdit: false },
+				{ claims: ["a.ts"], localEdit: false },
+				{ claims: ["a.ts"], localEdit: true },
+			]) {
 				const session = fakeSession();
+				// The child actually issued the command; assistant prose is not tool evidence.
+				writeFileSync(join(tmp, `${runId}-lead-0.events.jsonl`), `${JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command: `cd ${other} && touch a.ts` } })}\n`);
+				session.file = (name: string) => join(tmp, name);
 				const { ctx, notifications } = fakeCtx();
 				const events: string[] = [];
 				const deps = fakeDeps({
 					planRun: async () => plan,
 					recordEvent: (event) => { events.push(event); },
 					dispatchParallel: async (_cwd, _id, tasks) => {
-						if (tasks[0]?.capability !== "lead") throw new Error("QA must not run on the wrong worktree");
+						if (tasks[0]?.capability !== "lead") {
+							if (!localEdit) throw new Error("QA must not run on the wrong worktree");
+							return tasks.map((t) => ({
+								taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0,
+								stdout: "## Verdict\nPASS", stderr: "",
+								usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+								durationMs: 1, costUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+							}));
+						}
 						writeFileSync(join(other, "a.ts"), "edited in another worktree\n");
+						if (localEdit) writeFileSync(join(repo, "unrelated.ts"), "changed locally\n");
 						return tasks.map((t) => ({
 							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
-							stdout: `STATUS: completed\nRan: cd ${other} && wrote a.ts`, stderr: "",
+							stdout: "STATUS: completed\nWrote a.ts", stderr: "",
 							usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
 							durationMs: 1, costUsd: 0, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: claims,
 						}));
@@ -270,17 +286,36 @@ describe("pipeline/run-orchestration.ts out-of-tree warning (A6/N2)", () => {
 				const result = await runOrchestration(runId, repo, fakeArgs(), fakeAdapter(), fakeResolution(fakeAdapter()), ctx, session, { ...claimed, session }, deps);
 				expect(result.kind).toBe("completed");
 				if (result.kind !== "completed") continue;
-				expect(result.report.filesChangedCount).toBe(0);
+				expect(result.report.filesChangedCount).toBe(localEdit ? 1 : 0);
 				expect(result.report.outOfTreeChangesLine).toBe(`changes outside run tree: ${other}`);
 				expect(buildRunSummary(result.report).text).toContain(`changes outside run tree: ${other}`);
 				expect(notifications.some((n) => n.level === "warning" && n.text.includes(`changes outside run tree: ${other}`))).toBe(true);
 				expect(events).toContain("out_of_tree_changes");
 			}
+			// A bare report claim that the lead visited another worktree is not an edit.
+			rmSync(join(tmp, `${runId}-lead-0.events.jsonl`));
+			const proseSession = fakeSession();
+			proseSession.file = (name: string) => join(tmp, name);
+			const proseCtx = fakeCtx();
+			const proseDeps = fakeDeps({
+				planRun: async () => plan,
+				dispatchParallel: async (_cwd, _id, tasks) => tasks.map((t) => ({
+					taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+					stdout: `STATUS: completed\nI considered cd ${other} but made no edits.`, stderr: "",
+					usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+					durationMs: 1, costUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+				})),
+			});
+			const proseResult = await runOrchestration(runId, repo, fakeArgs(), fakeAdapter(), fakeResolution(fakeAdapter()), proseCtx.ctx, proseSession, { ...claimed, session: proseSession }, proseDeps);
+			expect(proseResult.kind).toBe("completed");
+			if (proseResult.kind === "completed") expect(proseResult.report.outOfTreeChangesLine).toBeNull();
+			expect(proseCtx.notifications.some((n) => n.text.includes("changes outside run tree:"))).toBe(false);
 			// A run may start in a subdirectory. A lead cd'ing to its repository root
 			// has not left the run tree and must not produce the foreign-worktree warning.
 			const nested = join(repo, "src");
 			mkdirSync(nested);
 			const session = fakeSession();
+			session.file = (name: string) => join(tmp, name);
 			const { ctx, notifications } = fakeCtx();
 			const deps = fakeDeps({
 				planRun: async () => plan,
@@ -367,6 +402,7 @@ describe("pipeline/run-orchestration.ts runOrchestration QA skip when no lead su
 		expect(dispatchedCapabilities).not.toContain("qa_agent");
 		if (result.kind === "completed") {
 			expect(result.report.dispatchOk).toBe(false);
+			expect(result.report.outOfTreeChangesLine).toBeNull(); // no git observation; don't trust scraped claims
 			expect(result.report.verificationSkipped).toBe(false);
 			expect(result.report.passedVerification).toBe(false);
 			const { text } = buildRunSummary(result.report);

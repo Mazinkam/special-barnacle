@@ -8,9 +8,9 @@
  *    is never blocked (the operator may genuinely be developing the orchestrator on itself) — only
  *    surfaced loudly, once, at run start.
  *
- * 2. `detectOutOfTreeChanges` — the run tree shows no changes, but a lead claimed changed
- *    files or showed a `cd`/`cwd` outside that tree. A different worktree/repo is a likely
- *    cause; without a warning, the run summary would silently report 0 files changed.
+ * 2. `detectOutOfTreeChanges` — lead claims are absent from git-observed paths, or an
+ *    actual tool call changed directory outside the run tree. A different worktree/repo is
+ *    a likely cause; report prose alone is not evidence of an edit.
  *
  * Everything here is pure string/path comparison over already-resolved inputs — no `node:fs`, no
  * `node:child_process`. The actual `git rev-parse --show-toplevel` / realpath calls (and their
@@ -92,7 +92,7 @@ export function detectLiveExtensionTree(
 const SCAN_MAX_TEXTS = 20;
 const SCAN_MAX_CHARS_PER_TEXT = 20_000;
 /** How many claimed files the summary line falls back to naming when no foreign path was found
- *  in the lead's own text (still never zero — see `detectOutOfTreeChanges`'s doc comment). */
+ *  in the lead's own text (still never zero when unmatched claims exist). */
 const CLAIMED_SAMPLE_MAX = 10;
 
 /** `cd /abs/path`, in command position (start of string, or after a shell separator/opener). */
@@ -129,11 +129,12 @@ export function extractForeignPath(leadTexts: string[], runRoot: string, realpat
 export interface OutOfTreeChangesInput {
 	/** Union of every lead's `DispatchResult.filesChanged` for this run (or this round). */
 	claimedFiles: string[];
-	/** All git-observed changes in the run tree for the same round. Empty means no edits
-	 *  appeared in the run's own tree, even if a lead reported editing elsewhere. */
-	observedFiles: string[];
-	/** Lead stdout/report text to scan for a `cd`/`cwd` reference to a path outside `runRoot`. */
+	/** Git-observed repo-relative paths; null when observation is unavailable (no inference from claims). */
+	observedFiles: string[] | null;
+	/** Lead stdout/report text: a foreign path here only corroborates an unobserved claim. */
 	leadTexts: string[];
+	/** Commands from actual tool calls (not assistant prose); a foreign cd is independent evidence. */
+	toolTexts?: string[];
 	/** The run's own (already-resolved) repo root, or `cwd` when git is unavailable. */
 	runRoot: string;
 	/** Optional filesystem resolution for cd targets (to compare symlink aliases to the run root). */
@@ -142,24 +143,36 @@ export interface OutOfTreeChangesInput {
 
 export interface OutOfTreeChangesResult {
 	detected: boolean;
-	/** An out-of-tree path named in a lead's own text, when one was found. */
+	/** A foreign path from tool arguments, corroborating prose, or an unmatched absolute claim. */
 	foreignPath: string | null;
-	/** Bounded sample of the files leads claimed changing (empty for a foreign cd with no claims). */
+	/** Bounded sample of unmatched claims (empty for a foreign tool cd with no claims). */
 	claimedFiles: string[];
 }
 
 /**
- * N2: the run's git tree shows zero changes, despite claimed files or a lead's explicit cd/cwd
- * outside the run tree. Detection is warn-only: it does not change QA scope.
+ * N2: compare each claim to the paths git actually observed, not merely whether the tree is
+ * dirty. A foreign command in an actual tool call is evidence even without a claim; report prose
+ * alone is not. Detection is warn-only: it does not change QA scope.
  */
 export function detectOutOfTreeChanges(input: OutOfTreeChangesInput): OutOfTreeChangesResult {
-	const { claimedFiles, observedFiles, leadTexts, runRoot, realpath } = input;
-	if (observedFiles.length > 0) return { detected: false, foreignPath: null, claimedFiles: [] };
-	const foreignPath = extractForeignPath(leadTexts, runRoot, realpath);
+	const { claimedFiles, observedFiles, leadTexts, toolTexts = [], runRoot, realpath } = input;
+	if (observedFiles === null) return { detected: false, foreignPath: null, claimedFiles: [] };
+	const observed = new Set(observedFiles);
+	const missing = claimedFiles.filter((file) => {
+		const absolute = file.startsWith("/") ? resolve(file) : null;
+		const localPath = absolute ? (realpath?.(absolute) ?? absolute) : null;
+		const relative = localPath && isPathWithin(runRoot, localPath)
+			? localPath.slice(stripTrailingSep(runRoot).length + 1)
+			: absolute ? null : file.replace(/^\.\//, "");
+		return relative === null || !observed.has(relative);
+	});
+	const toolPath = extractForeignPath(toolTexts, runRoot, realpath);
+	const foreignPath = toolPath ?? (missing.length > 0 ? extractForeignPath(leadTexts, runRoot, realpath) : null)
+		?? missing.find((f) => f.startsWith("/") && !isPathWithin(runRoot, realpath?.(resolve(f)) ?? resolve(f))) ?? null;
 	return {
-		detected: claimedFiles.length > 0 || foreignPath !== null,
+		detected: missing.length > 0 || toolPath !== null,
 		foreignPath,
-		claimedFiles: claimedFiles.slice(0, CLAIMED_SAMPLE_MAX),
+		claimedFiles: missing.slice(0, CLAIMED_SAMPLE_MAX),
 	};
 }
 

@@ -126,6 +126,25 @@ describe("core/live-tree.ts detectOutOfTreeChanges / outOfTreeChangesSummaryLine
 		expect(result.detected).toBe(false);
 		expect(outOfTreeChangesSummaryLine(result)).toBeNull();
 	});
+	test("foreign claimed path is warned even when an unrelated local file changed", () => {
+		const result = detectOutOfTreeChanges({
+			claimedFiles: ["src/local.ts", "/other/worktree/src/foreign.ts"],
+			observedFiles: ["src/local.ts"], leadTexts: [], runRoot: "/repo",
+		});
+		expect(outOfTreeChangesSummaryLine(result)).toBe("changes outside run tree: /other/worktree/src/foreign.ts");
+	});
+	test("unobserved relative claim is warned even when an unrelated local file changed", () => {
+		const result = detectOutOfTreeChanges({
+			claimedFiles: ["src/foreign.ts"], observedFiles: ["src/local.ts"], leadTexts: [], runRoot: "/repo",
+		});
+		expect(outOfTreeChangesSummaryLine(result)).toBe("changes outside run tree: src/foreign.ts");
+	});
+	test("git unavailable does not infer foreign edits from unverifiable claims", () => {
+		const result = detectOutOfTreeChanges({
+			claimedFiles: ["src/a.ts"], observedFiles: null, leadTexts: ["cd /other/worktree"], runRoot: "/repo",
+		});
+		expect(result.detected).toBe(false);
+	});
 	test("claimed files observed by git: not detected even if leads mention a foreign cd", () => {
 		const result = detectOutOfTreeChanges({
 			claimedFiles: ["a.ts"],
@@ -135,17 +154,23 @@ describe("core/live-tree.ts detectOutOfTreeChanges / outOfTreeChangesSummaryLine
 		});
 		expect(result.detected).toBe(false);
 	});
-	test("foreign cd with no claims and no git-observed changes is still reported", () => {
+	test("actual foreign tool cd with no claims and no git-observed changes is reported", () => {
 		const result = detectOutOfTreeChanges({
-			claimedFiles: [], observedFiles: [], leadTexts: ["tool: cd /other/worktree && git status"], runRoot: "/repo",
+			claimedFiles: [], observedFiles: [], leadTexts: [], toolTexts: ["cd /other/worktree && git status"], runRoot: "/repo",
 		});
 		expect(outOfTreeChangesSummaryLine(result)).toBe("changes outside run tree: /other/worktree");
 	});
-	test("foreign cd is not reported when the run tree did change", () => {
+	test("report prose alone does not imply an out-of-tree edit", () => {
 		const result = detectOutOfTreeChanges({
-			claimedFiles: [], observedFiles: ["src/a.ts"], leadTexts: ["cd /other/worktree"], runRoot: "/repo",
+			claimedFiles: [], observedFiles: [], leadTexts: ["cd /other/worktree"], runRoot: "/repo",
 		});
 		expect(result.detected).toBe(false);
+	});
+	test("actual foreign tool cd is warned when no corresponding local file changed", () => {
+		const result = detectOutOfTreeChanges({
+			claimedFiles: [], observedFiles: ["src/local.ts"], leadTexts: [], toolTexts: ["cd /other/worktree"], runRoot: "/repo",
+		});
+		expect(outOfTreeChangesSummaryLine(result)).toBe("changes outside run tree: /other/worktree");
 	});
 	test("claimed files but none observed: detected, names the foreign path when found", () => {
 		const result = detectOutOfTreeChanges({

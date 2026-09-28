@@ -24,7 +24,7 @@
  */
 import type { ExtensionContext } from "@humain/terminal";
 import { spawnSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -185,6 +185,42 @@ const REAL_LIVE_TREE_SEAMS: LiveTreeSeams = {
  * `null`-on-failure contract — this is a warn-only feature, never worth failing (or even noisily
  * logging) a run over.
  */
+/** Read only bounded head/tail of a lead's own diagnostic event log. Tool arguments are
+ * retained on tool_execution_start; assistant prose and nested subagent prompts are not tool
+ * execution evidence. Open without following symlinks, and fail closed on missing logs. */
+function leadToolCommands(session: RunSessionLike, taskId: string): string[] {
+	const safeId = taskId.replace(/[^a-zA-Z0-9._-]+/g, "_");
+	let fd: number;
+	try {
+		fd = openSync(session.file(`${safeId}.events.jsonl`), constants.O_RDONLY | constants.O_NOFOLLOW);
+	} catch { return []; }
+	try {
+		const size = fstatSync(fd).size;
+		const window = 128 * 1024;
+		const chunks: string[] = [];
+		for (const [start, length] of size <= window * 2
+			? [[0, size]]
+			: [[0, window], [size - window, window]]) {
+			const buffer = Buffer.alloc(length);
+			const bytes = readSync(fd, buffer, 0, length, start);
+			const text = buffer.toString("utf8", 0, bytes);
+			chunks.push(start === 0 ? text.slice(0, text.lastIndexOf("\n") + 1) : text.slice(text.indexOf("\n") + 1));
+		}
+		const commands: string[] = [];
+		for (const line of chunks.join("\n").split("\n")) {
+			if (!line || line.length > 20_000 || commands.length >= 20) continue;
+			try {
+				const event = JSON.parse(line) as { type?: unknown; toolName?: unknown; args?: { command?: unknown } };
+				if (event.type === "tool_execution_start" && (event.toolName === "bash" || event.toolName === "functions.bash") && typeof event.args?.command === "string") {
+					commands.push(event.args.command);
+				}
+			} catch { /* incomplete or malformed JSONL is not evidence */ }
+		}
+		return commands;
+	} catch { return []; }
+	finally { closeSync(fd); }
+}
+
 function warnIfLiveExtensionTree(
 	cwd: string,
 	ctx: ExtensionContext,
@@ -504,6 +540,7 @@ export async function runOrchestration(
 	// just ran (used for the phantom log); `priorResults` widen the prose
 	// fallback when git is unavailable so lead files aren't dropped on retry.
 	let snapshotWarned = false;
+	let gitObservationAvailable = dirtyBefore !== null;
 	const changedSince = (
 		label: string,
 		roundResults: DispatchResult[],
@@ -512,6 +549,7 @@ export async function runOrchestration(
 		const roundClaimed = new Set(roundResults.flatMap((r) => r.filesChanged));
 		const claimedFiles = new Set([...priorResults.flatMap((r) => r.filesChanged), ...roundClaimed]);
 		const dirtyAfter = gitDirtySnapshot(cwd);
+		if (!dirtyAfter) gitObservationAvailable = false;
 		if ((!dirtyBefore || !dirtyAfter) && !snapshotWarned) {
 			snapshotWarned = true;
 			session.log(
@@ -519,7 +557,10 @@ export async function runOrchestration(
 			);
 		}
 		const { changed, phantom, historyUnavailable } = changedFilesSinceRunStart(cwd, headBefore, dirtyBefore, claimedFiles, dirtyAfter);
-		if (historyUnavailable) session.log(`${label}: git history unavailable; using claimed file paths`);
+		if (historyUnavailable) {
+			gitObservationAvailable = false;
+			session.log(`${label}: git history unavailable; using claimed file paths`);
+		}
 		const roundPhantom = phantom.filter((f) => roundClaimed.has(f));
 		if (roundPhantom.length > 0) {
 			session.log(
@@ -530,9 +571,9 @@ export async function runOrchestration(
 	};
 	let allFiles = changedSince("lead phase", leadResults);
 
-	// A6/N2: the run's tree shows no changes although leads claimed changes or named a foreign
-	// cd/cwd. Warn-only: never blocks or alters `allFiles`/QA scope. Reuses the git-observed
-	// `allFiles` above and each lead's own `filesChanged` as evidence.
+	// A6/N2: compare claimed paths against git-observed paths, and inspect actual lead tool
+	// calls for a foreign cd. Warn-only: never alters `allFiles`/QA scope. When git observation
+	// is unavailable, prose/claims cannot establish a missing local edit.
 	const leadClaimedFiles = candidateOwnedFilesForLiveQa(leadResults);
 	// `cwd` can be a subdirectory; git's changed paths are relative to the repository root.
 	// Comparing cd targets to cwd would mislabel an in-repo cd as another worktree.
@@ -540,15 +581,16 @@ export async function runOrchestration(
 	const runTreeRoot = gitRoot ? (REAL_LIVE_TREE_SEAMS.realpath(gitRoot) ?? gitRoot) : repoRoot;
 	const outOfTreeChanges = detectOutOfTreeChanges({
 		claimedFiles: leadClaimedFiles,
-		observedFiles: allFiles,
+		observedFiles: gitObservationAvailable ? allFiles : null,
 		leadTexts: leadResults.map((r) => r.stdout),
+		toolTexts: leadResults.flatMap((r) => leadToolCommands(session, r.taskId)),
 		runRoot: runTreeRoot,
 		realpath: REAL_LIVE_TREE_SEAMS.realpath,
 	});
 	if (outOfTreeChanges.detected) {
 		const line = outOfTreeChangesSummaryLine(outOfTreeChanges) ?? "changes outside run tree: (unknown)";
 		session.log(`out-of-tree changes: ${line}`);
-		safeUi(() => ctx.ui.notify(`Warning: ${line} — lead(s) reported file changes not visible in this run's own repo.`, "warning"));
+		safeUi(() => ctx.ui.notify(`Warning: ${line} — lead activity not reflected by corresponding changes in this run's own repo.`, "warning"));
 		deps.recordEvent("out_of_tree_changes", {
 			run_id: runId,
 			foreign_path: outOfTreeChanges.foreignPath,
