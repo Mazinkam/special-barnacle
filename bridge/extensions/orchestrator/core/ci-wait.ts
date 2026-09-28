@@ -47,37 +47,45 @@ function safeTail(text: string): string {
   .slice(-MAX_LOG_CHARS);
 }
 
-function parseStatus(check: PendingCheck, stdout: string): { outcome: "pending" | "success" | "failure" | "unverified"; jobId?: string } {
- if (check.provider === "github") {
-  try {
-   const data: unknown = JSON.parse(stdout);
-   if (!data || typeof data !== "object") return { outcome: "unverified" };
-   const run = data as { status?: unknown; conclusion?: unknown; jobs?: unknown };
-   if (run.status !== "completed") return ["queued", "in_progress", "waiting", "pending", "requested"].includes(String(run.status)) ? { outcome: "pending" } : { outcome: "unverified" };
-   if (run.conclusion === "success") return { outcome: "success" };
-   if (!["failure", "timed_out", "cancelled", "action_required", "startup_failure"].includes(String(run.conclusion))) return { outcome: "unverified" };
-   const job = Array.isArray(run.jobs) ? run.jobs.find((item: unknown) => {
-    if (!item || typeof item !== "object") return false;
-    return ["failure", "timed_out"].includes(String((item as { conclusion?: unknown }).conclusion));
-   }) as { databaseId?: unknown } | undefined : undefined;
-   const jobId = job && String(job.databaseId);
-   return { outcome: "failure", ...(jobId && CI_ID_RE.test(jobId) ? { jobId } : {}) };
-  } catch { return { outcome: "unverified" }; }
- }
- // glab ci get -p prints a human-readable Status field. Do not treat incidental
- // mentions of "failed" in job logs/metadata as the pipeline's status.
- const status = /^\s*status\s*:\s*(\w+)\s*$/im.exec(stdout)?.[1]?.toLowerCase();
- if (["success", "passed"].includes(status ?? "")) return { outcome: "success" };
- if (["pending", "running", "created", "waiting_for_resource", "preparing", "scheduled", "manual"].includes(status ?? "")) return { outcome: "pending" };
- if (["failed", "canceled", "cancelled", "skipped"].includes(status ?? "")) {
-  const jobId = /(?:^|\n)\s*(?:failed\s+job|job\s+id)\s*[:#]\s*([0-9]{1,12})\b/im.exec(stdout)?.[1];
-  return { outcome: "failure", ...(jobId ? { jobId } : {}) };
- }
- return { outcome: "unverified" };
+interface RepoIdentity { host: string; path: string; url: string }
+
+/** The caller supplies the canonical HTTPS remote, never a path or a CLI flag. */
+function parseRepo(value: unknown): RepoIdentity | undefined {
+ if (typeof value !== "string") return undefined;
+ try {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash || url.pathname.endsWith("/") || url.pathname.endsWith(".git")) return undefined;
+  const path = url.pathname.slice(1);
+  if (!/^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/.test(path) || path.split("/").includes("..") || path.split("/").includes(".")) return undefined;
+  return { host: url.hostname, path, url: `https://${url.hostname}/${path}` };
+ } catch { return undefined; }
+}
+
+function parseStatus(check: PendingCheck, stdout: string, expectedSha: string, repo: RepoIdentity): "pending" | "success" | "failure" | "unverified" {
+ try {
+  const data: unknown = JSON.parse(stdout);
+  if (!data || typeof data !== "object" || Array.isArray(data)) return "unverified";
+  const run = data as Record<string, unknown>;
+  const id = run.id;
+  if ((typeof id !== "number" || !Number.isSafeInteger(id) || String(id) !== check.id)) return "unverified";
+  if (check.provider === "github") {
+   const repository = run.repository;
+   if (run.head_sha !== expectedSha || !repository || typeof repository !== "object" || (repository as Record<string, unknown>).full_name !== repo.path || run.html_url !== `${repo.url}/actions/runs/${check.id}`) return "unverified";
+   if (run.status === "completed") return run.conclusion === "success" ? "success" : ["failure", "timed_out", "cancelled", "action_required", "startup_failure"].includes(String(run.conclusion)) ? "failure" : "unverified";
+   return ["queued", "in_progress", "waiting", "pending", "requested"].includes(String(run.status)) ? "pending" : "unverified";
+  }
+  if (run.sha !== expectedSha || run.web_url !== `${repo.url}/-/pipelines/${check.id}`) return "unverified";
+  if (run.status === "success") return "success";
+  if (["pending", "running", "created", "waiting_for_resource", "preparing", "scheduled", "manual"].includes(String(run.status))) return "pending";
+  return ["failed", "canceled", "cancelled", "skipped"].includes(String(run.status)) ? "failure" : "unverified";
+ } catch { return "unverified"; }
 }
 
 export interface CiPollOptions {
  cwd: string;
+ /** Current candidate commit and canonical HTTPS repository URL, resolved by the caller. */
+ expectedSha?: string;
+ expectedRepo?: string;
  signal?: AbortSignal;
  spawn?: CiPollSpawn;
  now?: () => number;
@@ -89,6 +97,8 @@ export interface CiPollOptions {
 export async function pollCiCheck(check: PendingCheck, state: CiWaitState, options: CiPollOptions): Promise<CiPollResult> {
  if (!validCheck(check)) return { outcome: "unverified", reason: "invalid_check" };
  if (options.signal?.aborted) return { outcome: "cancelled" };
+ const repo = parseRepo(options.expectedRepo);
+ if (!repo || typeof options.expectedSha !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(options.expectedSha)) return { outcome: "unverified", reason: "invalid_check" };
  const now = (options.now ?? Date.now)();
  const rawCeiling = options.maxWaitMs ?? Number(process.env.HUMAIN_ORCHESTRATOR_CI_WAIT_MAX_MS ?? DEFAULT_MAX_WAIT_MS);
  const ceiling = Number.isSafeInteger(rawCeiling) && rawCeiling >= 0 ? rawCeiling : DEFAULT_MAX_WAIT_MS;
@@ -97,36 +107,49 @@ export async function pollCiCheck(check: PendingCheck, state: CiWaitState, optio
  }
  if (now < state.nextPollAt) return { outcome: "pending", state };
  const remaining = ceiling - (now - state.startedAt);
- const timeoutMs = Math.min(CALL_TIMEOUT_MS, remaining);
+ // Both CLI calls share the same deadline, including time spent in the first call.
+ const deadline = now + remaining;
  const controller = new AbortController();
  const onAbort = () => controller.abort();
  options.signal?.addEventListener("abort", onAbort, { once: true });
  if (options.signal?.aborted) controller.abort();
  const spawn = options.spawn ?? spawnCiCommand;
- const execute = (command: string, args: string[]) => spawn(command, args, { cwd: options.cwd, timeoutMs, signal: controller.signal });
+ const execute = (command: string, args: string[]) => {
+  const timeLeft = deadline - (options.now ?? Date.now)();
+  if (!Number.isFinite(timeLeft) || timeLeft <= 0) return undefined;
+  return spawn(command, args, { cwd: options.cwd, timeoutMs: Math.min(CALL_TIMEOUT_MS, timeLeft), signal: controller.signal });
+ };
  try {
   if (controller.signal.aborted) return { outcome: "cancelled" };
   const command = check.provider === "gitlab" ? "glab" : "gh";
-  const args = check.provider === "gitlab" ? ["ci", "get", "-p", check.id] : ["run", "view", check.id, "--json", "status,conclusion,jobs"];
-  const response = await execute(command, args);
+  // API endpoints are scoped to the expected repository; CLI plaintext is not an identity proof.
+  const args = check.provider === "gitlab"
+   ? ["api", "--hostname", repo.host, `projects/${encodeURIComponent(repo.path)}/pipelines/${check.id}`]
+   : ["api", "--hostname", repo.host, `repos/${repo.path}/actions/runs/${check.id}`];
+  const request = execute(command, args);
+  if (!request) return { outcome: "unverified", reason: "ceiling" };
+  const response = await request;
   if (controller.signal.aborted) return { outcome: "cancelled" };
+  if ((options.now ?? Date.now)() >= deadline) return { outcome: "unverified", reason: "ceiling" };
   if (response.exitCode !== 0) return { outcome: "unverified", reason: "cli_unavailable" };
-  const parsed = parseStatus(check, response.stdout);
-  if (parsed.outcome === "pending") {
+  const parsed = parseStatus(check, response.stdout, options.expectedSha, repo);
+  if (parsed === "pending") {
    const interval = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
    return { outcome: "pending", state: { startedAt: state.startedAt, nextPollAt: now + (Number.isSafeInteger(interval) && interval > 0 ? interval : DEFAULT_POLL_INTERVAL_MS) } };
   }
-  if (parsed.outcome !== "failure") return parsed.outcome === "success" ? { outcome: "success" } : { outcome: "unverified", reason: "unknown_status" };
+  if (parsed !== "failure") return parsed === "success" ? { outcome: "success" } : { outcome: "unverified", reason: "unknown_status" };
   let logTail: string | undefined;
-  if (parsed.jobId && !controller.signal.aborted) {
+  if (check.provider === "github" && repo.host === "github.com" && !controller.signal.aborted) {
    try {
-    const logArgs = check.provider === "gitlab" ? ["ci", "trace", parsed.jobId] : ["run", "view", check.id, "--job", parsed.jobId, "--log"];
-    const log = await execute(command, logArgs);
+    const request = execute(command, ["run", "view", check.id, "-R", repo.path, "--log-failed"]);
+    if (!request) return { outcome: "unverified", reason: "ceiling" };
+    const log = await request;
     if (log.exitCode === 0) logTail = safeTail(log.stdout);
-   } catch { /* Failure status still stands when logs are unavailable. */ }
+   } catch { /* Verified failure stands even when logs are unavailable. */ }
   }
   if (controller.signal.aborted) return { outcome: "cancelled" };
-  return { outcome: "failure", ...(parsed.jobId ? { jobId: parsed.jobId } : {}), ...(logTail ? { logTail } : {}) };
+  if ((options.now ?? Date.now)() >= deadline) return { outcome: "unverified", reason: "ceiling" };
+  return { outcome: "failure", ...(logTail ? { logTail } : {}) };
  } catch {
   return controller.signal.aborted ? { outcome: "cancelled" } : { outcome: "unverified", reason: "cli_unavailable" };
  } finally {
