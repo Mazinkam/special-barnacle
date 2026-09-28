@@ -40,7 +40,7 @@ import { mergePendingChecks, parsePendingChecks, type PendingCheck } from "../co
 import { CI_ID_RE, classifyTimeout, extractCiRefs } from "../core/wait-stall.ts";
 import type { CiPollResult } from "../core/ci-wait.ts";
 
-export interface ResolvedCheck extends Omit<CiPollResult, "reason"> { check: PendingCheck; candidateSha?: string | null; reason?: CiPollResult["reason"] | "candidate_changed" }
+export interface ResolvedCheck extends Omit<CiPollResult, "reason"> { check: PendingCheck; candidateSha?: string | null; reason?: CiPollResult["reason"] | "candidate_changed" | "truncated_checks" }
 import { formatReconEvidence, planReconTasks } from "../recon.ts";
 import { METHOD, shortName } from "../models.ts";
 import { fmtElapsed } from "../run-ui.ts";
@@ -82,9 +82,21 @@ function killedCommandChecks(r: DispatchResult): PendingCheck[] {
 	// ciRefs came from the raw command before display redaction/truncation. Only fall back to
 	// parsing the displayed command when raw evidence was not supplied at all.
 	const refs = tool?.ciRefs ?? extractCiRefs(tool?.command);
-	return mergePendingChecks([], refs.filter((ref) =>
+	return refs.filter((ref) =>
 		(ref.provider === "gitlab" && ref.kind === "pipeline" || ref.provider === "github" && ref.kind === "run") && CI_ID_RE.test(ref.id),
-	).map((ref) => ({ ...ref, source: "killed_command" as const })));
+	).map((ref) => ({ ...ref, source: "killed_command" as const }));
+}
+
+/** Prefer killed refs under the polling cap; any distinct unpolled ref keeps the gate closed. */
+function checksToPoll(report: string, killed: PendingCheck[]): { checks: PendingCheck[]; overflow?: ResolvedCheck } {
+	const parsed = parsePendingChecks(report);
+	const reportFirst = mergePendingChecks(parsed.checks, killed);
+	const checks = [...killed, ...parsed.checks].some((c) => !reportFirst.some((kept) => kept.provider === c.provider && kept.kind === c.kind && kept.id === c.id))
+		? mergePendingChecks(killed, parsed.checks) : reportFirst;
+	const kept = new Set(checks.map((c) => `${c.provider}:${c.kind}:${c.id}`));
+	const unpolled = [...killed, ...parsed.checks].find((c) => !kept.has(`${c.provider}:${c.kind}:${c.id}`));
+	const overflow = unpolled ?? (parsed.problems.includes("truncated:max_checks") ? parsed.checks.at(-1) : undefined);
+	return { checks, overflow: overflow ? { check: overflow, outcome: "unverified", reason: "truncated_checks" } : undefined };
 }
 
 function isProviderStall(r: DispatchResult): boolean {
@@ -410,9 +422,9 @@ export async function dispatchReconAndLeads(
 			const leadIndex = runnable[k];
 			let r = initial;
 			if (r.exitCode === 0 && effects.waitForChecks) {
-				const checks = mergePendingChecks(parsePendingChecks(r.stdout).checks, killedChecks.get(k) ?? []);
+				const { checks, overflow } = checksToPoll(r.stdout, killedChecks.get(k) ?? []);
 				if (checks.length) {
-					const resolved = await effects.waitForChecks(checks);
+					const resolved = [...await effects.waitForChecks(checks), ...(overflow ? [overflow] : [])];
 					effects.throwIfCancelled();
 					const failures = resolved.filter((c) => c.outcome === "failure");
 					let gatePassed = resolved.every((c) => c.outcome === "success");
@@ -439,11 +451,11 @@ export async function dispatchReconAndLeads(
 							r = fixed;
 							retriedLeadTaskIds.push(originalTask.taskId);
 							if (fixed.exitCode === 0) {
-								const nextChecks = mergePendingChecks(parsePendingChecks(fixed.stdout).checks, killedChecks.get(k) ?? []);
+								const { checks: nextChecks, overflow: nextOverflow } = checksToPoll(fixed.stdout, killedChecks.get(k) ?? []);
 								if (nextChecks.length) {
-									const next = await effects.waitForChecks(nextChecks);
+									const next = [...await effects.waitForChecks(nextChecks), ...(nextOverflow ? [nextOverflow] : [])];
 									replacementChecks = next;
-									gatePassed = next.every((c) => c.outcome === "success");
+									gatePassed = !overflow && next.every((c) => c.outcome === "success");
 								}
 							}
 						}

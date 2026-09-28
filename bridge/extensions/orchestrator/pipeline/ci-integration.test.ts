@@ -90,6 +90,45 @@ test("killed-command refs merge with report checks, rejecting invalid raw ids", 
  expect(output.skippedLeads).toBe(0);
 });
 
+test("a failing killed ref beyond 20 report refs is polled and blocks dependents", async () => {
+ const batches: DispatchTask[][] = [];
+ const polled: string[][] = [];
+ const report = `## Pending external checks\n${Array.from({ length: 20 }, (_, i) => `- gh run view ${i + 100}`).join("\n")}\nSTATUS: completed`;
+ const output = await dispatchReconAndLeads({ runId: "r", goal: "g", plan, adapter: { lead: { model: "m" } }, architectResult: architect, evidenceMaxChars: 1000, maxLeads: 2, repoRoot: "/repo" }, {
+  dispatch: async (tasks) => { batches.push(tasks); return tasks.map((task) => batches.length === 1 ? {
+   ...result(task, "partial"), exitCode: 124, outcome: "timed_out" as const, timeoutReason: "inactivity" as const,
+   toolInFlight: { name: "bash", command: "gh run watch 999", waitPattern: true, ciRefs: [{ provider: "github" as const, kind: "run" as const, id: "999" }] },
+  } : result(task, report)); },
+  capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+  waitForChecks: async (checks) => { polled.push(checks.map((check) => check.id)); return checks.map((check) => ({ check, outcome: check.id === "999" ? "failure" as const : "success" as const })); },
+ });
+ expect(polled).toHaveLength(1);
+ expect(polled[0]).toHaveLength(20);
+ expect(polled[0]).toContain("999");
+ expect(batches.map((batch) => batch.map((task) => task.taskId))).toEqual([["r-lead-0"], ["r-lead-0"]]);
+ expect(output.skippedLeads).toBe(1);
+ expect(output.pendingChecks).toEqual(expect.arrayContaining([expect.objectContaining({ check: expect.objectContaining({ id: "999" }), outcome: "failure" })]));
+ expect(output.pendingChecks).toEqual(expect.arrayContaining([expect.objectContaining({ outcome: "unverified" })]));
+});
+
+for (const distinct of [20, 21]) {
+ test(`${distinct} distinct report refs plus a duplicate ${distinct === 20 ? "release" : "gate"} dependents`, async () => {
+  const batches: DispatchTask[][] = [];
+  const polled: string[][] = [];
+  const report = `## Pending external checks\n${Array.from({ length: distinct }, (_, i) => `- gh run view ${i + 100}`).join("\n")}\n- gh run view 100\nSTATUS: completed`;
+  const output = await dispatchReconAndLeads({ runId: "r", goal: "g", plan, adapter: { lead: { model: "m" } }, architectResult: architect, evidenceMaxChars: 1000, maxLeads: 2, repoRoot: "/repo" }, {
+   dispatch: async (tasks) => { batches.push(tasks); return tasks.map((task) => result(task, task.taskId === "r-lead-0" ? report : "STATUS: completed")); },
+   capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+   waitForChecks: async (checks) => { polled.push(checks.map((check) => check.id)); return checks.map((check) => ({ check, outcome: "success" as const })); },
+  });
+  expect(polled).toHaveLength(1);
+  expect(polled[0]).toHaveLength(20);
+  expect(output.skippedLeads).toBe(distinct === 20 ? 0 : 1);
+  expect(batches).toHaveLength(distinct === 20 ? 2 : 1);
+  expect(output.pendingChecks.some((check) => check.outcome === "unverified")).toBe(distinct === 21);
+ });
+}
+
 test("a check failure gets one fix handoff but never starts ordinary dependents without a verified replacement", async () => {
  const batches: DispatchTask[][] = [];
  const output = await dispatchReconAndLeads({ runId: "r", goal: "g", plan, adapter: { lead: { model: "m" } }, architectResult: architect, evidenceMaxChars: 1000, maxLeads: 2, repoRoot: "/repo", inWaveRecovery: true }, {
