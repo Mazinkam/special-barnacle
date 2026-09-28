@@ -88,6 +88,21 @@ describe("core/live-tree.ts extractForeignPath", () => {
 	test("finds a `cd <path>` outside the run root", () => {
 		expect(extractForeignPath(["some text\ncd /elsewhere/repo\nmore text"], "/repo")).toBe("/elsewhere/repo");
 	});
+	test("ignores foreign cd mentioned in a quoted echo argument or shell comment", () => {
+		expect(extractForeignPath(["echo 'I considered cd /other/worktree'", "echo ready # cd /other/worktree", "echo \"cd /other/worktree\"", "echo considered: cd /other/worktree"], "/repo")).toBeNull();
+		const result = detectOutOfTreeChanges({
+			claimedFiles: [], observedFiles: [], leadTexts: [],
+			toolTexts: ["echo 'I considered cd /other/worktree'"], runRoot: "/repo",
+		});
+		expect(result.detected).toBe(false);
+	});
+	test("keeps cwd marker offsets correct after quoted Unicode", () => {
+		expect(extractForeignPath(["echo 🧭 'cwd: /other/worktree'"], "/repo")).toBeNull();
+		expect(extractForeignPath(["echo '🧭' && cwd: /other/worktree"], "/repo")).toBe("/other/worktree");
+	});
+	test("detects an actual cd after a shell separator without treating quoted text as a command", () => {
+		expect(extractForeignPath(["echo 'cd /not-a-command' && cd /other/worktree && git status"], "/repo")).toBe("/other/worktree");
+	});
 	test("ignores a `cd <path>` inside the run root", () => {
 		expect(extractForeignPath(["cd /repo/sub"], "/repo")).toBeNull();
 	});

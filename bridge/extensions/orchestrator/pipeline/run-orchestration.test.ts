@@ -249,14 +249,20 @@ describe("pipeline/run-orchestration.ts out-of-tree warning (A6/N2)", () => {
 				},
 				effective_quality_floor: 0.5, cost_aggressiveness: 0.5,
 			};
-			for (const { claims, localEdit } of [
-				{ claims: [] as string[], localEdit: false },
-				{ claims: ["a.ts"], localEdit: false },
-				{ claims: ["a.ts"], localEdit: true },
+			for (const { claims, localEdit, earlierCommands } of [
+				{ claims: [] as string[], localEdit: false, earlierCommands: 0 },
+				{ claims: ["a.ts"], localEdit: false, earlierCommands: 0 },
+				{ claims: ["a.ts"], localEdit: true, earlierCommands: 0 },
+				// A foreign cd as command 21 in the bounded log must not be lost to the first 20.
+				{ claims: [] as string[], localEdit: false, earlierCommands: 20 },
 			]) {
 				const session = fakeSession();
 				// The child actually issued the command; assistant prose is not tool evidence.
-				writeFileSync(join(tmp, `${runId}-lead-0.events.jsonl`), `${JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command: `cd ${other} && touch a.ts` } })}\n`);
+				const commandEvent = (command: string) => JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command } });
+				writeFileSync(join(tmp, `${runId}-lead-0.events.jsonl`), [
+					...Array.from({ length: earlierCommands }, () => commandEvent(`cd ${repo} && true`)),
+					commandEvent(`cd ${other} && touch a.ts`),
+				].join("\n") + "\n");
 				session.file = (name: string) => join(tmp, name);
 				const { ctx, notifications } = fakeCtx();
 				const events: string[] = [];

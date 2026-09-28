@@ -208,11 +208,12 @@ function leadToolCommands(session: RunSessionLike, taskId: string): string[] {
 		}
 		const commands: string[] = [];
 		for (const line of chunks.join("\n").split("\n")) {
-			if (!line || line.length > 20_000 || commands.length >= 20) continue;
+			if (!line || line.length > 20_000) continue;
 			try {
 				const event = JSON.parse(line) as { type?: unknown; toolName?: unknown; args?: { command?: unknown } };
 				if (event.type === "tool_execution_start" && (event.toolName === "bash" || event.toolName === "functions.bash") && typeof event.args?.command === "string") {
 					commands.push(event.args.command);
+					if (commands.length > 20) commands.shift(); // Keep the most recent calls in the bounded head/tail.
 				}
 			} catch { /* incomplete or malformed JSONL is not evidence */ }
 		}

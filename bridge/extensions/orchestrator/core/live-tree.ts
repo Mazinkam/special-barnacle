@@ -95,11 +95,43 @@ const SCAN_MAX_CHARS_PER_TEXT = 20_000;
  *  in the lead's own text (still never zero when unmatched claims exist). */
 const CLAIMED_SAMPLE_MAX = 10;
 
-/** `cd /abs/path`, in command position (start of string, or after a shell separator/opener). */
-const CD_RE = /(?:^|[\s;&|(])cd\s+(\/[^\s"'`;&|)]+)/g;
+/** `cd /abs/path` after a shell separator or at the start of a line. */
+const CD_RE = /(?:^|[\n;&|(])[ \t]*cd[ \t]+(\/[^\s"'`;&|)]+)/g;
+/** A report explicitly describing a prior command may corroborate an unmatched file claim. */
+const REPORTED_CD_RE = /(?:^|\n)I ran:[ \t]*cd[ \t]+(\/[^\s"'`;&|)]+)/g;
 /** `cwd: /abs/path` / `cwd=/abs/path` / `cwd = "/abs/path"`, as a lead's tool-call output or its
  *  own report prose sometimes echoes its working directory. */
 const CWD_RE = /\bcwd\b\s*[:=]\s*["']?(\/[^\s"'`]+)/gi;
+
+/** Mask literal arguments and comments without interpreting shell execution. Preserve offsets
+ * so cwd markers outside quotes can still be checked against the original text (including
+ * `cwd="/path"`). A command substitution inside a quote is deliberately not inferred. */
+function commandSurface(text: string): string {
+	const chars = text.split(""); // Preserve UTF-16 offsets for matches against the original text.
+	let quote: "'" | '"' | "`" | null = null;
+	let comment = false;
+	for (let i = 0; i < chars.length; i++) {
+		const ch = chars[i];
+		if (ch === "\n" && !quote) { comment = false; continue; }
+		if (comment) { chars[i] = " "; continue; }
+		if (quote) {
+			chars[i] = " ";
+			if (ch === "\\" && quote === '"' && i + 1 < chars.length) chars[++i] = " ";
+			else if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < chars.length) { chars[i++] = " "; chars[i] = " "; continue; }
+		if (ch === "'" || ch === '"' || ch === "`") {
+			// Backtick substitutions are ambiguous; conservatively ignore their content.
+			quote = ch;
+			chars[i] = " ";
+		} else if (ch === "#" && (i === 0 || /[\s;&|(:]/.test(text[i - 1]))) {
+			comment = true;
+			chars[i] = " ";
+		}
+	}
+	return chars.join("");
+}
 
 /**
  * Scan `leadTexts` (bounded — see `SCAN_MAX_TEXTS`/`SCAN_MAX_CHARS_PER_TEXT`) for the first
@@ -113,11 +145,13 @@ export function extractForeignPath(leadTexts: string[], runRoot: string, realpat
 	for (const raw of leadTexts.slice(0, SCAN_MAX_TEXTS)) {
 		if (!raw) continue;
 		const text = raw.slice(0, SCAN_MAX_CHARS_PER_TEXT);
-		for (const re of [CD_RE, CWD_RE]) {
+		const surface = commandSurface(text);
+		for (const re of [CD_RE, REPORTED_CD_RE, CWD_RE]) {
 			re.lastIndex = 0;
 			let m: RegExpExecArray | null;
 			// eslint-disable-next-line no-cond-assign
-			while ((m = re.exec(text))) {
+			while ((m = re.exec(re === CWD_RE ? text : surface))) {
+				if (re === CWD_RE && surface.slice(m.index, m.index + 3).toLowerCase() !== "cwd") continue;
 				const candidate = m[1];
 				if (candidate && !isPathWithin(root, realpath?.(resolve(candidate)) ?? resolve(candidate))) return resolve(candidate);
 			}
