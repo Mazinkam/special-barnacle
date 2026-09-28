@@ -46,6 +46,20 @@ export interface ReReviewFloor {
 	independent_review?: boolean;
 }
 
+export interface ModelRequirementSpec { min_context: number; min_output: number; effort_control?: boolean }
+export interface ModelRequirementsRule {
+	default: ModelRequirementSpec;
+	groups: Record<string, ModelRequirementSpec & { capabilities: string[] }>;
+}
+export interface ModelFailoverRule {
+	unhealthy_ms: number;
+	same_model_retry_delay_ms: number;
+	wait_schedule_ms: number[];
+	max_wait_ms: number;
+	max_switches: number;
+	real_work_min_tool_calls: number;
+}
+
 interface MethodFile {
 	schema_version: number;
 	tiers: Tier[];
@@ -81,6 +95,8 @@ interface MethodFile {
 			usd_by_capability: Record<string, number>;
 			default_usd: number;
 		};
+		model_requirements: ModelRequirementsRule;
+		model_failover: ModelFailoverRule;
 	};
 }
 
@@ -166,6 +182,8 @@ export interface ProfileSpec {
 	capabilities?: Record<string, string>;
 	/** capability -> HT thinking level */
 	effort?: Record<string, string>;
+	/** tier or capability -> ordered backup model specs (alias or provider/id). */
+	backups?: Record<string, string[]>;
 }
 
 export interface ProfilesFile {
@@ -259,6 +277,24 @@ export function parseProfileSpec(spec: unknown, where: string, problems: string[
 			else out.effort[cap] = v;
 		}
 	}
+	if (s.backups !== undefined) {
+		if (!s.backups || typeof s.backups !== "object" || Array.isArray(s.backups)) {
+			problems.push(`${where}.backups must be an object`);
+		} else {
+			out.backups = {};
+			for (const [key, value] of Object.entries(s.backups as Record<string, unknown>)) {
+				if (!isTier(key) && !ALL_CAPABILITIES.includes(key)) {
+					problems.push(`${where}.backups: unknown tier or capability "${key}"`);
+					continue;
+				}
+				if (!Array.isArray(value) || value.length === 0 || value.some((item) => typeof item !== "string" || !item.trim())) {
+					problems.push(`${where}.backups.${key} must be a list of non-empty strings`);
+					continue;
+				}
+				out.backups[key] = value.map((item) => (item as string).trim());
+			}
+		}
+	}
 	return out;
 }
 
@@ -312,6 +348,9 @@ export interface AvailableModel {
 	provider: string;
 	id: string;
 	name?: string;
+	contextWindow?: number;
+	maxTokens?: number;
+	reasoning?: boolean;
 }
 
 const REGION_RE = /^(global|eu|us|apac|ap|jp|au|ca)\./;

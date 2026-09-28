@@ -12,7 +12,14 @@ import type { AvailableModel } from "../models.ts";
 
 export function availableModels(ctx: ExtensionContext): AvailableModel[] {
 	try {
-		return ctx.modelRegistry.getAvailable().map((m) => ({ provider: m.provider, id: m.id, name: m.name }));
+		return ctx.modelRegistry.getAvailable().map((m) => ({
+			provider: m.provider,
+			id: m.id,
+			name: m.name,
+			contextWindow: m.contextWindow,
+			maxTokens: m.maxTokens,
+			reasoning: m.reasoning,
+		}));
 	} catch {
 		return [];
 	}

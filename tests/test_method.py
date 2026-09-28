@@ -163,6 +163,19 @@ class TestMethod(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "effort_aliases"):
             method._validate(data)
 
+    def test_model_requirements_reject_undeclared_capability(self):
+        data = json.loads(method.METHOD_PATH.read_text())
+        data["rules"]["model_requirements"]["groups"]["planning"]["capabilities"].append("nope")
+        with self.assertRaisesRegex(ValueError, "undeclared capability 'nope'"):
+            method._validate(data)
+
+    def test_model_failover_values_are_positive_integers(self):
+        for key, bad in (("max_switches", 0), ("unhealthy_ms", -1), ("max_wait_ms", True), ("wait_schedule_ms", [])):
+            data = json.loads(method.METHOD_PATH.read_text())
+            data["rules"]["model_failover"][key] = bad
+            with self.assertRaises(ValueError, msg=key):
+                method._validate(data)
+
 
 if __name__ == "__main__":
     unittest.main()

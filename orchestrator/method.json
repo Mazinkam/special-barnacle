@@ -135,6 +135,22 @@
       "usd_by_capability": { "lead_small": 1.5, "lead": 4.0, "lead_large": 10.0, "architect": 2.0 },
       "default_usd": 1.0
     },
+    "model_requirements": {
+      "default": { "min_context": 128000, "min_output": 16000, "effort_control": false },
+      "groups": {
+        "planning": { "capabilities": ["architect", "lead_small", "lead", "lead_large"], "min_context": 256000, "min_output": 64000 },
+        "review": { "capabilities": ["technical_review", "integration_review", "migration_review", "performance_review", "api_contract_review", "security_review", "qa_agent"], "min_context": 200000, "min_output": 32000 },
+        "worker": { "capabilities": ["scout", "worker", "implementation_fast", "implementation_strong", "analysis_mid", "analysis_strong", "technical_lead"], "min_context": 128000, "min_output": 32000 }
+      }
+    },
+    "model_failover": {
+      "unhealthy_ms": 600000,
+      "same_model_retry_delay_ms": 60000,
+      "wait_schedule_ms": [60000, 120000, 240000],
+      "max_wait_ms": 900000,
+      "max_switches": 4,
+      "real_work_min_tool_calls": 3
+    },
     "efficiency_controls": {
       "summary": "Phase-2 opt-in efficiency switches. Every switch defaults OFF; each is independent. Off = byte-identical baseline behaviour.",
       "config_version": "2026-09-25.1",

@@ -422,3 +422,32 @@ describe("tierOfModel", () => {
 		expect(classifyModelName("mystery-9")).toBe("unknown");
 	});
 });
+
+describe("profile backups", () => {
+	test("parses valid backup lists and reports invalid keys and values", () => {
+		const { file, problems } = parseProfilesFile({
+			version: 1,
+			active_profile: "p",
+			profiles: { p: { backups: { frontier: ["astra", " humain-node/glm-5.2 "], security_review: ["a/b"], bogus: ["x"], mid: "no", cheap: [""] } } },
+		});
+		expect(file.profiles.p.backups).toEqual({ frontier: ["astra", "humain-node/glm-5.2"], security_review: ["a/b"] });
+		expect(problems.some((p) => p.includes('backups: unknown tier or capability "bogus"'))).toBe(true);
+		expect(problems.some((p) => p.includes("backups.mid must be a list of non-empty strings"))).toBe(true);
+		expect(problems.some((p) => p.includes("backups.cheap must be a list of non-empty strings"))).toBe(true);
+	});
+});
+
+describe("method model failover rules", () => {
+	test("groups refer to unique declared capabilities and method exposes bounded retry rules", () => {
+		const seen = new Set<string>();
+		for (const group of Object.values(METHOD.rules.model_requirements.groups)) {
+			for (const cap of group.capabilities) {
+				expect(Object.keys(METHOD.capabilities)).toContain(cap);
+				expect(seen.has(cap)).toBe(false);
+				seen.add(cap);
+			}
+		}
+		expect(METHOD.rules.model_requirements.groups.planning.min_context).toBe(256000);
+		expect(METHOD.rules.model_failover.max_switches).toBe(4);
+	});
+});
