@@ -625,17 +625,17 @@ export async function runOrchestration(
 		if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
 		if (lastVerification.passed) break;
 
-		if (lastVerification.timedOut) {
+		if (lastVerification.timedOut || lastVerification.providerStall) {
+			const qaFailure = lastVerification.providerStall ? "provider_stall" : "timeout";
 			if (qaRerunUsed) {
-				// Already used this run's one re-run and QA timed out again — finish with the
-				// TIMED OUT verdict; a timed-out QA never had a real verdict to escalate on.
-				session.log("QA dispatch timed out again after the re-run; ending the run with QA TIMED OUT (no escalation)");
+				// No completed QA verdict exists; never escalate on a provider failure.
+				session.log(`QA dispatch ${qaFailure} again after the re-run; ending without a verification verdict (no escalation)`);
 				break;
 			}
 			qaRerunUsed = true;
-			session.log("QA dispatch timed out; re-running QA once with scoped-test-command guidance");
-			deps.recordEvent("qa_timed_out_rerun", { run_id: runId, attempt: 1 });
-			session.setPhase(`QA re-run (attempt 1) on ${allFiles.length} changed file(s) after a timeout`);
+			session.log(`QA dispatch ${qaFailure}; re-running QA once with scoped-test-command guidance`);
+			deps.recordEvent(qaFailure === "timeout" ? "qa_timed_out_rerun" : "qa_provider_stall_rerun", { run_id: runId, attempt: 1 });
+			session.setPhase(`QA re-run (attempt 1) on ${allFiles.length} changed file(s) after ${qaFailure}`);
 			lastVerification = await runVerification(
 				runId,
 				plan.plan_id,
@@ -649,14 +649,14 @@ export async function runOrchestration(
 					recordOutcome: deps.recordOutcome,
 				},
 				repoRoot,
-				{ attempt: 1 },
+				{ attempt: 1, reason: lastVerification.providerStall ? "provider_stall" : "timeout" },
 			);
 			session.cancellation.throwIfCancelled();
 			if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
 			if (lastVerification.passed) break;
-			if (lastVerification.timedOut) {
-				// The re-run also timed out — finish with that verdict now, no escalation.
-				session.log("QA re-run also timed out; ending the run with QA TIMED OUT (no escalation)");
+			if (lastVerification.timedOut || lastVerification.providerStall) {
+				// The re-run also failed before a verdict — finish now, no escalation.
+				session.log(`QA re-run also ${lastVerification.providerStall ? "hit provider_stall" : "timed out"}; ending without a verification verdict (no escalation)`);
 				break;
 			}
 			// The re-run completed and reported a real (non-timeout) verdict; fall through to the
@@ -814,7 +814,9 @@ export async function runOrchestration(
 	// The QA dispatch itself timing out (inactivity/absolute ceiling) is a distinct state from QA
 	// completing and reporting failing checks — the summary must say so instead of folding both
 	// into a plain FAIL (docs/architecture-review.md C5).
-	const verificationTimedOut = lastVerification?.dispatch?.outcome === "timed_out";
+	// Both failures are unverified dispatches, never code/check FAIL. The existing report
+	// verdict only has the timeout-shaped unverified state; preserve its no-FAIL gate.
+	const verificationTimedOut = lastVerification?.dispatch?.outcome === "timed_out" || lastVerification?.providerStall === true;
 	const failedChecks = lastVerification?.failedChecks ?? [];
 
 	// -----------------------------------------------------------------

@@ -123,6 +123,8 @@ export interface NestedWorkerSnapshot {
 	costUsd: number;
 	finished: boolean;
 	latestText: string;
+	/** Provider error from the nested worker's last snapshot, when available. */
+	errorMessage?: string;
 	changed: boolean;
 }
 
@@ -499,6 +501,7 @@ export class DispatchProgressTracker {
 						const previous = this.workers.get(item.taskId);
 						const incomingTurns = finiteNumber(usage.turns, 0);
 						const incomingText = typeof item.latestText === "string" ? item.latestText : "";
+						const incomingError = typeof item.errorMessage === "string" ? item.errorMessage : "";
 						const incomingExitCode = finiteNumber(item.exitCode, -1);
 						const placeholder = Boolean(previous && (
 							incomingTurns < previous.turns ||
@@ -509,10 +512,10 @@ export class DispatchProgressTracker {
 						let snapshot: NestedWorkerSnapshot;
 						let changed: boolean;
 						if (previous && placeholder) {
-						// Parallel result lists can contain stale/empty placeholders. Keep
-							// the authoritative snapshot intact and do not call it progress.
-							snapshot = { ...previous, changed: false };
-							changed = false;
+							// A partial result may carry a new provider error while its
+							// turns/text are stale. Keep the last turn but retain the error.
+							changed = Boolean(incomingError) && incomingError !== previous.errorMessage;
+							snapshot = { ...previous, ...(changed ? { errorMessage: incomingError } : {}), changed };
 						} else if (!previous) {
 							snapshot = {
 								taskId: item.taskId,
@@ -522,6 +525,7 @@ export class DispatchProgressTracker {
 								exitCode: incomingExitCode,
 								costUsd: finiteNumber(usage.cost, 0),
 								latestText: incomingText,
+								...(incomingError ? { errorMessage: incomingError } : {}),
 								finished: incomingExitCode !== -1,
 								changed: false,
 							};
@@ -529,6 +533,7 @@ export class DispatchProgressTracker {
 						} else {
 							const terminalTransition = previous.exitCode === -1 && incomingExitCode !== -1;
 							const incomingTextChanged = Boolean(incomingText) && textHash(incomingText) !== textHash(previous.latestText);
+							const incomingErrorChanged = Boolean(incomingError) && incomingError !== previous.errorMessage;
 							const turnsIncreased = incomingTurns > previous.turns;
 							const finished = previous.finished || incomingExitCode !== -1;
 							const newlyFinished = finished && !previous.finished;
@@ -542,10 +547,11 @@ export class DispatchProgressTracker {
 									: incomingExitCode === -1 ? previous.exitCode : incomingExitCode,
 								costUsd: finiteNumber(usage.cost, previous.costUsd),
 								latestText: incomingTextChanged ? incomingText : previous.latestText,
+								...(incomingErrorChanged ? { errorMessage: incomingError } : turnsIncreased || incomingTextChanged ? { errorMessage: undefined } : {}),
 								finished,
 								changed: false,
 							};
-							changed = !wasEvicted && (turnsIncreased || terminalTransition || incomingTextChanged || newlyFinished);
+							changed = !wasEvicted && (turnsIncreased || terminalTransition || incomingTextChanged || incomingErrorChanged || newlyFinished);
 						}
 						snapshot.changed = changed;
 						if (!previous && this.workers.size >= NESTED_WORKER_LIMIT) {
@@ -756,7 +762,7 @@ export interface InterruptionReport {
 	toolCalls: number;
 	repeatedToolCalls: number;
 	lastProgress: string | undefined;
-	nestedWorkers: Array<{ id: string; turns: number; finished: boolean }>;
+	nestedWorkers: Array<{ id: string; turns: number; finished: boolean; latestText?: string; errorMessage?: string }>;
 	partialText: string;
 	verified: false;
 }
@@ -789,10 +795,18 @@ export function buildInterruptionReport(input: InterruptionReportInput): Interru
 			id: worker.taskId,
 			turns: worker.turns,
 			finished: worker.finished,
+			...(worker.latestText ? { latestText: sanitizeControlChars(redactCredentials(worker.latestText)).slice(-500) } : {}),
+			...(worker.errorMessage ? { errorMessage: sanitizeControlChars(redactCredentials(worker.errorMessage)).slice(-500) } : {}),
 		})),
 		partialText: input.partialText.slice(-2000),
 		verified: false,
 	};
+}
+
+export function renderNestedWorkerDiagnostic(workers: InterruptionReport["nestedWorkers"]): string {
+	return workers.length === 0 ? "none observed" : workers.map((worker) =>
+		`${worker.id} (${worker.turns} turns, ${worker.finished ? "finished" : "running"})${worker.latestText ? ` lastText: ${worker.latestText}` : ""}${worker.errorMessage ? ` errorMessage: ${worker.errorMessage}` : ""}`,
+	).join(", ");
 }
 
 export function summarizeInterruption(report: InterruptionReport): string {
@@ -808,11 +822,7 @@ export function renderInterruptionReport(report: InterruptionReport): string {
 		? "inactivity"
 		: report.reason === "absolute_timeout" ? "absolute" : "cancelled";
 	const partialText = report.partialText.slice(-2000);
-	const workers = report.nestedWorkers.length === 0
-		? "none observed"
-		: report.nestedWorkers.map((worker) =>
-			`${worker.id} (${worker.turns} turns, ${worker.finished ? "finished" : "running"})`,
-		).join(", ");
+	const workers = renderNestedWorkerDiagnostic(report.nestedWorkers);
 	return [
 		`UNVERIFIED PARTIAL WORK — ${reason}`,
 		`taskId: ${report.taskId}`,

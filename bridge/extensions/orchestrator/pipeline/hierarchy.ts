@@ -50,24 +50,28 @@ import type { RunContext, RunSessionLike } from "../run/context.ts";
  * text. A cancelled dispatch is never resumed; a lead that exited 0 needs no
  * resuming; a lead whose own report says `STATUS: blocked` stopped at a
  * precondition, not a transient failure; a dispatch that hit its own
- * inactivity/absolute timeout (`outcome === "timed_out"`) or was stopped by
- * the per-dispatch spend cap (`stopReason === "spend_cap"`) is not resumed
- * either, mirroring dispatch/parallel.ts's quota-fallback eligibility check
- * (`r.outcome !== "timed_out" && r.stopReason !== "spend_cap"`) — resuming
- * either would re-run work that already ran to its own limit rather than a
- * transient provider hiccup. Deliberately does not look at `stdout`: a
+ * absolute timeout or spend-cap stop is not resumed. An inactivity kill with
+ * provider evidence in its stderr or nested snapshot is a provider_stall and
+ * uses the same single resume budget as A3. Deliberately does not look at `stdout`: a
  * lead's own prose can legitimately mention words like "overloaded" while
  * describing something else, and the result's error/stderr/stopReason/exit
  * text is what actually reflects why the dispatch itself ended.
  */
+function isProviderStall(r: DispatchResult): boolean {
+	if (r.exitCode === 0 || r.outcome === "cancelled" || r.stopReason === "spend_cap" || parseLeadStatus(r.stdout) === "blocked") return false;
+	if (r.outcome === "timed_out" && r.timeoutReason !== "inactivity") return false;
+	const nestedErrors = r.interruption?.nestedWorkers.flatMap((w) => [w.errorMessage ?? "", w.latestText ?? ""]) ?? [];
+	// The watchdog's own "dispatch timed out" note is not evidence of a provider outage.
+	const stderr = (r.stderr ?? "").split("\n").filter((line) => !/^dispatch timed out|^UNVERIFIED PARTIAL WORK|^\s*lastProgress:/i.test(line)).join("\n");
+	return [stderr, ...nestedErrors].some((text) => isTransientProviderError(text));
+}
+
 export function isTransientLeadFailure(r: DispatchResult): boolean {
 	if (r.exitCode === 0) return false;
 	if (r.outcome === "cancelled") return false;
-	// Never resume a dispatch that hit its own timeout (`timed_out`) or was
-	// stopped by the per-dispatch spend cap (`spend_cap`): resuming either
-	// would re-run work that already ran to its own limit, mirroring
-	// dispatch/parallel.ts's quota-fallback eligibility check
-	// (`r.outcome !== "timed_out" && r.stopReason !== "spend_cap"`).
+	if (isProviderStall(r)) return true;
+	// Other timeouts remain A3 retry candidates only when a dependent wave
+	// needs recovery. Never resume a spend-cap stop.
 	if (r.outcome === "timed_out") return false;
 	if (r.stopReason === "spend_cap") return false;
 	if (parseLeadStatus(r.stdout) === "blocked") return false;
@@ -303,7 +307,7 @@ export async function dispatchReconAndLeads(
 			const filesChangedSinceStart = effects.filesChangedSince
 				? effects.filesChangedSince(waveStartMark, r.filesChanged)
 				: r.filesChanged;
-			effects.setPhase(`lead ${leadIndex + 1}: transient provider error, resuming once`);
+			effects.setPhase(`lead ${leadIndex + 1}: ${isProviderStall(r) ? "provider_stall" : "transient provider error"}, resuming once`);
 			const otherLeads = buildOtherLeadsLines(leadIndex, leadCount, leadResults, currentWaveResults(), stopped, assignments);
 			const [resumed] = await effects.dispatch([
 				{ ...originalTask, task: resumeLeadPrompt(originalTask.task, r.stdout, filesChangedSinceStart, otherLeads) },

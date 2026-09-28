@@ -232,13 +232,13 @@ describe("pipeline/hierarchy.ts dispatchReconAndLeads lead resume after a transi
 		expect(result.resumedLeadTaskIds).toEqual(["run-lead-0"]);
 	});
 
-	test("dispatch's own timeout (outcome: timed_out) with transient-looking stderr: no resume, exactly 1 lead dispatch", async () => {
+	test("absolute timeout with transient-looking stderr: no resume, exactly 1 lead dispatch", async () => {
 		const leadBatches: DispatchTask[][] = [];
 
 		const result = await dispatchReconAndLeads(baseInput(), {
 			dispatch: async (tasks) => {
 				leadBatches.push(tasks);
-				return [transientFailure(tasks[0], { outcome: "timed_out", timeoutReason: "inactivity" })];
+				return [transientFailure(tasks[0], { outcome: "timed_out", timeoutReason: "absolute" })];
 			},
 			capture: async () => {},
 			setPhase: () => {},
@@ -720,6 +720,41 @@ describe("pipeline/hierarchy.ts dispatchReconAndLeads in-wave recovery (A3)", ()
 
 	const timedOut = (task: DispatchTask): DispatchResult => leadResult(task, {
 		exitCode: 1, stdout: "", stderr: "", outcome: "timed_out", timeoutReason: "inactivity",
+	});
+
+	test.each([
+		["ENOTFOUND", "getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com"],
+		["ECONNRESET", "read ECONNRESET"],
+		["fetch failed", "TypeError: fetch failed"],
+		["pending stream", "pending stream has been canceled"],
+		["no stop reason", "stream ended without a stop reason"],
+	])("provider_stall from nested worker %s resumes once, bills both attempts, and unblocks dependent wave", async (_label, error) => {
+		const { result, batches, billed, phases } = await runTwoLeadChain(true, (call, task) => call === 0
+			? leadResult(task, {
+				...timedOut(task),
+				interruption: {
+					taskId: task.taskId, reason: "inactivity_timeout", elapsedMs: 60000, sinceLastProgressMs: 60000,
+					turns: 1, toolCalls: 1, repeatedToolCalls: 0, lastProgress: "nested worker progress",
+					nestedWorkers: [{ id: "t11", turns: 9, finished: false, latestText: "trying provider", errorMessage: error }],
+					partialText: "partial report", verified: false,
+				},
+			})
+			: undefined);
+		expect(batches).toEqual([["r-lead-0"], ["r-lead-0"], ["r-lead-1"]]);
+		expect(result.resumedLeadTaskIds).toEqual(["r-lead-0"]);
+		expect(result.retriedLeadTaskIds).toEqual([]);
+		expect(result.resumedAttemptResults).toHaveLength(1);
+		expect(billed).toHaveLength(3);
+		expect(phases.some((p) => p.includes("provider_stall"))).toBe(true);
+	});
+
+	test("provider_stall on error-end resumes only once even when the resumed attempt also fails", async () => {
+		const { result, batches } = await runTwoLeadChain(true, (_call, task) => leadResult(task, {
+			exitCode: 1, outcome: "failed", stopReason: "error", stderr: "[provider error] fetch failed",
+		}));
+		expect(batches).toEqual([["r-lead-0"], ["r-lead-0"]]);
+		expect(result.resumedLeadTaskIds).toEqual(["r-lead-0"]);
+		expect(result.retriedLeadTaskIds).toEqual([]);
 	});
 
 	test("(a) lead 1 times out, lead 2 depends on it; the in-wave retry succeeds so lead 2 IS dispatched", async () => {

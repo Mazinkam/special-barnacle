@@ -777,6 +777,46 @@ describe("pipeline/run-orchestration.ts runOrchestration QA dispatch timing out 
 		expect(text).toContain("verification: PASS");
 	});
 
+	test.each([false, true])("QA provider failure with zero tools re-runs once; second provider failure=%s never reports check FAIL", async (secondFails) => {
+		const runId = `ht-orch-1700000000000-qaprovider${secondFails ? "2" : "1"}`;
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const plan = flatPlan(runId);
+		const dispatchedTaskIds: string[] = [];
+		let qaCalls = 0;
+		const outcomes: Record<string, unknown>[] = [];
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			recordOutcome: (row) => { outcomes.push(row); },
+			dispatchParallel: async (_cwd, _id, tasks) => {
+				dispatchedTaskIds.push(...tasks.map((t) => t.taskId));
+				return tasks.map((t) => {
+					if (t.capability === "qa_agent") {
+						qaCalls++;
+						const failed = qaCalls === 1 || secondFails;
+						return { taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: failed ? 1 : 0,
+							stdout: failed ? "| unit | FAIL |" : "## Verdict\nPASS", stderr: failed ? "TypeError: fetch failed" : "",
+							usage, durationMs: 1, costUsd: 0.01, costReported: true, outcome: failed ? "failed" as const : "completed" as const, filesChanged: [] };
+					}
+					return { taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"] };
+				});
+			},
+		});
+		const result = await runOrchestration(runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, fakeResolution(adapter), ctx, session, { ...claimed, session }, deps);
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(qaCalls).toBe(2);
+		expect(dispatchedTaskIds).toContain(`${runId}-qa-rerun-1`);
+		expect(dispatchedTaskIds.some((id) => id.includes("-lead-0-retry-"))).toBe(false);
+		expect(result.report.failedChecks).toEqual([]);
+		expect(outcomes.some((o) => o.task_id === `${runId}-qa` && o.outcome === "fail")).toBe(false);
+		if (secondFails) expect(buildRunSummary(result.report).text).not.toContain("verification: FAIL");
+		else expect(result.report.passedVerification).toBe(true);
+	});
+
 	test("both QA dispatches time out: report verdict starts with 'QA TIMED OUT', failedChecks is empty, no '-retry-' dispatch, summary never names `unit`", async () => {
 		const runId = "ht-orch-1700000000000-qatimeout2";
 		const session = fakeSession();

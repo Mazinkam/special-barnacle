@@ -393,9 +393,27 @@ describe("runSubagentProcess process/event handling", () => {
 			expect(result.exitCode).toBe(1);
 			expect(result.outcome).toBe("failed");
 			expect(result.stderr).toContain("usage limit");
+			expect((result.usage as typeof result.usage & { tool_calls?: number }).tool_calls).toBe(0);
 		} finally {
 			session.close();
 		}
+	});
+
+	test("error-end diagnostic carries nested worker last turn/text/errorMessage when lead stderr is empty", async () => {
+		const session = createSession("nested-provider-error");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = runSubagentProcess({ cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, env: () => process.env, capability: "lead", taskId: "nested-provider-lead", session, spawnChild: () => child as never });
+			emit({ type: "tool_execution_update", toolName: "subagent", partialResult: { details: { results: [{ taskId: "t11", agent: "worker", depth: 1, exitCode: -1, latestText: "retrying provider", errorMessage: "getaddrinfo ENOTFOUND bedrock-runtime", usage: { turns: 9, cost: 0 } }] } } });
+			emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", usage: { input: 0, output: 0, cost: { total: 0 } } } });
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.stderr).toContain("t11 (9 turns");
+			expect(result.stderr).toContain("retrying provider");
+			expect(result.stderr).toContain("ENOTFOUND");
+		} finally { session.close(); }
 	});
 
 	test("spend cap warn logs once and lets the dispatch finish", async () => {
