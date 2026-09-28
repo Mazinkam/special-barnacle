@@ -1,5 +1,12 @@
 ## Unreleased
 
+### orchestration reliability and parent-owned CI (A1–A6, N1–N2, B1–B2)
+
+- `/orchestrate` now uses the modular pipeline as its single execution path (A1); recovered lead attempts count toward the final result and escalation uses each lead's latest attempt (A2), with failed leads recovered in-wave before dependents are gated (A3).
+- QA timeouts and provider stalls are reported as unverified/unavailable rather than verification failures, with one bounded retry where applicable (A4–A5, N1); completed-but-not-exited children settle after a configurable grace period.
+- Change detection includes work outside the run tree and warns when the run repository contains the active extension (A6, N2).
+- CI checks are parent-owned: supported GitHub/GitLab checks are polled in bounded, cancellable ticks, tied to the expected repository and candidate commit, and can gate dependent waves. Failed checks can carry validated job/log evidence; missing CLI, auth, or unrecognized status stays unverified (B1). Wait-like inactivity stalls and provider stalls share a one-resume-per-lead budget, and extracted CI references become pending checks (B2).
+
 ### tests: split large test files (B5)
 
 - `bridge/extensions/orchestrator/index.test.ts` split alongside each new module, with the
