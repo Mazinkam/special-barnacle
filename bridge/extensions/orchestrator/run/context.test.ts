@@ -32,6 +32,15 @@ describe("RunRegistry", () => {
 		expect(claimed!.aliasTable).toBeNull();
 	});
 
+	test("claim() carries run-local routing candidates and model health", () => {
+		const registry = new RunRegistry<ReturnType<typeof fakeSession>>();
+		const candidates = { worker: [{ model: "p/m", spec: "p/m", source: "primary" as const, qualified: true, reasons: [], effortControl: false }] };
+		const modelHealth = { isHealthy: () => true } as never;
+		const claimed = registry.claim(fakeSession("a"), {}, null, null, { candidates, modelHealth });
+		expect(claimed!.candidates).toBe(candidates);
+		expect(claimed!.modelHealth).toBe(modelHealth);
+	});
+
 	test("tags is the same mutable object handed back by claim() — later mutation is visible through the context", () => {
 		const registry = new RunRegistry<ReturnType<typeof fakeSession>>();
 		const claimed = registry.claim(fakeSession("a"))!;
