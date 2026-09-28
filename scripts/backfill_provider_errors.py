@@ -17,7 +17,7 @@ CODES = (
     ('ECONNRESET', re.compile(r'\bECONNRESET\b', re.I)),
     ('ETIMEDOUT', re.compile(r'\bETIMEDOUT\b', re.I)),
     ('fetch_failed', re.compile(r'\bfetch failed\b', re.I)),
-    ('stream_canceled', re.compile(r'\bstream (?:has been |was )?cance(?:led|lled)\b', re.I)),
+    ('stream_canceled', re.compile(r'\b(?:pending )?stream (?:has been |was )?cance(?:led|lled)\b', re.I)),
     ('stream_no_stop_reason', re.compile(r'\b(?:stream ended without (?:a )?stop reason|no stop reason)\b', re.I)),
     ('http_5xx', re.compile(r'\b(?:HTTP|status(?: code)?|error|code)[\s:=#/-]+5\d\d\b', re.I)),
 )
@@ -28,7 +28,7 @@ MODEL = re.compile(r'\b([a-zA-Z0-9_-]{1,48})/[a-zA-Z0-9._/-]{1,120}\b')
 def backfill(root: Path, *, write: bool = False) -> dict[str, int]:
     """Scan only regular logs below root/runs, never following a symlink out of root."""
     root = Path(root)
-    if write and root.absolute() == default_state_root().absolute():
+    if write and root.resolve() == default_state_root().resolve():
         raise ValueError('refusing to write the live default state directory')
     if root.is_symlink() or not root.is_dir():
         raise ValueError('state directory must be an existing, non-symlink directory')

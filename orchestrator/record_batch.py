@@ -109,9 +109,12 @@ def validate_batch(records: Any) -> list[dict[str, Any]]:
                 if name in record and record[name] not in choices:
                     raise BatchValidationError(f'{where} has invalid {name}')
             if record['event'] == 'provider_error':
-                forbidden = {'stderr', 'message', 'error_message', 'raw_error', 'url'} & record.keys()
-                if forbidden:
-                    raise BatchValidationError(f'{where} contains raw provider evidence: {sorted(forbidden)}')
+                allowed = {'stream', 'record_id', 'event', 'ts', 'source', *spec['fields']}
+                unexpected = record.keys() - allowed
+                if unexpected:
+                    raise BatchValidationError(f'{where} has unsupported provider_error fields: {sorted(unexpected)}')
+                if 'source' in record and record['source'] != 'legacy_provider_backfill':
+                    raise BatchValidationError(f'{where} has invalid provider_error source')
                 if record.get('error_code') not in spec['error_code_values']:
                     raise BatchValidationError(f'{where} has invalid error_code')
                 host = record.get('endpoint_host')
