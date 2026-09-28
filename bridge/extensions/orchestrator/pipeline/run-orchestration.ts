@@ -484,6 +484,7 @@ export async function runOrchestration(
 		model: leadModel,
 		source: leadDecision.source,
 	});
+	session.log(`run settings: profile=${resolved.profileName} complexity=${effectiveComplexity} risk=${effectiveRisk} lead-size=${leadDecision.size}`);
 	session.log(`lead size: ${leadDecision.size} → ${leadDecision.capability} on ${leadModel} (source: ${leadDecision.source})`);
 
 	const needsArchitect = plan.topology.depth >= 2 && complexityNeedsArchitect(plan.complexity);

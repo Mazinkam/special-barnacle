@@ -673,7 +673,6 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 				return;
 			}
 			deps.recordRunStarted(runId, ctx.sessionManager?.getSessionFile?.() ?? null);
-			session.log(`run settings: profile=${resolved.profileName} complexity=${parsed.complexity} risk=${parsed.risk} lead-size=${parsed.leadSize ?? "auto"}`);
 			session.log(`policy: ${claimed.tags.policy_id}`);
 			session.log(`models (profile "${resolved.profileName}"):\n${formatAdapterTable(resolved).map((l) => `  ${l}`).join("\n")}`);
 			for (const n of resolved.notes) session.log(`note: ${n}`);

@@ -534,7 +534,7 @@ describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (
 		expect(recordRunStartedCalls[0].runId.startsWith("ht-orch-")).toBe(true);
 	});
 
-	test("nested command prefixes apply boundary flags and log effective settings without goal text", async () => {
+	test("nested command prefixes apply boundary flags without logging pre-triage settings", async () => {
 		const { pi, getHandler } = fakePi();
 		const logs: string[] = [];
 		const session = { ...fakeRunSessionLike("placeholder"), log: (line: string) => { logs.push(line); } };
@@ -557,7 +557,7 @@ describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (
 		expect(captured?.complexity).toBe(8);
 		expect(captured?.risk).toBe("high");
 		expect(captured?.leadSize).toBe("large");
-		expect(logs.some((line) => line.includes("profile=lean") && line.includes("complexity=8") && line.includes("risk=high") && line.includes("lead-size=large"))).toBe(true);
+		expect(logs.some((line) => line.startsWith("run settings:"))).toBe(false);
 		expect(logs.join("\n")).not.toContain("confidential auth flow");
 	});
 

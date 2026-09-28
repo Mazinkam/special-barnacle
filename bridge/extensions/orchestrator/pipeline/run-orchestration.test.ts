@@ -120,6 +120,35 @@ function fakeDeps(overrides: Partial<RunOrchestrationDeps> = {}): RunOrchestrati
 const claimed: RunContext<RunSession> = { session: undefined as unknown as RunSession, tags: {}, aliasTable: null };
 
 describe("pipeline/run-orchestration.ts runOrchestration", () => {
+	test.each([
+		{ name: "unflagged triage", args: { taskClass: "implementation" as const, complexity: 5, risk: "medium" as const }, triage: { task_class: "bugfix" as const, complexity: 2, risk: "low" as const, reasoning: "small fix" }, expected: "small" },
+		{ name: "auto lead sizing", args: { complexity: 8, risk: "high" as const }, triage: null, expected: "large" },
+		{ name: "explicit lead size", args: { complexity: 8, risk: "high" as const, leadSize: "small" as const }, triage: null, expected: "small" },
+	])("logs one effective run settings line after $name selection before dispatch, without the goal", async ({ args, triage, expected }) => {
+		const session = fakeSession();
+		let confirmations = 0;
+		const { ctx } = fakeCtx({ confirm: () => ++confirmations === 1 && triage !== null });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		resolved.profileName = "lean";
+		const logs = (session as unknown as { _logs: string[] })._logs;
+		const deps = fakeDeps({
+			triageTask: async () => triage,
+			planRun: async () => ({
+				plan_id: "plan-123456789012", run_id: "run", task_class: "bugfix", complexity: 5, risk: "medium",
+				topology: { depth: 1, leads: 1, workers: 1, shape: "flat" },
+				route: { selected: { capability: "lead", effort: "medium", verification_depth: "standard" }, recommended: { capability: "lead", effort: "medium", verification_depth: "standard" }, mode: "auto", history_sufficient: true, explanation: {} },
+				effective_quality_floor: 0.5, cost_aggressiveness: 0.5,
+			}),
+		});
+		const result = await runOrchestration("run", "/tmp/cwd", fakeArgs({ goal: "confidential auth flow", interactive: true, ...args }), adapter, resolved, ctx, session, { ...claimed, session }, deps);
+		expect(result.kind).toBe("aborted");
+		const settings = logs.filter((line) => line.startsWith("run settings:"));
+		expect(settings).toEqual([`run settings: profile=lean complexity=${triage?.complexity ?? args.complexity} risk=${triage?.risk ?? args.risk} lead-size=${expected}`]);
+		expect(settings[0]).not.toContain("confidential auth flow");
+		const leadIndex = logs.findIndex((line) => line.startsWith("lead size:"));
+		expect(leadIndex).toBeGreaterThan(logs.indexOf(settings[0]));
+	});
 	test("plan failing outright aborts the run: failRun'd, notified, no RunReport", async () => {
 		const session = fakeSession();
 		const { ctx, notifications } = fakeCtx();
