@@ -4279,6 +4279,27 @@ describe("nested subagent cost rows (Phase 1 item 2)", () => {
 	});
 	const leadTask: DispatchTask[] = [{ capability: "lead", task: "lead work", taskId: "run-lead" }];
 
+	test("primary dispatch reports normalized provider evidence and failure disposition", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		await orchestrator.dispatchParallel(process.cwd(), "run", leadTask,
+			{ lead: { model: "provider/lead-model" } }, {} as never, 0, {
+				recordEvent: (e, p) => { events.push([e, p]); },
+				runProcess: async () => nestedProc({ outcome: "failed", exitCode: 1,
+					stderr: "read ECONNRESET https://api.example.org/private?token=secret",
+					nestedProviderErrors: [
+						{ message: "read ECONNRESET https://api.example.org/one", timestamp: "2026-01-01T00:00:00.000Z" },
+						{ message: "read ECONNRESET https://api.example.org/two", timestamp: "2026-01-01T00:00:01.000Z" },
+					],
+				}),
+			});
+		const finished = events.find(([e]) => e === "dispatch_finished")?.[1];
+		expect(finished).toMatchObject({ outcome: "failed", failure_class: "transient", provider: "provider", provider_model: "lead-model", error_code: "ECONNRESET" });
+		const errors = events.filter(([e]) => e === "provider_error").map(([, p]) => p);
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toMatchObject({ endpoint_host: "api.example.org", error_code: "ECONNRESET", count: 3 });
+		expect(JSON.stringify(errors)).not.toMatch(/private|secret|https:/);
+	});
+
 	test("one row per nested call, tagged nested/nesting_depth, and nested_rows_emitted matches", async () => {
 		const calls: Record<string, unknown>[] = [];
 		const events: Array<[string, Record<string, unknown>]> = [];

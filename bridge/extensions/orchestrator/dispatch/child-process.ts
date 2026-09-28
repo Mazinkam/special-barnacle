@@ -175,6 +175,8 @@ export interface SubagentProcessResult {
 		ciRefs?: Array<{ provider: "gitlab" | "github"; kind: "pipeline" | "run"; id: string }>;
 	};
 	interruption?: InterruptionReport;
+	/** Bounded provider/network evidence from nested-worker snapshots; never persisted verbatim in telemetry. */
+	nestedProviderErrors?: Array<{ message: string; timestamp: string }>;
 	/** Raw child exit code before terminal-result recovery. */
 	processExitCode: number;
 	/** Teardown error retained alongside a valid settled result. */
@@ -553,6 +555,7 @@ export async function runSubagentProcess(opts: {
 		const nestedCost = new NestedCostTracker();
 		/** Own turns plus the child's own subagent calls: what the dispatch has cost so far. */
 		const spentSoFar = () => events.usage.cost + nestedCost.total();
+		const nestedProviderErrors: Array<{ message: string; timestamp: string }> = [];
 		let timedOut = false;
 		let cancelledByListener = false;
 		let timeoutReason: "inactivity" | "absolute" | undefined;
@@ -746,6 +749,7 @@ export async function runSubagentProcess(opts: {
 				timeoutReason,
 				toolInFlight,
 				interruption,
+				nestedProviderErrors,
 				postCompletionError: outcome.status === "completed_after_process_error" ? outcome.note : undefined,
 				postEndGraceExpired: postEndGraceExpired ? true : undefined,
 			});
@@ -768,6 +772,11 @@ export async function runSubagentProcess(opts: {
 			if (settled) return;
 			const now = Date.now();
 			const observation = cancelledByListener ? undefined : progressTracker?.observe(event, now);
+			for (const worker of observation?.nested ?? []) {
+				if (worker.errorMessage && nestedProviderErrors.length < 128) {
+					nestedProviderErrors.push({ message: worker.errorMessage.slice(0, 16_384), timestamp: new Date(now).toISOString() });
+				}
+			}
 			// The one place cost/turns/model/stopReason/settled-flags are derived from
 			// the raw event (dispatch/child-events.ts); both the board update below
 			// and this function's own bookkeeping consume its delta instead of each

@@ -118,6 +118,7 @@ import {
 	summarizeStderr,
 	trimEventForLog,
 } from "./dispatch/stderr-sink.ts";
+import { dispatchHealth, recordProviderErrors } from "./dispatch/provider-health.ts";
 import {
 	DispatchProgressTracker,
 	ORCHESTRATING_CAPABILITIES,
@@ -848,6 +849,7 @@ interface SubagentProcessResult {
 	outcome: "completed" | "completed_after_process_error" | "failed" | "timed_out" | "cancelled";
 	timeoutReason?: "inactivity" | "absolute";
 	interruption?: InterruptionReport;
+	nestedProviderErrors?: Array<{ message: string; timestamp: string }>;
 	/** Raw child exit code before terminal-result recovery. */
 	processExitCode: number;
 	/** Teardown error retained alongside a valid settled result. */
@@ -1936,6 +1938,7 @@ export async function runSubagentProcess(opts: {
 		const nestedCost = new NestedCostTracker();
 		/** Own turns plus the child's own subagent calls: what the dispatch has cost so far. */
 		const spentSoFar = () => usage.cost + nestedCost.total();
+		const nestedProviderErrors: Array<{ message: string; timestamp: string }> = [];
 		let costReported = false;
 		let stopReason: string | undefined;
 		let sawAgentSettled = false;
@@ -2112,6 +2115,7 @@ export async function runSubagentProcess(opts: {
 				processExitCode,
 				timeoutReason,
 				interruption,
+				nestedProviderErrors,
 				postCompletionError: outcome.status === "completed_after_process_error" ? outcome.note : undefined,
 				telemetry: telemetryTracker.fields(usage.turns),
 			});
@@ -2176,6 +2180,11 @@ export async function runSubagentProcess(opts: {
 			if (settled) return;
 			const now = Date.now();
 			const observation = cancelledByListener ? undefined : progressTracker?.observe(event, now);
+			for (const worker of observation?.nested ?? []) {
+				if (worker.errorMessage && nestedProviderErrors.length < 128) {
+					nestedProviderErrors.push({ message: worker.errorMessage.slice(0, 16_384), timestamp: new Date(now).toISOString() });
+				}
+			}
 			session?.onChildEvent(taskId, event);
 			if (event.type === "agent_settled") sawAgentSettled = true;
 			if (event.type === "agent_end") sawAgentEnd = true;
@@ -3173,11 +3182,13 @@ export async function dispatchParallel(
 			let ownNestedCostUsd = r.nestedCostUsd;
 			if (twin) {
 				const first = r;
+				recordProviderErrors(deps.recordEvent, { runId, taskId: input._taskId }, first);
 				const firstNestedRows = nestedModelCallRowsFor({
 					runId, parentTaskId: input._taskId ?? `unknown-${runId}`, dispatchDepth: depth, dispatchAttempt: 0,
 				}, first.nestedCalls ?? []);
 				for (const row of firstNestedRows) (deps.recordModelCall ?? recordModelCall)(row);
 				deps.recordEvent("dispatch_finished", {
+					...dispatchHealth({ ...first, model: first.model ?? input.model }),
 					run_id: runId, task_id: input._taskId, capability: input._capability, model: first.model ?? input.model,
 					exit_code: first.exitCode, duration_ms: first.durationMs, cost_usd: first.costUsd,
 					nested_cost_usd: first.nestedCostUsd, nested_rows_emitted: firstNestedRows.length, dispatch_attempt: 0,
@@ -3217,7 +3228,9 @@ export async function dispatchParallel(
 				runId, parentTaskId: input._taskId ?? `unknown-${runId}`, dispatchDepth: depth, dispatchAttempt,
 			}, ownNestedCalls ?? []);
 			for (const row of nestedRows) (deps.recordModelCall ?? recordModelCall)(row);
+			recordProviderErrors(deps.recordEvent, { runId, taskId: input._taskId, dispatchAttempt }, r);
 			deps.recordEvent("dispatch_finished", {
+				...dispatchHealth({ ...r, model: r.model ?? input.model }),
 				run_id: runId,
 				task_id: input._taskId,
 				capability: input._capability,

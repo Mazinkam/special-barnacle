@@ -23,6 +23,7 @@ import { METHOD, type AliasTable } from "../models.ts";
 import { bedrockFallbackFor, isQuotaError } from "../provider-fallback.ts";
 import type { RunContext } from "../run/context.ts";
 import { summarizeStderr } from "./stderr-sink.ts";
+import { dispatchHealth, recordProviderErrors } from "./provider-health.ts";
 import type { DispatchSession } from "./child-process.ts";
 import { runSubagentProcess } from "./child-process.ts";
 
@@ -214,7 +215,9 @@ export async function dispatchParallel(
 				r.stopReason !== "spend_cap" && !session?.cancellation.isCancelled;
 			const twin = eligible && table && isQuotaError(r.stderr) ? bedrockFallbackFor(input.model, table) : null;
 			if (twin) {
+				recordProviderErrors(deps.recordEvent, { runId, taskId: input._taskId }, r);
 				deps.recordEvent("dispatch_finished", {
+					...dispatchHealth({ ...r, model: r.model ?? input.model }),
 					run_id: runId, task_id: input._taskId, capability: input._capability, model: r.model ?? input.model,
 					exit_code: r.exitCode, duration_ms: r.durationMs, cost_usd: r.costUsd, turns: r.usage.turns,
 					stop_reason: r.stopReason, log_dir: session?.dir, superseded_by_fallback: true,
@@ -236,7 +239,9 @@ export async function dispatchParallel(
 					durationMs: first.durationMs + second.durationMs,
 				};
 			}
+			recordProviderErrors(deps.recordEvent, { runId, taskId: input._taskId, dispatchAttempt: twin ? 1 : 0 }, r);
 			deps.recordEvent("dispatch_finished", {
+				...dispatchHealth({ ...r, model: r.model ?? (twin || input.model) }),
 				run_id: runId,
 				task_id: input._taskId,
 				capability: input._capability,

@@ -2,6 +2,20 @@
   "schema_version": 1,
   "description": "Values shared verbatim between the Python engine (orchestrator/contract.py) and the HT bridge (bridge/extensions/orchestrator/*.ts, via the symlinked copy of this file). This is the on-disk layout and CLI wire contract: stream file names, protected file names, the durable-write CLI's exit codes and body statuses, batch/id limits, the path-redaction regexes and the state-root environment variables/default. It does NOT hold orchestration method vocabulary (capabilities, tiers, effort, roles) — that lives in method.json. Editing this file edits the on-disk contract for both runtimes at once; keep both sides' behaviour identical except where a field is explicitly documented as intentionally different (see redaction_regex).",
 
+  "telemetry_events": {
+    "dispatch_finished": {
+      "fields": ["outcome", "timeout_reason", "failure_class", "provider", "provider_model", "error_code"],
+      "outcome_values": ["completed", "completed_after_process_error", "failed", "timed_out", "cancelled"],
+      "failure_class_values": ["provider_stall", "wait_stall", "transient", "quota", "task", "cancelled"],
+      "_note": "Existing model remains the full dispatch model id; provider_model is its short normalized component. Optional failure_class only applies to non-successful dispositions."
+    },
+    "provider_error": {
+      "fields": ["run_id", "task_id", "dispatch_attempt", "provider", "model", "error_code", "endpoint_host", "count", "first_ts", "last_ts"],
+      "error_code_values": ["ENOTFOUND", "ECONNRESET", "ETIMEDOUT", "fetch_failed", "stream_canceled", "stream_no_stop_reason", "http_5xx", "quota"],
+      "_note": "Only normalized evidence; endpoint_host is an optional hostname without scheme, path, or credentials. No raw stderr or error message. Repeated evidence is aggregated within a dispatch attempt."
+    }
+  },
+
   "streams": {
     "event": "events.jsonl",
     "metric": "metrics.jsonl",

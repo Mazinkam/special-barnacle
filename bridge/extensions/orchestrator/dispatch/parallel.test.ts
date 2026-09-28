@@ -79,6 +79,26 @@ describe("recon tool boundary", () => {
 	});
 });
 
+test("dispatch telemetry includes disposition and deduplicated nested provider evidence", async () => {
+ const events: Array<[string, Record<string, unknown>]> = [];
+ await dispatchParallel(process.cwd(), "run", [{ capability: "scout", task: "inspect", taskId: "run-scout" }],
+  { scout: { model: "vendor/model" } }, {} as never, null, 0, {
+   recordEvent: (event, payload) => { events.push([event, payload]); }, maxConcurrentDispatches: 1,
+   runProcess: async () => ({ exitCode: 124, stdout: "", finalText: "", rawStdout: "", personaCanMutate: false,
+    stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+    costUsd: 0, costReported: false, durationMs: 1, processExitCode: 124, outcome: "timed_out" as const,
+    timeoutReason: "inactivity" as const, nestedProviderErrors: [
+     { message: "read ECONNRESET", timestamp: "2026-01-01T00:00:00.000Z" },
+     { message: "read ECONNRESET", timestamp: "2026-01-01T00:00:02.000Z" },
+    ] }),
+  });
+ expect(events.find(([name]) => name === "dispatch_finished")?.[1]).toMatchObject({ outcome: "timed_out", timeout_reason: "inactivity", failure_class: "provider_stall", provider: "vendor", model: "vendor/model", provider_model: "model", error_code: "ECONNRESET" });
+ expect(events.filter(([name]) => name === "provider_error").map(([, payload]) => payload)).toEqual([
+  expect.objectContaining({ run_id: "run", task_id: "run-scout", error_code: "ECONNRESET", count: 2,
+   first_ts: "2026-01-01T00:00:00.000Z", last_ts: "2026-01-01T00:00:02.000Z" }),
+ ]);
+});
+
 describe("codex -> Bedrock quota fallback (Phase A)", () => {
 	const table = buildAliasTable([
 		{ provider: "openai-codex", id: "gpt-6-astra" },
@@ -103,7 +123,7 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 				runProcess: async (opts) => {
 					models.push(opts.model);
 					return models.length === 1
-						? proc({ exitCode: 1, stderr: "usage limit reached for this account", costUsd: 0, costReported: true,
+						? proc({ exitCode: 1, outcome: "failed", stderr: "usage limit reached for this account", costUsd: 0, costReported: true,
 							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 } })
 						: proc({ model: "amazon-bedrock/global.openai.gpt-6-astra" });
 				},
@@ -112,6 +132,10 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.model).toBe("amazon-bedrock/global.openai.gpt-6-astra");
 		expect(result.taskId).toBe("run-sec");
+		const finished = events.filter(([e]) => e === "dispatch_finished");
+		expect(finished).toHaveLength(2);
+		expect(finished[0][1]).toMatchObject({ outcome: "failed", failure_class: "quota", provider: "openai-codex", provider_model: "gpt-6-astra" });
+		expect(finished[1][1]).toMatchObject({ outcome: "completed", provider: "amazon-bedrock", provider_model: "global.openai.gpt-6-astra" });
 		const degraded = events.filter(([e]) => e === "route_degraded");
 		expect(degraded).toHaveLength(1);
 		expect(degraded[0][1]).toMatchObject({ from_model: "openai-codex/gpt-6-astra", to_model: "amazon-bedrock/global.openai.gpt-6-astra", reason: "provider_quota" });
