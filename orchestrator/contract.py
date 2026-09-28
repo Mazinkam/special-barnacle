@@ -24,6 +24,7 @@ _CONTRACT: dict[str, Any] = json.loads(_CONTRACT_PATH.read_text(encoding='utf-8'
 #: Stream name -> JSONL file name (`record_index.STREAMS`, and former copies in
 #: runtime.py/archive.py/dashboard.py/history.py/outcomes.py/ingest_checkpoint.py).
 STREAMS: dict[str, str] = dict(_CONTRACT['streams'])
+TELEMETRY_EVENTS: dict[str, dict[str, Any]] = dict(_CONTRACT.get('telemetry_events', {}))
 
 #: Receipt file for the last ingest attempt (`cli.py`, `dashboard.py`, `archive.py`).
 INGEST_STATUS_FILE: str = _CONTRACT['ingest_status_file']

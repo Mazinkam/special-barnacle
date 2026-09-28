@@ -41,6 +41,7 @@ from .presentation.dashboard_data import (
     _verification_task_ids,
     build_data,
     build_ingest_status,
+    provider_health,
     tail_ratio,
 )
 from .presentation.dashboard_html import _LONE_SURROGATE, safe
@@ -53,7 +54,7 @@ from .presentation import publish as _publish
 __all__ = [
     'RECENT_EVENTS', 'RECENT_METRICS', 'RECENT_ADAPTIVE', 'RECENT_RUNS', 'RECENT_SPEND_CAP_BREACHES',
     'MIN_TAIL_SAMPLES', 'INSTRUMENTATION', 'EXECUTED_MIRROR_TOLERANCE', 'LEAD_SIZE_ORDER',
-    'safe', 'tail_ratio', 'build_ingest_status', 'build_data',
+    'safe', 'tail_ratio', 'build_ingest_status', 'provider_health', 'build_data',
     'stream_version', 'dashboard_is_current', 'generate_dashboard',
 ]
 

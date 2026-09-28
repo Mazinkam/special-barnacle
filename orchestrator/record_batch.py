@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import secrets
 import sqlite3
 from pathlib import Path
@@ -44,6 +45,7 @@ from .contract import (
     STATUS_OK,
     STATUS_REFRESH_FAILED,
     STREAMS,
+    TELEMETRY_EVENTS,
 )
 
 FORMAT_VERSION = 1
@@ -100,6 +102,24 @@ def validate_batch(records: Any) -> list[dict[str, Any]]:
         seen.add(record_id)
         if stream == 'event' and (not isinstance(record.get('event'), str) or not record['event'].strip()):
             raise BatchValidationError(f'{where} is an event record without a non-empty event name')
+        if stream == 'event' and record.get('event') in TELEMETRY_EVENTS:
+            spec = TELEMETRY_EVENTS[record['event']]
+            for field, choices in ((key, values) for key, values in spec.items() if key.endswith('_values')):
+                name = field.removesuffix('_values')
+                if name in record and record[name] not in choices:
+                    raise BatchValidationError(f'{where} has invalid {name}')
+            if record['event'] == 'provider_error':
+                forbidden = {'stderr', 'message', 'error_message', 'raw_error', 'url'} & record.keys()
+                if forbidden:
+                    raise BatchValidationError(f'{where} contains raw provider evidence: {sorted(forbidden)}')
+                if record.get('error_code') not in spec['error_code_values']:
+                    raise BatchValidationError(f'{where} has invalid error_code')
+                host = record.get('endpoint_host')
+                if host is not None and (not isinstance(host, str) or not re.fullmatch(r'[a-z0-9.-]{1,253}', host)):
+                    raise BatchValidationError(f'{where} has invalid endpoint_host')
+                count = record.get('count')
+                if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+                    raise BatchValidationError(f'{where} has invalid count')
         bad_key = invalid_key_field(record)
         if bad_key is not None:
             raise BatchValidationError(f'{where} has {bad_key} {record[bad_key]!r}; identifier fields '

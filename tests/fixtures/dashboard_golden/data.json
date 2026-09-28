@@ -821,6 +821,14 @@
       "verified_cost": null
     }
   ],
+  "provider_health": {
+    "errors_by_hour": [],
+    "failed_dispatch_cost_usd": null,
+    "failed_dispatches": 0,
+    "first_failure_provider_run_ids": [],
+    "first_failure_provider_runs": 0,
+    "outage_windows": []
+  },
   "routes": [
     {
       "avg_call_cost_usd": null,

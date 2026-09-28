@@ -614,6 +614,9 @@ class DashboardAggregateTests(SyntheticRootTestCase):
         self.freeze_outcome_clock()
         expected = normalized(reference_build_data(self.root, config={}))
         actual = normalized(dashboard.build_data(self.root, config={}))
+        expected['provider_health'] = {'errors_by_hour': [], 'outage_windows': [], 'failed_dispatches': 0,
+                                       'failed_dispatch_cost_usd': None, 'first_failure_provider_runs': 0,
+                                       'first_failure_provider_run_ids': []}
         self.assertEqual(sorted(actual), sorted(expected))
         for key in expected:
             with self.subTest(field=key):
@@ -666,6 +669,9 @@ class DashboardAggregateTests(SyntheticRootTestCase):
         self.freeze_outcome_clock()
         expected = normalized(reference_build_data(self.root, config={}))
         actual = normalized(dashboard.build_data(self.root, config={}))
+        expected['provider_health'] = {'errors_by_hour': [], 'outage_windows': [], 'failed_dispatches': 0,
+                                       'failed_dispatch_cost_usd': None, 'first_failure_provider_runs': 0,
+                                       'first_failure_provider_run_ids': []}
         assert_same_data(self, actual, expected)
         self.assertEqual(actual['ingest_status']['status'], 'unknown')
         self.assertEqual(actual['summary']['executed_spend']['rows'], 0)

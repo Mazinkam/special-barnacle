@@ -30,7 +30,7 @@ returned, in the same key order.
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -385,6 +385,73 @@ def _spend_caps(cap_events: list[dict], runs: list[dict]) -> dict[str, Any]:
             'by_capability': out, 'recent': recent}
 
 
+def provider_health(events: list[dict], *, now: datetime) -> dict[str, Any]:
+    """Seven-day normalized provider evidence and failed dispatches; no headline spend mutation."""
+    now = now.astimezone(timezone.utc)
+    cutoff = now - timedelta(days=7)
+    hours: dict[tuple[str, str], int] = defaultdict(int)
+    errors: dict[tuple[str, str], list[tuple[datetime, datetime, int, str | None]]] = defaultdict(list)
+    failed = []
+    first_by_run: dict[str, dict] = {}
+    for row in events:
+        if row.get('event') not in ('provider_error', 'dispatch_finished'):
+            continue
+        ts = _parse_row_ts(row.get('ts'))
+        if ts is None:
+            continue
+        ts = ts.astimezone(timezone.utc)
+        if row['event'] == 'dispatch_finished':
+            run_id = row.get('run_id')
+            if run_id is not None and row.get('outcome') in ('failed', 'timed_out'):
+                rid = str(run_id)
+                if rid not in first_by_run or ts < first_by_run[rid]['_ts']:
+                    first_by_run[rid] = {'_ts': ts, 'row': row}
+            if cutoff <= ts <= now and row.get('outcome') in ('failed', 'timed_out', 'cancelled'):
+                failed.append(row)
+            continue
+        start = _parse_row_ts(row.get('first_ts')) or ts
+        end = _parse_row_ts(row.get('last_ts')) or start
+        start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+        if end < cutoff or start > now or end < start:
+            continue
+        provider, code = row.get('provider'), row.get('error_code')
+        if not provider or not code:
+            continue
+        count = row.get('count')
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            continue
+        hours[(str(provider), start.replace(minute=0, second=0, microsecond=0).isoformat())] += count
+        errors[(str(provider), str(code))].append((start, end, count, str(row['run_id']) if row.get('run_id') is not None else None))
+    windows = []
+    for (provider, code), group in sorted(errors.items()):
+        active = None
+        for start, end, count, rid in sorted(group):
+            if active is None or (start - active['end_dt']) >= timedelta(minutes=10):
+                if active:
+                    windows.append(active)
+                active = {'provider': provider, 'error_code': code, 'start': start.isoformat(),
+                          'end_dt': end, 'count': count, '_runs': {rid} if rid else set()}
+            else:
+                active['end_dt'] = max(active['end_dt'], end)
+                active['count'] += count
+                if rid:
+                    active['_runs'].add(rid)
+        if active:
+            windows.append(active)
+    outages = [{'provider': w['provider'], 'error_code': w['error_code'], 'start': w['start'],
+                'end': w['end_dt'].isoformat(), 'count': w['count'], 'runs': len(w['_runs'])}
+               for w in windows]
+    ids = sorted(rid for rid, entry in first_by_run.items()
+                 if cutoff <= entry['_ts'] <= now and entry['row'].get('outcome') in ('failed', 'timed_out')
+                 and entry['row'].get('failure_class') in ('provider_stall', 'transient', 'quota'))
+    costs = [_num(r.get('cost_usd')) for r in failed if r.get('cost_usd') is not None]
+    return {'errors_by_hour': [{'hour': hour, 'provider': provider, 'count': count}
+                               for (provider, hour), count in sorted(hours.items(), key=lambda x: (x[0][1], x[0][0]))],
+            'outage_windows': sorted(outages, key=lambda w: (w['start'], w['provider'], w['error_code'])),
+            'failed_dispatches': len(failed), 'failed_dispatch_cost_usd': sum(costs) if costs else None,
+            'first_failure_provider_runs': len(ids), 'first_failure_provider_run_ids': ids}
+
+
 def build_ingest_status(raw: Any, *, now: datetime) -> dict[str, Any]:
     """Validate persisted ingest health and derive staleness without trusting its contents."""
     unknown = {
@@ -636,6 +703,7 @@ def build_data(root: Path, config: dict | None = None):
     conflict_rows = 0
     invalidations = 0
     run_events = []
+    health_events = []
     cap_events = []
     recent_events: deque[dict] = deque(maxlen=RECENT_EVENTS)
     for event in unique_records(iter_jsonl(root / STREAMS['event'])):
@@ -647,6 +715,8 @@ def build_data(root: Path, config: dict | None = None):
         invalidations += kind == 'decision_invalidated'
         if kind == SPEND_CAP_EVENT:
             cap_events.append(event)
+        if kind in ('provider_error', 'dispatch_finished'):
+            health_events.append(event)
         if event.get('run_id') is not None or kind == 'decision_invalidated':
             run_events.append(event)
     outcomes = list(unique_records(iter_jsonl(root / STREAMS['outcome'])))
@@ -822,6 +892,7 @@ def build_data(root: Path, config: dict | None = None):
             'run_evidence': run_cov, 'runs': runs[-RECENT_RUNS:],
             'lead_sizes': _lead_sizes(orchestrated, runs),
             'spend_caps': spend_caps,
+            'provider_health': provider_health(health_events, now=datetime.now(timezone.utc)),
             'nested_reconciliation_ambiguous': nested['ambiguous'],
             # flaky_stats only matches rows with event=='verification_result'; session-ingest rows
             # are event=='model_call' and never contribute, but we pass `orchestrated` for
