@@ -94,6 +94,12 @@ describe("core/live-tree.ts extractForeignPath", () => {
 	test("finds a `cwd: <path>` reference outside the run root", () => {
 		expect(extractForeignPath(["tool call: cwd: /elsewhere/repo did the thing"], "/repo")).toBe("/elsewhere/repo");
 	});
+	test("does not misidentify a symlink alias of the run root as foreign", () => {
+		expect(extractForeignPath(["cd /var/repo"], "/private/var/repo", (p) => p.replace(/^\/var\//, "/private/var/"))).toBeNull();
+	});
+	test("normalizes parent segments before comparing paths", () => {
+		expect(extractForeignPath(["cd /repo/sub/../../other"], "/repo")).toBe("/other");
+	});
 	test("finds a `cwd=<path>` reference outside the run root", () => {
 		expect(extractForeignPath(['cwd="/elsewhere/repo"'], "/repo")).toBe("/elsewhere/repo");
 	});
@@ -126,6 +132,18 @@ describe("core/live-tree.ts detectOutOfTreeChanges / outOfTreeChangesSummaryLine
 			observedFiles: ["a.ts"],
 			leadTexts: ["cd /elsewhere; edit a.ts"],
 			runRoot: "/repo",
+		});
+		expect(result.detected).toBe(false);
+	});
+	test("foreign cd with no claims and no git-observed changes is still reported", () => {
+		const result = detectOutOfTreeChanges({
+			claimedFiles: [], observedFiles: [], leadTexts: ["tool: cd /other/worktree && git status"], runRoot: "/repo",
+		});
+		expect(outOfTreeChangesSummaryLine(result)).toBe("changes outside run tree: /other/worktree");
+	});
+	test("foreign cd is not reported when the run tree did change", () => {
+		const result = detectOutOfTreeChanges({
+			claimedFiles: [], observedFiles: ["src/a.ts"], leadTexts: ["cd /other/worktree"], runRoot: "/repo",
 		});
 		expect(result.detected).toBe(false);
 	});

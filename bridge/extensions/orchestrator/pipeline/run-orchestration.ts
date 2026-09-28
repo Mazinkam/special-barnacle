@@ -530,18 +530,20 @@ export async function runOrchestration(
 	};
 	let allFiles = changedSince("lead phase", leadResults);
 
-	// A6/N2: leads claimed changing files, but this run's own git tree shows none of them — most
-	// often because a lead worked in a different git worktree/repo instead of this run's own tree.
-	// Warn-only: never blocks, never alters `allFiles`/QA scope. Reuses `allFiles` (just computed
-	// above) as the "observed" side rather than recomputing anything, and the union of every lead's
-	// own `filesChanged` (via `candidateOwnedFilesForLiveQa`, already used the same way below for
-	// the live-QA stage) as the "claimed" side.
+	// A6/N2: the run's tree shows no changes although leads claimed changes or named a foreign
+	// cd/cwd. Warn-only: never blocks or alters `allFiles`/QA scope. Reuses the git-observed
+	// `allFiles` above and each lead's own `filesChanged` as evidence.
 	const leadClaimedFiles = candidateOwnedFilesForLiveQa(leadResults);
+	// `cwd` can be a subdirectory; git's changed paths are relative to the repository root.
+	// Comparing cd targets to cwd would mislabel an in-repo cd as another worktree.
+	const gitRoot = REAL_LIVE_TREE_SEAMS.gitToplevel(cwd);
+	const runTreeRoot = gitRoot ? (REAL_LIVE_TREE_SEAMS.realpath(gitRoot) ?? gitRoot) : repoRoot;
 	const outOfTreeChanges = detectOutOfTreeChanges({
 		claimedFiles: leadClaimedFiles,
 		observedFiles: allFiles,
 		leadTexts: leadResults.map((r) => r.stdout),
-		runRoot: repoRoot,
+		runRoot: runTreeRoot,
+		realpath: REAL_LIVE_TREE_SEAMS.realpath,
 	});
 	if (outOfTreeChanges.detected) {
 		const line = outOfTreeChangesSummaryLine(outOfTreeChanges) ?? "changes outside run tree: (unknown)";

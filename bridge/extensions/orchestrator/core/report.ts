@@ -143,9 +143,9 @@ export interface RunReport {
 	};
 	/**
 	 * A6/N2: `core/live-tree.ts`'s `outOfTreeChangesSummaryLine` output for this run, pre-rendered
-	 * so this module never has to depend on `pipeline/*`. `null` on every run where no lead claimed
-	 * a file change the run's own git tree couldn't confirm — i.e. every run before this feature,
-	 * and the overwhelming majority of runs after it, get byte-identical summary output.
+	 * so this module never has to depend on `pipeline/*`. `null` when the run tree has changes,
+	 * or when no lead claimed changes or showed a foreign cd/cwd. Ordinary runs retain their
+	 * byte-identical summary output.
 	 */
 	outOfTreeChangesLine: string | null;
 }
@@ -188,6 +188,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		`run_id: ${report.runId}`,
 		`leads: ${report.succeededLeads}/${report.totalLeads} ${report.blocked ? "blocked" : "succeeded"}${report.skippedLeads > 0 ? ` (+${report.skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${report.retries} · files: ${report.filesChangedCount} changed${report.externalFilesCount > 0 ? ` (+${report.externalFilesCount} changed by someone else, not verified)` : ""}`,
 		report.reconWorkersLine,
+		...(report.outOfTreeChangesLine ? [report.outOfTreeChangesLine] : []),
 		...(report.resumedLeadIds.length > 0 ? [`resumes: ${report.resumedLeadIds.length} (${report.resumedLeadIds.join(", ")})`] : []),
 		...report.leadAttemptLines,
 		`verification: ${verdict}`,

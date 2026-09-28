@@ -8,11 +8,9 @@
  *    is never blocked (the operator may genuinely be developing the orchestrator on itself) — only
  *    surfaced loudly, once, at run start.
  *
- * 2. `detectOutOfTreeChanges` — a lead claims (`DispatchResult.filesChanged`, or its own report
- *    prose) to have changed files, but the run's own git tree shows none of those changes. The
- *    most common real cause: the lead `cd`'d into a different git worktree/repo (another checkout,
- *    a sibling clone) and did its work there instead of in the run's own tree, so the run's summary
- *    would otherwise silently report 0 files changed with no explanation.
+ * 2. `detectOutOfTreeChanges` — the run tree shows no changes, but a lead claimed changed
+ *    files or showed a `cd`/`cwd` outside that tree. A different worktree/repo is a likely
+ *    cause; without a warning, the run summary would silently report 0 files changed.
  *
  * Everything here is pure string/path comparison over already-resolved inputs — no `node:fs`, no
  * `node:child_process`. The actual `git rev-parse --show-toplevel` / realpath calls (and their
@@ -21,7 +19,7 @@
  * unit-testable with plain strings and no real repo.
  */
 
-import { sep } from "node:path";
+import { resolve, sep } from "node:path";
 
 /** Strip exactly one trailing path separator (so `"/a/b/"` and `"/a/b"` compare equal); never
  *  strips the root separator itself (`"/"` stays `"/"`). */
@@ -105,12 +103,11 @@ const CWD_RE = /\bcwd\b\s*[:=]\s*["']?(\/[^\s"'`]+)/gi;
 
 /**
  * Scan `leadTexts` (bounded — see `SCAN_MAX_TEXTS`/`SCAN_MAX_CHARS_PER_TEXT`) for the first
- * absolute path named after `cd `/`cwd` that sits OUTSIDE `runRoot` — evidence a lead worked in a
- * different git worktree/repo instead of the run's own tree. Returns `null` when no such path is
- * found (the mismatch is still reported by `detectOutOfTreeChanges`; it just can't name a specific
- * foreign path).
+ * absolute path named after `cd `/`cwd` outside `runRoot`. The optional resolver handles
+ * symlink aliases (e.g. /var and /private/var on macOS); return the path the lead named.
+ * Returns `null` when no such path is found.
  */
-export function extractForeignPath(leadTexts: string[], runRoot: string): string | null {
+export function extractForeignPath(leadTexts: string[], runRoot: string, realpath?: (path: string) => string | null): string | null {
 	const root = stripTrailingSep(runRoot);
 	if (!root) return null;
 	for (const raw of leadTexts.slice(0, SCAN_MAX_TEXTS)) {
@@ -122,7 +119,7 @@ export function extractForeignPath(leadTexts: string[], runRoot: string): string
 			// eslint-disable-next-line no-cond-assign
 			while ((m = re.exec(text))) {
 				const candidate = m[1];
-				if (candidate && !isPathWithin(root, candidate)) return candidate;
+				if (candidate && !isPathWithin(root, realpath?.(resolve(candidate)) ?? resolve(candidate))) return resolve(candidate);
 			}
 		}
 	}
@@ -132,42 +129,36 @@ export function extractForeignPath(leadTexts: string[], runRoot: string): string
 export interface OutOfTreeChangesInput {
 	/** Union of every lead's `DispatchResult.filesChanged` for this run (or this round). */
 	claimedFiles: string[];
-	/** The run's own git-observed changed files for the same round (already intersected against
-	 *  `claimedFiles` by the pipeline's own `changedSince`, per its doc comment) — empty here means
-	 *  the run's tree shows none of what was claimed, not merely "fewer than claimed". */
+	/** All git-observed changes in the run tree for the same round. Empty means no edits
+	 *  appeared in the run's own tree, even if a lead reported editing elsewhere. */
 	observedFiles: string[];
 	/** Lead stdout/report text to scan for a `cd`/`cwd` reference to a path outside `runRoot`. */
 	leadTexts: string[];
 	/** The run's own (already-resolved) repo root, or `cwd` when git is unavailable. */
 	runRoot: string;
+	/** Optional filesystem resolution for cd targets (to compare symlink aliases to the run root). */
+	realpath?: (path: string) => string | null;
 }
 
 export interface OutOfTreeChangesResult {
 	detected: boolean;
 	/** An out-of-tree path named in a lead's own text, when one was found. */
 	foreignPath: string | null;
-	/** Bounded sample of the files leads claimed changing (non-empty whenever `detected`). */
+	/** Bounded sample of the files leads claimed changing (empty for a foreign cd with no claims). */
 	claimedFiles: string[];
 }
 
 /**
- * N2: a lead claimed changing files, but the run's own git tree shows none of them changed —
- * most often because the lead worked in a different worktree/repo entirely. Detection is
- * deliberately simple (claimed-but-none-observed, plus a best-effort foreign path from the lead's
- * own text) rather than a precise diff of which claimed files are missing: precision here would
- * require re-running git per file, and the summary line this feeds is a warning, not a gate.
+ * N2: the run's git tree shows zero changes, despite claimed files or a lead's explicit cd/cwd
+ * outside the run tree. Detection is warn-only: it does not change QA scope.
  */
 export function detectOutOfTreeChanges(input: OutOfTreeChangesInput): OutOfTreeChangesResult {
-	const { claimedFiles, observedFiles, leadTexts, runRoot } = input;
-	if (claimedFiles.length === 0 || observedFiles.length > 0) {
-		return { detected: false, foreignPath: null, claimedFiles: [] };
-	}
+	const { claimedFiles, observedFiles, leadTexts, runRoot, realpath } = input;
+	if (observedFiles.length > 0) return { detected: false, foreignPath: null, claimedFiles: [] };
+	const foreignPath = extractForeignPath(leadTexts, runRoot, realpath);
 	return {
-		detected: true,
-		foreignPath: extractForeignPath(leadTexts, runRoot),
-		// Never empty: `claimedFiles.length === 0` already returned above, so a detected mismatch
-		// always has at least one claimed file to show — the whole point is to never silently
-		// report 0 files changed when leads claimed otherwise.
+		detected: claimedFiles.length > 0 || foreignPath !== null,
+		foreignPath,
 		claimedFiles: claimedFiles.slice(0, CLAIMED_SAMPLE_MAX),
 	};
 }
@@ -175,8 +166,7 @@ export function detectOutOfTreeChanges(input: OutOfTreeChangesInput): OutOfTreeC
 /**
  * Render `detectOutOfTreeChanges`'s result as the single summary line
  * (`core/report.ts`'s `buildRunSummary`) — `null` when there is nothing to report. Names the
- * foreign path when one was found; otherwise falls back to the claimed files themselves so the
- * line is never empty-handed.
+ * foreign path when one was found; otherwise falls back to the claimed files themselves.
  */
 export function outOfTreeChangesSummaryLine(result: OutOfTreeChangesResult): string | null {
 	if (!result.detected) return null;

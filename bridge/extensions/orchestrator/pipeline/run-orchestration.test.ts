@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionContext } from "@humain/terminal";
 
 import { runOrchestration, writeLeadReportsDiagnostic, type RunOrchestrationDeps } from "./run-orchestration.ts";
@@ -203,6 +207,97 @@ describe("pipeline/run-orchestration.ts runOrchestration", () => {
 		expect(dispatchCalls).toBe(0);
 		expect(failRunCalls).toBe(1);
 		expect(notifications.some((n) => n.text === "Cancelled." && n.level === "info")).toBe(true);
+	});
+});
+
+describe("pipeline/run-orchestration.ts out-of-tree warning (A6/N2)", () => {
+	test("running against this extension's own repo warns at start without blocking planning", async () => {
+		const session = fakeSession();
+		const { ctx, notifications } = fakeCtx();
+		const events: string[] = [];
+		const deps = fakeDeps({
+			planRun: async () => { throw new Error("plan marker"); },
+			recordEvent: (event) => { events.push(event); },
+		});
+		const result = await runOrchestration("ht-orch-1700000000000-live", process.cwd(), fakeArgs(), fakeAdapter(), fakeResolution(fakeAdapter()), ctx, session, { ...claimed, session }, deps);
+		expect(result.kind).toBe("aborted");
+		expect(events).toContain("live_extension_tree");
+		expect(notifications.some((n) => n.level === "warning" && n.text.includes("Live extension tree:"))).toBe(true);
+		expect(notifications.some((n) => n.level === "error" && n.text.includes("plan marker"))).toBe(true);
+	});
+	test("a lead editing another git worktree leaves this run at zero files but warns and names that worktree", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "orch-out-of-tree-"));
+		const repo = join(tmp, "repo");
+		const other = join(tmp, "other-worktree");
+		mkdirSync(repo);
+		const git = (args: string[]) => {
+			const result = spawnSync("git", args, { cwd: repo, encoding: "utf-8" });
+			if (result.status !== 0) throw new Error(result.stderr);
+		};
+		try {
+			git(["init", "-q"]);
+			git(["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "baseline"]);
+			git(["worktree", "add", "-q", "--detach", other]);
+			const runId = "ht-orch-1700000000000-foreign";
+			const plan: PlanResponse = {
+				plan_id: "plan-123456789012", run_id: runId, task_class: "bugfix", complexity: 3, risk: "medium",
+				topology: { depth: 1, leads: 1, workers: 0, shape: "flat" },
+				route: {
+					selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+					recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+					mode: "auto", history_sufficient: true, explanation: {},
+				},
+				effective_quality_floor: 0.5, cost_aggressiveness: 0.5,
+			};
+			for (const claims of [[], ["a.ts"]]) {
+				const session = fakeSession();
+				const { ctx, notifications } = fakeCtx();
+				const events: string[] = [];
+				const deps = fakeDeps({
+					planRun: async () => plan,
+					recordEvent: (event) => { events.push(event); },
+					dispatchParallel: async (_cwd, _id, tasks) => {
+						if (tasks[0]?.capability !== "lead") throw new Error("QA must not run on the wrong worktree");
+						writeFileSync(join(other, "a.ts"), "edited in another worktree\n");
+						return tasks.map((t) => ({
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+							stdout: `STATUS: completed\nRan: cd ${other} && wrote a.ts`, stderr: "",
+							usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+							durationMs: 1, costUsd: 0, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: claims,
+						}));
+					},
+				});
+				const result = await runOrchestration(runId, repo, fakeArgs(), fakeAdapter(), fakeResolution(fakeAdapter()), ctx, session, { ...claimed, session }, deps);
+				expect(result.kind).toBe("completed");
+				if (result.kind !== "completed") continue;
+				expect(result.report.filesChangedCount).toBe(0);
+				expect(result.report.outOfTreeChangesLine).toBe(`changes outside run tree: ${other}`);
+				expect(buildRunSummary(result.report).text).toContain(`changes outside run tree: ${other}`);
+				expect(notifications.some((n) => n.level === "warning" && n.text.includes(`changes outside run tree: ${other}`))).toBe(true);
+				expect(events).toContain("out_of_tree_changes");
+			}
+			// A run may start in a subdirectory. A lead cd'ing to its repository root
+			// has not left the run tree and must not produce the foreign-worktree warning.
+			const nested = join(repo, "src");
+			mkdirSync(nested);
+			const session = fakeSession();
+			const { ctx, notifications } = fakeCtx();
+			const deps = fakeDeps({
+				planRun: async () => plan,
+				dispatchParallel: async (_cwd, _id, tasks) => tasks.map((t) => ({
+					taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+					stdout: `STATUS: completed\nRan: cd ${repo} && read files`, stderr: "",
+					usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+					durationMs: 1, costUsd: 0, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+				})),
+			});
+			const result = await runOrchestration(runId, nested, fakeArgs(), fakeAdapter(), fakeResolution(fakeAdapter()), ctx, session, { ...claimed, session }, deps);
+			expect(result.kind).toBe("completed");
+			if (result.kind === "completed") expect(result.report.outOfTreeChangesLine).toBeNull();
+			expect(notifications.some((n) => n.text.includes("changes outside run tree:"))).toBe(false);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
 	});
 });
 

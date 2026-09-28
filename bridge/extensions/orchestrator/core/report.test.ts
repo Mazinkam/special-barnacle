@@ -79,6 +79,7 @@ function baseReport(): RunReport {
 		leadAttemptLines: [],
 		filesChangedCount: 3,
 		externalFilesCount: 0,
+		outOfTreeChangesLine: null,
 		reconWorkersLine: "recon: 0 workers dispatched",
 		verificationSkipped: false,
 		passedVerification: true,
@@ -176,6 +177,12 @@ describe("core/report.ts buildRunSummary", () => {
 	test("external files: annotates the leads line, excluded-from-QA count", () => {
 		const { text } = buildRunSummary({ ...baseReport(), externalFilesCount: 2 });
 		expect(text).toContain("files: 3 changed (+2 changed by someone else, not verified)");
+	});
+
+	test("out-of-tree edits are named in the summary even when git reports zero files", () => {
+		const { text } = buildRunSummary({ ...baseReport(), filesChangedCount: 0, verificationSkipped: true, outOfTreeChangesLine: "changes outside run tree: /other/worktree" });
+		expect(text).toContain("files: 0 changed");
+		expect(text).toContain("changes outside run tree: /other/worktree");
 	});
 
 	test("nested cost: appended to the total cost line", () => {
