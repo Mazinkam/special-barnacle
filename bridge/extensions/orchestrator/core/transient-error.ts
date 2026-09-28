@@ -56,7 +56,7 @@ const HTTP_5XX_LITERAL_RE = /\bhttp\b[^\n]{0,10}\b5xx\b/i;
  * 503 and "internal server error" for 500.
  */
 export const TRANSIENT_ERROR_RE =
-	/overloaded|rate[ -]?limit|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|socket hang up|stream ended|premature close|service unavailable|internal server error|bad gateway|gateway timeout|timed?[ -]?out|throttl(?:ed|ing)/i;
+	/overloaded|rate[ -]?limit|ENOTFOUND|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|fetch failed|pending stream has been cance(?:led|lled)|socket hang up|stream ended|premature close|service unavailable|internal server error|bad gateway|gateway timeout|timed?[ -]?out|throttl(?:ed|ing)/i;
 
 /** True when `text` looks like a transient provider/network failure worth retrying, and is not
  *  a permanent quota/billing error (see module header for the 429/rate-limit overlap note). */

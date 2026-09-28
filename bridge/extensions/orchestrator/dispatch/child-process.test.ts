@@ -8,6 +8,10 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { MAX_CHILD_STDERR_DISK_BYTES } from "./stderr-sink.ts";
+import { dispatchReconAndLeads, isTransientLeadFailure } from "../pipeline/hierarchy.ts";
+import { pollCiCheck } from "../core/ci-wait.ts";
+import type { DispatchResult } from "../core/records.ts";
+import type { DispatchTask, PlanResponse } from "../core/prompts.ts";
 
 // `child-process.ts` imports real bindings (not just types) from `@humain/terminal`, which has
 // no `node_modules` entry in this standalone bridge checkout (see scripts/typecheck-bridge.sh's
@@ -393,9 +397,63 @@ describe("runSubagentProcess process/event handling", () => {
 			expect(result.exitCode).toBe(1);
 			expect(result.outcome).toBe("failed");
 			expect(result.stderr).toContain("usage limit");
+			expect((result.usage as typeof result.usage & { tool_calls?: number }).tool_calls).toBe(0);
 		} finally {
 			session.close();
 		}
+	});
+
+	test("error-end copied nested latestText remains diagnostic, not provider evidence", async () => {
+		const session = createSession("nested-prose-only");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const pending = runSubagentProcess({ cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, env: () => process.env, capability: "lead", taskId: "nested-prose-only-lead", session, spawnChild: () => child as never });
+			child.stdout.write(`${JSON.stringify({ type: "tool_execution_update", toolName: "subagent", partialResult: { details: { results: [
+				{ taskId: "t11", agent: "worker", depth: 1, exitCode: -1, latestText: "fetch failed is the name of my test", usage: { turns: 9, cost: 0 } },
+			] } } })}\n`);
+			child.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", usage: { input: 0, output: 0, cost: { total: 0 } } } })}\n`);
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.stderr).toContain("lastText: fetch failed is the name of my test");
+			expect(isTransientLeadFailure({ ...result, taskId: "nested-prose-only-lead", capability: "lead", model: "p/m", filesChanged: [] } as DispatchResult)).toBe(false);
+		} finally { session.close(); }
+	});
+
+	test("error-end nested latestText stays diagnostic while only errorMessage is marked provider evidence", async () => {
+		const session = createSession("nested-prose-boundary");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const pending = runSubagentProcess({ cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, env: () => process.env, capability: "lead", taskId: "nested-prose-lead", session, spawnChild: () => child as never });
+			child.stdout.write(`${JSON.stringify({ type: "tool_execution_update", toolName: "subagent", partialResult: { details: { results: [
+				{ taskId: "t11", agent: "worker", depth: 1, exitCode: -1, latestText: "fetch failed is the name of my test", errorMessage: "getaddrinfo ENOTFOUND bedrock-runtime", usage: { turns: 9, cost: 0 } },
+			] } } })}\n`);
+			child.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", usage: { input: 0, output: 0, cost: { total: 0 } } } })}\n`);
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.stderr).toContain("lastText: fetch failed is the name of my test");
+			expect(result.stderr).toContain("errorMessage: getaddrinfo ENOTFOUND bedrock-runtime");
+			expect(result.stderr).toContain("[provider nested error] getaddrinfo ENOTFOUND bedrock-runtime");
+			expect(isTransientLeadFailure({ ...result, taskId: "nested-prose-lead", capability: "lead", model: "p/m", filesChanged: [] } as DispatchResult)).toBe(true);
+		} finally { session.close(); }
+	});
+
+	test("error-end diagnostic carries nested worker last turn/text/errorMessage when lead stderr is empty", async () => {
+		const session = createSession("nested-provider-error");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		const emit = (event: unknown) => child.stdout.write(`${JSON.stringify(event)}\n`);
+		try {
+			const pending = runSubagentProcess({ cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, env: () => process.env, capability: "lead", taskId: "nested-provider-lead", session, spawnChild: () => child as never });
+			emit({ type: "tool_execution_update", toolName: "subagent", partialResult: { details: { results: [{ taskId: "t11", agent: "worker", depth: 1, exitCode: -1, latestText: "retrying provider", errorMessage: "getaddrinfo ENOTFOUND bedrock-runtime", usage: { turns: 9, cost: 0 } }] } } });
+			emit({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", usage: { input: 0, output: 0, cost: { total: 0 } } } });
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.stderr).toContain("t11 (9 turns");
+			expect(result.stderr).toContain("retrying provider");
+			expect(result.stderr).toContain("ENOTFOUND");
+		} finally { session.close(); }
 	});
 
 	test("spend cap warn logs once and lets the dispatch finish", async () => {
@@ -1463,6 +1521,190 @@ describe("runSubagentProcess process/event handling", () => {
 	});
 });
 
+
+describe("B4 fixture replay with injected child and manually advanced timers", () => {
+ const fixturesDir = fileURLToPath(new URL("../fixtures/", import.meta.url));
+ const events = (name: string) => readFileSync(join(fixturesDir, name), "utf8").trim().split("\n").map(line => JSON.parse(line));
+ function child() {
+  return Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: mock(() => true) });
+ }
+ test("s11yls agent_end without process exit settles by post-end grace, not inactivity", async () => {
+  const proc = child();
+  const session = createSession("b4-s11-no-exit");
+  const realSetTimeout = globalThis.setTimeout;
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  let grace: (() => void) | undefined;
+  const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms: number) => {
+   if (ms === 4050) grace = callback;
+   const handle = realSetTimeout(() => {}, 60_000);
+   timers.push(handle);
+   return handle;
+  }) as typeof setTimeout);
+  try {
+   const pending = runSubagentProcess({ cwd: repoDir, agentName: NO_PERSONA, task: "fixture", model: "p/m", ctx: {} as never,
+    env: () => ({}), capability: "lead", taskId: "b4-s11", session,
+    leadTimeouts: { inactivityMs: 60_000, maxMs: 300_000 }, postEndGraceMs: 50, spawnChild: () => proc as never });
+   const replay = events("s11yls-lead-0-tail.jsonl");
+   expect(replay.map(event => event.type)).toEqual(["message_end", "turn_end", "agent_end", "auto_retry_start", "entry_appended"]);
+   for (const event of replay) proc.stdout.write(`${JSON.stringify(event)}\n`);
+   expect(grace).toBeDefined();
+   grace?.();
+   const result = await pending;
+   expect(result.postEndGraceExpired).toBe(true);
+   expect(result.outcome).toBe("failed");
+   expect(result.timeoutReason).toBeUndefined();
+   expect(result.stderr).toContain("ENOTFOUND");
+   expect(proc.kill).toHaveBeenCalled();
+  } finally {
+   timerSpy.mockRestore();
+   for (const handle of timers) clearTimeout(handle);
+   proc.emit("close", 0); session.close();
+  }
+ });
+ // Unlike a direct hierarchy fake, the timeout result here is produced by the actual child
+ // event parser + progress watchdog; only later attempts and external CI responses are injected.
+ async function timedOutFixture(name: string, taskId: string) {
+  const proc = child();
+  const session = createSession(`b4-${name.split("-")[0]}-${taskId}`);
+  const realSetTimeout = globalThis.setTimeout;
+  let now = Date.now();
+  let watchdog: (() => void) | undefined;
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const clockSpy = spyOn(Date, "now").mockImplementation(() => now);
+  const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms: number) => {
+   if (ms >= 50 && ms <= 30_000) watchdog = callback;
+   const handle = realSetTimeout(() => {}, 60_000);
+   timers.push(handle);
+   return handle;
+  }) as typeof setTimeout);
+  try {
+   const pending = runSubagentProcess({ cwd: repoDir, agentName: NO_PERSONA, task: "fixture", model: "p/m", ctx: {} as never,
+    env: () => ({}), capability: "lead", taskId, session,
+    leadTimeouts: { inactivityMs: 60_000, maxMs: 300_000 }, spawnChild: () => proc as never });
+   for (const event of events(name)) proc.stdout.write(`${JSON.stringify(event)}\n`);
+   expect(watchdog).toBeDefined();
+   now += 61_000;
+   watchdog?.();
+   const result = await pending;
+   expect(result.outcome).toBe("timed_out");
+   expect(result.timeoutReason).toBe("inactivity");
+   return result;
+  } finally {
+   timerSpy.mockRestore(); clockSpy.mockRestore();
+   for (const handle of timers) clearTimeout(handle);
+   proc.emit("close", 124); session.close();
+  }
+ }
+ const plan: PlanResponse = {
+  plan_id: "plan-b4", run_id: "run", task_class: "investigation", complexity: 3, risk: "medium",
+  topology: { depth: 2, leads: 2, workers: 0, shape: "multi_lead" },
+  route: { selected: { capability: "lead", effort: "standard", verification_depth: "targeted" },
+   recommended: { capability: "lead", effort: "standard", verification_depth: "targeted" },
+   mode: "adaptive", history_sufficient: true, explanation: {} },
+  effective_quality_floor: 0.8, cost_aggressiveness: 0.5,
+ };
+ const leadChain = (first: string) => ({ ...success({ taskId: "run-architect", capability: "architect", task: "" }),
+  stdout: `## Lead assignments\nLead 1: ${first} (depends on: none)\nLead 2: dependent (depends on: 1)\n` });
+ function success(task: DispatchTask): DispatchResult {
+  return { taskId: task.taskId, capability: task.capability, model: "p/m", exitCode: 0,
+   stdout: "STATUS: completed", stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+   durationMs: 1, costUsd: 0, costReported: true, filesChanged: [] };
+ }
+ function asDispatch(task: DispatchTask, result: Awaited<ReturnType<typeof runSubagentProcess>>): DispatchResult {
+  return { taskId: task.taskId, capability: task.capability, model: result.model ?? "p/m", exitCode: result.exitCode,
+   stdout: result.stdout, stderr: result.stderr, usage: result.usage, durationMs: result.durationMs,
+   costUsd: result.costUsd, costReported: result.costReported, filesChanged: [], outcome: result.outcome,
+   timeoutReason: result.timeoutReason, toolInFlight: result.toolInFlight, interruption: result.interruption, stopReason: result.stopReason };
+ }
+ test("u25qe4 fixture event -> watchdog result -> wait resume -> injected pending CI check gates dependent until checked pass", async () => {
+  const killed = await timedOutFixture("u25qe4-lead-0-wait.jsonl", "run-lead-0");
+  expect(killed.toolInFlight?.command).toContain("pipelines/219469");
+  expect(killed.toolInFlight?.waitPattern).toBe(true);
+  expect(killed.toolInFlight?.ciRefs).toEqual([{ provider: "gitlab", kind: "pipeline", id: "219469" }]);
+  const batches: DispatchTask[][] = [];
+  const billed: DispatchResult[] = [];
+  let checkingStarted = false;
+  let releaseCheck!: (result: Awaited<ReturnType<typeof pollCiCheck>>) => void;
+  const checked = new Promise<Awaited<ReturnType<typeof pollCiCheck>>>(resolve => { releaseCheck = resolve; });
+  const run = dispatchReconAndLeads({ runId: "run", goal: "repair", plan, adapter: { lead: { model: "p/m" } },
+   architectResult: leadChain("check pipeline"), evidenceMaxChars: 4000, maxLeads: 4, repoRoot: "/repo", inWaveRecovery: true }, {
+   dispatch: async tasks => {
+    batches.push(tasks);
+    return tasks.map(task => batches.length === 1 ? asDispatch(task, killed) : success(task));
+   }, capture: async result => { billed.push(result); }, setPhase: () => {}, throwIfCancelled: () => {},
+   waitForChecks: async checks => {
+    expect(checks).toEqual([{ provider: "gitlab", kind: "pipeline", id: "219469", source: "killed_command" }]);
+    checkingStarted = true;
+    return [{ check: checks[0], ...await checked }];
+   },
+  });
+  // Let the synchronous/async dispatch chain reach the pending-check seam without
+  // hanging the test if a regression omits that seam entirely.
+  for (let i = 0; i < 50 && !checkingStarted; i++) await Promise.resolve();
+  expect(checkingStarted).toBe(true);
+  expect(batches.map(batch => batch.map(t => t.taskId))).toEqual([["run-lead-0"], ["run-lead-0"]]);
+  expect(batches[1][0].task).toContain("do not wait for it again");
+  // No real GitLab/API access: the CLI runner is injected below; results retain the
+  // pollCiCheck identity and SHA validation rather than trusting a lead's prose.
+  let ciNow = 1000;
+  let status = "running";
+  const calls: string[][] = [];
+  const check = { provider: "gitlab" as const, kind: "pipeline" as const, id: "219469", source: "killed_command" as const };
+  const state = { startedAt: ciNow, nextPollAt: ciNow };
+  const poll = (s: typeof state) => pollCiCheck(check, s, { cwd: "/repo", expectedSha: "a".repeat(40), expectedRepo: "https://gitlab.example/forge/project", now: () => ciNow,
+   spawn: async (cmd, args) => {
+    expect(cmd).toBe("glab");
+    calls.push(args);
+    return { exitCode: 0, stderr: "", stdout: JSON.stringify({ id: 219469, sha: "a".repeat(40), web_url: "https://gitlab.example/forge/project/-/pipelines/219469", status }) };
+   },
+  });
+  const pending = await poll(state);
+  expect(pending.outcome).toBe("pending");
+  expect(batches).toHaveLength(2); // no dependent dispatch while the check is pending
+  ciNow = pending.state!.nextPollAt;
+  status = "success";
+  const passed = await poll(pending.state!);
+  expect(passed.outcome).toBe("success");
+  expect(batches).toHaveLength(2); // no dispatch even after checking, until the gate receives the checked pass
+  releaseCheck(passed);
+  const output = await run;
+  expect(calls).toEqual([
+   ["api", "--hostname", "gitlab.example", "projects/forge%2Fproject/pipelines/219469"],
+   ["api", "--hostname", "gitlab.example", "projects/forge%2Fproject/pipelines/219469"],
+  ]);
+  expect(batches.map(batch => batch.map(t => t.taskId))).toEqual([["run-lead-0"], ["run-lead-0"], ["run-lead-1"]]);
+  expect(batches[2][0].task).toContain("gitlab 219469: external check success");
+  expect(output.resumedLeadTaskIds).toEqual(["run-lead-0"]);
+  expect(output.pendingChecks.map(c => c.outcome)).toEqual(["success"]);
+  expect(billed.map(r => r.taskId)).toEqual(["run-lead-0", "run-lead-0", "run-lead-1"]);
+ });
+ test("vcy00z all 12 nested update events -> watchdog result -> one counted provider resume unblocks dependent wave", async () => {
+  const fixture = events("vcy00z-lead-0-tail.jsonl");
+  expect(fixture).toHaveLength(12);
+  expect(fixture[0].partialResult.details.results[0].errorMessage).toContain("ENOTFOUND");
+  expect(fixture.at(-1).partialResult.details.results[0].usage.turns).toBe(16);
+  const killed = await timedOutFixture("vcy00z-lead-0-tail.jsonl", "run-lead-0");
+  expect(killed.interruption?.nestedWorkers[0].turns).toBe(16);
+  expect(killed.interruption?.nestedWorkers[0].errorMessage).toContain("Bedrock stream ended without a stop reason");
+  expect(isTransientLeadFailure(asDispatch({ taskId: "run-lead-0", capability: "lead", task: "" }, killed))).toBe(true);
+  const batches: DispatchTask[][] = [];
+  const billed: DispatchResult[] = [];
+  const phases: string[] = [];
+  const output = await dispatchReconAndLeads({ runId: "run", goal: "repair", plan, adapter: { lead: { model: "p/m" } },
+   architectResult: leadChain("repair"), evidenceMaxChars: 4000, maxLeads: 4, repoRoot: "/repo", inWaveRecovery: true }, {
+   dispatch: async tasks => { batches.push(tasks); return tasks.map(task => batches.length === 1 ? asDispatch(task, killed) : success(task)); },
+   capture: async result => { billed.push(result); }, setPhase: phase => { phases.push(phase); }, throwIfCancelled: () => {},
+  });
+  expect(batches.map(batch => batch.map(t => t.taskId))).toEqual([["run-lead-0"], ["run-lead-0"], ["run-lead-1"]]);
+  expect(phases.join("\n")).toContain("provider_stall");
+  expect(output.resumedLeadTaskIds).toEqual(["run-lead-0"]);
+  expect(output.retriedLeadTaskIds).toEqual([]);
+  expect(output.resumedAttemptResults).toHaveLength(1);
+  expect(output.resumedAttemptResults[0].interruption?.nestedWorkers[0].turns).toBe(16);
+  expect(output.skippedLeads).toBe(0);
+  expect(billed.map(r => r.taskId)).toEqual(["run-lead-0", "run-lead-0", "run-lead-1"]);
+ });
+});
 
 describe("child stream handler safety", () => {
 	test("converts a stdout handler throw into a failed dispatch", async () => {

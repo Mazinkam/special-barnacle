@@ -21,6 +21,7 @@ import type { RunTags } from "../core/records.ts";
 import type { RunCancellation } from "../cancellation.ts";
 import type { QueueStats } from "../record-queue.ts";
 import type { RunTiming } from "./session.ts";
+export type PendingCheckRow = { provider: "gitlab" | "github"; id: string; outcome: "pending" | "success" | "failure" | "unverified"; mr?: string };
 
 /**
  * The `RunSession` surface `pipeline/*` and `commands/orchestrate.ts` actually call, as a
@@ -48,6 +49,7 @@ export interface RunSessionLike {
 	writeDiagnostic(name: string, text: string): boolean;
 	log(line: string): void;
 	setPhase(phase: string, notify?: boolean): void;
+	setPendingChecks?(rows: PendingCheckRow[]): void;
 	terminalTiming(): RunTiming;
 	cancelledDispatches(): string[];
 	totalCost(): number;

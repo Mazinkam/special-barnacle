@@ -34,7 +34,7 @@ import { SpendCapTracker } from "../spend-cap.ts";
 import type { QueueStats } from "../record-queue.ts";
 import type { ChildEventDelta, ChildStreamEvent } from "../dispatch/child-events.ts";
 import type { ProgressObservation, TimeoutCheck } from "../dispatch-progress.ts";
-import { applyObservation, applyWarnings, createProgressView, fmtElapsed } from "../run-ui.ts";
+import { applyObservation, applyWarnings, createProgressView, fmtElapsed, MAX_PENDING_CHECKS, type PendingCheckRow } from "../run-ui.ts";
 import { safeUi } from "./ui-sink.ts";
 import {
 	type BoardSnapshot,
@@ -136,6 +136,7 @@ export class RunSession {
 	/** Git worktree the run is operating in (null when cwd isn't git-tracked). */
 	readonly worktree: WorktreeInfo | null;
 	private readonly dispatches = new Map<string, DispatchProgress>();
+	private pendingChecks: PendingCheckRow[] = [];
 	private phase = "starting";
 	private renderTimer: ReturnType<typeof setTimeout> | undefined;
 	private readonly startedAt = Date.now();
@@ -305,6 +306,12 @@ export class RunSession {
 		safeUi(() => this.render());
 	}
 
+	/** Replace the live external CI snapshot. An empty list removes it from the board. */
+	setPendingChecks(rows: PendingCheckRow[]): void {
+		this.pendingChecks = rows.slice(0, MAX_PENDING_CHECKS).map((row) => ({ ...row }));
+		this.render();
+	}
+
 	startDispatch(taskId: string, label: string, model: string, depth: number = 0): void {
 		const now = Date.now();
 		this.dispatches.set(taskId, {
@@ -438,6 +445,7 @@ export class RunSession {
 			goal: this.goal,
 			worktree: this.worktree,
 			dispatches: [...this.dispatches.values()],
+			pendingChecks: this.pendingChecks,
 			queuedMessageCount: this.queuedMessages.length,
 			lastDelivery: this.deliveryLog[this.deliveryLog.length - 1],
 			totalCostUsd: this.totalCost(),

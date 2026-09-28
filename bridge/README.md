@@ -69,7 +69,9 @@ After install, restart HT (or `/reload`) to pick up the new commands:
 
 ## Dispatch timeouts
 
-Orchestrating capabilities (`lead`, `architect`, and `technical_lead`) use a progress-aware inactivity limit plus an absolute ceiling. Set `HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS` to change the no-progress limit (default: 20 minutes), and `HUMAIN_ORCHESTRATOR_LEAD_MAX_TIMEOUT_MS` to change the total runtime ceiling (default: 6 hours). The legacy `HUMAIN_ORCHESTRATOR_LEAD_TIMEOUT_MS` is used as the absolute-ceiling default only when `HUMAIN_ORCHESTRATOR_LEAD_MAX_TIMEOUT_MS` is unset; it no longer sets a fixed lead timeout. Leaf dispatches keep their separate fixed timeout.
+Orchestrating capabilities (`lead`, `architect`, and `technical_lead`) use a progress-aware inactivity limit plus an absolute ceiling. `HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS` changes the no-progress limit (default: 20 minutes); raising it is only a stopgap, not a way to make leads wait on CI. Leads should report checks under `## Pending external checks` and finish rather than poll or sleep. The parent may poll supported GitHub/GitLab checks on session ticks, bounded by `HUMAIN_ORCHESTRATOR_CI_WAIT_MAX_MS` (default: 60 minutes). Pending-check status and CLI/auth behavior have not been independently verified against live providers; unavailable or unrecognized results remain unverified, not passes.
+
+`HUMAIN_ORCHESTRATOR_LEAD_MAX_TIMEOUT_MS` changes the absolute orchestrating-dispatch ceiling (default: 6 hours). The legacy `HUMAIN_ORCHESTRATOR_LEAD_TIMEOUT_MS` supplies that ceiling's default only when the newer variable is unset. A `wait_stall` (inactivity timeout while a wait-like tool is active) and a `provider_stall` each use the shared one-resume-per-lead recovery budget; a failed resume does not get another retry. Leaf dispatches keep their separate fixed timeout. A child that emits its terminal `agent_end` but does not exit is given a post-end settle grace of 30 seconds by default; configure it with `HUMAIN_ORCHESTRATOR_POST_END_GRACE_MS`.
 
 ## Editing
 

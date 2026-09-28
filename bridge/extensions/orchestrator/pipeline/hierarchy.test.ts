@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { dispatchReconAndLeads, isTransientLeadFailure, collectBilledResults, summarizeReconWorkers } from "./hierarchy.ts";
 import { RunCancellation } from "../cancellation.ts";
 import { METHOD } from "../models.ts";
@@ -232,13 +233,13 @@ describe("pipeline/hierarchy.ts dispatchReconAndLeads lead resume after a transi
 		expect(result.resumedLeadTaskIds).toEqual(["run-lead-0"]);
 	});
 
-	test("dispatch's own timeout (outcome: timed_out) with transient-looking stderr: no resume, exactly 1 lead dispatch", async () => {
+	test("absolute timeout with transient-looking stderr: no resume, exactly 1 lead dispatch", async () => {
 		const leadBatches: DispatchTask[][] = [];
 
 		const result = await dispatchReconAndLeads(baseInput(), {
 			dispatch: async (tasks) => {
 				leadBatches.push(tasks);
-				return [transientFailure(tasks[0], { outcome: "timed_out", timeoutReason: "inactivity" })];
+				return [transientFailure(tasks[0], { outcome: "timed_out", timeoutReason: "absolute" })];
 			},
 			capture: async () => {},
 			setPhase: () => {},
@@ -271,6 +272,64 @@ describe("pipeline/hierarchy.ts dispatchReconAndLeads lead resume after a transi
 	});
 });
 
+const fixtureEvent = (name: string) => JSON.parse(readFileSync(new URL(`../fixtures/${name}`, import.meta.url), "utf8"));
+
+describe("B4 incident fixture evidence at the hierarchy seam", () => {
+ // u25qe4/vcy00z child-event -> result -> hierarchy paths live in dispatch/child-process.test.ts.
+ // hv4i5g lead-1 remains explicitly open: original stderr and line 2455 do not prove a provider failure.
+ test("hv4i5g lead-1 remains OPEN: original stderr and line 2455 cannot establish provider failure", () => {
+  const snapshot = fixtureEvent("hv4i5g-lead-1-nested-snapshot.jsonl");
+  const tail = readFileSync(new URL("../fixtures/hv4i5g-lead-1-tail.jsonl", import.meta.url), "utf8");
+  expect(snapshot._fixture.truncation).toContain("no nested errorMessage");
+  expect(snapshot.partialResult.details.results[0].errorMessage).toBeUndefined();
+  expect(tail).not.toContain('"errorMessage":"getaddrinfo ENOTFOUND');
+  expect(isTransientLeadFailure(transientFailure({ taskId: "run-lead-1", capability: "lead", task: "" }, {
+   stderr: "[orchestrator] inactivity timeout", outcome: "timed_out", timeoutReason: "inactivity",
+   interruption: { taskId: "run-lead-1", reason: "inactivity_timeout", elapsedMs: 1, sinceLastProgressMs: 1, turns: 1, toolCalls: 1, repeatedToolCalls: 0, lastProgress: "nested worker", nestedWorkers: [{ id: "t11", turns: 0, finished: false, latestText: snapshot.partialResult.details.results[0].latestText }], partialText: "", verified: false },
+  }))).toBe(false);
+ });
+});
+
+describe("wait-stall recovery through the single lead resume budget", () => {
+ const waitCommand = "for i in $(seq 1 40); do glab ci get -p 219469; sleep 60; done";
+ const interrupted = (task: DispatchTask, overrides: Partial<DispatchResult> = {}): DispatchResult => transientFailure(task, {
+  outcome: "timed_out", timeoutReason: "inactivity", stderr: "[orchestrator] inactivity timeout",
+  toolInFlight: { name: "bash", command: waitCommand, waitPattern: true, ciRefs: [{ provider: "gitlab", kind: "pipeline", id: "219469" }] },
+  ...overrides,
+ });
+ test("inactivity bash wait resumes once, even when the resumed attempt times out again", async () => {
+  const batches: DispatchTask[][] = [];
+  const phases: string[] = [];
+  const output = await dispatchReconAndLeads(baseInput(), {
+   dispatch: async (tasks) => { batches.push(tasks); return [interrupted(tasks[0])]; },
+   capture: async () => {}, setPhase: (phase) => phases.push(phase), throwIfCancelled: () => {},
+  });
+  expect(batches).toHaveLength(2);
+  expect(batches[1][0].task).toContain("## Resume");
+  expect(batches[1][0].task).toContain("inactivity watchdog");
+  expect(batches[1][0].task).toContain("do not wait for it again");
+  expect(output.resumedLeadTaskIds).toEqual(["run-lead-0"]);
+  expect(output.retriedLeadTaskIds).toEqual([]);
+  expect(phases.some((phase) => phase.includes("wait_stall"))).toBe(true);
+ });
+ test.each([
+  ["absolute", { timeoutReason: "absolute" }],
+  ["cancelled", { outcome: "cancelled" }],
+  ["spend cap", { stopReason: "spend_cap" }],
+  ["non-bash", { toolInFlight: { name: "write", command: waitCommand } }],
+  ["non-wait", { toolInFlight: { name: "bash", command: "tail -500 log" } }],
+  ["prose only", { toolInFlight: undefined, stdout: `I ran ${waitCommand}` }],
+ ] as const)("%s is not a wait-stall resume", async (_label, overrides) => {
+  const batches: DispatchTask[][] = [];
+  const output = await dispatchReconAndLeads(baseInput(), {
+   dispatch: async (tasks) => { batches.push(tasks); return [interrupted(tasks[0], overrides)]; },
+   capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+  });
+  expect(batches).toHaveLength(1);
+  expect(output.resumedLeadTaskIds).toEqual([]);
+ });
+});
+
 describe("pipeline/hierarchy.ts isTransientLeadFailure (docs/architecture-review.md C3)", () => {
 	function baseResult(opts: Partial<DispatchResult> = {}): DispatchResult {
 		return {
@@ -281,6 +340,62 @@ describe("pipeline/hierarchy.ts isTransientLeadFailure (docs/architecture-review
 			...opts,
 		};
 	}
+
+	test("inactivity timeout note alone is not provider evidence", () => {
+		expect(isTransientLeadFailure(baseResult({
+			outcome: "timed_out", timeoutReason: "inactivity",
+			stderr: "[orchestrator] inactivity timeout: no meaningful progress\nUNVERIFIED PARTIAL WORK — inactivity\nlastProgress: none\nnestedWorkers: none observed\npartialText: still working",
+		}))).toBe(false);
+	});
+
+	test("watchdog warning plus timeout report without a provider error does not resume", async () => {
+		const batches: DispatchTask[][] = [];
+		const result = await dispatchReconAndLeads(baseInput(), {
+			dispatch: async (tasks) => {
+				batches.push(tasks);
+				return [transientFailure(tasks[0], {
+					outcome: "timed_out", timeoutReason: "inactivity",
+					stderr: "⚠ no meaningful progress for 23min (limit 30min; 7min remaining; raise HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS) — last: bash wait for CI\n[orchestrator] inactivity timeout: no meaningful progress\nUNVERIFIED PARTIAL WORK — inactivity\ntaskId: run-lead-0\nlastProgress: bash wait for CI\nnestedWorkers: none observed\npartialText: still working",
+				})];
+			},
+			capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+		});
+		expect(batches).toHaveLength(1);
+		expect(result.resumedLeadTaskIds).toEqual([]);
+	});
+
+	test("a real nested provider error still resumes with a watchdog warning in stderr", () => {
+		expect(isTransientLeadFailure(baseResult({
+			outcome: "timed_out", timeoutReason: "inactivity",
+			stderr: "⚠ no meaningful progress for 23min (limit 30min; raise HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS) — last: bash wait for CI\n[orchestrator] inactivity timeout: no meaningful progress\nUNVERIFIED PARTIAL WORK — inactivity",
+			interruption: {
+				taskId: "t", reason: "inactivity_timeout", elapsedMs: 10, sinceLastProgressMs: 10,
+				turns: 1, toolCalls: 1, repeatedToolCalls: 0, lastProgress: "waiting",
+				nestedWorkers: [{ id: "t11", turns: 4, finished: false, latestText: "trying provider", errorMessage: "TypeError: fetch failed" }],
+				partialText: "still working", verified: false,
+			},
+		}))).toBe(true);
+	});
+
+	test("nested latestText prose mentioning fetch failed does not trigger a provider resume", () => {
+		expect(isTransientLeadFailure(baseResult({
+			outcome: "timed_out", timeoutReason: "inactivity",
+			stderr: "[orchestrator] inactivity timeout: no progress\nUNVERIFIED PARTIAL WORK — inactivity\nnestedWorkers: t11 (4 turns, running) lastText: the test for fetch failed passed\npartialText: fetch failed is a test name",
+			interruption: {
+				taskId: "t", reason: "inactivity_timeout", elapsedMs: 10, sinceLastProgressMs: 10,
+				turns: 1, toolCalls: 1, repeatedToolCalls: 0, lastProgress: "fetch failed test passed",
+				nestedWorkers: [{ id: "t11", turns: 4, finished: false, latestText: "fetch failed test passed" }],
+				partialText: "fetch failed test passed", verified: false,
+			},
+		}))).toBe(false);
+	});
+
+	test("error-end nested diagnostic lastText prose cannot trigger provider resume", () => {
+		expect(isTransientLeadFailure(baseResult({
+			stderr: "nestedWorkers: t11 (4 turns, running) lastText: fetch failed is a test case",
+			stopReason: "error",
+		}))).toBe(false);
+	});
 
 	test("a genuinely transient failure is resumable", () => {
 		expect(isTransientLeadFailure(baseResult())).toBe(true);
@@ -720,6 +835,52 @@ describe("pipeline/hierarchy.ts dispatchReconAndLeads in-wave recovery (A3)", ()
 
 	const timedOut = (task: DispatchTask): DispatchResult => leadResult(task, {
 		exitCode: 1, stdout: "", stderr: "", outcome: "timed_out", timeoutReason: "inactivity",
+	});
+
+	test.each([
+		["ENOTFOUND", "getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com"],
+		["ECONNRESET", "read ECONNRESET"],
+		["fetch failed", "TypeError: fetch failed"],
+		["pending stream", "pending stream has been canceled"],
+		["no stop reason", "stream ended without a stop reason"],
+	])("provider_stall from nested worker %s resumes once, bills both attempts, and unblocks dependent wave", async (_label, error) => {
+		const { result, batches, billed, phases } = await runTwoLeadChain(true, (call, task) => call === 0
+			? leadResult(task, {
+				...timedOut(task),
+				interruption: {
+					taskId: task.taskId, reason: "inactivity_timeout", elapsedMs: 60000, sinceLastProgressMs: 60000,
+					turns: 1, toolCalls: 1, repeatedToolCalls: 0, lastProgress: "nested worker progress",
+					nestedWorkers: [{ id: "t11", turns: 9, finished: false, latestText: "trying provider", errorMessage: error }],
+					partialText: "partial report", verified: false,
+				},
+			})
+			: undefined);
+		expect(batches).toEqual([["r-lead-0"], ["r-lead-0"], ["r-lead-1"]]);
+		expect(result.resumedLeadTaskIds).toEqual(["r-lead-0"]);
+		expect(result.retriedLeadTaskIds).toEqual([]);
+		expect(result.resumedAttemptResults).toHaveLength(1);
+		expect(billed).toHaveLength(3);
+		expect(phases.some((p) => p.includes("provider_stall"))).toBe(true);
+	});
+
+	test("wait_stall with a dependent lead shares the A3 budget: failed resume cannot get a third attempt", async () => {
+  const { result, batches } = await runTwoLeadChain(true, (_call, task) => leadResult(task, {
+   exitCode: 124, outcome: "timed_out", timeoutReason: "inactivity", stderr: "",
+   toolInFlight: { name: "bash", command: "gh run watch 123" },
+  }));
+  expect(batches).toEqual([["r-lead-0"], ["r-lead-0"]]);
+  expect(result.resumedLeadTaskIds).toEqual(["r-lead-0"]);
+  expect(result.retriedLeadTaskIds).toEqual([]);
+  expect(result.skippedLeads).toBe(1);
+ });
+
+ test("provider_stall on error-end resumes only once even when the resumed attempt also fails", async () => {
+		const { result, batches } = await runTwoLeadChain(true, (_call, task) => leadResult(task, {
+			exitCode: 1, outcome: "failed", stopReason: "error", stderr: "[provider error] fetch failed",
+		}));
+		expect(batches).toEqual([["r-lead-0"], ["r-lead-0"]]);
+		expect(result.resumedLeadTaskIds).toEqual(["r-lead-0"]);
+		expect(result.retriedLeadTaskIds).toEqual([]);
 	});
 
 	test("(a) lead 1 times out, lead 2 depends on it; the in-wave retry succeeds so lead 2 IS dispatched", async () => {

@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionContext } from "@humain/terminal";
 
 import { runOrchestration, writeLeadReportsDiagnostic, type RunOrchestrationDeps } from "./run-orchestration.ts";
@@ -206,6 +210,138 @@ describe("pipeline/run-orchestration.ts runOrchestration", () => {
 	});
 });
 
+describe("pipeline/run-orchestration.ts out-of-tree warning (A6/N2)", () => {
+	test("running against this extension's own repo warns at start without blocking planning", async () => {
+		const session = fakeSession();
+		const { ctx, notifications } = fakeCtx();
+		const events: string[] = [];
+		const deps = fakeDeps({
+			planRun: async () => { throw new Error("plan marker"); },
+			recordEvent: (event) => { events.push(event); },
+		});
+		const result = await runOrchestration("ht-orch-1700000000000-live", process.cwd(), fakeArgs(), fakeAdapter(), fakeResolution(fakeAdapter()), ctx, session, { ...claimed, session }, deps);
+		expect(result.kind).toBe("aborted");
+		expect(events).toContain("live_extension_tree");
+		expect(notifications.some((n) => n.level === "warning" && n.text.includes("Live extension tree:"))).toBe(true);
+		expect(notifications.some((n) => n.level === "error" && n.text.includes("plan marker"))).toBe(true);
+	});
+	test("a lead editing another git worktree leaves this run at zero files but warns and names that worktree", async () => {
+		const tmp = mkdtempSync(join(tmpdir(), "orch-out-of-tree-"));
+		const repo = join(tmp, "repo");
+		const other = join(tmp, "other-worktree");
+		mkdirSync(repo);
+		const git = (args: string[]) => {
+			const result = spawnSync("git", args, { cwd: repo, encoding: "utf-8" });
+			if (result.status !== 0) throw new Error(result.stderr);
+		};
+		try {
+			git(["init", "-q"]);
+			git(["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "baseline"]);
+			git(["worktree", "add", "-q", "--detach", other]);
+			const runId = "ht-orch-1700000000000-foreign";
+			const plan: PlanResponse = {
+				plan_id: "plan-123456789012", run_id: runId, task_class: "bugfix", complexity: 3, risk: "medium",
+				topology: { depth: 1, leads: 1, workers: 0, shape: "flat" },
+				route: {
+					selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+					recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+					mode: "auto", history_sufficient: true, explanation: {},
+				},
+				effective_quality_floor: 0.5, cost_aggressiveness: 0.5,
+			};
+			for (const { claims, localEdit, earlierCommands } of [
+				{ claims: [] as string[], localEdit: false, earlierCommands: 0 },
+				{ claims: ["a.ts"], localEdit: false, earlierCommands: 0 },
+				{ claims: ["a.ts"], localEdit: true, earlierCommands: 0 },
+				// A foreign cd as command 21 in the bounded log must not be lost to the first 20.
+				{ claims: [] as string[], localEdit: false, earlierCommands: 20 },
+			]) {
+				const session = fakeSession();
+				// The child actually issued the command; assistant prose is not tool evidence.
+				const commandEvent = (command: string) => JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command } });
+				writeFileSync(join(tmp, `${runId}-lead-0.events.jsonl`), [
+					...Array.from({ length: earlierCommands }, () => commandEvent(`cd ${repo} && true`)),
+					commandEvent(`cd ${other} && touch a.ts`),
+				].join("\n") + "\n");
+				session.file = (name: string) => join(tmp, name);
+				const { ctx, notifications } = fakeCtx();
+				const events: string[] = [];
+				const deps = fakeDeps({
+					planRun: async () => plan,
+					recordEvent: (event) => { events.push(event); },
+					dispatchParallel: async (_cwd, _id, tasks) => {
+						if (tasks[0]?.capability !== "lead") {
+							if (!localEdit) throw new Error("QA must not run on the wrong worktree");
+							return tasks.map((t) => ({
+								taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: 0,
+								stdout: "## Verdict\nPASS", stderr: "",
+								usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+								durationMs: 1, costUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+							}));
+						}
+						writeFileSync(join(other, "a.ts"), "edited in another worktree\n");
+						if (localEdit) writeFileSync(join(repo, "unrelated.ts"), "changed locally\n");
+						return tasks.map((t) => ({
+							taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+							stdout: "STATUS: completed\nWrote a.ts", stderr: "",
+							usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+							durationMs: 1, costUsd: 0, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: claims,
+						}));
+					},
+				});
+				const result = await runOrchestration(runId, repo, fakeArgs(), fakeAdapter(), fakeResolution(fakeAdapter()), ctx, session, { ...claimed, session }, deps);
+				expect(result.kind).toBe("completed");
+				if (result.kind !== "completed") continue;
+				expect(result.report.filesChangedCount).toBe(localEdit ? 1 : 0);
+				expect(result.report.outOfTreeChangesLine).toBe(`changes outside run tree: ${other}`);
+				expect(buildRunSummary(result.report).text).toContain(`changes outside run tree: ${other}`);
+				expect(notifications.some((n) => n.level === "warning" && n.text.includes(`changes outside run tree: ${other}`))).toBe(true);
+				expect(events).toContain("out_of_tree_changes");
+			}
+			// A bare report claim that the lead visited another worktree is not an edit.
+			rmSync(join(tmp, `${runId}-lead-0.events.jsonl`));
+			const proseSession = fakeSession();
+			proseSession.file = (name: string) => join(tmp, name);
+			const proseCtx = fakeCtx();
+			const proseDeps = fakeDeps({
+				planRun: async () => plan,
+				dispatchParallel: async (_cwd, _id, tasks) => tasks.map((t) => ({
+					taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+					stdout: `STATUS: completed\nI considered cd ${other} but made no edits.`, stderr: "",
+					usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+					durationMs: 1, costUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+				})),
+			});
+			const proseResult = await runOrchestration(runId, repo, fakeArgs(), fakeAdapter(), fakeResolution(fakeAdapter()), proseCtx.ctx, proseSession, { ...claimed, session: proseSession }, proseDeps);
+			expect(proseResult.kind).toBe("completed");
+			if (proseResult.kind === "completed") expect(proseResult.report.outOfTreeChangesLine).toBeNull();
+			expect(proseCtx.notifications.some((n) => n.text.includes("changes outside run tree:"))).toBe(false);
+			// A run may start in a subdirectory. A lead cd'ing to its repository root
+			// has not left the run tree and must not produce the foreign-worktree warning.
+			const nested = join(repo, "src");
+			mkdirSync(nested);
+			const session = fakeSession();
+			session.file = (name: string) => join(tmp, name);
+			const { ctx, notifications } = fakeCtx();
+			const deps = fakeDeps({
+				planRun: async () => plan,
+				dispatchParallel: async (_cwd, _id, tasks) => tasks.map((t) => ({
+					taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+					stdout: `STATUS: completed\nRan: cd ${repo} && read files`, stderr: "",
+					usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+					durationMs: 1, costUsd: 0, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+				})),
+			});
+			const result = await runOrchestration(runId, nested, fakeArgs(), fakeAdapter(), fakeResolution(fakeAdapter()), ctx, session, { ...claimed, session }, deps);
+			expect(result.kind).toBe("completed");
+			if (result.kind === "completed") expect(result.report.outOfTreeChangesLine).toBeNull();
+			expect(notifications.some((n) => n.text.includes("changes outside run tree:"))).toBe(false);
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("pipeline/run-orchestration.ts runOrchestration QA skip when no lead succeeded (C4)", () => {
 	test("every lead failing dispatches no QA agent, and the summary says verification was skipped because no lead succeeded", async () => {
 		const runId = "ht-orch-1700000000000-allfailed";
@@ -272,6 +408,7 @@ describe("pipeline/run-orchestration.ts runOrchestration QA skip when no lead su
 		expect(dispatchedCapabilities).not.toContain("qa_agent");
 		if (result.kind === "completed") {
 			expect(result.report.dispatchOk).toBe(false);
+			expect(result.report.outOfTreeChangesLine).toBeNull(); // no git observation; don't trust scraped claims
 			expect(result.report.verificationSkipped).toBe(false);
 			expect(result.report.passedVerification).toBe(false);
 			const { text } = buildRunSummary(result.report);
@@ -777,7 +914,61 @@ describe("pipeline/run-orchestration.ts runOrchestration QA dispatch timing out 
 		expect(text).toContain("verification: PASS");
 	});
 
-	test("both QA dispatches time out: report verdict starts with 'QA TIMED OUT', failedChecks is empty, no '-retry-' dispatch, summary never names `unit`", async () => {
+	test.each([false, true])("QA provider failure with zero tools re-runs once; second provider failure=%s never reports check FAIL", async (secondFails) => {
+		const runId = `ht-orch-1700000000000-qaprovider${secondFails ? "2" : "1"}`;
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const plan = flatPlan(runId);
+		const dispatchedTaskIds: string[] = [];
+		let qaCalls = 0;
+		const outcomes: Record<string, unknown>[] = [];
+		// hv4i5g QA event 9: zero-tool provider failure; the stderr from that run
+		// repeats this same ENOTFOUND diagnostic, not a test/check failure.
+		const qaEvent = JSON.parse(readFileSync(new URL("../fixtures/hv4i5g-qa-provider-error.jsonl", import.meta.url), "utf8"));
+		expect(qaEvent._fixture.source).toContain("qa.events.jsonl:9");
+		expect(qaEvent.message.usage.input).toBe(0);
+		const qaStderr = readFileSync(new URL("../fixtures/hv4i5g-qa-provider-error.stderr.log", import.meta.url), "utf8");
+		expect(qaStderr).toContain(qaEvent.message.errorMessage);
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			recordOutcome: (row) => { outcomes.push(row); },
+			dispatchParallel: async (_cwd, _id, tasks) => {
+				dispatchedTaskIds.push(...tasks.map((t) => t.taskId));
+				return tasks.map((t) => {
+					if (t.capability === "qa_agent") {
+						qaCalls++;
+						const failed = qaCalls === 1 || secondFails;
+						return { taskId: t.taskId, capability: t.capability, model: "p/qa", exitCode: failed ? 1 : 0,
+							stdout: failed ? "" : "## Verdict\nPASS", stderr: failed ? qaStderr : "",
+							usage, durationMs: 1, costUsd: 0.01, costReported: true, outcome: failed ? "failed" as const : "completed" as const, filesChanged: [] };
+					}
+					return { taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+						stdout: "STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "",
+						usage, durationMs: 1, costUsd: 0.01, costReported: true, outcome: "completed" as const, filesChanged: ["src/a.ts"] };
+				});
+			},
+		});
+		const result = await runOrchestration(runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, fakeResolution(adapter), ctx, session, { ...claimed, session }, deps);
+		expect(result.kind).toBe("completed");
+		if (result.kind !== "completed") return;
+		expect(qaCalls).toBe(2);
+		expect(dispatchedTaskIds).toContain(`${runId}-qa-rerun-1`);
+		expect(dispatchedTaskIds.some((id) => id.includes("-lead-0-retry-"))).toBe(false);
+		expect(result.report.failedChecks).toEqual([]);
+		expect(outcomes.some((o) => o.task_id === `${runId}-qa` && o.outcome === "fail")).toBe(false);
+		if (secondFails) {
+			expect(result.report.verificationTimedOut).toBe(false);
+			expect(result.report.verificationProviderStall).toBe(true);
+			const { text, succeeded } = buildRunSummary(result.report);
+			expect(text).toContain("verification: QA PROVIDER STALL (QA dispatch did not complete)");
+			expect(text).not.toContain("verification: QA TIMED OUT");
+			expect(text).not.toContain("verification: FAIL");
+			expect(succeeded).toBe(false);
+		} else expect(result.report.passedVerification).toBe(true);
+	});
+
+	test("injected QA timeout seam (not fixture replay): two timed-out QA attempts are counted, but unit is not a failed check", async () => {
 		const runId = "ht-orch-1700000000000-qatimeout2";
 		const session = fakeSession();
 		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
@@ -817,6 +1008,9 @@ describe("pipeline/run-orchestration.ts runOrchestration QA dispatch timing out 
 		expect(dispatchedTaskIds).toContain(`${runId}-qa`);
 		expect(dispatchedTaskIds).toContain(`${runId}-qa-rerun-1`);
 		expect(dispatchedTaskIds.some((id) => id.includes("-retry-"))).toBe(false);
+		// The QA re-run is counted as a dispatch, not as a lead escalation retry.
+		expect(result.report.dispatchCount).toBe(3); // one lead + two QA attempts
+		expect(dispatchedTaskIds).toEqual([`${runId}-lead-0`, `${runId}-qa`, `${runId}-qa-rerun-1`]);
 		expect(result.report.retries).toBe(0);
 		expect(result.report.verificationTimedOut).toBe(true);
 		expect(result.report.passedVerification).toBe(false);

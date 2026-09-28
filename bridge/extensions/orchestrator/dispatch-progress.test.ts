@@ -150,6 +150,24 @@ describe("DispatchProgressTracker", () => {
 		expect(report.partialText).toHaveLength(2000);
 	});
 
+	test("interruption diagnostic retains nested last turn, last text and errorMessage without losing them to stale placeholders", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		tracker.observe(nestedUpdate(nestedResult("worker-1", 9, "trying Bedrock")), 10);
+		tracker.observe(nestedUpdate({ ...nestedResult("worker-1", 0, ""), errorMessage: "getaddrinfo ENOTFOUND bedrock-runtime" }), 20);
+		const report = buildInterruptionReport({ taskId: "lead", reason: "inactivity_timeout", startedAt: 0, now: 30, turns: 1, toolCalls: 1, partialText: "", tracker });
+		expect(report.nestedWorkers).toMatchObject([{ id: "worker-1", turns: 9, latestText: "trying Bedrock", errorMessage: "getaddrinfo ENOTFOUND bedrock-runtime" }]);
+		const diagnostic = renderInterruptionReport(report);
+		expect(diagnostic).toContain("trying Bedrock");
+		expect(diagnostic).toContain("ENOTFOUND");
+	});
+
+	test("a newer healthy nested turn clears a stale provider error", () => {
+		const tracker = new DispatchProgressTracker(leadPolicy, 0);
+		tracker.observe(nestedUpdate({ ...nestedResult("worker-1", 1, "error"), errorMessage: "fetch failed" }), 10);
+		tracker.observe(nestedUpdate(nestedResult("worker-1", 2, "working normally")), 20);
+		expect(tracker.nestedWorkers()[0]?.errorMessage).toBeUndefined();
+	});
+
 	test("schedules checks at the next warning threshold", () => {
 		const tracker = new DispatchProgressTracker({ mode: "lead", inactivityMs: 1000, absoluteMs: 2000, notes: [] }, 0);
 		expect(tracker.check(0).nextCheckMs).toBe(750);

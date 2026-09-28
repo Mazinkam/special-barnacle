@@ -13,9 +13,10 @@
  *
  * run/* must not import index.ts.
  */
-import type { DispatchProgressView } from "../run-ui.ts";
+import type { DispatchProgressView, PendingCheckRow } from "../run-ui.ts";
 import {
 	fmtElapsed,
+	formatPendingCheckRows,
 	formatNestedWorkerRows,
 	formatProgressLine,
 	formatWarningLine,
@@ -171,6 +172,7 @@ export interface BoardSnapshot {
 	goal: string;
 	worktree: WorktreeInfo | null;
 	dispatches: DispatchProgress[];
+	pendingChecks?: readonly PendingCheckRow[];
 	queuedMessageCount: number;
 	/** Most recent delivered message batch, if any (shown when nothing is queued). */
 	lastDelivery?: { count: number; to: string; ts: number };
@@ -191,7 +193,7 @@ export interface BoardView {
  * that hands the result to `ctx.ui.setStatus`/`setWidget` (via `safeUi`).
  */
 export function renderBoard(snapshot: BoardSnapshot, now: number): BoardView {
-	const { runId, phase, startedAt, goal, worktree, dispatches, queuedMessageCount, lastDelivery, totalCostUsd, logPath } = snapshot;
+	const { runId, phase, startedAt, goal, worktree, dispatches, pendingChecks = [], queuedMessageCount, lastDelivery, totalCostUsd, logPath } = snapshot;
 	const running = dispatches.filter((d) => d.status === "running");
 	const done = dispatches.filter((d) => d.status !== "running");
 	const failed = done.filter((d) => d.status === "failed").length;
@@ -203,7 +205,9 @@ export function renderBoard(snapshot: BoardSnapshot, now: number): BoardView {
 	// here means the user can see the verdict in the status bar even after
 	// the widget has been closed.
 	const wtShort = worktree ? ` · ${worktree.shortBranch} @ ${worktree.name}` : "";
-	const statusLine = `orch ${phase} · ${elapsed} · ${running.length} running · ${failed} failed${wtShort} · $${totalCostUsd.toFixed(3)}`;
+	const ciPending = pendingChecks.filter((row) => row.outcome === "pending").length;
+	const ciStatus = pendingChecks.length ? ` · ${ciPending} CI pending` : "";
+	const statusLine = `orch ${phase} · ${elapsed} · ${running.length} running · ${failed} failed${ciStatus}${wtShort} · $${totalCostUsd.toFixed(3)}`;
 
 	const lines: string[] = [];
 	// Title bar: run id, phase, elapsed, total cost, worktree.
@@ -252,6 +256,11 @@ export function renderBoard(snapshot: BoardSnapshot, now: number): BoardView {
 		if (done.length > 6) {
 			lines.push(`    … ${done.length - 6} earlier in run.log`);
 		}
+	}
+
+	// External CI is informational; it does not change dispatch or run verdicts.
+	if (pendingChecks.length > 0) {
+		lines.push("", ...formatPendingCheckRows(pendingChecks));
 	}
 
 	// Message queue indicator — only when there is something queued.

@@ -23,11 +23,19 @@
  * `deps` instead, same as `pipeline/hierarchy.ts` and `pipeline/verify-loop.ts`.
  */
 import type { ExtensionContext } from "@humain/terminal";
-import { resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { OrchestrateArgs } from "../core/args.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
+import { detectLiveExtensionTree, detectOutOfTreeChanges, outOfTreeChangesSummaryLine, type LiveTreeSeams } from "../core/live-tree.ts";
 import { complexityNeedsArchitect, type DispatchTask, type PlanResponse } from "../core/prompts.ts";
+import { pollCiCheck, type CiPollSpawn, type CiWaitState } from "../core/ci-wait.ts";
+import type { PendingCheck } from "../core/pending-checks.ts";
+import type { ResolvedCheck } from "./hierarchy.ts";
+import type { RunCancellation } from "../cancellation.ts";
 import type { RunReport } from "../core/report.ts";
 import type { TriageResult } from "../core/triage.ts";
 import { loadEfficiencyControls } from "../efficiency-flags.ts";
@@ -41,9 +49,10 @@ import { classifyRunOutcome, externalChangeFiles, parseLeadStatus, qaScopeEviden
 import { summarizeStderr } from "../dispatch/stderr-sink.ts";
 import { confirmStep, safeUi } from "../run/ui-sink.ts";
 import { describeRunArtifact, type RunTiming } from "../run/session.ts";
-import type { RunContext, RunSessionLike } from "../run/context.ts";
+import type { RunContext, RunSessionLike, PendingCheckRow } from "../run/context.ts";
 import { telemetryWarning, type FlushReport, type QueueStats } from "../record-queue.ts";
 import { collectBilledResults, dispatchHierarchical, summarizeReconWorkers } from "./hierarchy.ts";
+import { redactSecrets } from "../live-qa.ts";
 import { collectLeadAttempts, formatLeadAttemptLines } from "./lead-attempts.ts";
 import { runVerification, type VerificationResult } from "./verify-loop.ts";
 import {
@@ -55,6 +64,93 @@ import {
 	runLiveQaStage,
 	type RunLiveQaStageResult,
 } from "../live-qa-stage.ts";
+
+type CheckRow = PendingCheckRow;
+
+/** One cancellable session tick at a time; injectable clock/scheduler and spawn keep tests deterministic. */
+export async function waitForPendingChecks(checks: PendingCheck[], options: {
+ cwd: string;
+ cancellation: RunCancellation;
+ now?: () => number;
+ spawn?: CiPollSpawn;
+ scheduleTick?: (delayMs: number, tick: () => void) => () => void;
+ expectedSha?: string | null;
+ expectedRepo?: string | null;
+ setPendingChecks?: (rows: CheckRow[]) => void;
+ onOutcome?: (result: ResolvedCheck) => void;
+}): Promise<ResolvedCheck[]> {
+ const now = options.now ?? Date.now;
+ const schedule = options.scheduleTick ?? ((delay: number, tick: () => void) => {
+  const timer = setTimeout(tick, delay);
+  return () => clearTimeout(timer);
+ });
+ const controller = new AbortController();
+ const offCancel = options.cancellation.onCancel(() => controller.abort());
+ const states: CiWaitState[] = checks.map(() => ({ startedAt: now(), nextPollAt: now() }));
+ const results: Array<ResolvedCheck | undefined> = checks.map(() => undefined);
+ const publish = () => options.setPendingChecks?.(checks.map((check, index) => ({
+  provider: check.provider, id: check.id, outcome: results[index]?.outcome === "cancelled" ? "unverified" : results[index]?.outcome ?? "pending",
+  ...(check.mr ? { mr: check.mr } : {}),
+ })));
+ publish();
+ try {
+  // Continuations are scheduled by one session tick, not by a blocking poll/sleep loop.
+  const tick = async (): Promise<void> => {
+   options.cancellation.throwIfCancelled();
+   for (let i = 0; i < checks.length; i++) {
+    if (results[i]) continue;
+    const outcome = await pollCiCheck(checks[i], states[i], { cwd: options.cwd, expectedSha: options.expectedSha ?? undefined, expectedRepo: options.expectedRepo ?? undefined, signal: controller.signal, now, spawn: options.spawn });
+    options.cancellation.throwIfCancelled();
+    if (outcome.outcome === "pending") states[i] = outcome.state!;
+    else {
+     const resolved: ResolvedCheck = { check: checks[i], ...outcome, candidateSha: options.expectedSha ?? null };
+     results[i] = resolved;
+     options.onOutcome?.(resolved);
+    }
+   }
+   publish();
+   if (results.every(Boolean)) return;
+   const delay = Math.max(0, Math.min(...states.filter((_, i) => !results[i]).map((s) => s.nextPollAt)) - now());
+   await new Promise<void>((resolve, reject) => {
+    let off = () => {};
+    const cancelTimer = schedule(delay, () => { off(); resolve(); });
+    off = options.cancellation.onCancel(() => { cancelTimer(); off(); reject(new Error("Orchestration cancelled")); });
+   });
+   return tick();
+  };
+  if (checks.length) await tick();
+  return results as ResolvedCheck[];
+ } finally { offCancel(); }
+}
+
+/** Persist bounded CI diagnostics in the session's owned artifact, never in a dispatch prompt. */
+export function writeCheckFailureDiagnostic(session: Pick<RunSessionLike, "writeDiagnostic" | "file">, text: string, env: Record<string, string | undefined>): string | null {
+ const name = "external-check-failure.log";
+ try {
+  return session.writeDiagnostic(name, redactSecrets(text, env)) ? session.file(name) : null;
+ } catch { return null; }
+}
+
+export function terminalCandidateChecks(checks: ResolvedCheck[], head: string | null): ResolvedCheck[] {
+ return checks.map((result) => result.outcome === "success" && (!head || result.candidateSha !== head)
+  ? { ...result, outcome: "unverified", reason: "candidate_changed" }
+  : result);
+}
+
+/** Resolve origin without a shell; reject ambiguous/untrusted remotes rather than checking a different repo. */
+export function canonicalOrigin(cwd: string): string | null {
+ try {
+  const remote = spawnSync("git", ["remote", "get-url", "origin"], { cwd, encoding: "utf8", timeout: 10_000 });
+  if (remote.status !== 0) return null;
+  const raw = remote.stdout.trim();
+  const ssh = /^git@([A-Za-z0-9.-]+):(.+)$/.exec(raw);
+  const url = new URL(ssh ? `https://${ssh[1]}/${ssh[2]}` : raw);
+  if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash) return null;
+  const path = url.pathname.replace(/\.git$/, "");
+  if (!/^\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/.test(path) || path.split("/").some((s) => s === "." || s === "..")) return null;
+  return `https://${url.hostname}${path}`;
+ } catch { return null; }
+}
 
 /** `planRun`'s options; structurally identical to index.ts's own (private) `PlanOptions` —
  *  redeclared here rather than imported so this module never has to import index.ts. */
@@ -112,6 +208,7 @@ export interface RunOrchestrationDeps {
 	/** Records a single model-usage row (the Python-side economics ledger); used to record the
 	 *  live-QA stage's own cost rows, independent of `recordOutcome`'s outcome row. */
 	recordModelCall: (metric: Record<string, unknown>) => void;
+	ciWait?: { now?: () => number; spawn?: CiPollSpawn; scheduleTick?: (delayMs: number, tick: () => void) => () => void };
 }
 
 /**
@@ -140,6 +237,105 @@ export type RunOrchestrationResult = RunCompleted | RunAborted;
  *  scope) can use the exact same wording. */
 export function warnTelemetry(ctx: ExtensionContext, report: FlushReport): void {
 	for (const line of telemetryWarning(report)) safeUi(() => ctx.ui.notify(line, "warning"));
+}
+
+/**
+ * A6/N2: the real (impure) `git rev-parse --show-toplevel` / realpath edge `detectLiveExtensionTree`
+ * (core/live-tree.ts) needs. Kept tiny and inlined here — never exported, never unit-tested
+ * directly — specifically so core/live-tree.ts's own tests never need a real repo: they inject
+ * their own `LiveTreeSeams` fixtures instead. Any failure here (not a git work tree, `git`
+ * missing, permission error) resolves to `null`, which `detectLiveExtensionTree` already treats
+ * as "skip silently".
+ */
+const REAL_LIVE_TREE_SEAMS: LiveTreeSeams = {
+	gitToplevel: (path) => {
+		try {
+			const result = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: path, encoding: "utf-8", timeout: 10_000 });
+			if (result.status !== 0) return null;
+			const top = result.stdout.trim();
+			return top || null;
+		} catch {
+			return null;
+		}
+	},
+	realpath: (path) => {
+		try {
+			return realpathSync(path);
+		} catch {
+			return null;
+		}
+	},
+};
+
+/**
+ * A6/N2: at run start (before any cost is spent), warn — loudly, but never block — when the
+ * orchestrator extension currently executing this run lives inside the very repo the run is
+ * about to dispatch leads against. A lead editing files under the extension's own directory
+ * would be rewriting the code driving this run mid-flight. `cwd` is the run's own working
+ * directory; the extension's own directory is derived from this module's `import.meta.url` (this
+ * file lives at `<extension dir>/pipeline/run-orchestration.ts`). Any git/realpath failure is
+ * swallowed here too, as a second line of defense on top of `detectLiveExtensionTree`'s own
+ * `null`-on-failure contract — this is a warn-only feature, never worth failing (or even noisily
+ * logging) a run over.
+ */
+/** Read only bounded head/tail of a lead's own diagnostic event log. Tool arguments are
+ * retained on tool_execution_start; assistant prose and nested subagent prompts are not tool
+ * execution evidence. Open without following symlinks, and fail closed on missing logs. */
+function leadToolCommands(session: RunSessionLike, taskId: string): string[] {
+	const safeId = taskId.replace(/[^a-zA-Z0-9._-]+/g, "_");
+	let fd: number;
+	try {
+		fd = openSync(session.file(`${safeId}.events.jsonl`), constants.O_RDONLY | constants.O_NOFOLLOW);
+	} catch { return []; }
+	try {
+		const size = fstatSync(fd).size;
+		const window = 128 * 1024;
+		const chunks: string[] = [];
+		for (const [start, length] of size <= window * 2
+			? [[0, size]]
+			: [[0, window], [size - window, window]]) {
+			const buffer = Buffer.alloc(length);
+			const bytes = readSync(fd, buffer, 0, length, start);
+			const text = buffer.toString("utf8", 0, bytes);
+			chunks.push(start === 0 ? text.slice(0, text.lastIndexOf("\n") + 1) : text.slice(text.indexOf("\n") + 1));
+		}
+		const commands: string[] = [];
+		for (const line of chunks.join("\n").split("\n")) {
+			if (!line || line.length > 20_000) continue;
+			try {
+				const event = JSON.parse(line) as { type?: unknown; toolName?: unknown; args?: { command?: unknown } };
+				if (event.type === "tool_execution_start" && (event.toolName === "bash" || event.toolName === "functions.bash") && typeof event.args?.command === "string") {
+					commands.push(event.args.command);
+					if (commands.length > 20) commands.shift(); // Keep the most recent calls in the bounded head/tail.
+				}
+			} catch { /* incomplete or malformed JSONL is not evidence */ }
+		}
+		return commands;
+	} catch { return []; }
+	finally { closeSync(fd); }
+}
+
+function warnIfLiveExtensionTree(
+	cwd: string,
+	ctx: ExtensionContext,
+	session: RunSessionLike,
+	runId: string,
+	recordEvent: RunOrchestrationDeps["recordEvent"],
+): void {
+	try {
+		const extensionDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+		const match = detectLiveExtensionTree(cwd, extensionDir, REAL_LIVE_TREE_SEAMS);
+		if (!match) return;
+		const message =
+			`Live extension tree: this run's repo (${match.runRoot}) contains the orchestrator extension ` +
+			`currently executing it (${match.extensionRoot}). A dispatched lead editing files under the ` +
+			"extension's own directory can rewrite the code driving this very run. Continuing — this is a warning, not a block.";
+		session.log(message);
+		safeUi(() => ctx.ui.notify(message, "warning"));
+		recordEvent("live_extension_tree", { run_id: runId, repo_root: match.runRoot, extension_dir: match.extensionRoot });
+	} catch {
+		// Warn-only feature; any unexpected failure skips silently.
+	}
 }
 
 /**
@@ -186,6 +382,10 @@ export async function runOrchestration(
 	claimed: RunContext<RunSessionLike>,
 	deps: RunOrchestrationDeps,
 ): Promise<RunOrchestrationResult> {
+	// A6/N2: warn (never block) when this run's own repo contains the orchestrator extension
+	// currently executing it — before any cost is spent, alongside the other run-start setup below.
+	warnIfLiveExtensionTree(cwd, ctx, session, runId, deps.recordEvent);
+
 	// -----------------------------------------------------------------
 	// A1 review fix: `scoped_leads`/`file_ownership`/`recon_before_architect` are efficiency
 	// switches this modular pipeline does not implement (core/records.ts's `scopedPhaseReports`
@@ -375,7 +575,8 @@ export async function runOrchestration(
 	// `workerResults` carries the parent-owned recon dispatches; they must stay
 	// destructured here or the run stops billing them (plan Task 3).
 	const repoRoot = resolve(cwd);
-	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks, resumedLeadTaskIds, retriedLeadTaskIds, resumedAttemptResults } = await dispatchHierarchical(
+	const checkRows = new Map<string, PendingCheckRow>();
+	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks, resumedLeadTaskIds, retriedLeadTaskIds, resumedAttemptResults, pendingChecks } = await dispatchHierarchical(
 		runId,
 		plan.plan_id,
 		parsed.goal,
@@ -396,6 +597,21 @@ export async function runOrchestration(
 			// escalation loop recovers it too late for those waves to ever be dispatched. Gated on
 			// `--max-retries` > 0, the same knob that gates the post-QA escalation loop below.
 			inWaveRecovery: parsed.maxRetries > 0,
+			writeCheckDiagnostic: (_name, text) => writeCheckFailureDiagnostic(session, text, deps.env),
+			waitForChecks: (checks) => waitForPendingChecks(checks, {
+				cwd, cancellation: session.cancellation, ...deps.ciWait,
+				// Resolve at each poll batch, after the owning lead has committed its candidate.
+				// Missing HEAD/origin is unverified, never an implicit success from another run.
+				expectedSha: gitHead(cwd), expectedRepo: canonicalOrigin(cwd),
+				setPendingChecks: (rows) => {
+					for (const row of rows) checkRows.set(`${row.provider}:${row.id}`, row);
+					session.setPendingChecks?.([...checkRows.values()]);
+				},
+				onOutcome: ({ check, outcome, reason, jobId }) => {
+					deps.recordEvent("external_check", { run_id: runId, provider: check.provider, id: check.id, outcome, reason, job_id: jobId });
+					deps.recordOutcome({ run_id: runId, stage: "external_check", provider: check.provider, check_id: check.id, outcome, reason, job_id: jobId });
+				},
+			}),
 			// C3: a lead's resume prompt needs "files changed since it started", using
 			// the same git dirty-snapshot machinery `changedSince` below uses for QA
 			// scope — a snapshot taken right before the lead's (wave's) dispatch,
@@ -434,6 +650,7 @@ export async function runOrchestration(
 	// just ran (used for the phantom log); `priorResults` widen the prose
 	// fallback when git is unavailable so lead files aren't dropped on retry.
 	let snapshotWarned = false;
+	let gitObservationAvailable = dirtyBefore !== null;
 	const changedSince = (
 		label: string,
 		roundResults: DispatchResult[],
@@ -442,6 +659,7 @@ export async function runOrchestration(
 		const roundClaimed = new Set(roundResults.flatMap((r) => r.filesChanged));
 		const claimedFiles = new Set([...priorResults.flatMap((r) => r.filesChanged), ...roundClaimed]);
 		const dirtyAfter = gitDirtySnapshot(cwd);
+		if (!dirtyAfter) gitObservationAvailable = false;
 		if ((!dirtyBefore || !dirtyAfter) && !snapshotWarned) {
 			snapshotWarned = true;
 			session.log(
@@ -449,7 +667,10 @@ export async function runOrchestration(
 			);
 		}
 		const { changed, phantom, historyUnavailable } = changedFilesSinceRunStart(cwd, headBefore, dirtyBefore, claimedFiles, dirtyAfter);
-		if (historyUnavailable) session.log(`${label}: git history unavailable; using claimed file paths`);
+		if (historyUnavailable) {
+			gitObservationAvailable = false;
+			session.log(`${label}: git history unavailable; using claimed file paths`);
+		}
 		const roundPhantom = phantom.filter((f) => roundClaimed.has(f));
 		if (roundPhantom.length > 0) {
 			session.log(
@@ -459,6 +680,33 @@ export async function runOrchestration(
 		return changed;
 	};
 	let allFiles = changedSince("lead phase", leadResults);
+
+	// A6/N2: compare claimed paths against git-observed paths, and inspect actual lead tool
+	// calls for a foreign cd. Warn-only: never alters `allFiles`/QA scope. When git observation
+	// is unavailable, prose/claims cannot establish a missing local edit.
+	const leadClaimedFiles = candidateOwnedFilesForLiveQa(leadResults);
+	// `cwd` can be a subdirectory; git's changed paths are relative to the repository root.
+	// Comparing cd targets to cwd would mislabel an in-repo cd as another worktree.
+	const gitRoot = REAL_LIVE_TREE_SEAMS.gitToplevel(cwd);
+	const runTreeRoot = gitRoot ? (REAL_LIVE_TREE_SEAMS.realpath(gitRoot) ?? gitRoot) : repoRoot;
+	const outOfTreeChanges = detectOutOfTreeChanges({
+		claimedFiles: leadClaimedFiles,
+		observedFiles: gitObservationAvailable ? allFiles : null,
+		leadTexts: leadResults.map((r) => r.stdout),
+		toolTexts: leadResults.flatMap((r) => leadToolCommands(session, r.taskId)),
+		runRoot: runTreeRoot,
+		realpath: REAL_LIVE_TREE_SEAMS.realpath,
+	});
+	if (outOfTreeChanges.detected) {
+		const line = outOfTreeChangesSummaryLine(outOfTreeChanges) ?? "changes outside run tree: (unknown)";
+		session.log(`out-of-tree changes: ${line}`);
+		safeUi(() => ctx.ui.notify(`Warning: ${line} — lead activity not reflected by corresponding changes in this run's own repo.`, "warning"));
+		deps.recordEvent("out_of_tree_changes", {
+			run_id: runId,
+			foreign_path: outOfTreeChanges.foreignPath,
+			claimed_files: outOfTreeChanges.claimedFiles,
+		});
+	}
 
 	// Run outcome from the leads' own STATUS lines. All leads blocked =>
 	// BLOCKED: no QA, no PASS. Files git shows as changed while every
@@ -531,17 +779,17 @@ export async function runOrchestration(
 		if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
 		if (lastVerification.passed) break;
 
-		if (lastVerification.timedOut) {
+		if (lastVerification.timedOut || lastVerification.providerStall) {
+			const qaFailure = lastVerification.providerStall ? "provider_stall" : "timeout";
 			if (qaRerunUsed) {
-				// Already used this run's one re-run and QA timed out again — finish with the
-				// TIMED OUT verdict; a timed-out QA never had a real verdict to escalate on.
-				session.log("QA dispatch timed out again after the re-run; ending the run with QA TIMED OUT (no escalation)");
+				// No completed QA verdict exists; never escalate on a provider failure.
+				session.log(`QA dispatch ${qaFailure} again after the re-run; ending without a verification verdict (no escalation)`);
 				break;
 			}
 			qaRerunUsed = true;
-			session.log("QA dispatch timed out; re-running QA once with scoped-test-command guidance");
-			deps.recordEvent("qa_timed_out_rerun", { run_id: runId, attempt: 1 });
-			session.setPhase(`QA re-run (attempt 1) on ${allFiles.length} changed file(s) after a timeout`);
+			session.log(`QA dispatch ${qaFailure}; re-running QA once with scoped-test-command guidance`);
+			deps.recordEvent(qaFailure === "timeout" ? "qa_timed_out_rerun" : "qa_provider_stall_rerun", { run_id: runId, attempt: 1 });
+			session.setPhase(`QA re-run (attempt 1) on ${allFiles.length} changed file(s) after ${qaFailure}`);
 			lastVerification = await runVerification(
 				runId,
 				plan.plan_id,
@@ -555,14 +803,14 @@ export async function runOrchestration(
 					recordOutcome: deps.recordOutcome,
 				},
 				repoRoot,
-				{ attempt: 1 },
+				{ attempt: 1, reason: lastVerification.providerStall ? "provider_stall" : "timeout" },
 			);
 			session.cancellation.throwIfCancelled();
 			if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
 			if (lastVerification.passed) break;
-			if (lastVerification.timedOut) {
-				// The re-run also timed out — finish with that verdict now, no escalation.
-				session.log("QA re-run also timed out; ending the run with QA TIMED OUT (no escalation)");
+			if (lastVerification.timedOut || lastVerification.providerStall) {
+				// The re-run also failed before a verdict — finish now, no escalation.
+				session.log(`QA re-run also ${lastVerification.providerStall ? "hit provider_stall" : "timed out"}; ending without a verification verdict (no escalation)`);
 				break;
 			}
 			// The re-run completed and reported a real (non-timeout) verdict; fall through to the
@@ -720,7 +968,10 @@ export async function runOrchestration(
 	// The QA dispatch itself timing out (inactivity/absolute ceiling) is a distinct state from QA
 	// completing and reporting failing checks — the summary must say so instead of folding both
 	// into a plain FAIL (docs/architecture-review.md C5).
+	// Both failures are unverified dispatches, never code/check FAIL; preserve
+	// their distinct causes in the report instead of labeling a provider error a timeout.
 	const verificationTimedOut = lastVerification?.dispatch?.outcome === "timed_out";
+	const verificationProviderStall = lastVerification?.providerStall === true && !verificationTimedOut;
 	const failedChecks = lastVerification?.failedChecks ?? [];
 
 	// -----------------------------------------------------------------
@@ -777,9 +1028,17 @@ export async function runOrchestration(
 	const liveQaHasUnknownCost = liveQaCostRowsHaveUnknownCost(liveQaCostRowsForRun);
 
 	session.cancellation.throwIfCancelled();
+	const finalChecks = terminalCandidateChecks(pendingChecks, gitHead(cwd));
+	for (const check of finalChecks) {
+		if (check.reason !== "candidate_changed") continue;
+		deps.recordEvent("external_check_candidate_changed", { run_id: runId, provider: check.check.provider, id: check.check.id, outcome: "unverified", reason: check.reason });
+		deps.recordOutcome({ run_id: runId, stage: "external_check", provider: check.check.provider, check_id: check.check.id, outcome: "unverified", reason: check.reason });
+	}
+	if (finalChecks.length) session.setPendingChecks?.(finalChecks.map(({ check, outcome }) => ({ provider: check.provider, id: check.id, outcome: outcome === "cancelled" ? "unverified" : outcome, ...(check.mr ? { mr: check.mr } : {}) })));
 	const telemetry = await deps.completeRun(runId, {
 		success_rate: finalSucceededLeads / Math.max(1, leadAttempts.length),
 		verification_passed: passedVerification,
+		external_checks: finalChecks.map(({ check, outcome, reason, jobId }) => ({ provider: check.provider, id: check.id, outcome, reason, job_id: jobId })),
 		blocked: finalRunOutcome === "blocked",
 		lead_statuses: finalLeadStatuses,
 		external_changes: externalFiles.length,
@@ -860,7 +1119,9 @@ export async function runOrchestration(
 		verificationSkipped,
 		passedVerification,
 		verificationTimedOut,
+		verificationProviderStall,
 		failedChecks,
+		externalChecks: finalChecks.map(({ check, outcome }) => ({ provider: check.provider, id: check.id, outcome: outcome === "cancelled" ? "unverified" as const : outcome })),
 		totalCostUsd: totalCost,
 		dispatchCount: billedResults.length + (triageCost.usd > 0 ? 1 : 0),
 		nestedCostUsd: nestedCost,
@@ -873,6 +1134,7 @@ export async function runOrchestration(
 		runLogPath: describeRunArtifact(session.file("run.log")),
 		stateRoot: deps.stateRoot,
 		telemetryReport: telemetry,
+		outOfTreeChangesLine: outOfTreeChangesSummaryLine(outOfTreeChanges),
 		...(parsed.liveQa ? { liveQa: { stage: liveQaStageResult, notRunReason: liveQaNotRunReason, hasUnknownCost: liveQaHasUnknownCost } } : {}),
 	};
 	return { kind: "completed", report };

@@ -38,6 +38,11 @@ describe("core/report.ts verificationVerdictFor", () => {
 		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true })).toBe("QA TIMED OUT (QA dispatch did not complete)");
 	});
 
+	test("QA provider failure without timeout is unverified, never QA TIMED OUT or FAIL", () => {
+		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationProviderStall: true, failedChecks: ["unit"] }))
+			.toBe("QA PROVIDER STALL (QA dispatch did not complete)");
+	});
+
 	test("a timeout still wins over named failed checks (QA never finished judging them)", () => {
 		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true, failedChecks: ["typecheck"] })).toBe("QA TIMED OUT (QA dispatch did not complete)");
 	});
@@ -74,6 +79,7 @@ function baseReport(): RunReport {
 		leadAttemptLines: [],
 		filesChangedCount: 3,
 		externalFilesCount: 0,
+		outOfTreeChangesLine: null,
 		reconWorkersLine: "recon: 0 workers dispatched",
 		verificationSkipped: false,
 		passedVerification: true,
@@ -95,6 +101,26 @@ function baseReport(): RunReport {
 }
 
 describe("core/report.ts buildRunSummary", () => {
+	test("external outcome does not overwrite QA verdict, and unverified is never QA FAIL", () => {
+		for (const outcome of ["failure", "unverified"] as const) {
+			const { text, succeeded } = buildRunSummary({ ...baseReport(), externalChecks: [{ provider: "github", id: "123", outcome }] });
+			expect(text).toContain("verification: PASS");
+			expect(text).toContain(`external check: github 123 ${outcome}`);
+			expect(text).not.toContain("verification: FAIL external check");
+			expect(succeeded).toBe(false);
+		}
+	});
+
+	test("external check without a successful verdict prevents PASS, including report-only runs", () => {
+		for (const outcome of ["failure", "unverified", "pending"] as const) {
+			const { text, succeeded } = buildRunSummary({ ...baseReport(), verificationSkipped: true, filesChangedCount: 0, externalChecks: [{ provider: "github", id: "123", outcome }] });
+			expect(succeeded).toBe(false);
+			expect(text).not.toContain("verification: PASS");
+			expect(text).toContain(`external check: github 123 ${outcome}`);
+			expect(text).toContain("Orchestration BLOCKED");
+		}
+	});
+
 	test("complete: passed verification, reported as succeeded", () => {
 		const { text, succeeded } = buildRunSummary(baseReport());
 		expect(text).toBe(
@@ -171,6 +197,12 @@ describe("core/report.ts buildRunSummary", () => {
 	test("external files: annotates the leads line, excluded-from-QA count", () => {
 		const { text } = buildRunSummary({ ...baseReport(), externalFilesCount: 2 });
 		expect(text).toContain("files: 3 changed (+2 changed by someone else, not verified)");
+	});
+
+	test("out-of-tree edits are named in the summary even when git reports zero files", () => {
+		const { text } = buildRunSummary({ ...baseReport(), filesChangedCount: 0, verificationSkipped: true, outOfTreeChangesLine: "changes outside run tree: /other/worktree" });
+		expect(text).toContain("files: 0 changed");
+		expect(text).toContain("changes outside run tree: /other/worktree");
 	});
 
 	test("nested cost: appended to the total cost line", () => {
@@ -307,6 +339,21 @@ describe("core/report.ts buildRunSummary", () => {
 				"telemetry: 1 record(s) could not be written to the ledger — ledger write failed",
 			].join("\n"),
 		);
+		expect(succeeded).toBe(false);
+	});
+
+	test("QA provider stall: exact summary says unverified provider failure, not timeout or check FAIL", () => {
+		const { text, succeeded } = buildRunSummary({ ...baseReport(), passedVerification: false, verificationProviderStall: true });
+		expect(text).toBe([
+			"Orchestration complete in 1m05s.",
+			"run_id: ht-orch-1700000000000-abcdef",
+			"leads: 2/2 succeeded · retries: 0 · files: 3 changed",
+			"recon: 0 workers dispatched",
+			"verification: QA PROVIDER STALL (QA dispatch did not complete)",
+			"total cost: $1.2345 (3 dispatches)",
+			"run log: /tmp/run.log",
+			"ledger: /tmp/state/metrics.jsonl",
+		].join("\n"));
 		expect(succeeded).toBe(false);
 	});
 

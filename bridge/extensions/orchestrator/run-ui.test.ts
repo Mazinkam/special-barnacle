@@ -5,12 +5,24 @@ import {
 	connectCancellationLoader,
 	createProgressView,
 	formatNestedWorkerRows,
+	formatPendingCheckRows,
 	formatProgressLine,
 	formatWarningLine,
 } from "./run-ui.ts";
 import type { NestedWorkerSnapshot } from "./dispatch-progress.ts";
 
 describe("orchestration progress UI", () => {
+	test("external CI rows escape controls, cap labels and visible rows", () => {
+		const rows = Array.from({ length: 12 }, (_, i) => ({ provider: "gitlab" as const, id: `check-${i}`, outcome: "pending" as const }));
+		rows[0] = { provider: "gitlab", id: `job\n\u001b[31m${"x".repeat(200)}`, outcome: "pending" };
+		const lines = formatPendingCheckRows(rows);
+		expect(lines[0]).toContain("external CI checks (12)");
+		expect(lines.filter((line) => line.includes("gitlab"))).toHaveLength(6);
+		expect(lines.some((line) => line.includes("6 more"))).toBe(true);
+		expect(lines[1]).toContain("job\\n\\x1b[31m");
+		expect(lines.every((line) => line.length <= 120 && !line.includes("\u001b"))).toBe(true);
+	});
+
 	test("progress updates its timestamp and clears only an inactivity warning", () => {
 		const view = createProgressView(100);
 		applyWarnings(view, [{ kind: "inactivity", text: "⚠ no meaningful progress (raise HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS)" }], 200, () => {});

@@ -62,6 +62,36 @@ function capturingVerifyDeps(qaStdout: string, exitCode = 0, outcome?: DispatchR
 const fakeCtx = {} as ExtensionContext;
 const fakeRun: RunContext<RunSession> | null = null;
 
+describe("QA provider stall (A5/N1b)", () => {
+	test("provider failure before any tool call is unverified, not a check FAIL", async () => {
+		const outcomes: Record<string, unknown>[] = [];
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), {
+			dispatch: async () => [{ ...fakeQaResult("| unit | FAIL |", 1, "failed"), stderr: "TypeError: fetch failed", usage: { ...fakeQaResult("").usage, tool_calls: 0 } }],
+			captureDispatchCost: async () => {},
+			recordOutcome: (row) => { outcomes.push(row); },
+		}, "/tmp/cwd-not-a-git-repo");
+		expect(result.providerStall).toBe(true);
+		expect(result.failedChecks).toEqual([]);
+		expect(outcomes[0]?.outcome).not.toBe("fail");
+	});
+
+	test("provider re-run guidance does not claim QA timed out", async () => {
+		const deps = capturingVerifyDeps("## Verdict\nPASS");
+		await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), deps, "/tmp/cwd-not-a-git-repo", { attempt: 1, reason: "provider_stall" });
+		expect(deps.lastTasks[0]?.task).toContain("previous QA dispatch hit a provider_stall");
+		expect(deps.lastTasks[0]?.task).not.toContain("previous QA dispatch on this run timed out");
+	});
+
+	test("provider failure after tool calls does not erase a real QA FAIL", async () => {
+		const result = await runVerification("run-1", "plan-1", ["src/a.ts"], fakeCtx, fakeRun, fakeCaptureOpts(), {
+			dispatch: async () => [{ ...fakeQaResult("| unit | FAIL |", 1, "failed"), stderr: "fetch failed", usage: { ...fakeQaResult("").usage, tool_calls: 2 } }],
+			captureDispatchCost: async () => {}, recordOutcome: () => {},
+		}, "/tmp/cwd-not-a-git-repo");
+		expect(result.providerStall).toBeUndefined();
+		expect(result.failedChecks).toEqual(["unit"]);
+	});
+});
+
 describe("parseFailedChecks", () => {
 	test("does not flag a passing row with a zero count", () => {
 		expect(parseFailedChecks("| lint | 0 errors |")).toEqual([]);

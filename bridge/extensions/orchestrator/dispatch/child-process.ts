@@ -45,6 +45,7 @@ import {
 	ORCHESTRATING_CAPABILITIES,
 	buildInterruptionReport,
 	renderInterruptionReport,
+	renderNestedWorkerDiagnostic,
 	summarizeInterruption,
 	resolveDispatchTimeoutPolicy,
 	applyLeadTimeoutOverride,
@@ -677,6 +678,17 @@ export async function runSubagentProcess(opts: {
 				spawnFailed,
 				stderrSummary,
 			});
+			// Error-end may have no parent errorMessage even though its nested worker
+			// failed at the provider. Preserve the last bounded worker diagnostic in
+			// stderr, which is what the resume classifier receives (not raw JSONL).
+			if (!interruption && outcome.status === "failed" && events.stopReason === "error" && progressTracker?.nestedWorkers().length) {
+				const snapshot = buildInterruptionReport({ taskId, reason: "inactivity_timeout", startedAt: dispatchStartedAt,
+					now: Date.now(), turns: assistantTurns, toolCalls, partialText: finalText, tracker: progressTracker });
+				stderrCapture.append(`\nnestedWorkers: ${renderNestedWorkerDiagnostic(snapshot.nestedWorkers)}`);
+				for (const worker of snapshot.nestedWorkers) {
+					if (worker.errorMessage) stderrCapture.append(`\n[provider nested error] ${worker.errorMessage}`);
+				}
+			}
 			stderrPrefix = outcome.status === "completed_after_process_error"
 				? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n`
 				: "";
@@ -690,11 +702,12 @@ export async function runSubagentProcess(opts: {
 			// on what comes first. `stderrSummary`/classification above already ran
 			// against `rawStderr` in its original (notes, then file) order; reordering
 			// only the string handed back to the caller does not change either.
+			const finalStderr = stderrCapture.text() + (fileText ? `\n${fileText}` : "");
 			const stderr = stderrPrefix
 				? fileBytes > 0
 					? `${stderrPrefix}${fileText}${stderrCapture.text() ? `\n${stderrCapture.text()}` : ""}`
-					: `${stderrPrefix}${rawStderr}`
-				: rawStderr;
+					: `${stderrPrefix}${finalStderr}`
+				: finalStderr;
 			if (diagnosticWriter) {
 				// If the child already has real bytes on disk (a real fd-backed stderr
 				// file), leave that file alone here: it may still be open for writing by
@@ -722,7 +735,7 @@ export async function runSubagentProcess(opts: {
 				personaCanMutate,
 				stderr,
 				model: events.model,
-				usage: events.usage,
+				usage: Object.assign({}, events.usage, { tool_calls: toolCalls }),
 				costUsd: events.usage.cost,
 				nestedCostUsd: nestedCost.total(),
 				costReported: events.costReported,

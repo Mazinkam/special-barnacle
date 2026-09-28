@@ -19,6 +19,7 @@ import type { ExtensionContext } from "@humain/terminal";
 import type { Adapter } from "../adapters/adapter-resolver.ts";
 import { testedRevisionFor } from "../adapters/git-changes.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
+import { isTransientProviderError } from "../core/transient-error.ts";
 import { QA_SCOPE_RULES, repoRootGuardrail, type DispatchTask } from "../core/prompts.ts";
 import type { RunContext, RunSessionLike } from "../run/context.ts";
 
@@ -98,6 +99,8 @@ export interface VerificationResult {
 	 *  timed-out dispatch's partial stdout is never parsed for check rows, since a row that
 	 *  looked like it was failing may simply have been mid-write when the process was killed. */
 	timedOut?: boolean;
+	/** QA failed at the provider before any tool ran; no check verdict exists. */
+	providerStall?: boolean;
 	/** The QA dispatch, so the caller can bill it into the run total. */
 	dispatch?: DispatchResult;
 }
@@ -109,6 +112,8 @@ export interface VerificationResult {
 export interface RunVerificationOptions {
 	/** 1-based re-run attempt number. Absent/undefined on the first (normal) QA dispatch. */
 	attempt?: number;
+	/** Why this QA dispatch is being re-run; guides the prompt without inventing a timeout. */
+	reason?: "timeout" | "provider_stall";
 }
 
 /** The dispatch/billing/telemetry seams `runVerification` needs; index.ts's caller supplies the real ones. */
@@ -378,7 +383,7 @@ export async function runVerification(
 		};
 	}
 
-	const { attempt } = options;
+	const { attempt, reason = "timeout" } = options;
 	const taskId = attempt ? `${runId}-qa-rerun-${attempt}` : `${runId}-qa`;
 
 	const qaTask = [
@@ -393,7 +398,7 @@ export async function runVerification(
 		...(attempt
 			? [
 					"",
-					"Re-run notice: a previous QA dispatch on this run timed out before it finished. This time, run ONLY scoped test commands targeting the files listed above (e.g. `bun test <file>`, or targeted pytest paths for the listed files) — never the full test suite if it is slow, and never a filesystem-wide search such as `find /` or `find ~`. Stay inside the repo root at all times.",
+					`Re-run notice: ${reason === "provider_stall" ? "a previous QA dispatch hit a provider_stall before any tool call" : "a previous QA dispatch on this run timed out before it finished"}. This time, run ONLY scoped test commands targeting the files listed above (e.g. \`bun test <file>\`, or targeted pytest paths for the listed files) — never the full test suite if it is slow, and never a filesystem-wide search such as \`find /\` or \`find ~\`. Stay inside the repo root at all times.`,
 				]
 			: []),
 		"Respond with the standard QA output format.",
@@ -412,6 +417,14 @@ export async function runVerification(
 	// The QA agent is a billable dispatch like any other. Recording only its
 	// outcome left its spend out of both metrics.jsonl and the run total.
 	await deps.captureDispatchCost({ ...captureOpts, planId }, qaResult, run);
+
+	const zeroToolProviderStall = qaResult.exitCode !== 0 && qaResult.outcome !== "cancelled" &&
+		(qaResult.usage as typeof qaResult.usage & { tool_calls?: number }).tool_calls === 0 &&
+		isTransientProviderError([qaResult.stderr, ...(qaResult.interruption?.nestedWorkers.map((w) => w.errorMessage ?? "") ?? [])].join("\n"));
+	if (zeroToolProviderStall) {
+		deps.recordOutcome({ ...qaVerificationOutcomeFor(runId, false, 0, "QA provider_stall before tool calls — no check verdict"), outcome: "unavailable" });
+		return { passed: false, providerStall: true, summary: "QA provider_stall before tool calls — verdict not determined.", failedChecks: [], dispatch: qaResult };
+	}
 
 	if (qaResult.outcome === "timed_out") {
 		// A timed-out QA dispatch's stdout is partial — it may contain a row that looks like a

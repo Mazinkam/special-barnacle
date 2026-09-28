@@ -37,6 +37,8 @@ export interface VerificationVerdictInput {
 	 *  completing and reporting failing checks. Distinct from a plain FAIL: a timeout means QA
 	 *  never finished judging the changed files at all. */
 	verificationTimedOut?: boolean;
+	/** QA failed at the provider before a check verdict, without timing out. */
+	verificationProviderStall?: boolean;
 	/** Named checks QA's own report identified as failing (`parseFailedChecks`), when verification
 	 *  ran and did not pass. Empty when QA failed (non-zero exit, or an explicit FAIL verdict with
 	 *  no named check) without the parser recognizing any specific check — the old
@@ -54,6 +56,7 @@ export function verificationVerdictFor(input: VerificationVerdictInput): string 
 			: "SKIPPED (no files changed)";
 	}
 	if (input.verificationTimedOut) return "QA TIMED OUT (QA dispatch did not complete)";
+	if (input.verificationProviderStall) return "QA PROVIDER STALL (QA dispatch did not complete)";
 	if (input.passedVerification) return "PASS";
 	const checks = input.failedChecks ?? [];
 	return checks.length > 0 ? `FAIL (${checks.join(", ")})` : "FAIL (unparsed)";
@@ -102,9 +105,13 @@ export interface RunReport {
 	passedVerification: boolean;
 	/** True when the QA dispatch itself timed out rather than completing (see `VerificationVerdictInput`). */
 	verificationTimedOut: boolean;
+	/** True when QA's provider failed before a verdict, without a dispatch timeout. */
+	verificationProviderStall?: boolean;
 	/** Named checks QA's report identified as failing; empty when it failed without the parser
 	 *  recognizing any specific check (`FAIL (unparsed)`). */
 	failedChecks: string[];
+	/** Parent-owned external CI results; unverified/failure never implies PASS. */
+	externalChecks?: Array<{ provider: "gitlab" | "github"; id: string; outcome: "pending" | "success" | "failure" | "unverified" }>;
 	totalCostUsd: number;
 	/** Number of billed dispatches (architect/workers/leads/verification/escalation + triage, when triage spent anything). */
 	dispatchCount: number;
@@ -136,6 +143,13 @@ export interface RunReport {
 		notRunReason: string | null;
 		hasUnknownCost: boolean;
 	};
+	/**
+	 * A6/N2: `core/live-tree.ts`'s `outOfTreeChangesSummaryLine` output for this run, pre-rendered
+	 * so this module never has to depend on `pipeline/*`. `null` when the run tree has changes,
+	 * or when no lead claimed changes or showed a foreign cd/cwd. Ordinary runs retain their
+	 * byte-identical summary output.
+	 */
+	outOfTreeChangesLine: string | null;
 }
 
 /**
@@ -152,6 +166,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		filesChangedCount: report.filesChangedCount,
 		passedVerification: report.passedVerification,
 		verificationTimedOut: report.verificationTimedOut,
+		verificationProviderStall: report.verificationProviderStall,
 		failedChecks: report.failedChecks,
 	});
 	let passedVerification = report.passedVerification;
@@ -170,14 +185,18 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		verdict = composed.verdict;
 		passedVerification = composed.passedVerification;
 	}
+	// External CI is an independent gate, never a rewrite of QA's own verdict.
+	const externalChecks = report.externalChecks ?? [];
 	const summary = [
-		`Orchestration ${report.blocked ? "BLOCKED" : report.dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(report.elapsedMs)}.`,
+		`Orchestration ${report.blocked || externalChecks.some((check) => check.outcome !== "success") ? "BLOCKED" : report.dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(report.elapsedMs)}.`,
 		`run_id: ${report.runId}`,
 		`leads: ${report.succeededLeads}/${report.totalLeads} ${report.blocked ? "blocked" : "succeeded"}${report.skippedLeads > 0 ? ` (+${report.skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${report.retries} · files: ${report.filesChangedCount} changed${report.externalFilesCount > 0 ? ` (+${report.externalFilesCount} changed by someone else, not verified)` : ""}`,
 		report.reconWorkersLine,
+		...(report.outOfTreeChangesLine ? [report.outOfTreeChangesLine] : []),
 		...(report.resumedLeadIds.length > 0 ? [`resumes: ${report.resumedLeadIds.length} (${report.resumedLeadIds.join(", ")})`] : []),
 		...report.leadAttemptLines,
 		`verification: ${verdict}`,
+		...externalChecks.map((check) => `external check: ${check.provider} ${check.id} ${check.outcome}`),
 		`total cost: $${report.totalCostUsd.toFixed(4)} (${report.dispatchCount} dispatches${report.nestedCostUsd > 0 ? `; $${report.nestedCostUsd.toFixed(4)} of it in lead subagents` : ""})`,
 		...(report.dispatchOk ? [] : [`first failure: ${report.firstFailureLine}`]),
 		...(report.liveQa ? liveQaSummaryLines(report.liveQa.stage, report.liveQa.notRunReason, report.liveQa.hasUnknownCost) : []),
@@ -193,6 +212,6 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 	const text = summary.join("\n");
 	// Whether the run is reported as a success in the notify and in chat must agree:
 	// a run whose verification failed is not "completed" just because dispatch succeeded.
-	const succeeded = (passedVerification || (report.dispatchOk && report.verificationSkipped)) && telemetryHealthy(report.telemetryReport);
+	const succeeded = (passedVerification || (report.dispatchOk && report.verificationSkipped)) && externalChecks.every((check) => check.outcome === "success") && telemetryHealthy(report.telemetryReport);
 	return { text, succeeded };
 }

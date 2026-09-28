@@ -1,4 +1,30 @@
 import type { ProgressObservation, TimeoutWarning } from "./dispatch-progress.ts";
+import { sanitizeControlChars } from "./core/text-safety.ts";
+
+/** External CI state for the live board; not a verdict for the orchestration run. */
+export interface PendingCheckRow {
+	provider: "gitlab" | "github";
+	id: string;
+	outcome: "pending" | "success" | "failure" | "unverified";
+	mr?: string;
+}
+
+/** Limit both session retention and per-render work when a provider returns many jobs. */
+export const MAX_PENDING_CHECKS = 32;
+const VISIBLE_PENDING_CHECKS = 6;
+
+export function formatPendingCheckRows(rows: readonly PendingCheckRow[]): string[] {
+	if (rows.length === 0) return [];
+	const lines = [`  ▸ external CI checks (${rows.length})`];
+	for (const row of rows.slice(0, VISIBLE_PENDING_CHECKS)) {
+		const label = `${row.provider} ${row.id}${row.mr ? ` · MR ${row.mr}` : ""}`;
+		const prefix = `    ${row.outcome === "pending" ? "◌" : row.outcome === "success" ? "✓" : row.outcome === "failure" ? "✗" : "?"} `;
+		lines.push(`${prefix}${truncate(sanitizeControlChars(label), 120 - prefix.length)}`);
+	}
+	if (rows.length > VISIBLE_PENDING_CHECKS) lines.push(`    … ${rows.length - VISIBLE_PENDING_CHECKS} more checks`);
+	return lines;
+}
+
 
 export interface NestedWorkerRow {
 	taskId: string;

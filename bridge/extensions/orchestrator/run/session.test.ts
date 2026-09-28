@@ -26,6 +26,40 @@ function createSession(id: string, ctx: unknown, goal: string) {
 	});
 }
 
+describe("RunSession external CI presentation", () => {
+	test("setPendingChecks replaces the live CI snapshot and clears it on empty input", () => {
+		const widgets: string[][] = [];
+		const statuses: string[] = [];
+		const session = createSession("ci-board-test", {
+			ui: {
+				setWidget: (_id: string, lines?: string[]) => { if (lines) widgets.push(lines); },
+				setStatus: (_id: string, text?: string) => { if (text) statuses.push(text); },
+				notify() {},
+			},
+		}, "wait for CI");
+		try {
+			session.setPendingChecks([{ provider: "github", id: "build", outcome: "pending", mr: "#42" }]);
+			expect(widgets.at(-1)?.join("\n")).toContain("github");
+			expect(widgets.at(-1)?.join("\n")).toContain("#42");
+			expect(statuses.at(-1)).toContain("1 CI pending");
+			session.setPendingChecks([{ provider: "gitlab", id: "lint", outcome: "failure" }]);
+			expect(widgets.at(-1)?.join("\n")).not.toContain("build");
+			expect(widgets.at(-1)?.join("\n")).toContain("lint");
+			const many = Array.from({ length: 100 }, (_, index) => ({ provider: "gitlab" as const, id: `job-${index}`, outcome: "pending" as const }));
+			session.setPendingChecks(many);
+			many[0].id = "changed-after-call";
+			expect(widgets.at(-1)?.join("\n")).toContain("external CI checks (32)");
+			expect(widgets.at(-1)?.join("\n")).not.toContain("changed-after-call");
+			expect(widgets.at(-1)?.join("\n")).not.toContain("job-99");
+			session.setPendingChecks([]);
+			expect(widgets.at(-1)?.join("\n")).not.toContain("external CI checks");
+			expect(statuses.at(-1)).not.toContain("CI pending");
+		} finally {
+			session.close();
+		}
+	});
+});
+
 describe("RunSession cancellation presentation", () => {
 	test("clears the widget and status after cancellation cleanup, keeping the trace in run.log", () => {
 		const widgets: unknown[] = [];
