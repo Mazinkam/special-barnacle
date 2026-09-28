@@ -16,11 +16,15 @@
 import type { ExtensionContext, SubagentUsageStats } from "@humain/terminal";
 
 import type { Adapter } from "../adapters/adapter-resolver.ts";
-import { parseFilesChanged } from "../adapters/git-changes.ts";
+import { diffDirtySnapshots, gitDirtySnapshot, parseFilesChanged } from "../adapters/git-changes.ts";
 import type { DispatchResult } from "../core/records.ts";
 import { formatTaskPrompt, type DispatchTask } from "../core/prompts.ts";
 import { METHOD, type AliasTable } from "../models.ts";
-import { bedrockFallbackFor, isQuotaError } from "../provider-fallback.ts";
+import { bedrockFallbackFor } from "../provider-fallback.ts";
+import { failoverConfig } from "./failover-policy.ts";
+import { dispatchWithFailover } from "./failover.ts";
+import { ModelHealth } from "../run/model-health.ts";
+import { usableModels, type Candidate } from "../adapters/model-router.ts";
 import type { RunContext } from "../run/context.ts";
 import { summarizeStderr } from "./stderr-sink.ts";
 import type { DispatchSession } from "./child-process.ts";
@@ -109,6 +113,11 @@ export async function dispatchParallel(
 		aliasTable?: AliasTable | null;
 		/** Bounded concurrency ceiling; the real caller passes its configured value. */
 		maxConcurrentDispatches: number;
+		/** Test seam / non-run caller routing; production normally uses RunContext. */
+		candidates?: Record<string, Candidate[]>;
+		modelHealth?: ModelHealth;
+		/** Test seam for retry waits; production waits cancelably on the run session. */
+		sleep?: (ms: number) => Promise<void>;
 	},
 ): Promise<DispatchResult[]> {
 	if (tasks.length === 0) return [];
@@ -155,143 +164,95 @@ export async function dispatchParallel(
 	// `humain-terminal --mode json --no-session` subprocess that writes JSON
 	// events to stdout; runSubagentProcess parses the assistant `message_end`
 	// for model + usage + cost.
+	const health = deps.modelHealth ?? run?.modelHealth ?? new ModelHealth();
 	const settled = await mapWithConcurrency(taskInputs, deps.maxConcurrentDispatches, async (input) => {
-		// `a || b ?? c` is a SyntaxError — mixing || and ?? needs explicit parens.
-		// Left unparenthesised this failed to load the whole extension.
-		const shortId =
-			(input._taskId ?? "").replace(`${runId}-`, "") || input._capability || "task";
-		// Queued, not awaited: the child starts now and the record lands in the next
-		// batch. Routed through `deps` so tests can observe it; the default binding
-		// is the same `recordEvent`, so the queuing behaviour is unchanged.
-		deps.recordEvent("dispatch_started", {
-			run_id: runId,
-			task_id: input._taskId,
-			capability: input._capability,
-			agent: input.agent,
-			model: input.model,
-			retry_of: input._retryOf,
-		});
+		const shortId = (input._taskId ?? "").replace(`${runId}-`, "") || input._capability || "task";
+		const aliasTable = deps.aliasTable === undefined ? (run?.aliasTable ?? null) : deps.aliasTable;
+		const declared = deps.candidates?.[input._capability] ?? run?.candidates?.[input._capability];
+		const twin = aliasTable ? bedrockFallbackFor(input.model, aliasTable) : null;
+		const models = declared ? usableModels(declared, input.model) : [input.model, ...(twin ? [twin] : [])];
+		let changedFiles: string[] = [];
+		const cancellableSleep = async (ms: number) => {
+			if (deps.sleep) return deps.sleep(ms);
+			if (!session) return;
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(() => { remove(); resolve(); }, ms);
+				const remove = session.cancellation.onCancel(() => { clearTimeout(timer); remove(); resolve(); });
+			});
+		};
+		deps.recordEvent("dispatch_started", { run_id: runId, task_id: input._taskId, capability: input._capability, agent: input.agent, model: input.model, retry_of: input._retryOf });
 		try {
-			const runOn = (model: string, taskId: string | undefined, label: string) => deps.runProcess({
-				cwd: input.cwd,
-				agentName: input.agent,
-				task: input.task,
-				model,
-				effort: input.effort,
-				taskId,
-				label,
-				capability: input._capability,
-				depth,
-				// Still no *hardcoded* tools override here — that is what previously
-				// granted reviewers write access and stripped tools the personas need.
-				// `input.tools` is per-task and set by exactly one producer,
-				// `planReconTasks()`, which pins recon to read-only. Every other task
-				// leaves it undefined, and runSubagentProcess then falls back to the
-				// persona's own frontmatter allow-list, so persona policy still wins
-				// everywhere it did before.
-				tools: input.tools,
-				ctx,
-				// Explicit (B4.4): this dispatch's progress/diagnostics belong to the
-				// run whose RunContext was passed in, not whatever the module-level
-				// registry currently holds.
-				session: session ?? undefined,
+			const fo = await dispatchWithFailover({ taskId: input._taskId ?? `unknown-${runId}`, capability: input._capability ?? "unknown", prompt: input.task }, models, {
+				runAttempt: async (model, prompt, attempt, spentBeforeUsd) => {
+					const attemptTaskId = attempt === 1 || !input._taskId ? input._taskId : `${input._taskId}-fallback-${attempt - 1}`;
+					deps.recordEvent("dispatch_attempt_started", { run_id: runId, task_id: input._taskId, attempt, model });
+					const result = await deps.runProcess({
+						cwd: input.cwd, agentName: input.agent, task: prompt, model, effort: input.effort,
+						taskId: attemptTaskId, label: attempt === 1 ? shortId : `${shortId}↻${attempt - 1}`,
+						capability: input._capability, depth, tools: input.tools, ctx, session: session ?? undefined,
+						spendCapOffsetUsd: spentBeforeUsd,
+					});
+					changedFiles = result.personaCanMutate ? parseFilesChanged(result.stdout) : [];
+					return result;
+				},
+				readEvents: (result) => result.rawStdout.split(/\r?\n/),
+				snapshot: () => gitDirtySnapshot(input.cwd),
+				changedSince: (snapshot) => diffDirtySnapshots(snapshot as Map<string, string> | null, gitDirtySnapshot(input.cwd), changedFiles).changed,
+				sleep: cancellableSleep,
+				health,
+				isCancelled: () => session?.cancellation.isCancelled ?? false,
+				recordEvent: (event, payload) => deps.recordEvent(event, { run_id: runId, ...payload }),
+				log: (line) => session?.log(line),
+				config: failoverConfig(),
+				redact: (text) => text,
+				effortDropped: (model) => Boolean(input.effort && !declared?.find((candidate) => candidate.model === model)?.effortControl),
 			});
-			let r = await runOn(input.model, input._taskId, shortId);
-			// Codex first, Bedrock fallback: a quota/rate-limit failure on an
-			// openai-codex model is retried ONCE on the same model id under
-			// amazon-bedrock. Both attempts are billed (usage summed).
-			const table = deps.aliasTable === undefined ? (run?.aliasTable ?? null) : deps.aliasTable;
-			// Only a genuine provider rejection qualifies: not a timeout, a user
-			// cancel, or a spend-cap stop (those would re-run finished work), and
-			// only when stderr (not the model's own prose) names the quota.
-			// `session` above is `run?.session` captured once at this call's start;
-			// unlike the old `session ?? ACTIVE_RUN` fallback, there is no live global
-			// left to re-read here. That fallback only ever mattered if the module
-			// global changed after `session` was captured but before this line ran —
-			// impossible in practice, since only one run is ever active and this
-			// closure only runs inside that same run's own dispatch flow.
-			const eligible = r.exitCode !== 0 && r.outcome !== "timed_out" && r.outcome !== "cancelled" &&
-				r.stopReason !== "spend_cap" && !session?.cancellation.isCancelled;
-			const twin = eligible && table && isQuotaError(r.stderr) ? bedrockFallbackFor(input.model, table) : null;
-			if (twin) {
-				deps.recordEvent("dispatch_finished", {
-					run_id: runId, task_id: input._taskId, capability: input._capability, model: r.model ?? input.model,
-					exit_code: r.exitCode, duration_ms: r.durationMs, cost_usd: r.costUsd, turns: r.usage.turns,
-					stop_reason: r.stopReason, log_dir: session?.dir, superseded_by_fallback: true,
-				});
-				deps.recordEvent("route_degraded", {
-					run_id: runId, task_id: input._taskId, capability: input._capability,
-					from_model: input.model, to_model: twin, reason: "provider_quota",
-					detail: summarizeStderr(r.stderr, 240),
-				});
-				session?.log(`${input._taskId}: ${input.model} hit a provider quota; retrying once on ${twin}`);
-				const first = r;
-				const second = await runOn(twin, input._taskId ? `${input._taskId}-fallback` : undefined, `${shortId}↻`);
-				r = {
-					...second,
-					usage: sumUsage(first.usage, second.usage),
-					costUsd: first.costUsd + second.costUsd,
-					nestedCostUsd: (first.nestedCostUsd ?? 0) + (second.nestedCostUsd ?? 0),
-					costReported: first.costReported && second.costReported,
-					durationMs: first.durationMs + second.durationMs,
-				};
-			}
-			deps.recordEvent("dispatch_finished", {
-				run_id: runId,
-				task_id: input._taskId,
-				capability: input._capability,
-				model: r.model ?? input.model,
-				exit_code: r.exitCode,
-				duration_ms: r.durationMs,
-				cost_usd: r.costUsd,
-				nested_cost_usd: r.nestedCostUsd,
-				turns: r.usage.turns,
-				stop_reason: r.stopReason,
-				log_dir: session?.dir,
-			});
+			const attempts = fo.attempts.map((attempt) => attempt.result);
+			const aggregateUsage = attempts.reduce((sum, result) => sumUsage(sum, result.usage), {
+				input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0,
+				} as SubagentUsageStats);
+			const r = {
+				...fo.result,
+				model: fo.finalModel,
+				usage: aggregateUsage,
+				costUsd: attempts.reduce((sum, result) => sum + result.costUsd, 0),
+				nestedCostUsd: attempts.reduce((sum, result) => sum + (result.nestedCostUsd ?? 0), 0),
+				durationMs: attempts.reduce((sum, result) => sum + result.durationMs, 0),
+				costReported: attempts.every((result) => result.costReported),
+			};
+			fo.attempts.forEach(({ model, result, record }, index) => deps.recordEvent("dispatch_finished", {
+				run_id: runId, task_id: input._taskId, capability: input._capability, model,
+				exit_code: result.exitCode, duration_ms: result.durationMs, cost_usd: result.costUsd,
+				nested_cost_usd: result.nestedCostUsd, turns: result.usage.turns, stop_reason: result.stopReason,
+				log_dir: session?.dir, attempt: index + 1, failure_class: record.cls,
+				superseded_by_fallback: index < fo.attempts.length - 1,
+			}));
 			return {
 				taskId: input._taskId ?? `unknown-${runId}`,
 				capability: input._capability ?? "unknown",
-				model: r.model ?? input.model,
+				model: r.model,
 				exitCode: r.exitCode,
 				stdout: r.stdout,
-				// On a non-zero exit HT often fails before emitting any event (bad
-				// argv, provider auth), so stderr is the only diagnostic. When even
-				// that is empty, fall back to the raw event stream so the failure is
-				// explainable in metrics.jsonl instead of a silent zero.
-				stderr:
-					r.exitCode === 0 ? r.stderr : summarizeStderr(r.stderr || r.rawStdout, 2_000) || "(no output)",
+				stderr: r.exitCode === 0 ? r.stderr : summarizeStderr(r.stderr || r.rawStdout, 2_000) || "(no output)",
 				usage: r.usage,
 				durationMs: r.durationMs,
 				costUsd: r.costUsd,
-				...((r.nestedCostUsd ?? 0) > 0 ? { nestedCostUsd: r.nestedCostUsd } : {}),
+				...(r.nestedCostUsd > 0 ? { nestedCostUsd: r.nestedCostUsd } : {}),
 				costReported: r.costReported,
 				stopReason: r.stopReason,
 				outcome: r.outcome,
 				timeoutReason: r.timeoutReason,
 				toolInFlight: r.toolInFlight,
 				interruption: r.interruption,
-				// parseFilesChanged scrapes the child's prose, so a read-only reviewer
-				// or QA agent would "report" every path it merely mentioned.
 				filesChanged: r.personaCanMutate ? parseFilesChanged(r.stdout) : [],
 				...(input.effort ? { effort: input.effort } : {}),
 			};
 		} catch (err) {
 			return {
-				taskId: input._taskId ?? `unknown-${runId}`,
-				capability: input._capability ?? "unknown",
-				model: input.model ?? "unknown",
-				exitCode: -1,
-				stdout: "",
-				stderr: (err as Error).message,
-				usage: {
-					input: 0, output: 0, cacheRead: 0, cacheWrite: 0,
-					cost: 0, contextTokens: 0, turns: 0,
-				},
-				durationMs: 0,
-				costUsd: 0,
-				costReported: false,
-				filesChanged: [],
+				taskId: input._taskId ?? `unknown-${runId}`, capability: input._capability ?? "unknown", model: input.model,
+				exitCode: -1, stdout: "", stderr: (err as Error).message,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				durationMs: 0, costUsd: 0, costReported: false, filesChanged: [],
 			};
 		}
 	});

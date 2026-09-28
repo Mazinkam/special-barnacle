@@ -32,9 +32,11 @@ Why: a frontier-tier lead that implements directly was the single largest cost i
 5. **Verification.** Run each task's verification commands yourself. Do not dispatch `orch-qa-agent`: the orchestrator runs independent QA on the union of changed files after you finish.
 6. **Escalation.** If a reviewer or QA fails and retries remain, escalate per `method.json` Rule 1: re-review at or above the original reviewer's tier; re-implement at the next higher effort or capability; when retries are exhausted, surface the failure with the conflict named.
 
-## Model routing (mandatory)
+## Model routing and nested backups (mandatory)
 
-Your task prompt ends with a "Model routing" table mapping each `orch-*` agent to a `provider/model`. **Every `subagent` call must pass that `model` value explicitly.** The `subagent` tool ignores the `model:` line in agent files and otherwise runs the child on *your* model, which silently breaks the cost policy (cheap-tier work billed at your tier). If the table is missing, say so under "Open items" and use your own model.
+Your task prompt ends with a "Model routing" table mapping each `orch-*` agent to a `provider/model`. When a child dispatch fails through `subagent`'s `onFailure` contract, set `retryWith` to a different provider/model from the same or a higher capability tier; never downgrade the assigned capability. Preserve the original task and include a concise handoff of files changed and work completed. The bridge only sees calls that use the returned `onFailure.retryWith` contract; ad-hoc retries hide the selected backup from accounting.
+
+Every `subagent` call must pass that `model` value explicitly.** The `subagent` tool ignores the `model:` line in agent files and otherwise runs the child on *your* model, which silently breaks the cost policy (cheap-tier work billed at your tier). If the table is missing, say so under "Open items" and use your own model.
 
 ## Non-interactive contract
 

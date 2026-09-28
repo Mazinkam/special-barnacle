@@ -54,7 +54,9 @@ export function classifyFailure(s: AttemptSignals): FailureClass {
 	if (s.exitCode === 0 && (s.outcome === "completed" || s.outcome === "completed_after_process_error")) return "ok";
 	if (s.stopReason === "spend_cap") return "task";
 	const text = providerText(s.stderr, s.errorMessage);
-	if (isQuotaError(text)) return "quota";
+	// Quota text can be quoted by timeout/interruption diagnostics; unlike a
+	// confirmed transient stream error, never restart timed-out completed work.
+	if (isQuotaError(text)) return s.outcome === "timed_out" ? "task" : "quota";
 	if (isTransientProviderError(text)) return "transient";
 	if (s.outcome === "timed_out" && s.timeoutReason === "inactivity" && !s.toolInFlight) return "stall";
 	return "task";

@@ -25,6 +25,7 @@ import { assembleProvidedContextBlock, contextFileLabel, CONTEXT_SOURCE_MAX_CHAR
 import { goalRefersToMissingContext } from "../core/context-detector.ts";
 import { redactPaths } from "../hooks/ingest.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
+import { ModelHealth } from "../run/model-health.ts";
 import type { DispatchTask, PlanResponse } from "../core/prompts.ts";
 import { buildRunSummary } from "../core/report.ts";
 import type { TriageResult } from "../core/triage.ts";
@@ -656,6 +657,7 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 				{ profile: resolved.profileName, policy_id: policyIdFor(resolved.profileName, adapter) },
 				resolved.table,
 				resolved.sources,
+				resolved.candidates ? { candidates: resolved.candidates, modelHealth: new ModelHealth() } : undefined,
 			);
 			if (!claimed) {
 				ctx.ui.notify(

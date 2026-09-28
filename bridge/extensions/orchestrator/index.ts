@@ -31,6 +31,8 @@ import { RunDiagnostics, type DiagnosticWriter } from "./run-diagnostics.ts";
 import { runLiveQaStage, type RunLiveQaStageResult } from "./live-qa-stage.ts";
 import { registerOrchestrateCommand, type OrchestrateDeps } from "./commands/orchestrate.ts";
 import { RunRegistry, type RunContext, type RunSessionLike } from "./run/context.ts";
+import type { Candidate } from "./adapters/model-router.ts";
+import type { ModelHealth } from "./run/model-health.ts";
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
 	appendFileSync,
@@ -1554,8 +1556,9 @@ class SyncedRunRegistry extends RunRegistry<RunSessionLike> {
 		tags: RunTags = {},
 		aliasTable: AliasTable | null = null,
 		modelSources: Record<string, BindingSource> | null = null,
+		routing?: { candidates: Record<string, Candidate[]>; modelHealth: ModelHealth },
 	): RunContext<RunSessionLike> | null {
-		const claimed = super.claim(session, tags, aliasTable, modelSources);
+		const claimed = super.claim(session, tags, aliasTable, modelSources, routing);
 		if (claimed) {
 			ACTIVE_RUN = session as RunSession;
 			CURRENT_RUN_TAGS = tags;
