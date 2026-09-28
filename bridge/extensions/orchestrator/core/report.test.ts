@@ -101,6 +101,16 @@ function baseReport(): RunReport {
 }
 
 describe("core/report.ts buildRunSummary", () => {
+	test("external outcome does not overwrite QA verdict, and unverified is never QA FAIL", () => {
+		for (const outcome of ["failure", "unverified"] as const) {
+			const { text, succeeded } = buildRunSummary({ ...baseReport(), externalChecks: [{ provider: "github", id: "123", outcome }] });
+			expect(text).toContain("verification: PASS");
+			expect(text).toContain(`external check: github 123 ${outcome}`);
+			expect(text).not.toContain("verification: FAIL external check");
+			expect(succeeded).toBe(false);
+		}
+	});
+
 	test("external check without a successful verdict prevents PASS, including report-only runs", () => {
 		for (const outcome of ["failure", "unverified", "pending"] as const) {
 			const { text, succeeded } = buildRunSummary({ ...baseReport(), verificationSkipped: true, filesChangedCount: 0, externalChecks: [{ provider: "github", id: "123", outcome }] });

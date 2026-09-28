@@ -185,13 +185,8 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		verdict = composed.verdict;
 		passedVerification = composed.passedVerification;
 	}
+	// External CI is an independent gate, never a rewrite of QA's own verdict.
 	const externalChecks = report.externalChecks ?? [];
-	if (externalChecks.some((check) => check.outcome !== "success")) {
-		if (passedVerification || report.verificationSkipped) {
-			verdict = `${externalChecks.some((check) => check.outcome === "failure") ? "FAIL" : "UNVERIFIED"} external check (${externalChecks.filter((check) => check.outcome !== "success").map((check) => `${check.provider} ${check.id}: ${check.outcome}`).join(", ")})`;
-		}
-		passedVerification = false;
-	}
 	const summary = [
 		`Orchestration ${report.blocked ? "BLOCKED" : report.dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(report.elapsedMs)}.`,
 		`run_id: ${report.runId}`,

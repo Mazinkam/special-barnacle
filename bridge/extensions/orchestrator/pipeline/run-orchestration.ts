@@ -73,6 +73,8 @@ export async function waitForPendingChecks(checks: PendingCheck[], options: {
  now?: () => number;
  spawn?: CiPollSpawn;
  scheduleTick?: (delayMs: number, tick: () => void) => () => void;
+ expectedSha?: string | null;
+ expectedRepo?: string | null;
  setPendingChecks?: (rows: CheckRow[]) => void;
  onOutcome?: (result: ResolvedCheck) => void;
 }): Promise<ResolvedCheck[]> {
@@ -96,7 +98,7 @@ export async function waitForPendingChecks(checks: PendingCheck[], options: {
    options.cancellation.throwIfCancelled();
    for (let i = 0; i < checks.length; i++) {
     if (results[i]) continue;
-    const outcome = await pollCiCheck(checks[i], states[i], { cwd: options.cwd, signal: controller.signal, now, spawn: options.spawn });
+    const outcome = await pollCiCheck(checks[i], states[i], { cwd: options.cwd, expectedSha: options.expectedSha ?? undefined, expectedRepo: options.expectedRepo ?? undefined, signal: controller.signal, now, spawn: options.spawn });
     options.cancellation.throwIfCancelled();
     if (outcome.outcome === "pending") states[i] = outcome.state!;
     else {
@@ -118,6 +120,21 @@ export async function waitForPendingChecks(checks: PendingCheck[], options: {
   if (checks.length) await tick();
   return results as ResolvedCheck[];
  } finally { offCancel(); }
+}
+
+/** Resolve origin without a shell; reject ambiguous/untrusted remotes rather than checking a different repo. */
+export function canonicalOrigin(cwd: string): string | null {
+ try {
+  const remote = spawnSync("git", ["remote", "get-url", "origin"], { cwd, encoding: "utf8", timeout: 10_000 });
+  if (remote.status !== 0) return null;
+  const raw = remote.stdout.trim();
+  const ssh = /^git@([A-Za-z0-9.-]+):(.+)$/.exec(raw);
+  const url = new URL(ssh ? `https://${ssh[1]}/${ssh[2]}` : raw);
+  if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash) return null;
+  const path = url.pathname.replace(/\.git$/, "");
+  if (!/^\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/.test(path) || path.split("/").some((s) => s === "." || s === "..")) return null;
+  return `https://${url.hostname}${path}`;
+ } catch { return null; }
 }
 
 /** `planRun`'s options; structurally identical to index.ts's own (private) `PlanOptions` —
@@ -567,6 +584,9 @@ export async function runOrchestration(
 			inWaveRecovery: parsed.maxRetries > 0,
 			waitForChecks: (checks) => waitForPendingChecks(checks, {
 				cwd, cancellation: session.cancellation, ...deps.ciWait,
+				// Resolve at each poll batch, after the owning lead has committed its candidate.
+				// Missing HEAD/origin is unverified, never an implicit success from another run.
+				expectedSha: gitHead(cwd), expectedRepo: canonicalOrigin(cwd),
 				setPendingChecks: (rows) => {
 					for (const row of rows) checkRows.set(`${row.provider}:${row.id}`, row);
 					session.setPendingChecks?.([...checkRows.values()]);
@@ -928,7 +948,7 @@ export async function runOrchestration(
 	// lead-attempts accounting quirk in either direction must never make an otherwise-passing QA
 	// verdict read as unverified.
 	const verificationSkipped = lastVerification?.skipped ?? false;
-	const passedVerification = (lastVerification?.passed ?? false) && (dispatchOk || finalDispatchOk) && pendingChecks.every((r) => r.outcome === "success");
+	const passedVerification = (lastVerification?.passed ?? false) && (dispatchOk || finalDispatchOk);
 	// The QA dispatch itself timing out (inactivity/absolute ceiling) is a distinct state from QA
 	// completing and reporting failing checks — the summary must say so instead of folding both
 	// into a plain FAIL (docs/architecture-review.md C5).
