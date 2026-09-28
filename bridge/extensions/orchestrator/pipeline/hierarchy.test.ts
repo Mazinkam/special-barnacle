@@ -289,6 +289,35 @@ describe("pipeline/hierarchy.ts isTransientLeadFailure (docs/architecture-review
 		}))).toBe(false);
 	});
 
+	test("watchdog warning plus timeout report without a provider error does not resume", async () => {
+		const batches: DispatchTask[][] = [];
+		const result = await dispatchReconAndLeads(baseInput(), {
+			dispatch: async (tasks) => {
+				batches.push(tasks);
+				return [transientFailure(tasks[0], {
+					outcome: "timed_out", timeoutReason: "inactivity",
+					stderr: "⚠ no meaningful progress for 23min (limit 30min; 7min remaining; raise HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS) — last: bash wait for CI\n[orchestrator] inactivity timeout: no meaningful progress\nUNVERIFIED PARTIAL WORK — inactivity\ntaskId: run-lead-0\nlastProgress: bash wait for CI\nnestedWorkers: none observed\npartialText: still working",
+				})];
+			},
+			capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+		});
+		expect(batches).toHaveLength(1);
+		expect(result.resumedLeadTaskIds).toEqual([]);
+	});
+
+	test("a real nested provider error still resumes with a watchdog warning in stderr", () => {
+		expect(isTransientLeadFailure(baseResult({
+			outcome: "timed_out", timeoutReason: "inactivity",
+			stderr: "⚠ no meaningful progress for 23min (limit 30min; raise HUMAIN_ORCHESTRATOR_LEAD_INACTIVITY_TIMEOUT_MS) — last: bash wait for CI\n[orchestrator] inactivity timeout: no meaningful progress\nUNVERIFIED PARTIAL WORK — inactivity",
+			interruption: {
+				taskId: "t", reason: "inactivity_timeout", elapsedMs: 10, sinceLastProgressMs: 10,
+				turns: 1, toolCalls: 1, repeatedToolCalls: 0, lastProgress: "waiting",
+				nestedWorkers: [{ id: "t11", turns: 4, finished: false, latestText: "trying provider", errorMessage: "TypeError: fetch failed" }],
+				partialText: "still working", verified: false,
+			},
+		}))).toBe(true);
+	});
+
 	test("nested latestText prose mentioning fetch failed does not trigger a provider resume", () => {
 		expect(isTransientLeadFailure(baseResult({
 			outcome: "timed_out", timeoutReason: "inactivity",

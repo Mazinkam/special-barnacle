@@ -57,9 +57,11 @@ import type { RunContext, RunSessionLike } from "../run/context.ts";
  * describing something else, and the result's error/stderr/stopReason/exit
  * text is what actually reflects why the dispatch itself ended.
  */
+// The watchdog's standalone ⚠ warning is also captured in stderr; its
+// timeout-setting hint is not a provider timeout or retry signal.
 function providerEvidenceStderr(stderr: string): string {
 	return stderr.split("\n").filter((line) =>
-		!/^\s*(?:\[orchestrator\].*timeout|dispatch timed out|UNVERIFIED PARTIAL WORK|taskId:|elapsedMs:|sinceLastProgressMs:|turns:|toolCalls:|repeatedToolCalls:|lastProgress:|nestedWorkers:|verified:|partialText:)/i.test(line),
+		!/^\s*(?:⚠\s*no meaningful progress\b|\[orchestrator\].*timeout|dispatch timed out|UNVERIFIED PARTIAL WORK|taskId:|elapsedMs:|sinceLastProgressMs:|turns:|toolCalls:|repeatedToolCalls:|lastProgress:|nestedWorkers:|verified:|partialText:)/i.test(line),
 	).join("\n");
 }
 
