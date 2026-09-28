@@ -51,18 +51,26 @@ import type { RunContext, RunSessionLike } from "../run/context.ts";
  * resuming; a lead whose own report says `STATUS: blocked` stopped at a
  * precondition, not a transient failure; a dispatch that hit its own
  * absolute timeout or spend-cap stop is not resumed. An inactivity kill with
- * provider evidence in its stderr or nested snapshot is a provider_stall and
+ * provider evidence in its stderr or nested errorMessage is a provider_stall and
  * uses the same single resume budget as A3. Deliberately does not look at `stdout`: a
  * lead's own prose can legitimately mention words like "overloaded" while
  * describing something else, and the result's error/stderr/stopReason/exit
  * text is what actually reflects why the dispatch itself ended.
  */
+function providerEvidenceStderr(stderr: string): string {
+	return stderr.split("\n").filter((line) =>
+		!/^\s*(?:\[orchestrator\].*timeout|dispatch timed out|UNVERIFIED PARTIAL WORK|taskId:|elapsedMs:|sinceLastProgressMs:|turns:|toolCalls:|repeatedToolCalls:|lastProgress:|nestedWorkers:|verified:|partialText:)/i.test(line),
+	).join("\n");
+}
+
 function isProviderStall(r: DispatchResult): boolean {
 	if (r.exitCode === 0 || r.outcome === "cancelled" || r.stopReason === "spend_cap" || parseLeadStatus(r.stdout) === "blocked") return false;
 	if (r.outcome === "timed_out" && r.timeoutReason !== "inactivity") return false;
-	const nestedErrors = r.interruption?.nestedWorkers.flatMap((w) => [w.errorMessage ?? "", w.latestText ?? ""]) ?? [];
-	// The watchdog's own "dispatch timed out" note is not evidence of a provider outage.
-	const stderr = (r.stderr ?? "").split("\n").filter((line) => !/^dispatch timed out|^UNVERIFIED PARTIAL WORK|^\s*lastProgress:/i.test(line)).join("\n");
+	const nestedErrors = r.interruption?.nestedWorkers.map((w) => w.errorMessage ?? "") ?? [];
+	// The watchdog's timeout/interruption report and the copied nested lastText
+	// are diagnostics, not provider evidence. Only actual stderr/provider error
+	// lines and structured nested errorMessage may trigger a resume.
+	const stderr = providerEvidenceStderr(r.stderr ?? "");
 	return [stderr, ...nestedErrors].some((text) => isTransientProviderError(text));
 }
 
@@ -75,7 +83,7 @@ export function isTransientLeadFailure(r: DispatchResult): boolean {
 	if (r.outcome === "timed_out") return false;
 	if (r.stopReason === "spend_cap") return false;
 	if (parseLeadStatus(r.stdout) === "blocked") return false;
-	const text = [r.stderr, r.stopReason, r.timeoutReason].filter(Boolean).join("\n");
+	const text = [providerEvidenceStderr(r.stderr ?? ""), r.stopReason, r.timeoutReason].filter(Boolean).join("\n");
 	return isTransientProviderError(text);
 }
 

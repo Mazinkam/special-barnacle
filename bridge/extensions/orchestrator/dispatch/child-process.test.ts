@@ -8,6 +8,8 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { MAX_CHILD_STDERR_DISK_BYTES } from "./stderr-sink.ts";
+import { isTransientLeadFailure } from "../pipeline/hierarchy.ts";
+import type { DispatchResult } from "../core/records.ts";
 
 // `child-process.ts` imports real bindings (not just types) from `@humain/terminal`, which has
 // no `node_modules` entry in this standalone bridge checkout (see scripts/typecheck-bridge.sh's
@@ -397,6 +399,42 @@ describe("runSubagentProcess process/event handling", () => {
 		} finally {
 			session.close();
 		}
+	});
+
+	test("error-end copied nested latestText remains diagnostic, not provider evidence", async () => {
+		const session = createSession("nested-prose-only");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const pending = runSubagentProcess({ cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, env: () => process.env, capability: "lead", taskId: "nested-prose-only-lead", session, spawnChild: () => child as never });
+			child.stdout.write(`${JSON.stringify({ type: "tool_execution_update", toolName: "subagent", partialResult: { details: { results: [
+				{ taskId: "t11", agent: "worker", depth: 1, exitCode: -1, latestText: "fetch failed is the name of my test", usage: { turns: 9, cost: 0 } },
+			] } } })}\n`);
+			child.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", usage: { input: 0, output: 0, cost: { total: 0 } } } })}\n`);
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.stderr).toContain("lastText: fetch failed is the name of my test");
+			expect(isTransientLeadFailure({ ...result, taskId: "nested-prose-only-lead", capability: "lead", model: "p/m", filesChanged: [] } as DispatchResult)).toBe(false);
+		} finally { session.close(); }
+	});
+
+	test("error-end nested latestText stays diagnostic while only errorMessage is marked provider evidence", async () => {
+		const session = createSession("nested-prose-boundary");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const pending = runSubagentProcess({ cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, env: () => process.env, capability: "lead", taskId: "nested-prose-lead", session, spawnChild: () => child as never });
+			child.stdout.write(`${JSON.stringify({ type: "tool_execution_update", toolName: "subagent", partialResult: { details: { results: [
+				{ taskId: "t11", agent: "worker", depth: 1, exitCode: -1, latestText: "fetch failed is the name of my test", errorMessage: "getaddrinfo ENOTFOUND bedrock-runtime", usage: { turns: 9, cost: 0 } },
+			] } } })}\n`);
+			child.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], stopReason: "error", usage: { input: 0, output: 0, cost: { total: 0 } } } })}\n`);
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.stderr).toContain("lastText: fetch failed is the name of my test");
+			expect(result.stderr).toContain("errorMessage: getaddrinfo ENOTFOUND bedrock-runtime");
+			expect(result.stderr).toContain("[provider nested error] getaddrinfo ENOTFOUND bedrock-runtime");
+			expect(isTransientLeadFailure({ ...result, taskId: "nested-prose-lead", capability: "lead", model: "p/m", filesChanged: [] } as DispatchResult)).toBe(true);
+		} finally { session.close(); }
 	});
 
 	test("error-end diagnostic carries nested worker last turn/text/errorMessage when lead stderr is empty", async () => {

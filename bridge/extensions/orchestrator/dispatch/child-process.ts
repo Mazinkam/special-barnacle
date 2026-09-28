@@ -685,6 +685,9 @@ export async function runSubagentProcess(opts: {
 				const snapshot = buildInterruptionReport({ taskId, reason: "inactivity_timeout", startedAt: dispatchStartedAt,
 					now: Date.now(), turns: assistantTurns, toolCalls, partialText: finalText, tracker: progressTracker });
 				stderrCapture.append(`\nnestedWorkers: ${renderNestedWorkerDiagnostic(snapshot.nestedWorkers)}`);
+				for (const worker of snapshot.nestedWorkers) {
+					if (worker.errorMessage) stderrCapture.append(`\n[provider nested error] ${worker.errorMessage}`);
+				}
 			}
 			stderrPrefix = outcome.status === "completed_after_process_error"
 				? `[orchestrator] child produced a terminal result (agent_settled, stopReason=stop) then exited ${processExitCode}; result kept.\n`

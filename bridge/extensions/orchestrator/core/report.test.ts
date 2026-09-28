@@ -38,6 +38,11 @@ describe("core/report.ts verificationVerdictFor", () => {
 		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true })).toBe("QA TIMED OUT (QA dispatch did not complete)");
 	});
 
+	test("QA provider failure without timeout is unverified, never QA TIMED OUT or FAIL", () => {
+		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationProviderStall: true, failedChecks: ["unit"] }))
+			.toBe("QA PROVIDER STALL (QA dispatch did not complete)");
+	});
+
 	test("a timeout still wins over named failed checks (QA never finished judging them)", () => {
 		expect(verificationVerdictFor({ ...base, passedVerification: false, verificationTimedOut: true, failedChecks: ["typecheck"] })).toBe("QA TIMED OUT (QA dispatch did not complete)");
 	});
@@ -307,6 +312,21 @@ describe("core/report.ts buildRunSummary", () => {
 				"telemetry: 1 record(s) could not be written to the ledger — ledger write failed",
 			].join("\n"),
 		);
+		expect(succeeded).toBe(false);
+	});
+
+	test("QA provider stall: exact summary says unverified provider failure, not timeout or check FAIL", () => {
+		const { text, succeeded } = buildRunSummary({ ...baseReport(), passedVerification: false, verificationProviderStall: true });
+		expect(text).toBe([
+			"Orchestration complete in 1m05s.",
+			"run_id: ht-orch-1700000000000-abcdef",
+			"leads: 2/2 succeeded · retries: 0 · files: 3 changed",
+			"recon: 0 workers dispatched",
+			"verification: QA PROVIDER STALL (QA dispatch did not complete)",
+			"total cost: $1.2345 (3 dispatches)",
+			"run log: /tmp/run.log",
+			"ledger: /tmp/state/metrics.jsonl",
+		].join("\n"));
 		expect(succeeded).toBe(false);
 	});
 

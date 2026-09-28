@@ -814,9 +814,10 @@ export async function runOrchestration(
 	// The QA dispatch itself timing out (inactivity/absolute ceiling) is a distinct state from QA
 	// completing and reporting failing checks — the summary must say so instead of folding both
 	// into a plain FAIL (docs/architecture-review.md C5).
-	// Both failures are unverified dispatches, never code/check FAIL. The existing report
-	// verdict only has the timeout-shaped unverified state; preserve its no-FAIL gate.
-	const verificationTimedOut = lastVerification?.dispatch?.outcome === "timed_out" || lastVerification?.providerStall === true;
+	// Both failures are unverified dispatches, never code/check FAIL; preserve
+	// their distinct causes in the report instead of labeling a provider error a timeout.
+	const verificationTimedOut = lastVerification?.dispatch?.outcome === "timed_out";
+	const verificationProviderStall = lastVerification?.providerStall === true && !verificationTimedOut;
 	const failedChecks = lastVerification?.failedChecks ?? [];
 
 	// -----------------------------------------------------------------
@@ -956,6 +957,7 @@ export async function runOrchestration(
 		verificationSkipped,
 		passedVerification,
 		verificationTimedOut,
+		verificationProviderStall,
 		failedChecks,
 		totalCostUsd: totalCost,
 		dispatchCount: billedResults.length + (triageCost.usd > 0 ? 1 : 0),

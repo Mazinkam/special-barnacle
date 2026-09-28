@@ -813,8 +813,15 @@ describe("pipeline/run-orchestration.ts runOrchestration QA dispatch timing out 
 		expect(dispatchedTaskIds.some((id) => id.includes("-lead-0-retry-"))).toBe(false);
 		expect(result.report.failedChecks).toEqual([]);
 		expect(outcomes.some((o) => o.task_id === `${runId}-qa` && o.outcome === "fail")).toBe(false);
-		if (secondFails) expect(buildRunSummary(result.report).text).not.toContain("verification: FAIL");
-		else expect(result.report.passedVerification).toBe(true);
+		if (secondFails) {
+			expect(result.report.verificationTimedOut).toBe(false);
+			expect(result.report.verificationProviderStall).toBe(true);
+			const { text, succeeded } = buildRunSummary(result.report);
+			expect(text).toContain("verification: QA PROVIDER STALL (QA dispatch did not complete)");
+			expect(text).not.toContain("verification: QA TIMED OUT");
+			expect(text).not.toContain("verification: FAIL");
+			expect(succeeded).toBe(false);
+		} else expect(result.report.passedVerification).toBe(true);
 	});
 
 	test("both QA dispatches time out: report verdict starts with 'QA TIMED OUT', failedChecks is empty, no '-retry-' dispatch, summary never names `unit`", async () => {

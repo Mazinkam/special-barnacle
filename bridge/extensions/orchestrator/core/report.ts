@@ -37,6 +37,8 @@ export interface VerificationVerdictInput {
 	 *  completing and reporting failing checks. Distinct from a plain FAIL: a timeout means QA
 	 *  never finished judging the changed files at all. */
 	verificationTimedOut?: boolean;
+	/** QA failed at the provider before a check verdict, without timing out. */
+	verificationProviderStall?: boolean;
 	/** Named checks QA's own report identified as failing (`parseFailedChecks`), when verification
 	 *  ran and did not pass. Empty when QA failed (non-zero exit, or an explicit FAIL verdict with
 	 *  no named check) without the parser recognizing any specific check — the old
@@ -54,6 +56,7 @@ export function verificationVerdictFor(input: VerificationVerdictInput): string 
 			: "SKIPPED (no files changed)";
 	}
 	if (input.verificationTimedOut) return "QA TIMED OUT (QA dispatch did not complete)";
+	if (input.verificationProviderStall) return "QA PROVIDER STALL (QA dispatch did not complete)";
 	if (input.passedVerification) return "PASS";
 	const checks = input.failedChecks ?? [];
 	return checks.length > 0 ? `FAIL (${checks.join(", ")})` : "FAIL (unparsed)";
@@ -102,6 +105,8 @@ export interface RunReport {
 	passedVerification: boolean;
 	/** True when the QA dispatch itself timed out rather than completing (see `VerificationVerdictInput`). */
 	verificationTimedOut: boolean;
+	/** True when QA's provider failed before a verdict, without a dispatch timeout. */
+	verificationProviderStall?: boolean;
 	/** Named checks QA's report identified as failing; empty when it failed without the parser
 	 *  recognizing any specific check (`FAIL (unparsed)`). */
 	failedChecks: string[];
@@ -159,6 +164,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 		filesChangedCount: report.filesChangedCount,
 		passedVerification: report.passedVerification,
 		verificationTimedOut: report.verificationTimedOut,
+		verificationProviderStall: report.verificationProviderStall,
 		failedChecks: report.failedChecks,
 	});
 	let passedVerification = report.passedVerification;

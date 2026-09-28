@@ -282,6 +282,33 @@ describe("pipeline/hierarchy.ts isTransientLeadFailure (docs/architecture-review
 		};
 	}
 
+	test("inactivity timeout note alone is not provider evidence", () => {
+		expect(isTransientLeadFailure(baseResult({
+			outcome: "timed_out", timeoutReason: "inactivity",
+			stderr: "[orchestrator] inactivity timeout: no meaningful progress\nUNVERIFIED PARTIAL WORK — inactivity\nlastProgress: none\nnestedWorkers: none observed\npartialText: still working",
+		}))).toBe(false);
+	});
+
+	test("nested latestText prose mentioning fetch failed does not trigger a provider resume", () => {
+		expect(isTransientLeadFailure(baseResult({
+			outcome: "timed_out", timeoutReason: "inactivity",
+			stderr: "[orchestrator] inactivity timeout: no progress\nUNVERIFIED PARTIAL WORK — inactivity\nnestedWorkers: t11 (4 turns, running) lastText: the test for fetch failed passed\npartialText: fetch failed is a test name",
+			interruption: {
+				taskId: "t", reason: "inactivity_timeout", elapsedMs: 10, sinceLastProgressMs: 10,
+				turns: 1, toolCalls: 1, repeatedToolCalls: 0, lastProgress: "fetch failed test passed",
+				nestedWorkers: [{ id: "t11", turns: 4, finished: false, latestText: "fetch failed test passed" }],
+				partialText: "fetch failed test passed", verified: false,
+			},
+		}))).toBe(false);
+	});
+
+	test("error-end nested diagnostic lastText prose cannot trigger provider resume", () => {
+		expect(isTransientLeadFailure(baseResult({
+			stderr: "nestedWorkers: t11 (4 turns, running) lastText: fetch failed is a test case",
+			stopReason: "error",
+		}))).toBe(false);
+	});
+
 	test("a genuinely transient failure is resumable", () => {
 		expect(isTransientLeadFailure(baseResult())).toBe(true);
 	});
