@@ -968,6 +968,52 @@ describe("pipeline/run-orchestration.ts runOrchestration QA dispatch timing out 
 		} else expect(result.report.passedVerification).toBe(true);
 	});
 
+	test("vcy00z nested provider evidence drives lead resume and dependent wave; injected QA timeout re-runs without unit failure", async () => {
+		// The lead event is historical; QA's timeout response below is an injected scenario,
+		// not a claim that a QA timeout appears in the vcy00z event tail.
+		const tail = readFileSync(new URL("../fixtures/vcy00z-lead-0-tail.jsonl", import.meta.url), "utf8").trim().split("\n").map(line => JSON.parse(line));
+		const nested = tail.at(-1)?.partialResult?.details?.results?.[0];
+		expect(nested.errorMessage).toContain("Bedrock stream ended without a stop reason");
+		const runId = "ht-orch-1700000000000-vcy00zreplay";
+		const session = fakeSession();
+		const { ctx } = fakeCtx();
+		const adapter = fakeAdapter();
+		const plan = { ...flatPlan(runId), complexity: 8, topology: { depth: 3, leads: 2, workers: 0, shape: "multi_lead" } } as PlanResponse;
+		const batches: string[][] = [];
+		let leadAttempts = 0;
+		let qaAttempts = 0;
+		const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0, tool_calls: 0 };
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async (_cwd, _id, tasks) => {
+				batches.push(tasks.map(t => t.taskId));
+				return tasks.map(t => {
+					const common = { taskId: t.taskId, capability: t.capability, model: "p/lead", usage, durationMs: 1, costUsd: 0, costReported: true, filesChanged: [] };
+					if (t.capability === "architect") return { ...common, exitCode: 0, stdout: "## Lead assignments\nLead 1: repair (depends on: none)\nLead 2: dependent (depends on: 1)\n", stderr: "", outcome: "completed" as const };
+					if (t.capability === "qa_agent") {
+						qaAttempts++;
+						return { ...common, exitCode: qaAttempts === 1 ? 1 : 0, stdout: qaAttempts === 1 ? "| unit | FAIL |\n(killed by timeout)" : "## Verdict\nPASS", stderr: "", outcome: qaAttempts === 1 ? "timed_out" as const : "completed" as const };
+					}
+					if (t.taskId.endsWith("-lead-0") && leadAttempts++ === 0) return { ...common, exitCode: 124, stdout: "", stderr: "[orchestrator] inactivity timeout", outcome: "timed_out" as const, timeoutReason: "inactivity" as const,
+						interruption: { taskId: t.taskId, reason: "inactivity_timeout" as const, elapsedMs: 1, sinceLastProgressMs: 1, turns: 1, toolCalls: 1, repeatedToolCalls: 0, lastProgress: "nested worker", nestedWorkers: [{ id: "t11", turns: nested.usage.turns, finished: false, latestText: nested.latestText, errorMessage: nested.errorMessage }], partialText: "", verified: false } };
+					return { ...common, exitCode: 0, stdout: "STATUS: completed\n\n## Files Changed\n- `src/a.ts`", stderr: "", outcome: "completed" as const, filesChanged: ["src/a.ts"] };
+				});
+			},
+		});
+		const output = await runOrchestration(runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, fakeResolution(adapter), ctx, session, { ...claimed, session }, deps);
+		expect(output.kind).toBe("completed");
+		if (output.kind !== "completed") return;
+		expect(batches.slice(-4)).toEqual([[`${runId}-lead-0`], [`${runId}-lead-1`], [`${runId}-qa`], [`${runId}-qa-rerun-1`]]);
+		expect(leadAttempts).toBe(2);
+		expect(qaAttempts).toBe(2);
+		expect(output.report.resumedLeadIds).toContain("lead-0");
+		expect(output.report.failedChecks).not.toContain("unit");
+		expect(output.report.passedVerification).toBe(true);
+		const { text } = buildRunSummary(output.report);
+		expect(text).toContain("verification: PASS");
+		expect(text).not.toContain("verification failed: `unit`");
+	});
+
 	test("injected QA timeout seam (not fixture replay): two timed-out QA attempts are counted, but unit is not a failed check", async () => {
 		const runId = "ht-orch-1700000000000-qatimeout2";
 		const session = fakeSession();

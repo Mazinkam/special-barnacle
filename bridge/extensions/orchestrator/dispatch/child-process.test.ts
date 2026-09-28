@@ -9,7 +9,8 @@ import { fileURLToPath } from "node:url";
 
 import { MAX_CHILD_STDERR_DISK_BYTES } from "./stderr-sink.ts";
 import { dispatchReconAndLeads, isTransientLeadFailure } from "../pipeline/hierarchy.ts";
-import { pollCiCheck } from "../core/ci-wait.ts";
+import { waitForPendingChecks } from "../pipeline/run-orchestration.ts";
+import { RunCancellation } from "../cancellation.ts";
 import type { DispatchResult } from "../core/records.ts";
 import type { DispatchTask, PlanResponse } from "../core/prompts.ts";
 
@@ -1623,50 +1624,44 @@ describe("B4 fixture replay with injected child and manually advanced timers", (
   expect(killed.toolInFlight?.ciRefs).toEqual([{ provider: "gitlab", kind: "pipeline", id: "219469" }]);
   const batches: DispatchTask[][] = [];
   const billed: DispatchResult[] = [];
-  let checkingStarted = false;
-  let releaseCheck!: (result: Awaited<ReturnType<typeof pollCiCheck>>) => void;
-  const checked = new Promise<Awaited<ReturnType<typeof pollCiCheck>>>(resolve => { releaseCheck = resolve; });
+  let checkTick: (() => void) | undefined;
+  const checkStates: string[] = [];
+  const calls: string[][] = [];
+  let ciNow = 1000;
+  let polls = 0;
   const run = dispatchReconAndLeads({ runId: "run", goal: "repair", plan, adapter: { lead: { model: "p/m" } },
    architectResult: leadChain("check pipeline"), evidenceMaxChars: 4000, maxLeads: 4, repoRoot: "/repo", inWaveRecovery: true }, {
    dispatch: async tasks => {
     batches.push(tasks);
     return tasks.map(task => batches.length === 1 ? asDispatch(task, killed) : success(task));
    }, capture: async result => { billed.push(result); }, setPhase: () => {}, throwIfCancelled: () => {},
-   waitForChecks: async checks => {
+   currentCandidateSha: () => "a".repeat(40),
+   waitForChecks: checks => {
     expect(checks).toEqual([{ provider: "gitlab", kind: "pipeline", id: "219469", source: "killed_command" }]);
-    checkingStarted = true;
-    return [{ check: checks[0], ...await checked }];
+    return waitForPendingChecks(checks, {
+     cwd: "/repo", cancellation: new RunCancellation(), expectedSha: "a".repeat(40),
+     expectedRepo: "https://gitlab.example/forge/project", now: () => ciNow,
+     setPendingChecks: rows => { checkStates.push(rows[0].outcome); },
+     scheduleTick: (delay, tick) => { expect(delay).toBe(15000); ciNow += delay; checkTick = tick; return () => {}; },
+     spawn: async (cmd, args) => {
+      expect(cmd).toBe("glab"); calls.push(args);
+      return { exitCode: 0, stderr: "", stdout: JSON.stringify({ id: 219469, sha: "a".repeat(40),
+       web_url: "https://gitlab.example/forge/project/-/pipelines/219469", status: ++polls === 1 ? "running" : "success" }) };
+     },
+    });
    },
   });
   // Let the synchronous/async dispatch chain reach the pending-check seam without
   // hanging the test if a regression omits that seam entirely.
-  for (let i = 0; i < 50 && !checkingStarted; i++) await Promise.resolve();
-  expect(checkingStarted).toBe(true);
+  for (let i = 0; i < 50 && !checkTick; i++) await Promise.resolve();
+  expect(checkTick).toBeDefined();
   expect(batches.map(batch => batch.map(t => t.taskId))).toEqual([["run-lead-0"], ["run-lead-0"]]);
   expect(batches[1][0].task).toContain("do not wait for it again");
-  // No real GitLab/API access: the CLI runner is injected below; results retain the
-  // pollCiCheck identity and SHA validation rather than trusting a lead's prose.
-  let ciNow = 1000;
-  let status = "running";
-  const calls: string[][] = [];
-  const check = { provider: "gitlab" as const, kind: "pipeline" as const, id: "219469", source: "killed_command" as const };
-  const state = { startedAt: ciNow, nextPollAt: ciNow };
-  const poll = (s: typeof state) => pollCiCheck(check, s, { cwd: "/repo", expectedSha: "a".repeat(40), expectedRepo: "https://gitlab.example/forge/project", now: () => ciNow,
-   spawn: async (cmd, args) => {
-    expect(cmd).toBe("glab");
-    calls.push(args);
-    return { exitCode: 0, stderr: "", stdout: JSON.stringify({ id: 219469, sha: "a".repeat(40), web_url: "https://gitlab.example/forge/project/-/pipelines/219469", status }) };
-   },
-  });
-  const pending = await poll(state);
-  expect(pending.outcome).toBe("pending");
-  expect(batches).toHaveLength(2); // no dependent dispatch while the check is pending
-  ciNow = pending.state!.nextPollAt;
-  status = "success";
-  const passed = await poll(pending.state!);
-  expect(passed.outcome).toBe("success");
-  expect(batches).toHaveLength(2); // no dispatch even after checking, until the gate receives the checked pass
-  releaseCheck(passed);
+  // The parent's scheduled tick, not a direct pollCiCheck invocation, releases the gate.
+  expect(checkStates).toEqual(["pending", "pending"]);
+  expect(polls).toBe(1);
+  checkTick?.();
+  expect(batches).toHaveLength(2); // dependent cannot start until the parent receives pass
   const output = await run;
   expect(calls).toEqual([
    ["api", "--hostname", "gitlab.example", "projects/forge%2Fproject/pipelines/219469"],
@@ -1675,6 +1670,7 @@ describe("B4 fixture replay with injected child and manually advanced timers", (
   expect(batches.map(batch => batch.map(t => t.taskId))).toEqual([["run-lead-0"], ["run-lead-0"], ["run-lead-1"]]);
   expect(batches[2][0].task).toContain("gitlab 219469: external check success");
   expect(output.resumedLeadTaskIds).toEqual(["run-lead-0"]);
+  expect(checkStates).toEqual(["pending", "pending", "success"]);
   expect(output.pendingChecks.map(c => c.outcome)).toEqual(["success"]);
   expect(billed.map(r => r.taskId)).toEqual(["run-lead-0", "run-lead-0", "run-lead-1"]);
  });
