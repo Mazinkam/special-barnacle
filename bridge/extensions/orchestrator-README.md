@@ -197,16 +197,32 @@ aliases fail with suggestions, **before** anything is dispatched.
 The old `orchestrator-adapter.json` is no longer migrated (the migrated `default`
 profile was retired); run `install.sh` to install the shipped profiles.
 
-### Lead sizing, spend cap, provider fallback
+### Lead sizing, spend cap, model backups and provider failover
 
 - **Lead sizing** (`method.json` `rules.lead_sizing`): complexity 1–3 → `lead_small` (mid),
   4–6 → `lead` (premium), 7–10 → `lead_large` (frontier); medium risk ≥ standard,
   high/critical = large. `--lead-size` overrides. A failed verification retries the lead
   one size up. Each decision is recorded as a `lead_sized` event.
 - **Spend cap** (`rules.dispatch_spend_cap`, ships as `warn`): per-dispatch USD ceilings;
-  `warn` records `spend_cap_exceeded` once, `enforce` also stops the dispatch.
-- **Provider fallback**: an `openai-codex/*` dispatch that fails on a usage/quota/rate limit
-  is retried once on the same model under `amazon-bedrock`, recorded as `route_degraded`.
+  `warn` records `spend_cap_exceeded` once, `enforce` also stops the dispatch. Costs from
+  superseded attempts, including nested workers, count toward the same cap.
+- **Candidate order**: configured primary, its Codex→Bedrock twin when available, profile
+  `backups` for the capability (or its tier), then qualifying models from higher tiers only.
+  Candidates below the capability tier are never used. Backup candidates require known
+  context/output facts meeting `method.json` `rules.model_requirements`; the primary remains
+  selectable with a warning even if its facts are unknown or below the minimum. The live
+  terminal model registry supplies facts when available. Optional overrides live at
+  `~/.humain-terminal/agent/model-facts.json` (or `HUMAIN_ORCHESTRATOR_MODEL_FACTS_FILE`):
+  `{ "version": 1, "models": { "provider/model": { "context": 200000,
+  "max_output": 16000, "effort_control": true } } }`. Overrides apply field-by-field.
+- **Failure handling**: only provider quota/transient errors and no-progress stalls enter
+  failover; ordinary task failures and cancellation do not. After real work, one same-model
+  retry receives bounded handoff context; otherwise routing switches to another healthy
+  candidate, preferring a different provider/region. Health cooldown is run-scoped. If all
+  candidates are unhealthy, configured bounded waits apply before the run gives up.
+  Attempt-level `dispatch_finished` records retain per-attempt usage/cost; `route_degraded`
+  and `model_unhealthy` events explain switches and cooldowns. `/orchestrator-models` shows
+  qualified and excluded candidates.
 - Every `model_call`/`route_executed` row carries `profile`, `policy_id`
   (`<profile>-<hash of resolved bindings>`) and `lead_size`; the dashboard's **Lead sizing**
   table groups lead cost and verified outcomes by size.

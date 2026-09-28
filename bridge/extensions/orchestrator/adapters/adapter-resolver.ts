@@ -179,7 +179,7 @@ export async function resolveAdapter(
 	}
 	const candidates = Object.fromEntries(ALL_CAPABILITIES.flatMap((capability) => {
 		const primary = merged.adapter[capability]?.model;
-		return primary ? [[capability, resolveCandidates({ capability, primary, backups: profile?.backups, tierPrimaries, table, preference, catalog })]] : [];
+		return primary ? [[capability, resolveCandidates({ capability, primary, backups: profile?.backups, tierPrimaries, adapter: merged.adapter, table, preference, catalog })]] : [];
 	}));
 	// Fallback/dynamic specs are canonical already but may name models the user
 	// has not configured; those show up as non-user warnings and are informational.

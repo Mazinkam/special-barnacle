@@ -1,5 +1,5 @@
 /** Pure ordered backup resolution and capability qualification. */
-import { METHOD, resolveAlias, shortName, tierOf, type AliasTable, type ModelRequirementsRule, type Tier } from "../models.ts";
+import { METHOD, resolveAlias, shortName, tierIndex, tierOf, tierOfModel, type AliasTable, type ModelRequirementsRule, type Tier } from "../models.ts";
 import type { Catalog } from "./model-catalog.ts";
 import { providerRegion } from "../run/model-health.ts";
 import { bedrockFallbackFor } from "../provider-fallback.ts";
@@ -18,6 +18,7 @@ export interface CandidateInput {
 	primary: string;
 	backups?: Record<string, string[]>;
 	tierPrimaries: Partial<Record<Tier, string>>;
+	adapter?: Record<string, { model: string }>;
 	table: AliasTable;
 	preference: string[];
 	catalog: Catalog;
@@ -50,7 +51,13 @@ export function resolveCandidates(input: CandidateInput): Candidate[] {
 		if (seen.has(model)) return;
 		seen.add(model);
 		const facts = check(model, input.catalog, requirement);
-		result.push({ model, spec, source, qualified: source === "primary" || facts.reasons.length === 0, reasons: facts.reasons, effortControl: facts.effortControl });
+		const capabilityTier = tierOf(input.capability);
+		const modelTier = tierOfModel(model, input.adapter ?? {});
+		const lowerTier = capabilityTier && modelTier !== "unknown" && tierIndex(modelTier) < tierIndex(capabilityTier)
+			? `tier ${modelTier} below capability tier ${capabilityTier}`
+			: undefined;
+		const reasons = lowerTier ? [...facts.reasons, lowerTier] : facts.reasons;
+		result.push({ model, spec, source, qualified: source === "primary" || reasons.length === 0, reasons, effortControl: facts.effortControl });
 	};
 	const addSpec = (spec: string, source: Candidate["source"]) => {
 		const resolved = resolveAlias(spec, input.table, input.preference);

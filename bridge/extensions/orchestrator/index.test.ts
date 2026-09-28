@@ -12,6 +12,7 @@ import { planReconTasks } from "./recon.ts";
 import { METHOD, TIER_CAPABILITIES, buildAliasTable } from "./models.ts";
 import type { DispatchResult, DispatchTask } from "./index.ts";
 import { RunCancellation } from "./cancellation.ts";
+import { ModelHealth } from "./run/model-health.ts";
 import { liveQaCostRows, prepareTestedRevision, type LiveQaVerdict } from "./live-qa.ts";
 import { MAX_CHILD_STDERR_DISK_BYTES } from "./dispatch/stderr-sink.ts";
 import { loadEfficiencyControls, type EfficiencyControls } from "./efficiency-flags.ts";
@@ -4030,7 +4031,33 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 		expect(result.taskId).toBe("run-sec");
 		const degraded = events.filter(([e]) => e === "route_degraded");
 		expect(degraded).toHaveLength(1);
-		expect(degraded[0][1]).toMatchObject({ from_model: "openai-codex/gpt-6-astra", to_model: "amazon-bedrock/global.openai.gpt-6-astra", reason: "provider_quota" });
+		expect(degraded[0][1]).toMatchObject({ from_model: "openai-codex/gpt-6-astra", to_model: "amazon-bedrock/global.openai.gpt-6-astra", class: "quota" });
+	});
+
+	test("active RunContext profile backups drive production dispatch routing", async () => {
+		const primary = "amazon-bedrock/global.anthropic.claude-opus-5-5";
+		const backup = "openai-codex/gpt-6-astra";
+		const registry = orchestrator.runRegistryForTest();
+		const session = { runId: "run", dir: "/tmp", cancellation: new RunCancellation(), log: () => {}, drainMessages: () => [] };
+		const context = registry.claim(session as never, {}, table, {}, { candidates: { security_review: [
+			{ model: primary, qualified: true, reasons: [], effortControl: true, spec: primary, source: "primary" },
+			{ model: backup, qualified: true, reasons: [], effortControl: true, spec: backup, source: "backup" },
+		] }, modelHealth: new ModelHealth() });
+		if (!context) throw new Error("test registry unexpectedly active");
+		try {
+			const models: string[] = [];
+			const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", task(""), { security_review: { model: primary } }, {} as never, 0, {
+				recordEvent: () => {}, aliasTable: table,
+				runProcess: async (opts) => {
+					models.push(opts.model);
+					return models.length === 1 ? proc({ exitCode: 1, outcome: "failed", stderr: "Service unavailable (503)" }) : proc({ model: opts.model });
+				},
+			});
+			expect(models).toEqual([primary, backup]);
+			expect(result.model).toBe(backup);
+		} finally {
+			registry.release(context);
+		}
 	});
 
 	test("no Bedrock twin: the original failure is returned, no redispatch", async () => {

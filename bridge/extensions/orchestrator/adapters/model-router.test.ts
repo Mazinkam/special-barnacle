@@ -43,13 +43,13 @@ describe("resolveCandidates", () => {
 			},
 		});
 		expect(view(c)).toEqual([
-			["amazon-bedrock/global.anthropic.claude-opus-5-5", "primary", true, []],
-			["amazon-bedrock/eu.anthropic.claude-opus-5-5", "backup", true, []],
+			["amazon-bedrock/global.anthropic.claude-opus-5-5", "primary", true, ["tier premium below capability tier frontier"]],
+			["amazon-bedrock/eu.anthropic.claude-opus-5-5", "backup", false, ["tier premium below capability tier frontier"]],
 			["openai-codex/gpt-6-astra", "backup", true, []],
-			["humain-node/minimax-m3", "backup", false, ["context 204800 < 256000", "min_output 16384 < 64000"]],
-			["humain-node/glm-5.2", "backup", true, []],
-			["humain-node/claude-opus-5", "backup", false, ["unknown context", "unknown max output"]],
-			["nope/x", "backup", false, [expect.stringContaining("unresolved: unknown provider")]],
+			["humain-node/minimax-m3", "backup", false, ["context 204800 < 256000", "min_output 16384 < 64000", "tier mid below capability tier frontier"]],
+			["humain-node/glm-5.2", "backup", false, ["tier mid below capability tier frontier"]],
+			["humain-node/claude-opus-5", "backup", false, ["unknown context", "unknown max output", "tier premium below capability tier frontier"]],
+			["nope/x", "backup", false, ['unresolved: unknown provider "nope" (providers: amazon-bedrock, openai-codex, humain-node)']],
 		]);
 		expect(c.find((x) => x.model === "humain-node/glm-5.2")?.effortControl).toBe(false);
 	});
@@ -78,7 +78,7 @@ describe("resolveCandidates", () => {
 	});
 	test("the primary is usable even when it fails a minimum; the failure is kept as a warning", () => {
 		const c = resolveCandidates({ ...base, capability: "lead_large", primary: "humain-node/minimax-m3" });
-		expect(view(c)).toEqual([["humain-node/minimax-m3", "primary", true, ["context 204800 < 256000", "min_output 16384 < 64000"]]]);
+		expect(view(c)).toEqual([["humain-node/minimax-m3", "primary", true, ["context 204800 < 256000", "min_output 16384 < 64000", "tier mid below capability tier frontier"]]]);
 	});
 });
 
@@ -90,7 +90,7 @@ describe("usableModels / pickBackup", () => {
 	test("usable = qualified, primary first; no list means just the primary", () => {
 		expect(usableModels(cands, "amazon-bedrock/global.anthropic.claude-opus-5-5")).toEqual([
 			"amazon-bedrock/global.anthropic.claude-opus-5-5", "amazon-bedrock/global.anthropic.claude-fable-5-1",
-			"amazon-bedrock/eu.anthropic.claude-opus-5-5", "openai-codex/gpt-6-astra",
+			"openai-codex/gpt-6-astra",
 		]);
 		expect(usableModels(undefined, "a/b")).toEqual(["a/b"]);
 		expect(usableModels(cands, "x/override")[0]).toBe("x/override");
@@ -98,7 +98,7 @@ describe("usableModels / pickBackup", () => {
 	test("backup prefers another provider/region, skips unhealthy, else same region, else none", () => {
 		const models = usableModels(cands, "amazon-bedrock/global.anthropic.claude-opus-5-5");
 		const cur = models[0];
-		expect(pickBackup(models, cur)).toBe("amazon-bedrock/eu.anthropic.claude-opus-5-5");
+		expect(pickBackup(models, cur)).toBe("openai-codex/gpt-6-astra");
 		const h = new ModelHealth(() => 0);
 		h.markUnhealthy("amazon-bedrock/eu.anthropic.claude-opus-5-5", "transient", 10);
 		h.markUnhealthy("openai-codex/gpt-6-astra", "transient", 10);
@@ -115,7 +115,7 @@ describe("formatting", () => {
 	};
 	test("one line per candidate list, capabilities grouped", () => {
 		expect(formatCandidates(t.lead)).toBe(
-			"opus-5-5@amazon-bedrock/global ✓ · glm-5.2@humain-node ✓ (effort n/a) · minimax-m3@humain-node ✗ context 204800 < 256000; min_output 16384 < 64000",
+			"opus-5-5@amazon-bedrock/global ✓ · glm-5.2@humain-node ✗ tier mid below capability tier premium · minimax-m3@humain-node ✗ context 204800 < 256000; min_output 16384 < 64000; tier mid below capability tier premium",
 		);
 		expect(formatCandidateGroups(t)).toEqual([
 			`lead, architect: ${formatCandidates(t.lead)}`,
@@ -123,6 +123,6 @@ describe("formatting", () => {
 		]);
 	});
 	test("warns once for capabilities with no usable backup", () => {
-		expect(backupWarnings(t)).toEqual(["no qualifying backup for scout; a provider outage will fail those dispatches"]);
+		expect(backupWarnings(t)).toEqual(["no qualifying backup for lead, architect, scout; a provider outage will fail those dispatches"]);
 	});
 });

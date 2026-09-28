@@ -31,8 +31,12 @@ import { RunDiagnostics, type DiagnosticWriter } from "./run-diagnostics.ts";
 import { runLiveQaStage, type RunLiveQaStageResult } from "./live-qa-stage.ts";
 import { registerOrchestrateCommand, type OrchestrateDeps } from "./commands/orchestrate.ts";
 import { RunRegistry, type RunContext, type RunSessionLike } from "./run/context.ts";
-import type { Candidate } from "./adapters/model-router.ts";
-import type { ModelHealth } from "./run/model-health.ts";
+import { resolveCandidates, usableModels, type Candidate } from "./adapters/model-router.ts";
+import { buildCatalog, parseModelFacts } from "./adapters/model-catalog.ts";
+import { dispatchWithFailover } from "./dispatch/failover.ts";
+import { failoverConfig } from "./dispatch/failover-policy.ts";
+import { ModelHealth } from "./run/model-health.ts";
+import type { ModelHealth as ModelHealthType } from "./run/model-health.ts";
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import {
 	appendFileSync,
@@ -103,7 +107,7 @@ import {
 	type LeadSize,
 	userLayerWarnings,
 } from "./models.ts";
-import { bedrockFallbackFor, isQuotaError } from "./provider-fallback.ts";
+import { bedrockFallbackFor } from "./provider-fallback.ts";
 import { parseLeadAssignments, planLeadWaves, type LeadAssignment } from "./lead-plan.ts";
 import { classifyRunOutcome, externalChangeFiles, parseLeadFilesChanged, parseLeadStatus } from "./run-outcome.ts";
 import { SpendCapTracker, capFor, type SpendCapVerdict } from "./spend-cap.ts";
@@ -188,6 +192,7 @@ const PROFILES_PATH =
 const LEGACY_ADAPTER_PATH =
 	process.env.HUMAIN_ORCHESTRATOR_ADAPTER_FILE ??
 	join(homedir(), ".humain-terminal", "agent", "orchestrator-adapter.json");
+const MODEL_FACTS_PATH = process.env.HUMAIN_ORCHESTRATOR_MODEL_FACTS_FILE ?? join(dirname(PROFILES_PATH), "model-facts.json");
 
 /**
  * The profiles shipped with the skill (`bridge/orchestrator-profiles.json`).
@@ -625,7 +630,7 @@ function loadProfiles(): LoadedProfiles {
 
 function availableModels(ctx: ExtensionContext): AvailableModel[] {
 	try {
-		return ctx.modelRegistry.getAvailable().map((m) => ({ provider: m.provider, id: m.id, name: m.name }));
+		return ctx.modelRegistry.getAvailable().map((m) => ({ provider: m.provider, id: m.id, name: m.name, contextWindow: m.contextWindow, maxTokens: m.maxTokens, reasoning: m.reasoning }));
 	} catch {
 		return [];
 	}
@@ -636,6 +641,7 @@ interface FullResolution extends ResolvedAdapter {
 	profiles: LoadedProfiles;
 	table: AliasTable;
 	preference: string[];
+	candidates?: Record<string, Candidate[]>;
 }
 
 /**
@@ -673,6 +679,26 @@ async function resolveAdapter(
 		{ source: "fallback", bindings: FALLBACK_ADAPTER },
 	];
 	const merged = mergeLayers(layers, table, preference, profile?.effort ?? {}, overrides.effort);
+	let modelFacts: Record<string, import("./adapters/model-catalog.ts").ModelFacts> = {};
+	if (existsSync(MODEL_FACTS_PATH)) {
+		try {
+			const parsed = parseModelFacts(JSON.parse(readFileSync(MODEL_FACTS_PATH, "utf-8")));
+			modelFacts = parsed.facts;
+			warnings.push(...parsed.problems);
+		} catch (error) {
+			warnings.push(`model facts file could not be read: ${(error as Error).message}`);
+		}
+	}
+	const catalog = buildCatalog(table.models, modelFacts);
+	const tierPrimaries: Partial<Record<Tier, string>> = {};
+	for (const [capability, binding] of Object.entries(merged.adapter)) {
+		const tier = tierOf(capability);
+		if (tier && !tierPrimaries[tier]) tierPrimaries[tier] = binding.model;
+	}
+	const candidates = Object.fromEntries(ALL_CAPABILITIES.flatMap((capability) => {
+		const primary = merged.adapter[capability]?.model;
+		return primary ? [[capability, resolveCandidates({ capability, primary, backups: profile?.backups, tierPrimaries, adapter: merged.adapter, table, preference, catalog })]] : [];
+	}));
 	// Fallback/dynamic specs are canonical already but may name models the user
 	// has not configured; those show up as non-user warnings and are informational.
 	return {
@@ -682,6 +708,7 @@ async function resolveAdapter(
 		profiles,
 		table,
 		preference,
+		candidates,
 	};
 }
 
@@ -1556,7 +1583,7 @@ class SyncedRunRegistry extends RunRegistry<RunSessionLike> {
 		tags: RunTags = {},
 		aliasTable: AliasTable | null = null,
 		modelSources: Record<string, BindingSource> | null = null,
-		routing?: { candidates: Record<string, Candidate[]>; modelHealth: ModelHealth },
+		routing?: { candidates: Record<string, Candidate[]>; modelHealth: ModelHealthType },
 	): RunContext<RunSessionLike> | null {
 		const claimed = super.claim(session, tags, aliasTable, modelSources, routing);
 		if (claimed) {
@@ -1819,6 +1846,8 @@ export async function runSubagentProcess(opts: {
 	capability?: string;
 	/** Nesting depth for the widget (0 = top-level, 1 = child of a lead, etc.). */
 	depth?: number;
+	/** Earlier spend from superseded attempts of this same logical dispatch. */
+	spendCapOffsetUsd?: number;
 	/** Test seam for deterministic progress/absolute timeout coverage. */
 	leadTimeouts?: { inactivityMs: number; maxMs: number };
 	/** Optional owning session; production callers use the active run. */
@@ -2156,7 +2185,7 @@ export async function runSubagentProcess(opts: {
 			// (stopReason "stop") is only warned about: killing it would throw away
 			// a finished report to save nothing.
 			if (msg.usage) {
-				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar()) ?? "ok";
+				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar() + (opts.spendCapOffsetUsd ?? 0)) ?? "ok";
 				if (verdict !== "ok") handleSpendCap(verdict === "stop" && msg.stopReason === "stop" ? "warn" : verdict);
 			}
 		};
@@ -2191,7 +2220,7 @@ export async function runSubagentProcess(opts: {
 			}
 			if (nestedCost.observe(event)) {
 				session?.setNestedCost(taskId, nestedCost.total());
-				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar()) ?? "ok";
+				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar() + (opts.spendCapOffsetUsd ?? 0)) ?? "ok";
 				if (verdict !== "ok") handleSpendCap(verdict);
 			}
 			if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
@@ -2291,11 +2320,12 @@ export async function runSubagentProcess(opts: {
 			if (settled || cancelledByListener) return;
 			const capability = opts.capability ?? "unknown";
 			const cap = capFor(capability);
-			const message = `spend cap $${cap.toFixed(2)} for ${capability} exceeded by ${taskId} at $${spentSoFar().toFixed(4)}${nestedCost.total() > 0 ? ` ($${nestedCost.total().toFixed(4)} in its subagents)` : ""}`;
+			const cumulativeSpend = spentSoFar() + (opts.spendCapOffsetUsd ?? 0);
+			const message = `spend cap $${cap.toFixed(2)} for ${capability} exceeded by ${taskId} at $${cumulativeSpend.toFixed(4)}${nestedCost.total() > 0 ? ` ($${nestedCost.total().toFixed(4)} in its subagents)` : ""}`;
 			session?.log(`${message} (${verdict === "stop" ? "stopping it" : "warn only"})`);
 			recordEvent("spend_cap_exceeded", {
 				run_id: session?.runId, task_id: taskId, capability, model: opts.model,
-				cap_usd: cap, cost_usd: spentSoFar(), nested_cost_usd: nestedCost.total(), action: verdict,
+				cap_usd: cap, cost_usd: cumulativeSpend, nested_cost_usd: nestedCost.total(), action: verdict,
 			});
 			session?.ctx.ui?.notify?.(`${message}${verdict === "stop" ? " — stopping it" : ""}`, "warning");
 			if (verdict !== "stop") return;
@@ -2506,6 +2536,7 @@ async function triageTask(
 	goal: string,
 	cwd: string,
 	ctx: ExtensionContext,
+	run: RunContext<RunSessionLike> | null,
 	costSink: { usd: number },
 	adapter: Adapter,
 ): Promise<TriageResult | null> {
@@ -2521,24 +2552,49 @@ async function triageTask(
 
 	const prompt = TRIAGE_PROMPT + "\n" + goal + "\n\nJSON:\n";
 	try {
-		const r = await runSubagentProcess({
-			cwd,
-			agentName: "orch-implementation-fast",
-			task: prompt,
-			model: cheapest.model,
-			ctx,
-			taskId: "triage",
-			label: "triage",
+		const session = run?.session as RunSession | undefined;
+		const capability = adapter.implementation_fast ? "implementation_fast" : adapter.worker ? "worker" : "scout";
+		const declared = run?.candidates?.[capability];
+		const twin = run?.aliasTable ? bedrockFallbackFor(cheapest.model, run.aliasTable) : null;
+		const routeCandidates = declared ? usableModels(declared, cheapest.model) : [cheapest.model, ...(twin ? [twin] : [])];
+		const failover = await dispatchWithFailover({ taskId: "triage", capability, prompt }, routeCandidates, {
+			runAttempt: (model, task, attempt, spendCapOffsetUsd) => runSubagentProcess({
+				cwd, agentName: "orch-implementation-fast", task, model, ctx,
+				taskId: attempt === 1 ? "triage" : `triage-fallback-${attempt - 1}`,
+				label: attempt === 1 ? "triage" : `triage↻${attempt - 1}`, capability,
+				session, spendCapOffsetUsd,
+			}),
+			readEvents: (result) => result.rawStdout.split(/\r?\n/),
+			snapshot: () => gitDirtySnapshot(cwd),
+			changedSince: (snapshot) => diffDirtySnapshots(snapshot as Map<string, string> | null, gitDirtySnapshot(cwd), []).changed,
+			sleep: async (ms) => {
+				if (!session) return;
+				await new Promise<void>((resolve) => {
+					const timer = setTimeout(() => { remove(); resolve(); }, ms);
+					const remove = session.cancellation.onCancel(() => { clearTimeout(timer); remove(); resolve(); });
+				});
+			},
+			health: run?.modelHealth ?? new ModelHealth(),
+			isCancelled: () => session?.cancellation.isCancelled ?? false,
+			recordEvent: (event, payload) => recordEvent(event, { run_id: runId, ...payload }),
+			log: (line) => session?.log(line), config: failoverConfig(), redact: redactPaths,
+			effortDropped: (model) => Boolean(cheapest.effort && !declared?.find((candidate) => candidate.model === model)?.effortControl),
 		});
-		costSink.usd += r?.costUsd ?? 0;
-		// Bill the dispatch before parsing: malformed/empty classifier output still used tokens.
-		await captureDispatchCost(
-			{ runId, planId: "triage", taskClass: "triage", complexity: 5, risk: "medium",
-				recommended: { capability: "implementation_fast", effort: "low", verification_depth: "none" }, mode: "triage" },
-			{ taskId: "triage", capability: "triage", model: r.model ?? cheapest.model,
-				exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, usage: r.usage,
-				durationMs: r.durationMs, costUsd: r.costUsd, costReported: r.costReported, stopReason: r.stopReason, filesChanged: [] },
-		);
+		const r = failover.result;
+		// Every provider attempt is billed independently, including a superseded
+		// classifier call; malformed final output still leaves honest cost rows.
+		for (let index = 0; index < failover.attempts.length; index++) {
+			const attempt = failover.attempts[index];
+			costSink.usd += attempt.result.costUsd;
+			await captureDispatchCost(
+				{ runId, planId: "triage", taskClass: "triage", complexity: 5, risk: "medium",
+					recommended: { capability: "implementation_fast", effort: "low", verification_depth: "none" }, mode: "triage" },
+				{ taskId: index === 0 ? "triage" : `triage-fallback-${index}`, capability: "triage", model: attempt.result.model ?? attempt.model,
+					exitCode: attempt.result.exitCode, stdout: attempt.result.stdout, stderr: attempt.result.stderr, usage: attempt.result.usage,
+					durationMs: attempt.result.durationMs, costUsd: attempt.result.costUsd, costReported: attempt.result.costReported,
+					stopReason: attempt.result.stopReason, filesChanged: [] },
+			);
+		}
 		if (r.exitCode !== 0) {
 			console.warn(`[orchestrator] triage exited ${r.exitCode}: ${summarizeStderr(r.stderr || r.rawStdout, 400) || "(no output)"}`);
 			return null;
@@ -3055,6 +3111,8 @@ export async function dispatchParallel(
 	// anything that arrived during or after this one. Draining mid-batch would
 	// split messages across two prompts in non-obvious ways.
 	const session = ACTIVE_RUN;
+	const runContext = runRegistry.active();
+	const modelHealth = runContext?.modelHealth ?? new ModelHealth();
 	const recipient = tasks.length === 1
 		? `${tasks[0].capability}:${tasks[0].taskId.replace(`${runId}-`, "")}`
 		: `${tasks.length} ${tasks[0].capability} tasks`;
@@ -3129,92 +3187,67 @@ export async function dispatchParallel(
 			retry_of: input._retryOf,
 		});
 		try {
-			const runOn = (model: string, taskId: string | undefined, label: string) => deps.runProcess({
-				cwd: input.cwd,
-				agentName: input.agent,
-				task: input.task,
-				model,
-				effort: input.effort,
-				taskId,
-				label,
-				capability: input._capability,
-				depth,
-				// Still no *hardcoded* tools override here — that is what previously
-				// granted reviewers write access and stripped tools the personas need.
-				// `input.tools` is per-task and set by exactly one producer,
-				// `planReconTasks()`, which pins recon to read-only. Every other task
-				// leaves it undefined, and runSubagentProcess then falls back to the
-				// persona's own frontmatter allow-list, so persona policy still wins
-				// everywhere it did before.
-				tools: input.tools,
-				ctx,
+			const runCandidates = runContext?.candidates?.[input._capability];
+			const aliasTable = deps.aliasTable === undefined ? CURRENT_ALIAS_TABLE : deps.aliasTable;
+			const bedrockTwin = aliasTable ? bedrockFallbackFor(input.model, aliasTable) : null;
+			const routeCandidates = runCandidates ? usableModels(runCandidates, input.model) : [input.model, ...(bedrockTwin ? [bedrockTwin] : [])];
+			let latestChangedFiles: string[] = [];
+			const failover = await dispatchWithFailover({ taskId: input._taskId ?? `unknown-${runId}`, capability: input._capability ?? "unknown", prompt: input.task }, routeCandidates, {
+				runAttempt: async (model, prompt, attempt, spentBeforeUsd) => {
+					const taskId = attempt === 1 || !input._taskId ? input._taskId : `${input._taskId}-fallback-${attempt - 1}`;
+					const result = await deps.runProcess({
+						cwd: input.cwd, agentName: input.agent, task: prompt, model, effort: input.effort,
+						taskId, label: attempt === 1 ? shortId : `${shortId}↻${attempt - 1}`,
+						capability: input._capability, depth, tools: input.tools, ctx, session: session ?? undefined,
+						spendCapOffsetUsd: spentBeforeUsd,
+					});
+					latestChangedFiles = result.personaCanMutate ? parseFilesChanged(result.stdout) : [];
+					return result;
+				},
+				readEvents: (result) => result.rawStdout.split(/\r?\n/),
+				snapshot: () => gitDirtySnapshot(cwd),
+				changedSince: (snapshot) => diffDirtySnapshots(snapshot as Map<string, string> | null, gitDirtySnapshot(cwd), latestChangedFiles).changed,
+				sleep: async (ms) => {
+					if (!session) return;
+					await new Promise<void>((resolve) => {
+						const timer = setTimeout(() => { remove(); resolve(); }, ms);
+						const remove = session.cancellation.onCancel(() => { clearTimeout(timer); remove(); resolve(); });
+					});
+				},
+				health: modelHealth,
+				isCancelled: () => session?.cancellation.isCancelled ?? false,
+				recordEvent: (event, payload) => deps.recordEvent(event, { run_id: runId, ...payload }),
+				log: (line) => session?.log(line),
+				config: failoverConfig(),
+				redact: redactPaths,
+				effortDropped: (model) => Boolean(input.effort && !runCandidates?.find((candidate) => candidate.model === model)?.effortControl),
 			});
-			let r = await runOn(input.model, input._taskId, shortId);
-			// Codex first, Bedrock fallback: a quota/rate-limit failure on an
-			// openai-codex model is retried ONCE on the same model id under
-			// amazon-bedrock. Both attempts are billed (usage summed).
-			const table = deps.aliasTable === undefined ? CURRENT_ALIAS_TABLE : deps.aliasTable;
-			// Only a genuine provider rejection qualifies: not a timeout, a user
-			// cancel, or a spend-cap stop (those would re-run finished work), and
-			// only when stderr (not the model's own prose) names the quota.
-			const eligible = r.exitCode !== 0 && r.outcome !== "timed_out" && r.outcome !== "cancelled" &&
-				r.stopReason !== "spend_cap" && !(session ?? ACTIVE_RUN)?.cancellation.isCancelled;
-			const twin = eligible && table && isQuotaError(r.stderr) ? bedrockFallbackFor(input.model, table) : null;
-			// `dispatchAttempt` disambiguates the two dispatch_finished events a quota fallback can
-			// write for the SAME task_id: 0 is the original (superseded) attempt, 1 is the Bedrock
-			// retry. Each attempt's event carries ONLY that attempt's own nested cost/rows — never a
-			// running sum — so Python-side reconciliation (`economics.nested_residual_rows`, keyed on
-			// `(run_id, task_id, dispatch_attempt)`) never has two events double-claiming attempt 0's
-			// nested spend (Phase 1 review finding T1). The nested per-task detail rows carry the same
-			// attempt tag in their `record_id` (Phase 1 review finding T2): the two attempts are
-			// separate child processes with independently-numbered tool-call ids, so without the
-			// attempt tag a coincidental `(toolCallId, taskId, attempt)` collision across attempts
-			// would dedup away a paid nested call from one of them.
-			let dispatchAttempt = 0;
-			let ownNestedCalls = r.nestedCalls;
-			let ownNestedCostUsd = r.nestedCostUsd;
-			if (twin) {
-				const first = r;
-				const firstNestedRows = nestedModelCallRowsFor({
-					runId, parentTaskId: input._taskId ?? `unknown-${runId}`, dispatchDepth: depth, dispatchAttempt: 0,
-				}, first.nestedCalls ?? []);
-				for (const row of firstNestedRows) (deps.recordModelCall ?? recordModelCall)(row);
-				deps.recordEvent("dispatch_finished", {
-					run_id: runId, task_id: input._taskId, capability: input._capability, model: first.model ?? input.model,
-					exit_code: first.exitCode, duration_ms: first.durationMs, cost_usd: first.costUsd,
-					nested_cost_usd: first.nestedCostUsd, nested_rows_emitted: firstNestedRows.length, dispatch_attempt: 0,
-					turns: first.usage.turns, stop_reason: first.stopReason, log_dir: ACTIVE_RUN?.dir, superseded_by_fallback: true,
-				});
-				deps.recordEvent("route_degraded", {
-					run_id: runId, task_id: input._taskId, capability: input._capability,
-					from_model: input.model, to_model: twin, reason: "provider_quota",
-					detail: summarizeStderr(r.stderr, 240),
-				});
-				ACTIVE_RUN?.log(`${input._taskId}: ${input.model} hit a provider quota; retrying once on ${twin}`);
-				const second = await runOn(twin, input._taskId ? `${input._taskId}-fallback` : undefined, `${shortId}↻`);
-				r = {
-					...second,
-					usage: sumUsage(first.usage, second.usage),
-					// `costUsd`/`nestedCostUsd`/`durationMs` on the RETURNED `DispatchResult` are the
-					// dispatch's true total across both billed attempts — callers of `dispatchParallel`
-					// (e.g. `dispatchRecordsFor`) still see one row for the dispatch's own full spend.
-					// This total is never re-derived from the `dispatch_finished` EVENT stream, so it
-					// staying cumulative here does not reintroduce the double-count the events avoid.
-					costUsd: first.costUsd + second.costUsd,
-					nestedCostUsd: (first.nestedCostUsd ?? 0) + (second.nestedCostUsd ?? 0),
-					// Both attempts spawned separate child processes with their own tool-call ids, so
-					// concatenating (not deduping) is safe: no key can collide across attempts. Both
-					// attempts' detail rows are still emitted (own-attempt at a time, below and above),
-					// so this concatenated list is ONLY for the returned `DispatchResult.nestedCalls`,
-					// never re-emitted as rows itself.
-					nestedCalls: [...(first.nestedCalls ?? []), ...(second.nestedCalls ?? [])],
-					costReported: first.costReported && second.costReported,
-					durationMs: first.durationMs + second.durationMs,
-				};
-				dispatchAttempt = 1;
-				ownNestedCalls = second.nestedCalls;
-				ownNestedCostUsd = second.nestedCostUsd;
+			const attempts = failover.attempts.map((attempt) => attempt.result);
+			const finalAttempt = attempts.at(-1)!;
+			for (let index = 0; index < attempts.length - 1; index++) {
+				const attempt = attempts[index];
+				const rows = nestedModelCallRowsFor({ runId, parentTaskId: input._taskId ?? `unknown-${runId}`, dispatchDepth: depth, dispatchAttempt: index }, attempt.nestedCalls ?? []);
+				for (const row of rows) (deps.recordModelCall ?? recordModelCall)(row);
+				deps.recordEvent("dispatch_finished", { run_id: runId, task_id: input._taskId, capability: input._capability,
+					model: failover.attempts[index].model, exit_code: attempt.exitCode, duration_ms: attempt.durationMs,
+					cost_usd: attempt.costUsd, nested_cost_usd: attempt.nestedCostUsd, nested_rows_emitted: rows.length,
+					dispatch_attempt: index, turns: attempt.usage.turns, stop_reason: attempt.stopReason,
+					log_dir: session?.dir, superseded_by_fallback: true });
 			}
+			let r = {
+				...finalAttempt, model: failover.finalModel,
+				usage: attempts.reduce((sum, attempt) => sumUsage(sum, attempt.usage), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 } as SubagentUsageStats),
+				costUsd: attempts.reduce((sum, attempt) => sum + attempt.costUsd, 0),
+				nestedCostUsd: attempts.reduce((sum, attempt) => sum + (attempt.nestedCostUsd ?? 0), 0),
+				nestedCalls: attempts.flatMap((attempt) => attempt.nestedCalls ?? []),
+				durationMs: attempts.reduce((sum, attempt) => sum + attempt.durationMs, 0),
+				costReported: attempts.every((attempt) => attempt.costReported),
+			};
+			// The final attempt keeps its own nested rows; earlier attempts were
+			// emitted above with distinct dispatch_attempt ids.
+			const dispatchAttempt = attempts.length - 1;
+			const ownNestedCalls = finalAttempt.nestedCalls;
+			const ownNestedCostUsd = finalAttempt.nestedCostUsd;
 			const nestedRows = nestedModelCallRowsFor({
 				runId, parentTaskId: input._taskId ?? `unknown-${runId}`, dispatchDepth: depth, dispatchAttempt,
 			}, ownNestedCalls ?? []);
@@ -4557,7 +4590,7 @@ export default function (pi: ExtensionAPI) {
 		// pipeline's other callers but not read here: `triageTask` takes no run-scoped state at
 		// all (see its own signature below), same as it did when the inline handler called it
 		// directly with no `run` argument.
-		triageTask: (runId, goal, cwd, ctx, _run, costSink, adapter) => triageTask(runId, goal, cwd, ctx, costSink, adapter),
+		triageTask: (runId, goal, cwd, ctx, run, costSink, adapter) => triageTask(runId, goal, cwd, ctx, run, costSink, adapter),
 		planRun,
 		recordEvent,
 		recordOutcome,
