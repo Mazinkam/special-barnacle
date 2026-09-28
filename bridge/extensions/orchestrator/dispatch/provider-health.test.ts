@@ -20,7 +20,9 @@ test.each([
 
 test("classifies disposition and distinguishes wait stalls from provider stalls", () => {
  expect(dispatchHealth({ ...base, outcome: "timed_out", timeoutReason: "inactivity", toolInFlight: { name: "bash", waitPattern: true } }).failure_class).toBe("wait_stall");
- expect(dispatchHealth({ ...base, outcome: "timed_out", timeoutReason: "inactivity" }).failure_class).toBe("provider_stall");
+ expect(dispatchHealth({ ...base, outcome: "timed_out", timeoutReason: "inactivity" }).failure_class).toBe("task");
+ expect(dispatchHealth({ ...base, outcome: "timed_out", timeoutReason: "absolute", stderr: "fetch failed" }).failure_class).toBe("provider_stall");
+ expect(dispatchHealth({ ...base, outcome: "timed_out", timeoutReason: "inactivity", nestedProviderErrors: [{ message: "read ECONNRESET", timestamp: "2026-01-01T00:00:00Z" }] }).failure_class).toBe("provider_stall");
  expect(dispatchHealth({ ...base, stderr: "HTTP 502" }).failure_class).toBe("transient");
  expect(dispatchHealth({ ...base, stderr: "usage limit reached" }).failure_class).toBe("quota");
  expect(dispatchHealth({ ...base, outcome: "cancelled" }).failure_class).toBe("cancelled");
@@ -35,6 +37,22 @@ test("does not count the child diagnostic's replay of a nested error as new evid
  });
  expect(entries).toHaveLength(1);
  expect(entries[0]).toMatchObject({ error_code: "ECONNRESET", count: 1 });
+});
+
+test("keeps own and nested errors separate even when code and host match", () => {
+ const entries = providerErrors({ ...base, stderr: "read ECONNRESET https://api.example.com/own", nestedProviderErrors: [
+  { message: "read ECONNRESET https://api.example.com/nested", timestamp: "2026-01-01T00:00:00.000Z" },
+ ] });
+ expect(entries).toHaveLength(2);
+ expect(entries.map(e => [e.nested, e.count])).toEqual([[true, 1], [false, 1]]);
+});
+
+test("extracts DNS endpoint hostname without persisting the diagnostic", () => {
+ const message = "getaddrinfo ENOTFOUND bedrock-runtime.us-east-1.amazonaws.com";
+ const [entry] = providerErrors({ ...base, stderr: message });
+ expect(entry).toMatchObject({ error_code: "ENOTFOUND", endpoint_host: "bedrock-runtime.us-east-1.amazonaws.com", nested: false });
+ expect(JSON.stringify(entry)).not.toContain(message);
+ expect(providerErrors({ ...base, stderr: "getaddrinfo ENOTFOUND ../bad" })[0]).not.toHaveProperty("endpoint_host");
 });
 
 test("deduplicates nested snapshots within a dispatch and exposes only endpoint host", () => {

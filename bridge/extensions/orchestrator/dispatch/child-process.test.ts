@@ -404,6 +404,26 @@ describe("runSubagentProcess process/event handling", () => {
 		}
 	});
 
+	test("nested snapshots record only new error observations across unchanged replays", async () => {
+		const session = createSession("nested-error-replay");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const pending = runSubagentProcess({ cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, env: () => process.env, capability: "lead", taskId: "nested-error-replay-lead", session, spawnChild: () => child as never });
+			const emit = (turns: number, errorMessage: string) => child.stdout.write(`${JSON.stringify({ type: "tool_execution_update", toolName: "subagent", partialResult: { details: { results: [
+				{ taskId: "worker-1", agent: "worker", exitCode: -1, errorMessage, usage: { turns, cost: 0 } },
+			] } } })}\n`);
+			emit(1, "read ECONNRESET");
+			emit(1, "read ECONNRESET");
+			emit(2, "read ECONNRESET");
+			emit(2, "getaddrinfo ENOTFOUND api.example.com");
+			emit(2, "getaddrinfo ENOTFOUND api.example.com");
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.nestedProviderErrors?.map(e => e.message)).toEqual(["read ECONNRESET", "getaddrinfo ENOTFOUND api.example.com"]);
+		} finally { session.close(); }
+	});
+
 	test("error-end copied nested latestText remains diagnostic, not provider evidence", async () => {
 		const session = createSession("nested-prose-only");
 		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });

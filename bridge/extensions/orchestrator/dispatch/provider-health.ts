@@ -33,10 +33,10 @@ function modelIdentity(model?: string): { provider?: string; model?: string } {
 
 function endpointHost(message: string): string | undefined {
  const match = /https?:\/\/[^\s"'<>]{1,512}/i.exec(message.slice(0, 16_384));
- if (!match) return undefined;
+ const dns = match ? null : /\bgetaddrinfo\s+ENOTFOUND\s+([^\s"'<>]{1,253})(?=\s|$)/i.exec(message.slice(0, 16_384));
  try {
-  const host = new URL(match[0]).hostname.toLowerCase();
-  return /^[a-z0-9.-]{1,253}$/.test(host) ? host : undefined;
+  const host = (match ? new URL(match[0]).hostname : dns?.[1])?.toLowerCase();
+  return host && host.length <= 253 && host.split(".").every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) ? host : undefined;
  } catch { return undefined; }
 }
 
@@ -44,7 +44,7 @@ export function dispatchHealth(input: HealthInput): { outcome: string; timeout_r
  const ownStderr = (input.stderr ?? "").split("\nnestedWorkers:", 1)[0].slice(0, 16_384);
  const code = errorCode(ownStderr) ?? input.nestedProviderErrors?.map(e => errorCode(e.message)).find(Boolean);
  const failureClass = input.outcome === "cancelled" ? "cancelled"
-  : input.outcome === "timed_out" ? classifyTimeout(input) === "wait_stall" ? "wait_stall" : "provider_stall"
+  : input.outcome === "timed_out" ? classifyTimeout(input) === "wait_stall" ? "wait_stall" : code || isTransientProviderError(ownStderr) || input.nestedProviderErrors?.some(e => isTransientProviderError(e.message.slice(0, 16_384))) ? "provider_stall" : "task"
   : input.outcome === "completed" || input.outcome === "completed_after_process_error" ? undefined
   : code === "quota" ? "quota" : isTransientProviderError(ownStderr) || input.nestedProviderErrors?.some(e => isTransientProviderError(e.message.slice(0, 16_384))) ? "transient" : "task";
  const identity = modelIdentity(input.model);
@@ -62,23 +62,23 @@ export function recordProviderErrors(recordEvent: (event: string, payload: Recor
 
 export function providerErrors(input: HealthInput): Array<Record<string, unknown>> {
  const identity = modelIdentity(input.model);
- const evidence: Evidence[] = [...(input.nestedProviderErrors ?? [])];
+ const evidence: Array<Evidence & { nested: boolean }> = (input.nestedProviderErrors ?? []).map(e => ({ ...e, nested: true }));
  const ownStderr = (input.stderr ?? "").split("\nnestedWorkers:", 1)[0].slice(0, 16_384);
  if (ownStderr && input.outcome !== "completed" && input.outcome !== "cancelled") {
-  evidence.push({ message: ownStderr, timestamp: new Date().toISOString() });
+  evidence.push({ message: ownStderr, timestamp: new Date().toISOString(), nested: false });
  }
  const grouped = new Map<string, Record<string, unknown>>();
  for (const entry of evidence) {
   const code = errorCode(entry.message);
   if (!code) continue;
   const host = endpointHost(entry.message);
-  const key = JSON.stringify([code, host, identity.provider, identity.model]);
+  const key = JSON.stringify([entry.nested, code, host, identity.provider, identity.model]);
   const existing = grouped.get(key);
   if (existing) {
    existing.count = Number(existing.count) + 1;
    if (entry.timestamp < String(existing.first_ts)) existing.first_ts = entry.timestamp;
    if (entry.timestamp > String(existing.last_ts)) existing.last_ts = entry.timestamp;
-  } else grouped.set(key, { ...identity, error_code: code, ...(host ? { endpoint_host: host } : {}),
+  } else grouped.set(key, { ...identity, nested: entry.nested, error_code: code, ...(host ? { endpoint_host: host } : {}),
    count: 1, first_ts: entry.timestamp, last_ts: entry.timestamp });
  }
  return [...grouped.values()];

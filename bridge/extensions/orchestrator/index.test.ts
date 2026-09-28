@@ -1303,6 +1303,26 @@ describe("runSubagentProcess process/event handling", () => {
 		}
 	});
 
+	test("legacy index process records only new nested error observations", async () => {
+		const session = createSession("index-nested-error-replay");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const pending = orchestrator.runSubagentProcess({ cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "index-nested-error-replay-lead", session, spawnChild: () => child as never });
+			const emit = (turns: number, errorMessage: string) => child.stdout.write(`${JSON.stringify({ type: "tool_execution_update", toolName: "subagent", partialResult: { details: { results: [
+				{ taskId: "worker-1", agent: "worker", exitCode: -1, errorMessage, usage: { turns, cost: 0 } },
+			] } } })}\n`);
+			emit(1, "read ECONNRESET");
+			emit(1, "read ECONNRESET");
+			emit(2, "read ECONNRESET");
+			emit(2, "getaddrinfo ENOTFOUND api.example.com");
+			emit(2, "getaddrinfo ENOTFOUND api.example.com");
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.nestedProviderErrors?.map(e => e.message)).toEqual(["read ECONNRESET", "getaddrinfo ENOTFOUND api.example.com"]);
+		} finally { session.close(); }
+	});
+
 	test("timed-out progress dispatch retains trailing diagnostics until pipe close without revising its result", async () => {
 		const session = createSession("timed-out-diagnostic-drain");
 		// Model the real gap between kill/early settlement and stdio close deterministically.
@@ -4295,8 +4315,9 @@ describe("nested subagent cost rows (Phase 1 item 2)", () => {
 		const finished = events.find(([e]) => e === "dispatch_finished")?.[1];
 		expect(finished).toMatchObject({ outcome: "failed", failure_class: "transient", provider: "provider", provider_model: "lead-model", error_code: "ECONNRESET" });
 		const errors = events.filter(([e]) => e === "provider_error").map(([, p]) => p);
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toMatchObject({ endpoint_host: "api.example.org", error_code: "ECONNRESET", count: 3 });
+		expect(errors).toHaveLength(2);
+		expect(errors).toContainEqual(expect.objectContaining({ nested: true, endpoint_host: "api.example.org", error_code: "ECONNRESET", count: 2 }));
+		expect(errors).toContainEqual(expect.objectContaining({ nested: false, endpoint_host: "api.example.org", error_code: "ECONNRESET", count: 1 }));
 		expect(JSON.stringify(errors)).not.toMatch(/private|secret|https:/);
 	});
 

@@ -556,6 +556,7 @@ export async function runSubagentProcess(opts: {
 		/** Own turns plus the child's own subagent calls: what the dispatch has cost so far. */
 		const spentSoFar = () => events.usage.cost + nestedCost.total();
 		const nestedProviderErrors: Array<{ message: string; timestamp: string }> = [];
+		const lastNestedProviderError = new Map<string, string>();
 		let timedOut = false;
 		let cancelledByListener = false;
 		let timeoutReason: "inactivity" | "absolute" | undefined;
@@ -773,7 +774,8 @@ export async function runSubagentProcess(opts: {
 			const now = Date.now();
 			const observation = cancelledByListener ? undefined : progressTracker?.observe(event, now);
 			for (const worker of observation?.nested ?? []) {
-				if (worker.errorMessage && nestedProviderErrors.length < 128) {
+				if (worker.errorMessage && nestedProviderErrors.length < 128 && lastNestedProviderError.get(worker.taskId) !== worker.errorMessage) {
+					lastNestedProviderError.set(worker.taskId, worker.errorMessage);
 					nestedProviderErrors.push({ message: worker.errorMessage.slice(0, 16_384), timestamp: new Date(now).toISOString() });
 				}
 			}
