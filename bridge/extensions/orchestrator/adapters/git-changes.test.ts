@@ -4,7 +4,12 @@ import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { changedFilesSinceRunStart, diffDirtySnapshots, gitDirtySnapshot, gitHead } from "./git-changes.ts";
+import { changedFilesSinceRunStart, diffDirtySnapshots, gitDirtySnapshot, gitHead, parseFilesChanged } from "./git-changes.ts";
+
+test("plain paths require explicit Files Changed bullets, not arbitrary prose", () => {
+	expect(parseFilesChanged("Discussed src/prose.ts\n- src/loose.ts\n## Files Changed\n- src/actual.ts — fixed\n- src/second.ts\n- not-a-file\n## Notes\n- src/note.ts\nSTATUS: completed")).toEqual(["src/actual.ts", "src/second.ts"]);
+	expect(parseFilesChanged("## Files Changed\nNone\nSTATUS: completed")).toEqual([]);
+});
 
 describe("changed-file detection around the lead phase", () => {
 	function initRepo(): string {

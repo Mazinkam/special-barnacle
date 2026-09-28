@@ -201,6 +201,13 @@ export function parseFilesChanged(text: string): string[] {
 		const f = m[1];
 		if (!files.includes(f) && looksLikeFilePath(f)) files.push(f);
 	}
+	// Plain paths count only in an explicit Files Changed section, never in
+	// arbitrary prose. Keep the existing backtick-token behavior for other reports.
+	const section = /^##[ \t]*Files Changed[ \t]*:?[ \t]*[^\n]*\n([\s\S]*?)(?=^##[ \t]|^[ \t>*_`-]*STATUS[*_`]*[ \t]*:|(?![\s\S]))/im.exec(text)?.[1] ?? "";
+	for (const line of section.split("\n")) {
+		const path = /^\s*[-*]\s+(`?)([^`\s—]+)\1(?:\s*(?:—|–|:).*)?\s*$/.exec(line)?.[2];
+		if (path && looksLikeFilePath(path) && !files.includes(path)) files.push(path);
+	}
 	return files;
 }
 

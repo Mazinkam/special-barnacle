@@ -253,9 +253,9 @@ export interface ObservedEditConflict {
 }
 
 /**
- * Ground truth from what leads actually changed (not what they declared).
- * Only reports a file when >=2 leads actually touched it — never fabricate a
- * conflict for a file no one, or only one lead, changed.
+ * Overlap of per-lead reported paths (not proof of per-lead writes).
+ * Callers with run-wide git evidence should filter reported paths against it;
+ * a shared worktree cannot independently attribute edits to concurrent leads.
  */
 export function observedEditConflicts(changed: Array<{ lead: number; files: string[] }>): ObservedEditConflict[] {
 	const byFile = new Map<string, Set<number>>();

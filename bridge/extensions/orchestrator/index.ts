@@ -145,6 +145,7 @@ import contract from "./contract.ts";
 import { formatReconEvidence, planReconTasks } from "./recon.ts";
 import { DispatchTelemetryTracker, type DispatchTelemetryFields } from "./dispatch-telemetry.ts";
 import { loadEfficiencyControls, type EfficiencyControls } from "./efficiency-flags.ts";
+import { parseFilesChanged as parseReportedFilesChanged } from "./adapters/git-changes.ts";
 import { assignCanary, canaryTelemetryFields, parseModelCanaries, type CanaryAssignment } from "./model-canary.ts";
 
 // -----------------------------------------------------------------------------
@@ -3563,14 +3564,7 @@ export function changedFilesSinceRunStart(
 }
 
 function parseFilesChanged(text: string): string[] {
-	const files: string[] = [];
-	const re = /`([^`]+\.[a-zA-Z0-9]+)`/g;
-	let m: RegExpExecArray | null;
-	while ((m = re.exec(text)) !== null) {
-		const f = m[1];
-		if (!files.includes(f) && looksLikeFilePath(f)) files.push(f);
-	}
-	return files;
+	return parseReportedFilesChanged(text);
 }
 
 function looksLikeFilePath(s: string): boolean {

@@ -600,6 +600,13 @@ export async function runOrchestration(
 			// the same git dirty-snapshot machinery `changedSince` below uses for QA
 			// scope — a snapshot taken right before the lead's (wave's) dispatch,
 			// diffed against the tree at resume-decision time.
+			observedChangedFiles: () => {
+				if (!dirtyBefore) return null;
+				const after = gitDirtySnapshot(cwd);
+				if (!after) return null;
+				const observed = changedFilesSinceRunStart(cwd, headBefore, dirtyBefore, [], after);
+				return observed.historyUnavailable ? null : observed.changed;
+			},
 			markFiles: () => ({ head: gitHead(cwd), dirty: gitDirtySnapshot(cwd) }),
 			filesChangedSince: (mark, claimedFiles) => {
 				const { head, dirty } = mark as { head: string | null; dirty: Map<string, string> | null };

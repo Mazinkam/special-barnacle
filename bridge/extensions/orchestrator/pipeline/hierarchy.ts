@@ -236,6 +236,8 @@ export async function dispatchReconAndLeads(
 		markFiles?: () => unknown;
 		/** Files changed since `mark` was taken, unioned with `claimed` (files the lead's own report named). Optional: falls back to `claimed` when absent. */
 		filesChangedSince?: (mark: unknown, claimed: string[]) => string[];
+		/** Run-wide git changes, or null when git evidence is unavailable. Never attributes a change to a particular lead. */
+		observedChangedFiles?: () => string[] | null;
 		waitForChecks?: (checks: PendingCheck[]) => Promise<ResolvedCheck[]>;
 		/** Read HEAD after polling, at the gate boundary. Defaults to the run's repo. */
 		currentCandidateSha?: () => string | null;
@@ -517,7 +519,9 @@ export async function dispatchReconAndLeads(
 	}
 
 	if (input.fileOwnershipMode === "report") {
-		const edits = leadResults.map((result) => ({ lead: Number(result.taskId.match(/-lead-(\d+)$/)?.[1]), files: result.filesChanged }));
+		const observed = effects.observedChangedFiles?.();
+		const observedSet = observed == null ? null : new Set(observed);
+		const edits = leadResults.map((result) => ({ lead: Number(result.taskId.match(/-lead-(\d+)$/)?.[1]), files: result.filesChanged.filter((file) => !observedSet || observedSet.has(file)) }));
 		for (const conflict of observedEditConflicts(edits)) effects.recordEvent?.("lead_edit_conflict", { run_id: runId, ...conflict });
 	}
 
@@ -552,6 +556,8 @@ export interface HierarchyDeps {
 	markFiles?: () => unknown;
 	/** Files changed since `mark` was taken, unioned with `claimed` (files the lead's own report named). Optional. */
 	filesChangedSince?: (mark: unknown, claimed: string[]) => string[];
+	/** Run-wide git changes, or null when git evidence is unavailable. */
+	observedChangedFiles?: () => string[] | null;
 	/** A3: recover an in-wave-dependent lead that still fails after the transient-resume pass, instead
 	 *  of leaving every dependent wave marked "not started" until the post-QA escalation loop recovers
 	 *  it too late to matter. Default `false`. */
@@ -656,6 +662,7 @@ export async function dispatchHierarchical(
 			throwIfCancelled: () => run?.session.cancellation.throwIfCancelled(),
 			markFiles: deps.markFiles,
 			filesChangedSince: deps.filesChangedSince,
+			observedChangedFiles: deps.observedChangedFiles,
 			waitForChecks: deps.waitForChecks,
 			currentCandidateSha: deps.currentCandidateSha,
 			writeCheckDiagnostic: deps.writeCheckDiagnostic,

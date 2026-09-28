@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { gitDirtySnapshot, gitHead, changedFilesSinceRunStart } from "../adapters/git-changes.ts";
+import { dispatchParallel } from "../dispatch/parallel.ts";
 import { dispatchReconAndLeads, isTransientLeadFailure, collectBilledResults, summarizeReconWorkers } from "./hierarchy.ts";
 import { RunCancellation } from "../cancellation.ts";
 import { METHOD } from "../models.ts";
@@ -445,6 +450,41 @@ test("report ownership emits overlap and observed conflicts without splitting pa
 	expect(waves).toEqual([["run-lead-0", "run-lead-1"]]);
 	expect(events.some((e) => e.event === "lead_ownership" && e.payload.kind === "ownership_overlap")).toBe(true);
 	expect(events.some((e) => e.event === "lead_edit_conflict" && e.payload.file === "src/shared.ts")).toBe(true);
+});
+
+test("plain Files Changed entries travel through real dispatch parsing to observed conflicts, but phantom reports do not", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "lead-conflict-"));
+	try {
+		execFileSync("git", ["init", "-q", cwd]);
+		execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+		execFileSync("git", ["-C", cwd, "config", "user.name", "Test"]);
+		mkdirSync(join(cwd, "src"));
+		writeFileSync(join(cwd, "src/shared.ts"), "before\n");
+		execFileSync("git", ["-C", cwd, "add", "."]);
+		execFileSync("git", ["-C", cwd, "commit", "-qm", "baseline"]);
+		const head = gitHead(cwd);
+		const before = gitDirtySnapshot(cwd);
+		const events: Array<{ event: string; payload: Record<string, unknown> }> = [];
+		const architectResult = { ...twoIndependentLeads, stdout: "## Lead assignments\nLead 1: backend (depends on: none)\nLead 2: frontend (depends on: none)\n" };
+		const run = async () => {
+			events.length = 0;
+			return dispatchReconAndLeads({ ...baseInput(), repoRoot: cwd, plan: { ...plan, topology: { ...plan.topology, leads: 2 } }, architectResult, fileOwnershipMode: "report" }, {
+				dispatch: (tasks) => dispatchParallel(cwd, "run", tasks, adapter, {} as never, null, 0, {
+					recordEvent: () => {}, maxConcurrentDispatches: 2,
+					runProcess: async () => ({ exitCode: 0, stdout: "## Files Changed\n- src/shared.ts\n\nSTATUS: completed", finalText: "", rawStdout: "", stderr: "", personaCanMutate: true, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 }, costUsd: 0, costReported: true, durationMs: 1, outcome: "completed", processExitCode: 0 }),
+				}),
+				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+				observedChangedFiles: () => changedFilesSinceRunStart(cwd, head, before, []).changed,
+				recordEvent: (event, payload) => { events.push({ event, payload }); },
+			});
+		};
+		await run();
+		expect(events.filter((e) => e.event === "lead_edit_conflict")).toEqual([]);
+		writeFileSync(join(cwd, "src/shared.ts"), "after\n");
+		const result = await run();
+		expect(result.leadResults.map((r) => r.filesChanged)).toEqual([["src/shared.ts"], ["src/shared.ts"]]);
+		expect(events.filter((e) => e.event === "lead_edit_conflict").map((e) => e.payload.file)).toEqual(["src/shared.ts"]);
+	} finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
 /** Two independent leads, as the architect must now declare them (one wave). */
