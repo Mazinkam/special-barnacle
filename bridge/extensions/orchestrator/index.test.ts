@@ -1323,6 +1323,26 @@ describe("runSubagentProcess process/event handling", () => {
 		} finally { session.close(); }
 	});
 
+	test("legacy index worker recovery allows the same provider error to be counted again", async () => {
+		const session = createSession("index-nested-error-recovery");
+		const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+		try {
+			const pending = orchestrator.runSubagentProcess({ cwd: repoDir, agentName: "__no_persona__", task: "fixture", model: "p/m",
+				ctx: {} as never, capability: "lead", taskId: "index-nested-error-recovery-lead", session, spawnChild: () => child as never });
+			const emit = (turns: number, errorMessage?: string) => child.stdout.write(`${JSON.stringify({ type: "tool_execution_update", toolName: "subagent", partialResult: { details: { results: [
+				{ taskId: "worker-1", agent: "worker", exitCode: -1, errorMessage, usage: { turns, cost: 0 } },
+			] } } })}\n`);
+			emit(1, "read ECONNRESET");
+			emit(1, "read ECONNRESET");
+			emit(2);
+			emit(3, "read ECONNRESET");
+			emit(3, "read ECONNRESET");
+			child.emit("close", 0);
+			const result = await pending;
+			expect(result.nestedProviderErrors?.map(e => e.message)).toEqual(["read ECONNRESET", "read ECONNRESET"]);
+		} finally { session.close(); }
+	});
+
 	test("timed-out progress dispatch retains trailing diagnostics until pipe close without revising its result", async () => {
 		const session = createSession("timed-out-diagnostic-drain");
 		// Model the real gap between kill/early settlement and stdio close deterministically.
