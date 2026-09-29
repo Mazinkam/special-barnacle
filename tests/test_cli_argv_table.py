@@ -23,6 +23,9 @@ CASES: list[tuple[list[str], dict]] = [
     # durable write the bridge makes goes through `batch -`.
     (['batch', '-'], {'cmd': 'batch', 'payload': '-'}),
     (['batch'], {'cmd': 'batch', 'payload': None}),
+    (['defect-link', 'R1', '--type', 'revert', '--severity', 'high', '--evidence', 'abc123 reverts'],
+     {'cmd': 'defect-link', 'run_id': 'R1', 'type': 'revert', 'severity': 'high', 'evidence': 'abc123 reverts',
+      'attribution': 'file_overlap', 'confirmed': False}),
     (['init'], {'cmd': 'init'}),
     (['status'], {'cmd': 'status'}),
     (['dashboard'], {'cmd': 'dashboard'}),

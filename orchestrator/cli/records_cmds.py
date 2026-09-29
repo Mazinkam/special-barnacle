@@ -24,6 +24,13 @@ def register(sp) -> None:
     m.add_argument('payload', help='JSON object payload')
     o = sp.add_parser('outcome', help='append one outcome record and refresh the ledger/dashboard once')
     o.add_argument('payload', help='JSON object payload')
+    d = sp.add_parser('defect-link', help='record a delayed-defect candidate against an original run (only --confirmed counts as bad)')
+    d.add_argument('run_id', help='run_id of the original orchestrated run')
+    d.add_argument('--type', required=True, choices=['revert', 'reopened', 'bug_traced', 'hotfix'])
+    d.add_argument('--severity', required=True, choices=['low', 'medium', 'high', 'critical'])
+    d.add_argument('--evidence', required=True, help='commit sha, issue link or short description')
+    d.add_argument('--attribution', default='file_overlap', choices=['exact_lineage', 'human_confirmed', 'file_overlap'])
+    d.add_argument('--confirmed', action='store_true', help='causality confirmed; counts against the run')
     b = sp.add_parser('batch', help='append an ordered batch of event/metric/outcome records (JSON array on stdin or as argument) and refresh once')
     b.add_argument('payload', nargs='?', default=None, help="JSON array of {stream, record_id, ...} records, or '-'/omitted to read stdin")
     q = sp.add_parser('quality', help='score a QualityEvidence payload (hard-gate pass/fail and its evidence score) without appending anything')
@@ -70,6 +77,19 @@ def handle_outcome(args, root, C) -> None:
     raise SystemExit(cli._single('outcome', args.payload, root=root))
 
 
+def handle_defect_link(args, root, C) -> None:
+    from orchestrator import cli
+    payload = {
+        'run_id': args.run_id, 'task_id': 'defect-link', 'kind': 'defect_link',
+        'defect_type': args.type, 'severity': args.severity, 'evidence': args.evidence,
+        'attribution': args.attribution, 'confirmed': bool(args.confirmed),
+        # `regression` is the key `outcomes.bad_signal` already reads; a candidate states False
+        # explicitly so a note payload can never turn it bad.
+        'regression': bool(args.confirmed),
+    }
+    raise SystemExit(cli._single('outcome', json.dumps(payload), root=root))
+
+
 def handle_batch(args, root, C) -> None:
     from orchestrator import cli
     try:
@@ -94,6 +114,7 @@ HANDLERS = {
     'event': handle_event,
     'metric': handle_metric,
     'outcome': handle_outcome,
+    'defect-link': handle_defect_link,
     'batch': handle_batch,
     'quality': handle_quality,
 }
