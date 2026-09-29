@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Compare the orchestrator's actual spend against flat single-model baselines.
 
-Reads metrics.jsonl, filters out session-ingest noise, reprices each orchestrated
-record at three flat-model brackets (haiku / sonnet / opus), and prints a side-by-
-side report: cost, success rate, cost-per-success, retry rate, waste. The intent is
-to answer "is the orchestrator earning its keep?" without changing the dashboard or
-touching the data stream.
+Reads metrics.jsonl, filters out session-ingest noise, and reprices the same recorded
+orchestrated tokens at the active premium profile's flat model tiers. This is a cost-only
+sensitivity analysis, not a simulated no-skill run: it assumes identical tokens and outcomes.
+The script writes nothing to the dashboard or data stream.
 
 Run from anywhere:
     python3 skill_vs_baseline.py
@@ -28,15 +27,17 @@ from orchestrator.pricing import estimate_cost_usd, load_pricing  # noqa: E402
 STATE = Path('~/.local/state/coding-agent-orchestrator').expanduser()
 METRICS = STATE / 'metrics.jsonl'
 
-# Flat-model counterfactual brackets. Picked to bracket reality: the orchestrator's
-# dominant model (sonnet-4-5), the cheapest haiku tier, the most expensive opus tier.
-# Repricing uses the SAME token profile the orchestrator actually spent; only the
-# per-token rate changes.
+# Cost-only flat-model sensitivity brackets from the active `premium` profile.
+# Repricing preserves the SAME tokens and outcomes from priced calls; only per-token
+# rates change. These are not observed no-skill runs or quality-equivalent alternatives.
 BRACKETS = [
-    ('haiku-4-5 (budget)', 'claude-haiku-4-5'),
-    ('sonnet-4-5 (common)', 'claude-sonnet-4-5'),
-    ('opus-4-5 (premium)', 'claude-opus-4-5'),
+    ('gpt-6-luna (cheap tier)', 'gpt-6-luna'),
+    ('sonnet-5-5 (mid tier)', 'claude-sonnet-5-5'),
+    ('opus-5-5 (premium tier)', 'claude-opus-5-5'),
+    ('fable-5-1 (frontier sensitivity)', 'claude-fable-5-1'),
 ]
+COMMON_BASELINE_LABEL = 'sonnet-5-5 (mid tier)'
+COMMON_BASELINE_MODEL = 'claude-sonnet-5-5'
 
 PASS_VALUES = {'pass', 'success', 'ok', 'reported'}
 
@@ -161,7 +162,7 @@ def per_breakdown(records: list[dict[str, Any]], key: str, pricing: dict[str, An
             v = '(unset)'
         groups[str(v)].append(r)
     out: dict[str, dict[str, Any]] = {}
-    common_model = 'claude-sonnet-4-5'
+    common_model = COMMON_BASELINE_MODEL
     for name, rows in groups.items():
         priced = [r for r in rows if (r.get('cost_usd') or 0) > 0]
         cost_actual = sum(float(r.get('cost_usd') or 0) for r in priced)
@@ -245,7 +246,8 @@ def main() -> int:
 
     section('Orchestrated work — actual vs flat baselines')
     print(f'  work records:                {agg_o["work_records"]:,}')
-    print(f'  priced records:              {agg_o["priced_records"]:,}')
+    priced_pct = (agg_o["priced_records"] / agg_o["work_records"] * 100) if agg_o["work_records"] else 0
+    print(f'  priced records:              {agg_o["priced_records"]:,} / {agg_o["work_records"]:,} ({priced_pct:.1f}%); unmetered rows excluded from cost')
     print(f'  decision events skipped:     {agg_o["decision_records"]}')
     print(f'  total actual cost:           {fmt_money(agg_o["cost_actual_usd"])}')
     print(f'  pass / fail:                 {agg_o["pass_count"]} / {agg_o["fail_count"]}')
@@ -256,13 +258,13 @@ def main() -> int:
     print(f'  complexity avg:              {agg_o["complexity_avg"]}')
     print(f'  cost per success (actual):   {fmt_money(agg_o["cost_per_success_actual"])}')
     print()
-    print(f'  {"bracket":<24} {"flat cost":>12} {"per-call":>10} {"per success":>12}')
-    print(f'  {"-"*24} {"-"*12} {"-"*10} {"-"*12}')
+    print(f'  {"flat-model sensitivity":<34} {"flat cost":>12} {"per-call":>10} {"per success":>12}')
+    print(f'  {"-"*34} {"-"*12} {"-"*10} {"-"*12}')
     for label, _ in BRACKETS:
         bc = agg_o['bracket_costs'][label]
         cps = agg_o['bracket_cost_per_success'][label]
         per_call = (bc / agg_o['priced_records']) if (bc is not None and agg_o['priced_records']) else None
-        print(f'  {label:<24} {fmt_money(bc):>12} {fmt_money(per_call):>10} {fmt_money(cps):>12}')
+        print(f'  {label:<34} {fmt_money(bc):>12} {fmt_money(per_call):>10} {fmt_money(cps):>12}')
     # delta vs each bracket
     print()
     print('  delta vs actual (negative = orchestrator cheaper)')
@@ -280,11 +282,11 @@ def main() -> int:
     print(f'  pass rate (n/a for ingest):  {fmt_pct(agg_i["success_rate"])}')
     print(f'  tokens in/out:               {agg_i["input_tokens"]:,} / {agg_i["output_tokens"]:,}')
 
-    section('Per-role: orchestrated actual vs sonnet-4-5 flat')
+    section(f'Per-role: orchestrated actual vs {COMMON_BASELINE_LABEL} flat')
     print_breakdown('role', per_breakdown(orchestrated, 'role', pricing))
-    section('Per-capability: orchestrated actual vs sonnet-4-5 flat')
+    section(f'Per-capability: orchestrated actual vs {COMMON_BASELINE_LABEL} flat')
     print_breakdown('capability_class', per_breakdown(orchestrated, 'capability_class', pricing))
-    section('Per-model: orchestrated actual (no baseline — model is the choice)')
+    section(f'Per-model: orchestrated actual vs {COMMON_BASELINE_LABEL} flat')
     print_breakdown('model', per_breakdown(orchestrated, 'model', pricing))
 
     section('Cost-per-success ladder')
@@ -294,11 +296,11 @@ def main() -> int:
     for label, _ in BRACKETS:
         cps = agg_o['bracket_cost_per_success'][label]
         print(f'    {label:<14}: {fmt_money(cps)}')
-    if cps_actual and all(agg_o['bracket_cost_per_success'][l] is not None for l, _ in BRACKETS):
-        sonnet_cps = agg_o['bracket_cost_per_success']['sonnet-4-5 (common)']
-        if sonnet_cps:
-            print(f'\n  orchestrator vs sonnet-flat: {(cps_actual - sonnet_cps):+.4f} per success '
-                  f'({(cps_actual - sonnet_cps) / sonnet_cps * 100:+.1f}%)')
+    sonnet_cps = agg_o['bracket_cost_per_success'][COMMON_BASELINE_LABEL]
+    if cps_actual is not None and sonnet_cps:
+        print(f'\n  orchestrator vs {COMMON_BASELINE_LABEL} flat: {(cps_actual - sonnet_cps):+.4f} per success '
+              f'({(cps_actual - sonnet_cps) / sonnet_cps * 100:+.1f}%)')
+    print('  Caution: same-token repricing does not model no-skill workflow, task quality, or elapsed time.')
 
     print()
     return 0

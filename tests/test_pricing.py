@@ -73,15 +73,41 @@ class PricingProvenanceTests(unittest.TestCase):
                 self.assertIsNotNone(result, f'{model_id} did not resolve to any rate at all')
                 self.assertIsNotNone(result['cost_rate_source'], f'{model_id} resolved but lost its provenance')
 
-    def test_no_config_rate_entry_is_verified_yet(self):
-        """Authoritative price-verification work still needed (Phase 1 item 6): every rate entry
-        `config.json` defines today is `unverified-local-catalog` with no `verified_on` date. This
-        pins the current state so the day a rate is actually verified, this test fails and must be
-        updated deliberately \u2014 it must never be relaxed to make an unverified rate look verified.
+    def test_public_reference_rates_are_labeled_and_do_not_claim_provider_verification(self):
+        expected = {
+            'qwen3.8-27b': (0.5, 3.0, 0.1, 0.625),
+            'gpt-5-mini': (0.25, 2.0, 0.025, 0.25),
+        }
+        for model_id, rates in expected.items():
+            with self.subTest(model=model_id):
+                rate = self.models[model_id]
+                self.assertEqual(
+                    (rate['input_per_mtok'], rate['output_per_mtok'],
+                     rate['cache_read_per_mtok'], rate['cache_write_per_mtok']),
+                    rates,
+                )
+                self.assertTrue(rate['source'].startswith('unverified-'))
+                self.assertIsNone(rate['verified_on'])
+                estimate = estimate_cost_usd(
+                    model=model_id, input_tokens=1_000_000, output_tokens=1_000_000,
+                    cached_input_tokens=1_000_000, cache_write_tokens=1_000_000,
+                    pricing=self.pricing,
+                )
+                self.assertIsNotNone(estimate)
+                expected_total = rates[2] + rates[3] + rates[1]
+                # All input tokens are classified as cached, then cache writes and output.
+                self.assertEqual(estimate['cost_usd'], round(expected_total, 6))
+                self.assertEqual(estimate['cost_rate_source'], rate['source'])
+
+    def test_configured_rates_are_explicitly_unverified_until_provider_checked(self):
+        """Local-catalog, HUMAIN-node, and public-reference rates are not provider-of-record
+        confirmations. Keep source provenance visible and require explicit provider evidence before
+        a rate can be treated as authoritative.
         """
-        unverified = [m for m, r in self.models.items() if r.get('source') == 'unverified-local-catalog' and not r.get('verified_on')]
-        self.assertEqual(sorted(unverified), sorted(self.models.keys()),
-                         'a rate entry has provenance beyond unverified-local-catalog; update the audit doc, do not relax this test')
+        missing_provenance = [m for m, r in self.models.items() if not str(r.get('source') or '').startswith('unverified-')]
+        self.assertEqual(missing_provenance, [], 'every local estimate must identify itself as unverified')
+        falsely_verified = [m for m, r in self.models.items() if r.get('verified_on')]
+        self.assertEqual(falsely_verified, [], 'a rate is marked verified without provider evidence')
 
 
 if __name__ == '__main__':
