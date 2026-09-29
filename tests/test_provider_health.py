@@ -336,9 +336,12 @@ def test_structured_backfill_dedupes_repeated_top_level_error_message(tmp_path: 
         {'type': 'agent_end', 'messages': [{'role': 'user', 'content': 'hi'}, ENOTFOUND_MESSAGE]},
         'not json at all',
     ])
-    (run / 'run-a-lead-0.events.jsonl').open('a').write('{broken json\n')
-    # Structured evidence exists for this run, so its dated text lines are not double-counted.
-    (run / 'run.log').write_text('2026-09-26T21:49:27Z getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com)\n')
+    with (run / 'run-a-lead-0.events.jsonl').open('a') as handle:
+        handle.write('{broken json\n')
+    # Structured evidence exists for this run, so its dated *.stderr.log lines (which ARE scanned
+    # for runs without structured rows) are not double-counted.
+    (run / 'run-a-lead-0.stderr.log').write_text(
+        '2026-09-26T21:49:27Z getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com)\n')
     assert backfill(root) == {'candidates': 1, 'persisted': 0}
     assert backfill(root, write=True)['persisted'] == 1
     row, = _rows(root)
@@ -450,3 +453,112 @@ def test_backfill_script_runs_without_pythonpath(tmp_path: Path):
                             capture_output=True, text=True, check=False, env=env, cwd=tmp_path)
     assert result.returncode == 0, result.stderr
     assert "'candidates': 0" in result.stdout
+
+
+def _live_state_env(monkeypatch, live: Path) -> None:
+    """Point every live-root source at `live` or away from it, never at the real state dir."""
+    from scripts import backfill_provider_errors as module
+    monkeypatch.setattr(module, 'DEFAULT_STATE_ROOT', str(live))
+    for name in (module.STATE_ROOT_ENV_VAR, *module.STATE_ROOT_ENV_ALIASES):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _state_with_error(root: Path) -> Path:
+    run = root / 'runs' / 'r1'
+    run.mkdir(parents=True)
+    (run / 'task.stderr.log').write_text('2026-09-26T10:00:00Z ECONNRESET\n')
+    return root
+
+
+def test_backfill_refuses_case_variant_of_live_root(tmp_path: Path, monkeypatch):
+    probe = tmp_path / 'caseprobe'
+    probe.write_text('')
+    if not (tmp_path / 'CASEPROBE').exists():
+        pytest.skip('tmp filesystem is case-sensitive')
+    live = _state_with_error(tmp_path / 'live')
+    _live_state_env(monkeypatch, live)
+    with pytest.raises(ValueError, match='--allow-live-state'):
+        backfill(tmp_path / 'LIVE', write=True)
+    assert not (live / 'events.jsonl').exists()
+
+
+def test_backfill_env_override_still_protects_default_state_root(tmp_path: Path, monkeypatch):
+    from scripts import backfill_provider_errors as module
+    live = _state_with_error(tmp_path / 'live')
+    elsewhere = tmp_path / 'elsewhere'
+    elsewhere.mkdir()
+    _live_state_env(monkeypatch, live)
+    monkeypatch.setenv(module.STATE_ROOT_ENV_VAR, str(elsewhere))
+    with pytest.raises(ValueError, match='--allow-live-state'):
+        backfill(live, write=True)
+    assert not (live / 'events.jsonl').exists()
+    # The override target itself is protected too.
+    with pytest.raises(ValueError, match='--allow-live-state'):
+        backfill(elsewhere, write=True)
+
+
+def test_backfill_env_alias_value_is_protected(tmp_path: Path, monkeypatch):
+    from scripts import backfill_provider_errors as module
+    if not module.STATE_ROOT_ENV_ALIASES:
+        pytest.skip('contract defines no state-root env aliases')
+    live = _state_with_error(tmp_path / 'live')
+    aliased = _state_with_error(tmp_path / 'aliased')
+    _live_state_env(monkeypatch, live)
+    monkeypatch.setenv(module.STATE_ROOT_ENV_VAR, str(tmp_path / 'canonical'))
+    monkeypatch.setenv(module.STATE_ROOT_ENV_ALIASES[0], str(aliased))
+    with pytest.raises(ValueError, match='--allow-live-state'):
+        backfill(aliased, write=True)
+    assert not (aliased / 'events.jsonl').exists()
+
+
+def test_backfill_refuses_symlink_and_samefile_alias_of_live_root(tmp_path: Path, monkeypatch):
+    live = _state_with_error(tmp_path / 'live')
+    _live_state_env(monkeypatch, live)
+    link = tmp_path / 'link'
+    link.symlink_to(live, target_is_directory=True)
+    with pytest.raises(ValueError):
+        backfill(link, write=True)
+    via_link = tmp_path / 'link' / '.'
+    with pytest.raises(ValueError, match='--allow-live-state'):
+        backfill(via_link, write=True)
+    assert not (live / 'events.jsonl').exists()
+
+
+def test_backfill_allow_live_state_permits_write_to_protected_root(tmp_path: Path, monkeypatch):
+    from scripts import backfill_provider_errors as module
+    live = _state_with_error(tmp_path / 'live')
+    _live_state_env(monkeypatch, live)
+    monkeypatch.setenv(module.STATE_ROOT_ENV_VAR, str(tmp_path / 'elsewhere'))
+    assert backfill(live, write=True, allow_live_state=True) == {'candidates': 1, 'persisted': 1}
+    assert len(_rows(live)) == 1
+
+
+def test_text_backfill_skips_oversized_stderr_line_without_shifting_line_numbers(tmp_path: Path, monkeypatch):
+    from scripts import backfill_provider_errors as module
+    root = tmp_path / 'state'
+    run = root / 'runs' / 'run-g'
+    run.mkdir(parents=True)
+    normal = '2026-09-26T10:00:00Z ECONNRESET\n'
+    stderr_log = run / 'lead.stderr.log'
+    stderr_log.write_text('prefix\n' + normal)
+    expected = module.text_rows(root, run, stderr_log)
+    monkeypatch.setattr(module, 'MAX_LINE_BYTES', 4096)
+    # A single dated, matching line far over the cap: skipped (like events.jsonl), not loaded.
+    stderr_log.write_text('2026-09-26T09:00:00Z ECONNRESET ' + 'x' * (module.MAX_LINE_BYTES * 4) + '\n' + normal)
+    rows = module.text_rows(root, run, stderr_log)
+    assert [row['first_ts'] for row in rows] == ['2026-09-26T10:00:00Z']
+    assert [row['record_id'] for row in rows] == [row['record_id'] for row in expected]
+    stderr_log.write_text('2026-09-26T09:00:00Z ECONNRESET ' + 'x' * (module.MAX_LINE_BYTES * 4))
+    assert backfill(root) == {'candidates': 0, 'persisted': 0}
+
+
+def test_text_backfill_does_not_follow_symlink_swapped_in_after_listing(tmp_path: Path):
+    from scripts import backfill_provider_errors as module
+    root = tmp_path / 'state'
+    run = root / 'runs' / 'run-h'
+    run.mkdir(parents=True)
+    outside = tmp_path / 'outside.stderr.log'
+    outside.write_text('2026-09-26T10:00:00Z ECONNRESET\n')
+    link = run / 'lead.stderr.log'
+    link.symlink_to(outside)
+    assert module.text_rows(root, run, link) == []

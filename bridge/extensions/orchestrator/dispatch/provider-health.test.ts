@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { dispatchHealth, providerErrors } from "./provider-health.ts";
-import { classifyFailure, telemetryFailureClass, type AttemptSignals } from "../core/failure-class.ts";
+import { dispatchHealth, healthSignals, providerErrors } from "./provider-health.ts";
+import { dispatchWithFailover } from "./failover.ts";
+import { failoverConfig } from "./failover-policy.ts";
+import { ModelHealth } from "../run/model-health.ts";
+import { scanEvents } from "../core/event-scan.ts";
+import { attemptSignalsFromScan, classifyFailure, telemetryFailureClass, type AttemptSignals } from "../core/failure-class.ts";
 import { classifyTimeout } from "../core/wait-stall.ts";
 
 const base = { outcome: "failed" as const, exitCode: 1, model: "openai-codex/gpt-6", timeoutReason: undefined };
@@ -170,5 +174,47 @@ describe("one provider-failure classifier: failover's decision and telemetry's f
   const expectedFailoverClass = classifyFailure(row.signals);
   const expectedTelemetryClass = timeoutClass === "wait_stall" ? "wait_stall" : telemetryFailureClass(expectedFailoverClass, timedOut);
   expect(dispatchHealth(row.input).failure_class).toBe(expectedTelemetryClass);
+ });
+});
+
+describe("tool-in-flight signal: failover and telemetry read the same any-tool scan", () => {
+ // Regression: an inactivity timeout while a NON-bash tool (here `subagent`) is still open.
+ // The progress tracker's `toolInFlight` is bash-only (undefined here), but failover's scan
+ // counts any open `tool_execution_start`, so failover says "task". Telemetry used to read the
+ // bash-only value and report "provider_stall" for the same attempt.
+ const rawStdout = [
+  JSON.stringify({ type: "tool_execution_start", toolCallId: "call-1", toolName: "subagent", args: { tasks: [{ id: "w1" }] } }),
+  "",
+ ].join("\n");
+ const attempt = { exitCode: 1, outcome: "timed_out" as const, timeoutReason: "inactivity" as const, stderr: "", rawStdout, costUsd: 0 };
+
+ test("healthSignals builds the same signals failover's attemptSignalsFromScan builds", () => {
+  const failoverSignals = attemptSignalsFromScan(attempt, scanEvents(attempt.rawStdout.split(/\r?\n/)), false);
+  expect(failoverSignals.toolInFlight).toBe(true);
+  expect(healthSignals({ ...base, ...attempt })).toEqual(failoverSignals);
+  expect(classifyFailure(failoverSignals)).toBe("task");
+ });
+
+ test("real dispatchWithFailover decision and dispatchHealth failure_class agree (task, not provider_stall)", async () => {
+  const fo = await dispatchWithFailover({ taskId: "t", capability: "c", prompt: "p" }, [base.model], {
+   runAttempt: async () => attempt,
+   readEvents: (r) => r.rawStdout.split(/\r?\n/),
+   snapshot: () => null,
+   changedSince: () => [],
+   sleep: async () => {},
+   health: new ModelHealth(() => 0),
+   isCancelled: () => false,
+   recordEvent: () => {},
+   log: () => {},
+   config: failoverConfig(),
+  });
+  expect(fo.attempts[0].record.cls).toBe("task");
+  expect(dispatchHealth({ ...base, ...attempt }).failure_class).toBe("task");
+ });
+
+ test("with no tool open, both still call the same inactivity timeout a provider stall", () => {
+  const idle = { ...base, ...attempt, rawStdout: "" };
+  expect(classifyFailure(healthSignals(idle))).toBe("stall");
+  expect(dispatchHealth(idle).failure_class).toBe("provider_stall");
  });
 });

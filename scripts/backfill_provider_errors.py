@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,7 @@ from urllib.parse import urlsplit
 # Runnable as `python3 scripts/backfill_provider_errors.py` without PYTHONPATH.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from orchestrator.contract import DEFAULT_STATE_ROOT, STATE_ROOT_ENV_ALIASES, STATE_ROOT_ENV_VAR  # noqa: E402
 from orchestrator.core.env import default_state_root  # noqa: E402
 from orchestrator.record_batch import write_batch  # noqa: E402
 
@@ -109,18 +112,71 @@ def error_messages(event: object):
                     stack.append((child, depth + 1, nested, key))
 
 
-def _bounded_lines(path: Path):
-    """Yield complete lines up to MAX_LINE_BYTES; skip (drain) longer ones."""
-    with path.open('rb') as source:
+def _open_no_follow(path: Path):
+    """Open a regular file for binary reading without following a final symlink, or None.
+
+    Closes the race between the caller's is_symlink()/is_file() check and the open itself.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+        return os.fdopen(fd, 'rb')
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _numbered_bounded_lines(path: Path):
+    """Yield (line_number, line) for complete lines up to MAX_LINE_BYTES.
+
+    Longer lines are drained and skipped but still counted, so later line numbers never shift.
+    """
+    source = _open_no_follow(path)
+    if source is None:
+        return
+    with source:
+        number = 0
         while True:
             line = source.readline(MAX_LINE_BYTES + 1)
             if not line:
                 return
+            number += 1
             if len(line) > MAX_LINE_BYTES and not line.endswith(b'\n'):
                 while line and not line.endswith(b'\n'):
                     line = source.readline(MAX_LINE_BYTES)
                 continue
-            yield line
+            yield number, line
+
+
+def _bounded_lines(path: Path):
+    """Yield complete lines up to MAX_LINE_BYTES; skip (drain) longer ones."""
+    for _, line in _numbered_bounded_lines(path):
+        yield line
+
+
+def _text_lines(path: Path):
+    """Yield (line_number, text) numbered exactly as text-mode iteration (universal newlines).
+
+    Reads through _numbered_bounded_lines' byte cap: a bare '\\r' inside a '\\n'-terminated chunk is
+    split the way open(..., newline=None) would, so record ids built from these numbers match
+    the ones earlier runs produced. An oversized line is skipped and counts as one line.
+    """
+    offset = 0
+    for number, raw in _numbered_bounded_lines(path):
+        text = raw.decode('utf-8', 'replace')
+        if text.endswith('\n'):
+            text = text[:-1]
+        if text.endswith('\r'):
+            text = text[:-1]
+        pieces = text.split('\r')
+        for index, piece in enumerate(pieces):
+            yield number + offset + index, piece
+        offset += len(pieces) - 1
 
 
 def structured_rows(root: Path, run: Path, path: Path) -> list[dict]:
@@ -167,29 +223,64 @@ def text_rows(root: Path, run: Path, path: Path) -> list[dict]:
     """Dated text-log lines only; an undated line has no observation time."""
     relative = path.relative_to(root).as_posix()
     rows = []
-    with path.open(encoding='utf-8', errors='replace') as source:
-        for line_number, line in enumerate(source, 1):
-            bounded = line[:16384]
-            code = classify(bounded)
-            stamp = STAMP.search(bounded) if code else None
-            if stamp is None:
-                continue
-            host = provider_endpoint(bounded)
-            identity = f'{relative}:{line_number}:{code}'
-            rows.append({'stream': 'event', 'event': 'provider_error',
-                         'record_id': 'provider-backfill-' + hashlib.sha256(identity.encode()).hexdigest(),
-                         'run_id': run.name, 'provider': 'amazon-bedrock' if host else 'unknown',
-                         'error_code': code, 'count': 1,
-                         **({'endpoint_host': host} if host else {}),
-                         'ts': stamp.group(), 'first_ts': stamp.group(), 'last_ts': stamp.group(),
-                         'source': 'legacy_provider_backfill'})
+    for line_number, line in _text_lines(path):
+        bounded = line[:16384]
+        code = classify(bounded)
+        stamp = STAMP.search(bounded) if code else None
+        if stamp is None:
+            continue
+        host = provider_endpoint(bounded)
+        identity = f'{relative}:{line_number}:{code}'
+        rows.append({'stream': 'event', 'event': 'provider_error',
+                     'record_id': 'provider-backfill-' + hashlib.sha256(identity.encode()).hexdigest(),
+                     'run_id': run.name, 'provider': 'amazon-bedrock' if host else 'unknown',
+                     'error_code': code, 'count': 1,
+                     **({'endpoint_host': host} if host else {}),
+                     'ts': stamp.group(), 'first_ts': stamp.group(), 'last_ts': stamp.group(),
+                     'source': 'legacy_provider_backfill'})
     return rows
+
+
+def _protected_roots() -> list[Path]:
+    """Every location that may be the live state root, whatever the environment says.
+
+    default_state_root() honours the env override, so the contract default and every set env
+    alias are listed too: an override pointing elsewhere never unprotects the real default.
+    """
+    roots = [default_state_root(), Path(DEFAULT_STATE_ROOT).expanduser()]
+    for name in (STATE_ROOT_ENV_VAR, *STATE_ROOT_ENV_ALIASES):
+        value = os.environ.get(name)
+        if value:
+            roots.append(Path(value).expanduser())
+    return roots
+
+
+# macOS and Windows default to case-insensitive filesystems.
+_CASE_INSENSITIVE_OS = sys.platform in ('darwin', 'win32')
+
+
+def _same_location(root: Path, protected: Path) -> bool:
+    """True when root and protected name the same directory (symlink, alias or case variant)."""
+    try:
+        if protected.exists() and os.path.samefile(root, protected):
+            return True
+    except OSError:
+        pass
+    left = os.path.normcase(str(root.resolve()))
+    right = os.path.normcase(str(protected.resolve()))
+    if left == right:
+        return True
+    return _CASE_INSENSITIVE_OS and left.casefold() == right.casefold()
+
+
+def is_live_state_root(root: Path) -> bool:
+    return any(_same_location(Path(root), protected) for protected in _protected_roots())
 
 
 def backfill(root: Path, *, write: bool = False, allow_live_state: bool = False) -> dict[str, int]:
     """Scan only regular files below root/runs, never following a symlink out of root."""
     root = Path(root)
-    if write and not allow_live_state and root.resolve() == default_state_root().resolve():
+    if write and not allow_live_state and is_live_state_root(root):
         raise ValueError('refusing to write the live default state directory without --allow-live-state')
     if root.is_symlink() or not root.is_dir():
         raise ValueError('state directory must be an existing, non-symlink directory')

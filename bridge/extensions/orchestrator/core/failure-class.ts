@@ -60,13 +60,49 @@ export function providerText(stderr: string, errorMessage?: string): string {
  * (which decides real routing/failover behavior) and `dispatch/provider-health.ts`'s
  * `dispatchHealth` (which decides the `dispatch_finished`/`provider_error` telemetry class) can
  * never drift into classifying the same attempt two different ways from two different signal
- * sets ("one classifier"). Both callers pass exactly the attempt's OWN stderr/errorMessage here --
- * nested worker evidence (`provider-health.ts`'s `nestedProviderErrors`) is recorded separately
- * (see `providerErrors()`) and may still drive a diagnostic `error_code` fallback there, but must
- * never reach `classifyFailure` and change `failure_class`/the failover decision.
+ * sets ("one classifier"). Both callers pass the attempt's full, unstripped `stderr`. That stderr
+ * can legitimately carry `[provider nested error] ...` lines the child process replays from its
+ * nested workers (dispatch/child-process.ts): `providerText` keeps them, so that nested evidence
+ * DOES reach `classifyFailure` -- on purpose, identically for both callers. What must never reach
+ * it is `provider-health.ts`'s separate `nestedProviderErrors` array: that is recorded on its own
+ * (see `providerErrors()`) and may only drive a diagnostic `error_code` fallback there.
  */
 export function attemptSignals(input: AttemptSignals): AttemptSignals {
 	return { ...input };
+}
+
+/** The per-attempt fields (a subset of `SubagentProcessResult`) the classifier reads besides the event scan. */
+export interface AttemptOutcome {
+	exitCode: number;
+	outcome: string;
+	stderr?: string;
+	stopReason?: string;
+	timeoutReason?: "inactivity" | "absolute";
+}
+
+/**
+ * The one way to build `AttemptSignals` from a finished attempt plus `scanEvents()` over its
+ * event stream. Both `dispatch/failover.ts` and `dispatch/provider-health.ts` call this, so the
+ * harness error (`scan.lastErrorMessage`) and the tool-in-flight bit come from the same scan on
+ * both sides. `toolInFlight` here is ANY open `tool_execution_start` (bash, `subagent`, ...),
+ * never the bash-only `SubagentProcessResult.toolInFlight` the progress tracker reports -- that
+ * one only feeds `core/wait-stall.ts`'s `classifyTimeout` wait-stall check.
+ */
+export function attemptSignalsFromScan(
+	attempt: AttemptOutcome,
+	scan: Pick<EventScan, "toolInFlight" | "lastErrorMessage">,
+	cancelled: boolean,
+): AttemptSignals {
+	return attemptSignals({
+		exitCode: attempt.exitCode,
+		outcome: attempt.outcome,
+		stderr: attempt.stderr ?? "",
+		errorMessage: scan.lastErrorMessage,
+		stopReason: attempt.stopReason,
+		timeoutReason: attempt.timeoutReason,
+		toolInFlight: scan.toolInFlight,
+		cancelled,
+	});
 }
 
 export function classifyFailure(s: AttemptSignals): FailureClass {

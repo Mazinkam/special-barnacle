@@ -1,18 +1,21 @@
 import { isQuotaError } from "../provider-fallback.ts";
 import { isTransientProviderError } from "../core/transient-error.ts";
 import { classifyTimeout } from "../core/wait-stall.ts";
-import { classifyFailure, providerText, telemetryFailureClass, attemptSignals, type AttemptSignals } from "../core/failure-class.ts";
+import { scanEvents } from "../core/event-scan.ts";
+import { classifyFailure, providerText, telemetryFailureClass, attemptSignalsFromScan, type AttemptSignals } from "../core/failure-class.ts";
 
 interface Evidence { message: string; timestamp: string }
 interface HealthInput {
  outcome: string;
  exitCode: number;
  timeoutReason?: "inactivity" | "absolute";
+ /** Bash-only in-flight tool from the progress tracker; used ONLY for `classifyTimeout`'s wait-stall check. */
  toolInFlight?: { name: string; command?: string; waitPattern?: boolean };
+ /** The attempt's raw JSON event stream -- the same text failover's `readEvents` splits and scans. */
+ rawStdout?: string;
  stderr?: string;
  model?: string;
  stopReason?: string;
- errorMessage?: string;
  nestedProviderErrors?: Evidence[];
 }
 
@@ -58,13 +61,28 @@ function ownStderr(input: HealthInput): string {
  return (input.stderr ?? "").split("\nnestedWorkers:", 1)[0].slice(0, 16_384);
 }
 
-export function dispatchHealth(input: HealthInput): { outcome: string; timeout_reason?: string; failure_class?: string; provider?: string; model?: string; error_code?: string } {
+export interface DispatchHealth { outcome: string; timeout_reason?: string; failure_class?: string; provider?: string; provider_model?: string; error_code?: string }
+
+/**
+ * Classifier signals for this attempt, built exactly as `dispatch/failover.ts` builds them:
+ * `scanEvents` over the attempt's event lines (split the way both callers' `readEvents` split
+ * `rawStdout`) fed through the shared `attemptSignalsFromScan`, from the SAME unstripped
+ * `input.stderr` failover reads (never `ownStderr`'s tail-stripped slice). So `toolInFlight` is
+ * any open tool (e.g. a `subagent` call), not the bash-only `input.toolInFlight`.
+ */
+export function healthSignals(input: HealthInput): AttemptSignals {
+ const scan = scanEvents((input.rawStdout ?? "").split(/\r?\n/));
+ return attemptSignalsFromScan(input, scan, input.outcome === "cancelled");
+}
+
+export function dispatchHealth(input: HealthInput): DispatchHealth {
+ const signals = healthSignals(input);
  const stderr = ownStderr(input);
  const nestedMessages = (input.nestedProviderErrors ?? []).map(e => e.message.slice(0, 16_384));
  // Same filtering `classifyFailure` applies internally (drop orchestrator-written diagnostic
  // lines and the interruption report) before either the shared classifier or the `errorCode`
  // diagnostic sub-code below ever look at the text -- one filter, read by both.
- const filteredOwn = providerText(stderr, input.errorMessage);
+ const filteredOwn = providerText(stderr, signals.errorMessage);
  const filteredNested = nestedMessages.map(m => providerText(m));
  const code = errorCode(filteredOwn) ?? filteredNested.map(errorCode).find(Boolean);
  const identity = modelIdentity(input.model);
@@ -82,24 +100,11 @@ export function dispatchHealth(input: HealthInput): { outcome: string; timeout_r
   // `pipeline/hierarchy.ts`), not a second copy of the provider-failure rule table.
   failureClass = "wait_stall";
  } else {
-  // Same shared construction `dispatch/failover.ts` uses (`attemptSignals`, core/failure-class.ts),
-  // fed the SAME unstripped `input.stderr` failover reads (never `ownStderr`'s tail-stripped
-  // slice): failover has no `ownStderr` step, so if this stripped the `\nnestedWorkers: ...`
-  // tail (and any `[provider nested error] ...` lines inside it) before classifying, this
-  // `failure_class` could disagree with the `FailureClass` failover already acted on for the
-  // exact same attempt. `ownStderr` still gates the diagnostic `error_code` above and the own
-  // (nested:false) `providerErrors()` row below, so nested evidence still never gets double-
-  // counted as this attempt's own row -- it just must never change `failure_class` itself.
-  const signals: AttemptSignals = attemptSignals({
-   exitCode: input.exitCode,
-   outcome: input.outcome,
-   stderr: input.stderr ?? "",
-   errorMessage: input.errorMessage,
-   stopReason: input.stopReason,
-   timeoutReason: input.timeoutReason,
-   toolInFlight: Boolean(input.toolInFlight),
-   cancelled: input.outcome === "cancelled",
-  });
+  // `signals` comes from `healthSignals` (same scan + `attemptSignalsFromScan` failover uses,
+  // same unstripped stderr), so this `failure_class` cannot disagree with the `FailureClass`
+  // failover already acted on for this attempt. `ownStderr` still gates the diagnostic
+  // `error_code` above and the own (nested:false) `providerErrors()` row below, so nested
+  // evidence never gets double-counted as this attempt's own row.
   const cls = classifyFailure(signals);
   failureClass = telemetryFailureClass(cls, input.outcome === "timed_out");
  }

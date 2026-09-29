@@ -3,7 +3,7 @@
  * through `deps`, so tests use a fake clock and fake attempts.
  */
 import { scanEvents, type EventScan } from "../core/event-scan.ts";
-import { attemptSignals, classifyFailure, failureReason, hadRealWork, type AttemptSignals, type FailureClass } from "../core/failure-class.ts";
+import { attemptSignalsFromScan, classifyFailure, failureReason, hadRealWork, type AttemptSignals, type FailureClass } from "../core/failure-class.ts";
 import { applyStep, initialState, nextStep, pickCandidate, resumeAfterWait, waitOrGiveUp, type FailoverConfig, type Step } from "./failover-policy.ts";
 import { buildHandoff } from "./handoff.ts";
 import { providerRegion, type ModelHealth } from "../run/model-health.ts";
@@ -68,16 +68,7 @@ export async function dispatchWithFailover<R extends AttemptLike>(
 		const result = await deps.runAttempt(model, prompt, n, spent);
 		spent += result.costUsd + (result.nestedCostUsd ?? 0);
 		const scan = scanEvents(deps.readEvents(result));
-		const signals: AttemptSignals = attemptSignals({
-			exitCode: result.exitCode,
-			outcome: result.outcome,
-			stderr: result.stderr,
-			errorMessage: scan.lastErrorMessage,
-			stopReason: result.stopReason,
-			timeoutReason: result.timeoutReason,
-			toolInFlight: scan.toolInFlight,
-			cancelled: deps.isCancelled(),
-		});
+		const signals: AttemptSignals = attemptSignalsFromScan(result, scan, deps.isCancelled());
 		const cls = classifyFailure(signals);
 		const changed = deps.changedSince(snap);
 		for (const f of changed) files.add(f);
