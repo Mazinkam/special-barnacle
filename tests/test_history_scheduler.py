@@ -297,3 +297,14 @@ class T(unittest.TestCase):
         self.assertFalse(r['history_sufficient'])
         self.assertEqual(r['explanation']['action'],'fallback_insufficient_history')
         self.assertEqual(r['selected'],r['default'])
+
+
+def test_pass_rate_ignores_result_less_route_rows():
+    from orchestrator.history import build_route_stats
+    base = {'run_id': 'R', 'task_id': 'T', 'task_class': 'implementation', 'complexity': 3, 'risk': 'low',
+            'capability_class': 'implementation_fast', 'effort': 'low', 'verification_depth': 'targeted'}
+    rows = [dict(base, event='model_call', result='pass', cost_usd=.1, cost_source='reported', input_tokens=1, model='m'),
+            dict(base, event='route_executed', cost_usd=.1)]
+    [group] = build_route_stats(rows)
+    assert group['pass_rate'] == 1.0
+    assert group['result_samples'] == 1
