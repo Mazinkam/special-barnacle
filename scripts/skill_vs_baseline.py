@@ -21,10 +21,12 @@ from typing import Any, Iterable
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # .../hierarchical-agent-orchestrator/
 
+from orchestrator import records  # noqa: E402
+from orchestrator.core.env import default_state_root  # noqa: E402
 from orchestrator.economics import is_session_ingest  # noqa: E402
 from orchestrator.pricing import estimate_cost_usd, load_pricing  # noqa: E402
 
-STATE = Path('~/.local/state/coding-agent-orchestrator').expanduser()
+STATE = default_state_root()
 METRICS = STATE / 'metrics.jsonl'
 
 # Cost-only flat-model sensitivity brackets from the active `premium` profile.
@@ -40,6 +42,7 @@ COMMON_BASELINE_LABEL = 'sonnet-5-5 (mid tier)'
 COMMON_BASELINE_MODEL = 'claude-sonnet-5-5'
 
 PASS_VALUES = {'pass', 'success', 'ok', 'reported'}
+FAIL_VALUES = {'fail', 'failed', 'error', 'timeout'}
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
@@ -74,8 +77,8 @@ def partition(records: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
 
 
 def is_decision_record(r: dict[str, Any]) -> bool:
-    """Decisions aren't work — they carry recommended_* estimates but no real cost."""
-    return r.get('event') == 'adaptive_route_decision'
+    """Decision/route events (`route_executed`, `adaptive_route_decision`, …) are not work."""
+    return records.classify(r) == records.EVENT
 
 
 def reprice(record: dict[str, Any], model: str, pricing: dict[str, Any]) -> float | None:
@@ -99,6 +102,8 @@ def aggregate(records: list[dict[str, Any]], pricing: dict[str, Any]) -> dict[st
     priced = [r for r in work if (r.get('cost_usd') or 0) > 0]
     cost_actual = sum(float(r.get('cost_usd') or 0) for r in priced)
     pass_count = sum(1 for r in work if str(r.get('result', '')).lower() in PASS_VALUES)
+    fail_count = sum(1 for r in work if str(r.get('result', '')).lower() in FAIL_VALUES)
+    known = pass_count + fail_count
     retry_count = sum(1 for r in work if (r.get('retry') or 0) > 0)
     waste_count = sum(1 for r in work if r.get('waste_reason'))
     input_tokens = sum(int(r.get('input_tokens') or 0) for r in priced)
@@ -132,8 +137,9 @@ def aggregate(records: list[dict[str, Any]], pricing: dict[str, Any]) -> dict[st
         'priced_records': len(priced),
         'cost_actual_usd': round(cost_actual, 4),
         'pass_count': pass_count,
-        'fail_count': len(work) - pass_count,
-        'success_rate': round(pass_count / len(work), 4) if work else None,
+        'fail_count': fail_count,
+        'unknown_result_count': len(work) - known,
+        'success_rate': round(pass_count / known, 4) if known else None,
         'retry_count': retry_count,
         'retry_rate': round(retry_count / len(work), 4) if work else None,
         'waste_count': waste_count,
@@ -167,6 +173,7 @@ def per_breakdown(records: list[dict[str, Any]], key: str, pricing: dict[str, An
         priced = [r for r in rows if (r.get('cost_usd') or 0) > 0]
         cost_actual = sum(float(r.get('cost_usd') or 0) for r in priced)
         pass_count = sum(1 for r in rows if str(r.get('result', '')).lower() in PASS_VALUES)
+        known_rows = sum(1 for r in rows if str(r.get('result', '')).lower() in PASS_VALUES | FAIL_VALUES)
         baseline = 0.0
         baseline_priced = 0
         for r in priced:
@@ -182,7 +189,7 @@ def per_breakdown(records: list[dict[str, Any]], key: str, pricing: dict[str, An
             'cost_actual_usd': round(cost_actual, 4),
             'cost_per_call_usd': round(cost_actual / len(priced), 4) if priced else None,
             'pass_count': pass_count,
-            'success_rate': round(pass_count / len(rows), 4) if rows else None,
+            'success_rate': (round(pass_count / known_rows, 4) if known_rows else None),
             'baseline_sonnet_4_5_usd': baseline_cost,
             'delta_usd': (
                 round(cost_actual - baseline_cost, 4)
@@ -224,16 +231,21 @@ def print_breakdown(name: str, breakdown: dict[str, dict[str, Any]], top: int = 
               f'{v["pass_count"]:>5} {fmt_pct(v["success_rate"])}')
 
 
-def main() -> int:
-    if not METRICS.exists():
-        print(f'error: no metrics stream at {METRICS}', file=sys.stderr)
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--state-dir', type=Path, default=STATE, help='state root to read (default: resolved state root)')
+    args = parser.parse_args(argv)
+    metrics_path = args.state_dir / 'metrics.jsonl'
+    if not metrics_path.exists():
+        print(f'error: no metrics stream at {metrics_path}', file=sys.stderr)
         return 1
 
     pricing = load_pricing()
     if not pricing.get('enabled'):
         print('warning: pricing disabled in config; baselines will be n/a', file=sys.stderr)
 
-    records = load_records(METRICS)
+    records = load_records(metrics_path)
     orchestrated, interactive = partition(records)
 
     section('Stream volume')
@@ -250,7 +262,7 @@ def main() -> int:
     print(f'  priced records:              {agg_o["priced_records"]:,} / {agg_o["work_records"]:,} ({priced_pct:.1f}%); unmetered rows excluded from cost')
     print(f'  decision events skipped:     {agg_o["decision_records"]}')
     print(f'  total actual cost:           {fmt_money(agg_o["cost_actual_usd"])}')
-    print(f'  pass / fail:                 {agg_o["pass_count"]} / {agg_o["fail_count"]}')
+    print(f'  pass / fail / unknown:       {agg_o["pass_count"]} / {agg_o["fail_count"]} / {agg_o["unknown_result_count"]}')
     print(f'  success rate:                {fmt_pct(agg_o["success_rate"])}')
     print(f'  retry rate:                  {fmt_pct(agg_o["retry_rate"])}')
     print(f'  waste rate:                  {fmt_pct(agg_o["waste_rate"])}')
@@ -301,6 +313,23 @@ def main() -> int:
         print(f'\n  orchestrator vs {COMMON_BASELINE_LABEL} flat: {(cps_actual - sonnet_cps):+.4f} per success '
               f'({(cps_actual - sonnet_cps) / sonnet_cps * 100:+.1f}%)')
     print('  Caution: same-token repricing does not model no-skill workflow, task quality, or elapsed time.')
+
+    from orchestrator.analytics.task_outcomes import task_outcomes, summarize_task_outcomes
+    from orchestrator.runtime import iter_jsonl
+    events = list(iter_jsonl(args.state_dir / 'events.jsonl'))
+    outcomes = list(iter_jsonl(args.state_dir / 'outcomes.jsonl'))
+    section('Task outcomes by complexity band (one row per run)')
+    print(f'  {"band":<10} {"n":>4} {"pass":>5} {"fail":>5} {"unk":>5} {"pass%known":>10} '
+          f'{"p50 min":>8} {"p90 min":>8} {"t cov":>6} {"$ known":>9} {"$ cov":>6} {"$/verified":>10} {"fix":>5}')
+    for band, s in sorted(summarize_task_outcomes(task_outcomes(orchestrated, events, outcomes)).items()):
+        p50 = f'{s["elapsed_p50_ms"] / 60000:8.1f}' if s['elapsed_p50_ms'] is not None else '     n/a'
+        p90 = f'{s["elapsed_p90_ms"] / 60000:8.1f}' if s['elapsed_p90_ms'] is not None else '     n/a'
+        fix = f'{s["fix_rounds_mean"]:.2f}' if s['fix_rounds_mean'] is not None else 'n/a'
+        print(f'  {band:<10} {s["n"]:>4} {s["pass"]:>5} {s["fail"]:>5} {s["unknown"]:>5} '
+              f'{fmt_pct(s["pass_rate_known"]):>10} {p50} {p90} '
+              f'{fmt_pct(s["elapsed_coverage"]):>6} {fmt_money(s["cost_known_usd"])} {fmt_pct(s["cost_complete_coverage"]):>6} '
+              f'{fmt_money(s["cost_per_verified_usd"]):>10} {fix:>5}')
+    print('  Descriptive only: historical runs are not a matched comparison (spec §1.4).')
 
     print()
     return 0
