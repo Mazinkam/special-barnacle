@@ -15,23 +15,24 @@ export function routeWorkflow(s: WorkflowSignals, policy: WorkflowPolicy): Workf
 		...(s.ambiguous ? ["no candidate files resolved from the goal"] : []),
 		...(s.checks.length === 0 ? ["no deterministic checks discovered"] : []),
 	];
+	const baseFloor: WorkflowLevel = s.checks.length === 0 ? "checked" : "direct";
 	const highRisk = s.triageRisk === "high" || s.triageRisk === "critical";
 	if (highRisk || s.riskPathHits.length > 0) {
 		return { level: "full", floor: "full", uncertainty, reasons: [highRisk ? `explicit risk ${s.triageRisk}` : `protected path: ${s.riskPathHits[0]}`] };
 	}
 	if (s.interfaceHits.length > 0 && s.packages.length > 1) {
-		return { level: "full", floor: "direct", uncertainty, reasons: [`interface change across ${s.packages.length} packages`] };
+		return { level: "full", floor: baseFloor, uncertainty, reasons: [`interface change across ${s.packages.length} packages`] };
 	}
 	const t = policy.thresholds;
 	if (s.ambiguous || s.candidates.length >= t.led_min_files || s.packages.length >= t.led_min_packages) {
 		const why = s.ambiguous ? "scope unresolved" : s.candidates.length >= t.led_min_files ? `${s.candidates.length} candidate files` : `${s.packages.length} packages`;
-		return { level: "led", floor: "direct", uncertainty, reasons: [why] };
+		return { level: "led", floor: baseFloor, uncertainty, reasons: [why] };
 	}
 	if (s.candidates.length === 1 && s.triageRisk === "low" && s.interfaceHits.length === 0 && s.testsNearby && s.checks.length > 0) {
 		return { level: "direct", floor: "direct", uncertainty, reasons: ["one localized low-risk file with adjacent tests and runnable checks"] };
 	}
 	const why = s.checks.length === 0 ? "no runnable checks" : !s.testsNearby ? "no adjacent tests" : s.interfaceHits.length ? "local interface change" : s.triageRisk !== "low" ? `risk ${s.triageRisk}` : `${s.candidates.length} files`;
-	return { level: "checked", floor: "direct", uncertainty, reasons: [why] };
+	return { level: "checked", floor: baseFloor, uncertainty, reasons: [why] };
 }
 
 export function applyWorkflowOverride(d: WorkflowDecision, requested: WorkflowLevel | undefined): WorkflowDecision {

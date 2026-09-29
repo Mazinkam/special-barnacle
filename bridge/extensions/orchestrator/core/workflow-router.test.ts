@@ -37,4 +37,15 @@ describe("applyWorkflowOverride", () => {
 		expect(d.level).toBe("full");
 		expect(d.override).toEqual({ requested: "direct", accepted: false, reason: "below hard floor full" });
 	});
+	test("no discovered checks: --workflow direct rejected (floor checked)", () => {
+		const d = applyWorkflowOverride(route({ checks: [] }), "direct");
+		expect(d.level).toBe("checked");
+		expect(d.floor).toBe("checked");
+		expect(d.override).toEqual({ requested: "direct", accepted: false, reason: "below hard floor checked" });
+	});
+	test("no checks and ambiguous: --workflow direct rejected", () => {
+		const d = applyWorkflowOverride(route({ checks: [], candidates: [], ambiguous: true }), "direct");
+		expect(d.level).toBe("led");
+		expect(d.override?.accepted).toBe(false);
+	});
 });
