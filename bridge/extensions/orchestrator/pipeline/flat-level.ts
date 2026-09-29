@@ -47,16 +47,41 @@ export async function dispatchFlat(
 		resumedLeadTaskIds: [], retriedLeadTaskIds: [], resumedAttemptResults: [], pendingChecks: [] };
 }
 
-/** Affirmative PASS: `## Verdict` section whose first non-empty line starts with PASS, or a `VERDICT: PASS` line. */
-function hasAffirmativePassVerdict(rawText: string): boolean {
-	const lines = rawText.split(/\r?\n/);
-	for (let i = 0; i < lines.length; i++) {
-		if (/^\s*#{1,6}\s*Verdict\s*:?\s*$/i.test(lines[i]!)) {
-			const next = lines.slice(i + 1).find((l) => l.trim() !== "");
-			if (next !== undefined && /^\W*PASS\b/i.test(next.trim())) return true;
-		} else if (/^\s*VERDICT\s*:\s*PASS\b/i.test(lines[i]!)) return true;
+/** Drop fenced code blocks (``` / ~~~) and blockquote lines so quoted examples cannot supply a verdict. */
+function stripFencedAndQuoted(rawText: string): string {
+	const out: string[] = [];
+	let fence: string | undefined;
+	for (const line of rawText.split(/\r?\n/)) {
+		const m = /^\s*(`{3,}|~{3,})/.exec(line);
+		if (fence) {
+			if (m && m[1]![0] === fence[0] && m[1]!.length >= fence.length) fence = undefined;
+			continue;
+		}
+		if (m) { fence = m[1]; continue; }
+		if (/^\s*>/.test(line)) continue;
+		out.push(line);
 	}
-	return false;
+	return out.join("\n");
+}
+
+/**
+ * Affirmative PASS: at least one verdict (`## Verdict` heading's first non-empty following line, or
+ * `VERDICT: X` line) in the de-fenced text, and EVERY verdict starts with the exact token PASS.
+ */
+function hasAffirmativePassVerdict(rawText: string): boolean {
+	const lines = stripFencedAndQuoted(rawText).split(/\r?\n/);
+	const verdicts: string[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i]!;
+		if (/^\s*#{1,6}\s*Verdict\s*:?\s*$/i.test(line)) {
+			const next = lines.slice(i + 1).find((l) => l.trim() !== "");
+			verdicts.push(next?.trim() ?? "");
+		} else {
+			const m = /^\s*VERDICT\s*:\s*(.*)$/i.exec(line);
+			if (m) verdicts.push(m[1]!.trim());
+		}
+	}
+	return verdicts.length > 0 && verdicts.every((v) => /^PASS(?![\w?])/.test(v.replace(/^[*_`\s]+/, "")));
 }
 
 function reviewTask(runId: string, goal: string, files: string[], checks: CheckRunResult[]): DispatchTask {

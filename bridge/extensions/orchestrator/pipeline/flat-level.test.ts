@@ -71,5 +71,34 @@ describe("flat level", () => {
 		test("VERDICT: PASS line passes", async () => {
 			expect((await review("VERDICT: PASS")).passed).toBe(true);
 		});
+		test("PASS with trailing text passes", async () => {
+			expect((await review("## Verdict\nPASS — ok")).passed).toBe(true);
+		});
+		test("fenced example verdict does not satisfy the gate", async () => {
+			const v = await review("```text\n## Verdict\nPASS\n```\nI cannot PASS this change.");
+			expect(v.passed).toBe(false);
+			expect(v.failedChecks).toContain("review");
+		});
+		test("tilde-fenced example verdict does not satisfy the gate", async () => {
+			expect((await review("~~~\nVERDICT: PASS\n~~~\nno verdict")).passed).toBe(false);
+		});
+		test("conflicting VERDICT lines fail", async () => {
+			const v = await review("VERDICT: PASS\nVERDICT: FAIL");
+			expect(v.passed).toBe(false);
+			expect(v.failedChecks).toContain("review");
+		});
+		test("conflicting ## Verdict headings fail", async () => {
+			const v = await review("## Verdict\nPASS\n\n## Verdict\nFAIL");
+			expect(v.passed).toBe(false);
+			expect(v.failedChecks).toContain("review");
+		});
+		test("blockquoted-only verdict fails", async () => {
+			const v = await review("> ## Verdict\n> PASS");
+			expect(v.passed).toBe(false);
+			expect(v.failedChecks).toContain("review");
+		});
+		test("ambiguous PASS? token fails", async () => {
+			expect((await review("## Verdict\nPASS?")).passed).toBe(false);
+		});
 	});
 });
