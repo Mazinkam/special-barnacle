@@ -80,6 +80,13 @@ Orchestrating capabilities (`lead`, `architect`, and `technical_lead`) use a pro
 - Unsupported `scoped_leads` and `recon_before_architect` switches were removed. `file_ownership` supports `off`/`report`, not serialization: `lead_edit_conflict` reports overlapping explicit lead file claims only with run-wide Git change evidence. This cannot prove which lead wrote the file, and does not gate scheduling.
 - Legacy provider-error backfill is **operator opt-in**. From the repo root, first run `python3 scripts/backfill_provider_errors.py --state-dir /path/to/state-copy` (dry-run). Inspect candidates and source logs, then, only against an explicitly chosen **copy**, run `python3 scripts/backfill_provider_errors.py --state-dir /path/to/state-copy --write` and regenerate its dashboard with `CODING_AGENT_ORCHESTRATOR_HOME=/path/to/state-copy python3 -m orchestrator.cli dashboard`. `--write` rejects the live default state root; do not treat a dry-run or synthetic fixture as verified real-outage evidence. A real outage window requires inspecting the regenerated dashboard against the copied historical logs before making that claim. Do not write to live state during verification.
 
+## Run 10 operational notes
+
+- The run summary explains `STATUS: partial` lead results as **Orchestration partial**, includes the code-verification verdict, a **why partial:** explanation, and up to five **what still needs action:** bullets, while hiding the raw STATUS line. BLOCKED/FAILED take precedence; full-report mode omits the action list.
+- CI's pending-check gate fails closed for any parser problem (`unparsed_checks`), not only truncated reports (B1, `b53c69c`).
+- Phase 3 merged main's modular model failover with telemetry. `core/failure-class.ts` `classifyFailure` and shared `attemptSignals()` drive both failover and `dispatch_finished.failure_class`; `telemetryFailureClass()` maps telemetry names (stall → `provider_stall`; timed-out transient → `provider_stall`), while `wait_stall` comes from `classifyTimeout`. Unexplained no-tool inactivity timeouts are now `provider_stall` (and already trigger failover).
+- Each superseded failover attempt emits its own `dispatch_finished` (`superseded_by_fallback: true`) and `provider_error` rows using that attempt's provider/model. The final `dispatch_finished` uses the final provider/model and its own cost/turns/duration, not cumulative totals; returned `DispatchResult` retains totals. Lead and QA dispatches both use failover (N3 covered).
+
 ## Editing
 
 Because the runtime paths are symlinks, editing a file under `bridge/` is

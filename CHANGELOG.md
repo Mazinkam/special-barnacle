@@ -1,5 +1,12 @@
 ## Unreleased
 
+### Run 10 — partial summaries, fail-closed CI and failover telemetry
+
+- Phase 0 summaries explain `STATUS: partial` lead results as **Orchestration partial**, show the code-verification verdict, **why partial:** and up to five **what still needs action:** bullets, and hide the raw STATUS line. BLOCKED/FAILED take precedence; full-report mode omits the action list.
+- B1 hardening makes the CI gate fail closed on any pending-check parser problem (`unparsed_checks`), not just truncation (`b53c69c`).
+- Phase 3 merged main's modular model failover with the telemetry branch. `core/failure-class.ts` `classifyFailure` and shared `attemptSignals()` drive both failover and `dispatch_finished.failure_class`; `telemetryFailureClass()` maps telemetry names (stall → `provider_stall`; timed-out transient → `provider_stall`), and `wait_stall` comes from `classifyTimeout`. Unexplained no-tool inactivity timeouts are now `provider_stall` (they already trigger failover).
+- On failover, each superseded attempt emits its own `dispatch_finished` (`superseded_by_fallback: true`) and `provider_error` rows with that attempt's provider/model. The final `dispatch_finished` carries the final provider/model and its own cost/turns/duration (not cumulative); returned `DispatchResult` retains totals. Lead and QA dispatches go through failover (N3 covered).
+
 ### Run 9 — CI evidence, replay, telemetry and guardrails
 
 - B1 parent-owned GitHub/GitLab CI gates require validated repository/check IDs, candidate SHA and bounded failed-job logs; truncated or stale check evidence fails closed. A bounded cancellable timer remains in place of RunSession ticks. CLI/auth and live-provider behavior remain unverified.
