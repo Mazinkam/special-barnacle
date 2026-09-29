@@ -364,6 +364,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
         else: other_rows[rid] += 1
 
     started_events: dict[str, dict] = {}
+    terminal_event_ts: dict[str, str] = {}
     terminal: dict[str, dict[str, Any]] = {}
     status: dict[str, str] = {}
     retry_dispatches: dict[str, set[str]] = defaultdict(set)
@@ -375,6 +376,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
         rid = touch(rid, e.get('ts')); kind = e.get('event')
         if kind == 'run_started': started_events.setdefault(rid, e)
         elif kind in TERMINAL_EVENTS:
+            if e.get('ts'): terminal_event_ts.setdefault(rid, str(e['ts']))
             status[rid] = TERMINAL_EVENTS[kind]; terminal[rid] = {**terminal.get(rid, {}), **{k: v for k, v in _terminal_fields(e).items() if v is not None}}
         elif kind == 'dispatch_started' and e.get('retry_of'): retry_dispatches[rid].add(str(e.get('task_id') or e.get('retry_of')))
         elif kind in {'rework', 'decision_invalidated', 'merge_conflict_resolution'}: rework_events[rid] += 1
@@ -503,6 +505,13 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
                     verdict = 'unknown'
         term = terminal.get(rid)
         elapsed_ms, elapsed_source = _elapsed(term)
+        if elapsed_ms is None:
+            # Credible lifecycle pair only: the owning process's own start stamp and the ts of the
+            # terminal event it wrote. Never first/last metric timestamps (those are not lifecycle).
+            start = _parse_ts(started_events.get(rid, {}).get('started_at'))
+            finish = _parse_ts(terminal_event_ts.get(rid))
+            if start and finish and finish >= start:
+                elapsed_ms, elapsed_source = int((finish - start).total_seconds() * 1000), 'lifecycle_timestamps'
         raw_status = status.get(rid, 'incomplete')
         # Restart reconciliation: a run with no terminal event is reclassified 'interrupted'
         # only when the run_started ownership evidence proves the owning process is gone —

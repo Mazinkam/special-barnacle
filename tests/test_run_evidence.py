@@ -579,3 +579,26 @@ class DelayedBadOutcomeSemanticsTests(unittest.TestCase):
         outcomes=[{'run_id':'rb2','task_id':'rb2-t1','outcome':'verified','regression':False,'note':'{"regression": true}'}]
         r=by_run(summarize_runs([call('rb2','rb2-t1',cost_usd=.01,cost_source='reported')],[],outcomes))['rb2']
         self.assertFalse(r['delayed_bad_outcome'])
+
+
+class LifecycleElapsedTests(unittest.TestCase):
+    def test_run_started_plus_terminal_event_ts(self):
+        events=[{'event':'run_started','run_id':'le1','started_at':'2026-09-20T10:00:00+00:00','ts':'2026-09-20T10:00:00+00:00'},
+                {'event':'run_failed','run_id':'le1','error':'x','ts':'2026-09-20T10:02:00+00:00'}]
+        r=by_run(summarize_runs([],events,[]))['le1']
+        self.assertEqual(r['elapsed_ms'],120000)
+        self.assertEqual(r['elapsed_source'],'lifecycle_timestamps')
+
+    def test_no_terminal_keeps_elapsed_unknown(self):
+        events=[{'event':'run_started','run_id':'le2','started_at':'2026-09-20T10:00:00+00:00','ts':'2026-09-20T10:00:00+00:00'}]
+        metrics=[call('le2','le2-t1',cost_usd=.01,cost_source='reported',ts='2026-09-20T11:00:00+00:00')]
+        r=by_run(summarize_runs(metrics,events,[]))['le2']
+        self.assertIsNone(r['elapsed_ms'])
+        self.assertEqual(r['elapsed_source'],'unknown')
+
+    def test_reported_elapsed_is_not_overridden(self):
+        events=[{'event':'run_started','run_id':'le3','started_at':'2026-09-20T10:00:00+00:00'},
+                {'event':'run_completed','run_id':'le3','elapsed_ms':5000,'elapsed_source':'monotonic','ts':'2026-09-20T10:09:00+00:00'}]
+        r=by_run(summarize_runs([],events,[]))['le3']
+        self.assertEqual(r['elapsed_ms'],5000)
+        self.assertEqual(r['elapsed_source'],'monotonic')
