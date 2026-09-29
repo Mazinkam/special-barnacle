@@ -50,6 +50,17 @@ describe("core/records.ts dispatchRecordsFor", () => {
 		expect(records[0].policy_id).toBeUndefined();
 	});
 
+	test("marks usage from a failed dispatch as a partial lower bound", () => {
+		const [call] = dispatchRecordsFor(opts, result({ exitCode: 1, costReported: false }));
+		expect(call.usage_scope).toBe("partial");
+		expect(call.cost_usd).toBeUndefined();
+	});
+
+	test("marks usage from a clean dispatch as final", () => {
+		const [call] = dispatchRecordsFor(opts, result());
+		expect(call.usage_scope).toBe("final");
+	});
+
 	test("flags lead_self_implemented only for a lead capability that changed files itself", () => {
 		const records = dispatchRecordsFor(opts, result({ filesChanged: ["a.ts"], stdout: "edited a.ts myself" }));
 		expect(records[0].lead_self_implemented).toBe(true);

@@ -514,6 +514,8 @@ describe("pipeline/run-orchestration.ts runOrchestration lead resume after a tra
 		if (result.kind !== "completed") return;
 		expect(result.report.dispatchOk).toBe(true);
 		expect(completedSummary?.verification_passed).toBe(true);
+		expect(completedSummary?.fix_rounds).toBe(completedSummary?.retries);
+		expect(typeof completedSummary?.fix_rounds).toBe("number");
 		expect(result.report.resumedLeadIds).toEqual(["lead-0"]);
 		// (e) A resume is not a verification retry: the QA retry counter is untouched.
 		expect(result.report.retries).toBe(0);

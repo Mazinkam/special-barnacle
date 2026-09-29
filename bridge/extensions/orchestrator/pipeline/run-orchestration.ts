@@ -1037,6 +1037,9 @@ export async function runOrchestration(
 		total_cost_usd: totalCost,
 		files_changed: allFiles,
 		retries,
+		// Quality repair rounds (QA/escalation loop iterations). `retries` is kept for existing
+		// readers; `fix_rounds` is the explicit name the evaluation reads (spec §1.3).
+		fix_rounds: retries,
 		models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
 		log_dir: session.dir,
 		// Phase 3 opt-in Forge live-QA stage (T1): the `live_qa` key itself is present ONLY when

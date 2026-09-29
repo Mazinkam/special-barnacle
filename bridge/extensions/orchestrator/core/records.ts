@@ -193,6 +193,9 @@ export function dispatchRecordsFor(
 		output_tokens: usage.output ?? 0,
 		...(hasReportedCost ? { cost_usd: result.costUsd, cost_source: "reported" } : {}),
 		duration_ms: result?.durationMs ?? 0,
+		// A non-zero exit means the child may have died before its final usage report: tokens
+		// seen are a lower bound, not the call's full usage (spec §1.2).
+		usage_scope: result?.exitCode === 0 ? "final" : "partial",
 		result: result?.exitCode === 0 ? "pass" : "fail",
 		stop_reason: result?.stopReason,
 		files_changed: result?.filesChanged ?? [],
