@@ -18,6 +18,11 @@
         "performance_review": "gpt-6-sol",
         "api_contract_review": "gpt-6-sol",
         "security_review": "astra"
+      },
+      "backups": {
+        "lead": ["fable-5-1"],
+        "technical_review": ["sonnet-5"],
+        "security_review": ["fable-5-1"]
       }
     },
     "anthropic": {

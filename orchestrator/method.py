@@ -86,7 +86,54 @@ def _validate(m: dict[str, Any]) -> None:
     cap = m["rules"].get("dispatch_spend_cap")
     if cap and cap["mode"] not in ("off", "warn", "enforce"):
         raise ValueError(f"method.json: dispatch_spend_cap has unknown mode {cap['mode']!r}")
+    _validate_model_rules(m)
     _validate_rule_efforts_and_tiers(m["rules"], efforts, tiers)
+
+
+def _positive_int(value: Any, where: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"method.json: {where} must be a positive integer, got {value!r}")
+
+
+def _validate_model_rules(m: dict[str, Any]) -> None:
+    rules = m["rules"]
+    if "model_requirements" in rules:
+        mr = rules["model_requirements"]
+        if not isinstance(mr, dict) or not isinstance(mr.get("default"), dict):
+            raise ValueError("method.json: model_requirements.default must be a dict")
+        groups = mr.get("groups", {})
+        if not isinstance(groups, dict):
+            raise ValueError("method.json: model_requirements.groups must be a dict")
+        specs = [("model_requirements.default", mr["default"])] + [(f"model_requirements.groups.{name}", group) for name, group in groups.items()]
+        for where, spec in specs:
+            _positive_int(spec.get("min_context"), f"{where}.min_context")
+            _positive_int(spec.get("min_output"), f"{where}.min_output")
+            if not isinstance(spec.get("effort_control", False), bool):
+                raise ValueError(f"method.json: {where}.effort_control must be a boolean")
+        seen: dict[str, str] = {}
+        for name, group in groups.items():
+            capabilities = group.get("capabilities")
+            if not isinstance(capabilities, list):
+                raise ValueError(f"method.json: model_requirements.groups.{name!r}.capabilities must be a list")
+            for cap in capabilities:
+                if not isinstance(cap, str):
+                    raise ValueError(f"method.json: model_requirements group {name!r} has non-string capability {cap!r}")
+                if cap not in m["capabilities"]:
+                    raise ValueError(f"method.json: model_requirements group {name!r} names undeclared capability {cap!r}")
+                if cap in seen:
+                    raise ValueError(f"method.json: capability {cap!r} is in groups {seen[cap]!r} and {name!r}")
+                seen[cap] = name
+    if "model_failover" in rules:
+        mf = rules["model_failover"]
+        if not isinstance(mf, dict):
+            raise ValueError("method.json: model_failover must be a dict")
+        for key in ("unhealthy_ms", "same_model_retry_delay_ms", "max_wait_ms", "max_switches", "real_work_min_tool_calls"):
+            _positive_int(mf.get(key), f"model_failover.{key}")
+        schedule = mf.get("wait_schedule_ms")
+        if not isinstance(schedule, list) or not schedule:
+            raise ValueError("method.json: model_failover.wait_schedule_ms must be a non-empty list")
+        for i, delay in enumerate(schedule):
+            _positive_int(delay, f"model_failover.wait_schedule_ms[{i}]")
 
 
 def _validate_rule_efforts_and_tiers(node: Any, efforts: set[str], tiers: set[str], path: str = "rules") -> None:

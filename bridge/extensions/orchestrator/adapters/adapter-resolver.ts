@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto";
 
 import {
+	ALL_CAPABILITIES,
 	type AliasTable,
 	type AvailableModel,
 	type Binding,
@@ -31,11 +32,14 @@ import {
 	type Tier,
 	TIER_CAPABILITIES,
 	tiersToBindings,
+	tierOf,
 } from "../models.ts";
 import { emptyOverrides, type ModelOverrides } from "../core/args.ts";
 import type { LoadedProfiles } from "./profiles-store.ts";
 // Use the canonical file; Bun --isolate can load the bridge symlink as an empty JSON module.
 import profilesFile from "../../../orchestrator-profiles.json";
+import { buildCatalog, type ModelFacts } from "./model-catalog.ts";
+import { resolveCandidates, type Candidate } from "./model-router.ts";
 
 export type Adapter = Record<string, Binding>;
 
@@ -121,6 +125,7 @@ export interface FullResolution extends ResolvedAdapter {
 	profiles: LoadedProfiles;
 	table: AliasTable;
 	preference: string[];
+	candidates?: Record<string, Candidate[]>;
 }
 
 export interface ResolveAdapterDeps {
@@ -129,6 +134,7 @@ export interface ResolveAdapterDeps {
 	loadProfiles: () => LoadedProfiles;
 	availableModels: () => AvailableModel[];
 	dynamicCli: DynamicAdapterCli;
+	modelFacts?: Record<string, ModelFacts>;
 }
 
 /**
@@ -166,6 +172,16 @@ export async function resolveAdapter(
 		{ source: "fallback", bindings: FALLBACK_ADAPTER },
 	];
 	const merged = mergeLayers(layers, table, preference, profile?.effort ?? {}, overrides.effort);
+	const catalog = buildCatalog(table.models, deps.modelFacts);
+	const tierPrimaries: Partial<Record<Tier, string>> = {};
+	for (const [capability, binding] of Object.entries(merged.adapter)) {
+		const tier = tierOf(capability);
+		if (tier && !tierPrimaries[tier]) tierPrimaries[tier] = binding.model;
+	}
+	const candidates = Object.fromEntries(ALL_CAPABILITIES.flatMap((capability) => {
+		const primary = merged.adapter[capability]?.model;
+		return primary ? [[capability, resolveCandidates({ capability, primary, backups: profile?.backups, tierPrimaries, adapter: merged.adapter, table, preference, catalog })]] : [];
+	}));
 	// Fallback/dynamic specs are canonical already but may name models the user
 	// has not configured; those show up as non-user warnings and are informational.
 	return {
@@ -175,5 +191,6 @@ export async function resolveAdapter(
 		profiles,
 		table,
 		preference,
+		candidates,
 	};
 }

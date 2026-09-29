@@ -2,16 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { availableModels } from "./model-registry.ts";
 import type { ExtensionContext } from "@humain/terminal";
 
-function ctxWith(getAvailable: () => Array<{ provider: string; id: string; name: string }>): ExtensionContext {
+function ctxWith(getAvailable: () => Array<{ provider: string; id: string; name: string; contextWindow?: number; maxTokens?: number; reasoning?: boolean }>): ExtensionContext {
 	return { modelRegistry: { getAvailable } } as unknown as ExtensionContext;
 }
 
 describe("availableModels", () => {
-	test("maps provider/id/name off the live model registry", () => {
+	test("maps identity and qualification facts off the live model registry", () => {
 		const ctx = ctxWith(() => [
-			{ provider: "anthropic", id: "claude-x", name: "Claude X", extra: "ignored" as never },
+			{ provider: "anthropic", id: "claude-x", name: "Claude X", contextWindow: 200_000, maxTokens: 32_000, reasoning: true, extra: "ignored" as never },
 		]);
-		expect(availableModels(ctx)).toEqual([{ provider: "anthropic", id: "claude-x", name: "Claude X" }]);
+		expect(availableModels(ctx)).toEqual([{ provider: "anthropic", id: "claude-x", name: "Claude X", contextWindow: 200_000, maxTokens: 32_000, reasoning: true }]);
 	});
 
 	test("returns an empty list when the registry throws", () => {

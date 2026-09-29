@@ -426,6 +426,8 @@ export async function runSubagentProcess(opts: {
 	capability?: string;
 	/** Nesting depth for the widget (0 = top-level, 1 = child of a lead, etc.). */
 	depth?: number;
+	/** Earlier spend from superseded attempts of this same logical dispatch. */
+	spendCapOffsetUsd?: number;
 	/** Test seam for deterministic progress/absolute timeout coverage. */
 	leadTimeouts?: { inactivityMs: number; maxMs: number };
 	/**
@@ -802,13 +804,13 @@ export async function runSubagentProcess(opts: {
 				// (stopReason "stop") is only warned about: killing it would throw away
 				// a finished report to save nothing.
 				if (delta.turn.hadUsage) {
-					const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar()) ?? "ok";
+					const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar() + (opts.spendCapOffsetUsd ?? 0)) ?? "ok";
 					if (verdict !== "ok") handleSpendCap(verdict === "stop" && delta.turn.stopReason === "stop" ? "warn" : verdict);
 				}
 			}
 			if (nestedCost.observe(event)) {
 				session?.setNestedCost(taskId, nestedCost.total());
-				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar()) ?? "ok";
+				const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar() + (opts.spendCapOffsetUsd ?? 0)) ?? "ok";
 				if (verdict !== "ok") handleSpendCap(verdict);
 			}
 			// Post-end grace (A5/N1a): agent_end or an error-stopReason turn arms
@@ -962,11 +964,12 @@ export async function runSubagentProcess(opts: {
 			if (settled || cancelledByListener) return;
 			const capability = opts.capability ?? "unknown";
 			const cap = capFor(capability);
-			const message = `spend cap $${cap.toFixed(2)} for ${capability} exceeded by ${taskId} at $${spentSoFar().toFixed(4)}${nestedCost.total() > 0 ? ` ($${nestedCost.total().toFixed(4)} in its subagents)` : ""}`;
+			const cumulativeSpend = spentSoFar() + (opts.spendCapOffsetUsd ?? 0);
+			const message = `spend cap $${cap.toFixed(2)} for ${capability} exceeded by ${taskId} at $${cumulativeSpend.toFixed(4)}${nestedCost.total() > 0 ? ` ($${nestedCost.total().toFixed(4)} in its subagents)` : ""}`;
 			session?.log(`${message} (${verdict === "stop" ? "stopping it" : "warn only"})`);
 			recordEvent("spend_cap_exceeded", {
 				run_id: session?.runId, task_id: taskId, capability, model: opts.model,
-				cap_usd: cap, cost_usd: spentSoFar(), nested_cost_usd: nestedCost.total(), action: verdict,
+				cap_usd: cap, cost_usd: cumulativeSpend, nested_cost_usd: nestedCost.total(), action: verdict,
 			});
 			session?.ctx.ui?.notify?.(`${message}${verdict === "stop" ? " — stopping it" : ""}`, "warning");
 			if (verdict !== "stop") return;

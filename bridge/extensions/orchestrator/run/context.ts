@@ -21,6 +21,8 @@ import type { RunTags } from "../core/records.ts";
 import type { RunCancellation } from "../cancellation.ts";
 import type { QueueStats } from "../record-queue.ts";
 import type { RunTiming } from "./session.ts";
+import type { Candidate } from "../adapters/model-router.ts";
+import type { ModelHealth } from "./model-health.ts";
 export type PendingCheckRow = { provider: "gitlab" | "github"; id: string; outcome: "pending" | "success" | "failure" | "unverified"; mr?: string };
 
 /**
@@ -83,6 +85,10 @@ export interface RunContext<TSession> {
 	 * built by tests before this field existed keep typechecking.
 	 */
 	readonly modelSources?: Record<string, BindingSource> | null;
+	/** Resolved, qualification-checked model alternatives shared by dispatches in this run. */
+	readonly candidates?: Record<string, Candidate[]>;
+	/** Provider failures mark models unhealthy for later dispatches in this run only. */
+	readonly modelHealth?: ModelHealth;
 }
 
 /**
@@ -120,9 +126,10 @@ export class RunRegistry<TSession> {
 		tags: RunTags = {},
 		aliasTable: AliasTable | null = null,
 		modelSources: Record<string, BindingSource> | null = null,
+		routing?: { candidates: Record<string, Candidate[]>; modelHealth: ModelHealth },
 	): RunContext<TSession> | null {
 		if (this.current) return null;
-		this.current = { session, tags, aliasTable, modelSources };
+		this.current = { session, tags, aliasTable, modelSources, ...routing };
 		return this.current;
 	}
 
