@@ -195,16 +195,15 @@ def test_backfill_bedrock_host_and_undated_evidence_never_create_precise_windows
         '2026-09-26T10:01:00Z ECONNRESET https://user:secret@bedrock-runtime.eu-west-2.amazonaws.com/path\n'
         '2026-09-26T10:02:00Z fetch failed https://bedrock-runtime.eu-west-2.amazonaws.com.evil.test/path\n'
     )
-    assert backfill(root, write=True)['persisted'] == 6
+    # Undated lines are no longer emitted; only the three dated ones are.
+    assert backfill(root, write=True)['persisted'] == 3
     assert backfill(root, write=True)['persisted'] == 0
     rows = [json.loads(line) for line in (root / 'events.jsonl').read_text().splitlines()]
+    assert all('timestamp_precision' not in row for row in rows)
     assert rows[0]['provider'] == 'amazon-bedrock'
     assert rows[0]['endpoint_host'] == 'bedrock-runtime.eu-west-2.amazonaws.com'
-    assert rows[0]['timestamp_precision'] == 'unknown'
-    assert 'first_ts' not in rows[0] and 'last_ts' not in rows[0]
-    assert rows[3]['provider'] == 'amazon-bedrock'
-    assert rows[3]['first_ts'] == '2026-09-26T10:00:00Z'
-    assert rows[1]['provider'] == rows[2]['provider'] == rows[4]['provider'] == rows[5]['provider'] == 'unknown'
+    assert rows[0]['first_ts'] == '2026-09-26T10:00:00Z'
+    assert rows[1]['provider'] == rows[2]['provider'] == 'unknown'
     assert all('private' not in str(row) and 'secret' not in str(row) and 'evil.test' not in str(row) for row in rows)
     panel = provider_health(rows, now=datetime(2026, 9, 27, tzinfo=timezone.utc))
     assert panel['outage_windows'] == [{
@@ -235,13 +234,14 @@ def test_backfill_matches_pending_stream_has_been_canceled(tmp_path: Path):
     root = tmp_path / 'state'
     run = root / 'runs' / 'r1'
     run.mkdir(parents=True)
-    (run / 'run.log').write_text('Error: pending stream has been canceled\n')
+    (run / 'run.log').write_text('Error: pending stream has been canceled\n'
+                                 '2026-09-26T10:00:00Z Error: pending stream has been canceled\n')
     assert backfill(root) == {'candidates': 1, 'persisted': 0}
     assert backfill(root, write=True)['persisted'] == 1
     record = json.loads((root / 'events.jsonl').read_text().splitlines()[0])
     assert record['error_code'] == 'stream_canceled'
-    assert record['timestamp_precision'] == 'unknown'
-    assert 'first_ts' not in record and 'last_ts' not in record
+    assert 'timestamp_precision' not in record
+    assert record['first_ts'] == record['last_ts'] == '2026-09-26T10:00:00Z'
 
 
 def test_backfill_refuses_resolved_live_root_alias_before_read_or_write(tmp_path: Path, monkeypatch):
@@ -271,3 +271,147 @@ def test_backfill_refuses_symlinked_logs_and_write_without_explicit_directory(tm
                             capture_output=True, text=True, check=False)
     assert result.returncode != 0
     assert '--state-dir is required' in result.stderr
+
+
+ENOTFOUND_MESSAGE = {
+    'role': 'assistant', 'api': 'bedrock-converse-stream', 'provider': 'amazon-bedrock',
+    'model': 'global.anthropic.claude-sonnet-5', 'stopReason': 'error', 'timestamp': 1790459367376,
+    'content': [],
+    'errorMessage': 'The pending stream has been canceled (caused by: getaddrinfo ENOTFOUND '
+                    'bedrock-runtime.eu-west-2.amazonaws.com)',
+}
+
+
+def _events(path: Path, events: list) -> None:
+    path.write_text(''.join(json.dumps(event) + '\n' for event in events))
+
+
+def _rows(root: Path) -> list[dict]:
+    return [json.loads(line) for line in (root / 'events.jsonl').read_text().splitlines()]
+
+
+def test_structured_backfill_dedupes_repeated_top_level_error_message(tmp_path: Path):
+    root = tmp_path / 'state'
+    run = root / 'runs' / 'run-a'
+    run.mkdir(parents=True)
+    _events(run / 'run-a-lead-0.events.jsonl', [
+        {'type': 'message_start', 'message': ENOTFOUND_MESSAGE},
+        {'type': 'message_end', 'message': ENOTFOUND_MESSAGE},
+        {'type': 'turn_end', 'message': ENOTFOUND_MESSAGE, 'toolResults': []},
+        {'type': 'agent_end', 'messages': [{'role': 'user', 'content': 'hi'}, ENOTFOUND_MESSAGE]},
+        'not json at all',
+    ])
+    (run / 'run-a-lead-0.events.jsonl').open('a').write('{broken json\n')
+    # Structured evidence exists for this run, so its dated text lines are not double-counted.
+    (run / 'run.log').write_text('2026-09-26T21:49:27Z getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com)\n')
+    assert backfill(root) == {'candidates': 1, 'persisted': 0}
+    assert backfill(root, write=True)['persisted'] == 1
+    row, = _rows(root)
+    assert row['ts'] == row['first_ts'] == row['last_ts'] == '2026-09-26T21:49:27.376Z'
+    assert row['endpoint_host'] == 'bedrock-runtime.eu-west-2.amazonaws.com'
+    assert row['provider'] == 'amazon-bedrock'
+    assert row['model'] == 'global.anthropic.claude-sonnet-5'
+    assert row['error_code'] == 'ENOTFOUND'
+    assert row['nested'] is False
+    assert row['task_id'] == 'run-a-lead-0' and row['run_id'] == 'run-a'
+    assert row['source'] == 'legacy_provider_backfill' and row['count'] == 1
+    assert 'timestamp_precision' not in row
+    assert 'pending stream' not in json.dumps(row) and 'errorMessage' not in row
+    from orchestrator.presentation.dashboard_data import provider_health
+    window, = provider_health(_rows(root), now=datetime(2026, 9, 27, tzinfo=timezone.utc))['outage_windows']
+    assert window['start'] == '2026-09-26T21:49:27.376000+00:00'
+    assert window['endpoint_host'] == 'bedrock-runtime.eu-west-2.amazonaws.com'
+
+
+def test_structured_backfill_marks_worker_results_nested(tmp_path: Path):
+    root = tmp_path / 'state'
+    run = root / 'runs' / 'run-b'
+    run.mkdir(parents=True)
+    codex = {'role': 'assistant', 'provider': 'openai-codex', 'model': 'gpt-6', 'stopReason': 'error',
+             'timestamp': 1790459400000, 'errorMessage': 'fetch failed'}
+    worker = {'details': {'results': [{'messages': [codex]}]}}
+    _events(run / 'run-b-lead-0.events.jsonl', [
+        {'type': 'tool_execution_end', 'result': worker},
+        {'type': 'message_end', 'message': {'role': 'toolResult', **worker}},
+        {'type': 'turn_end', 'toolResults': [worker]},
+    ])
+    assert backfill(root, write=True)['persisted'] == 1
+    row, = _rows(root)
+    assert row['nested'] is True
+    assert row['provider'] == 'openai-codex' and row['error_code'] == 'fetch_failed'
+    assert 'endpoint_host' not in row
+
+
+def test_structured_backfill_ignores_text_mentions_and_untimestamped_messages(tmp_path: Path):
+    root = tmp_path / 'state'
+    run = root / 'runs' / 'run-c'
+    run.mkdir(parents=True)
+    mention = {'role': 'assistant', 'provider': 'amazon-bedrock', 'model': 'm', 'stopReason': 'stop',
+               'timestamp': 1790459367376,
+               'content': [{'type': 'text', 'text': 'getaddrinfo ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com'}],
+               'errorMessage': 'getaddrinfo ENOTFOUND'}
+    tool_output = {'role': 'toolResult', 'stopReason': 'error', 'timestamp': 1790459367376,
+                   'errorMessage': 'ENOTFOUND', 'content': [{'type': 'text', 'text': 'ENOTFOUND'}]}
+    untimestamped = [{**ENOTFOUND_MESSAGE, 'timestamp': value} for value in ('1790459367376', 1790459367.5, True, 5)]
+    no_ts = {key: value for key, value in ENOTFOUND_MESSAGE.items() if key != 'timestamp'}
+    _events(run / 'run-c-lead-0.events.jsonl', [
+        {'type': 'message_end', 'message': mention},
+        {'type': 'message_end', 'message': tool_output},
+        {'type': 'tool_execution_update', 'partialResult': {'details': {'results': [{'messages': [no_ts]}]}}},
+        *({'type': 'message_end', 'message': message} for message in untimestamped),
+    ])
+    assert backfill(root) == {'candidates': 0, 'persisted': 0}
+
+
+def test_text_logs_emit_only_dated_lines_when_run_has_no_structured_rows(tmp_path: Path):
+    root = tmp_path / 'state'
+    run = root / 'runs' / 'run-d'
+    run.mkdir(parents=True)
+    _events(run / 'run-d-lead-0.events.jsonl', [{'type': 'message_end', 'message': {'role': 'assistant', 'content': []}}])
+    (run / 'run.log').write_text('ENOTFOUND bedrock-runtime.eu-west-2.amazonaws.com\nfetch failed\n')
+    (run / 'lead.stderr.log').write_text('ECONNRESET\n2026-09-26T10:00:00Z ECONNRESET\n')
+    assert backfill(root, write=True)['persisted'] == 1
+    row, = _rows(root)
+    assert row['error_code'] == 'ECONNRESET' and row['first_ts'] == '2026-09-26T10:00:00Z'
+    assert 'timestamp_precision' not in row
+
+
+def test_structured_backfill_second_write_is_idempotent(tmp_path: Path):
+    root = tmp_path / 'state'
+    run = root / 'runs' / 'run-e'
+    run.mkdir(parents=True)
+    later = {**ENOTFOUND_MESSAGE, 'timestamp': ENOTFOUND_MESSAGE['timestamp'] + 60_000}
+    _events(run / 'run-e-qa.events.jsonl', [{'type': 'message_end', 'message': ENOTFOUND_MESSAGE},
+                                            {'type': 'message_end', 'message': later}])
+    assert backfill(root, write=True) == {'candidates': 2, 'persisted': 2}
+    assert backfill(root, write=True) == {'candidates': 2, 'persisted': 0}
+    assert len(_rows(root)) == 2
+
+
+def test_structured_backfill_skips_oversized_lines_and_symlinked_event_files(tmp_path: Path, monkeypatch):
+    from scripts import backfill_provider_errors as module
+    monkeypatch.setattr(module, 'MAX_LINE_BYTES', 4096)
+    root = tmp_path / 'state'
+    run = root / 'runs' / 'run-f'
+    run.mkdir(parents=True)
+    huge = {'type': 'message_end', 'message': ENOTFOUND_MESSAGE, 'pad': 'x' * (module.MAX_LINE_BYTES + 10)}
+    later = {**ENOTFOUND_MESSAGE, 'timestamp': ENOTFOUND_MESSAGE['timestamp'] + 1}
+    _events(run / 'run-f-lead-0.events.jsonl', [huge, {'type': 'message_end', 'message': later}])
+    outside = tmp_path / 'outside.events.jsonl'
+    _events(outside, [{'type': 'message_end', 'message': ENOTFOUND_MESSAGE}])
+    (run / 'escaped.events.jsonl').symlink_to(outside)
+    assert backfill(root, write=True)['persisted'] == 1
+    row, = _rows(root)
+    assert row['ts'] == '2026-09-26T21:49:27.377Z'
+
+
+def test_backfill_script_runs_without_pythonpath(tmp_path: Path):
+    import os
+    root = tmp_path / 'state'
+    (root / 'runs' / 'run-g').mkdir(parents=True)
+    env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+    script = Path(__file__).resolve().parents[1] / 'scripts' / 'backfill_provider_errors.py'
+    result = subprocess.run([sys.executable, str(script), '--state-dir', str(root)],
+                            capture_output=True, text=True, check=False, env=env, cwd=tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "'candidates': 0" in result.stdout

@@ -50,4 +50,10 @@ Note: the script needs `PYTHONPATH=.`. Provider health shows ONE Bedrock eu-west
 3. N3: covered by main's failover (lead/QA go through `dispatchWithFailover`); no gap.
 4. `3ca717d` has not been independently reviewed beyond the 2-round cap.
 5. Unexplained inactivity timeouts are now telemetry `provider_stall`, and the dashboard counts them as provider failures; confirm that this is intended.
-6. Operator steps: after merging, open a fresh HUMAIN Terminal or run `/reload`; run `PYTHONPATH=. python3 scripts/backfill_provider_errors.py --state-dir ~/.local/state/coding-agent-orchestrator` (dry-run), then add `--write`; push main when satisfied.
+6. Operator steps: after merging, open a fresh HUMAIN Terminal or run `/reload`; run `python3 scripts/backfill_provider_errors.py --state-dir ~/.local/state/coding-agent-orchestrator` (dry-run), then add `--write` (note that `--write` refuses the live default root, so write a copy or an explicitly chosen non-default state dir); push main when satisfied.
+
+## Follow-up: structured backfill
+
+Option A is implemented: `scripts/backfill_provider_errors.py` now reads the harness's structured error fields in `runs/*/*.events.jsonl`. It uses assistant messages with `stopReason: "error"`, an `errorMessage` and an epoch-ms `timestamp`, and never model text. Rows are de-duplicated per file, carry exact timestamps, and get `nested: true` under `details.results`. Undated text-log lines are dropped. Dated text lines count only for runs without structured rows. `PYTHONPATH=.` is no longer needed.
+
+On a fresh copy (`/tmp/orch-state-copy`) the dry-run found 60 candidates. The first `--write` persisted 60 and the second persisted 0. The regenerated dashboard lists Bedrock `bedrock-runtime.eu-west-2.amazonaws.com` ENOTFOUND windows on 2026-09-26 (21:49:27Z–21:49:29Z, run `vcy00z`) and on 2026-09-27 (11 windows, 08:10Z–19:58Z).
