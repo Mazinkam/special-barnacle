@@ -139,6 +139,20 @@ The highest-capability lead receives those compact evidence packets and owns syn
 
 Skip reconnaissance for a low-risk, well-localized change. Use only the workers needed to remove a specific uncertainty; they do not make implementation decisions.
 
+### Rule 6: Workflow levels
+
+`method.json` `rules.workflow_policy` picks a workflow level from observable repository evidence, not from the triage complexity score. Levels: `direct` (one implementer + deterministic checks), `checked` (direct + one independent review), `led` and `full` (the coordinated pipeline; `full` is a floor nothing can lower). A repo with no discovered checks is never routed `direct`; its floor is raised to `checked`, so `--workflow direct` is rejected there.
+
+| Evidence | Level |
+|---|---|
+| explicit high/critical risk, or any `risk_path_globs` hit | full (hard floor) |
+| interface change across packages | full |
+| 4 or more candidate files, 3 or more packages, or unresolved scope | led |
+| exactly one low-risk file with adjacent tests and discovered checks, no interface change | direct |
+| anything else | checked |
+
+`mode` is `off` by default; `HUMAIN_ORCHESTRATOR_WORKFLOW_MODE=off|observe|enforce` overrides it. `observe` records `workflow_level_planned` and runs today's pipeline. `enforce` runs `direct`/`checked` with `fix_rounds_per_level` repair rounds, then escalates to `led` carrying the working tree, prior cost and feedback (`workflow_level_escalated`). `led` and `full` both run the coordinated pipeline in this phase. A direct/checked attempt that escalates keeps the pre-run git snapshot so QA still covers its files. `--workflow <level>` may raise the level, never lower it below the floor. `investigation` and `qa_verification` tasks are never run flat.
+
 ## Toggle classes
 
 Use consistent state types:

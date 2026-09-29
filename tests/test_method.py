@@ -80,6 +80,14 @@ class TestMethod(unittest.TestCase):
             self.assertRegex(text, rf"\|\s*{band['min']}[–-]{band['max']}\s*\|\s*{band['workers']}\s*\|")
         self.assertIn("orchestrator/method.json", text)
 
+    def test_skill_md_quotes_workflow_policy(self):
+        text = (ROOT / "SKILL.md").read_text()
+        wf = method.load_method()["rules"]["workflow_policy"]
+        self.assertIn("rules.workflow_policy", text)
+        self.assertIn(f"{wf['thresholds']['led_min_files']} or more candidate files", text)
+        self.assertIn(f"{wf['thresholds']['led_min_packages']} or more packages", text)
+        self.assertIn("HUMAIN_ORCHESTRATOR_WORKFLOW_MODE", text)
+
     def test_lead_capabilities_and_tiers(self):
         self.assertEqual(method.tier_of("lead_small"), "mid")
         self.assertEqual(method.tier_of("lead"), "premium")
