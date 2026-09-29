@@ -58,6 +58,7 @@ import os
 import socket
 
 from . import records
+from .outcomes import bad_signal
 from .economics import REPORTED, ESTIMATED, UNMETERED, cost_class, has_reported_tokens, is_call_row, is_session_ingest, row_cost, unique_records
 #: `run_evidence.py`'s historical `_parse_ts`: falsy guard, then `str()` coercion —
 #: `vocab.parse_iso_ts`'s default (`coerce_str=True`) reproduces this exactly.
@@ -389,7 +390,9 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
         rid = o.get('run_id')
         if rid is None: continue
         rid = touch(rid, o.get('ts')); tid = str(o.get('task_id') or '')
-        if any(o.get(k) for k in BAD_OUTCOME_KEYS): delayed_bad[rid] = True
+        # One definition of "bad" across run evidence, history and the dashboard: typed top-level
+        # fields win, JSON-in-note is the fallback (`outcomes.bad_signal`).
+        if bad_signal(o): delayed_bad[rid] = True
         if tid in TERMINAL_OUTCOME_TASKS:
             status[rid] = TERMINAL_OUTCOME_TASKS[tid]
             terminal[rid] = {**terminal.get(rid, {}), **{k: v for k, v in _terminal_fields(o).items() if v is not None}}

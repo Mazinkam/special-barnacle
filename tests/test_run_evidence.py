@@ -567,3 +567,15 @@ class RestartReconciliationTests(unittest.TestCase):
         from orchestrator.run_evidence import classify_liveness
         self.assertIsNone(classify_liveness(None))
         self.assertIsNone(classify_liveness({}))
+
+
+class DelayedBadOutcomeSemanticsTests(unittest.TestCase):
+    def test_note_json_regression_marks_run_bad(self):
+        outcomes=[{'run_id':'rb1','task_id':'rb1-t1','outcome':'verified','note':'{"regression": true}'}]
+        r=by_run(summarize_runs([call('rb1','rb1-t1',cost_usd=.01,cost_source='reported')],[],outcomes))['rb1']
+        self.assertTrue(r['delayed_bad_outcome'])
+
+    def test_explicit_top_level_false_wins_over_note(self):
+        outcomes=[{'run_id':'rb2','task_id':'rb2-t1','outcome':'verified','regression':False,'note':'{"regression": true}'}]
+        r=by_run(summarize_runs([call('rb2','rb2-t1',cost_usd=.01,cost_source='reported')],[],outcomes))['rb2']
+        self.assertFalse(r['delayed_bad_outcome'])
