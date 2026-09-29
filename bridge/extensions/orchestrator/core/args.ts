@@ -14,6 +14,7 @@ import {
 	type LeadSize,
 	THINKING_LEVELS,
 	type Tier,
+	type WorkflowLevel,
 } from "../models.ts";
 import { isLeadSize } from "../lead-sizing.ts";
 
@@ -48,6 +49,7 @@ export interface OrchestrateArgs {
 	models: ModelOverrides;
 	/** `--lead-size small|standard|large`: overrides triage sizing and the risk floor. */
 	leadSize?: LeadSize;
+	workflowLevel?: WorkflowLevel;
 	/**
 	 * `--context <file>` (repeatable), raw as given on the command line — resolved against the
 	 * run's cwd and read by `commands/orchestrate.ts` (docs/architecture-review.md C6). This module
@@ -118,7 +120,7 @@ const KNOWN_FLAGS = new Set([
 	"--task-class", "--complexity", "--risk", "--quality-floor", "--cost-aggressiveness",
 	"--fan-out", "--max-retries", "--interactive", "--context", "--with-last-reply",
 	"--force", "--live-qa", "--no-live-qa", "--live-qa-adapter", "--live-qa-scope",
-	"--yes", "-y", "--check", "--live", "--profile", "--lead-size", "--effort",
+	"--yes", "-y", "--check", "--live", "--profile", "--lead-size", "--workflow", "--effort",
 	"--cheap", "--mid", "--premium", "--frontier", "--model",
 ]);
 
@@ -228,6 +230,12 @@ function consumeFlag(tokens: string[], start: number, out: OrchestrateArgs): num
 			case "--lead-size": {
 				if (next && isLeadSize(next)) out.leadSize = next;
 				else out.unknownFlags.push(next ? `--lead-size ${next} (expected small|standard|large)` : "--lead-size (missing value)");
+				if (next) i++;
+				break;
+			}
+			case "--workflow": {
+				if (next && ["direct", "checked", "led", "full"].includes(next)) out.workflowLevel = next as WorkflowLevel;
+				else out.unknownFlags.push(`--workflow ${next ?? ""}`.trim());
 				if (next) i++;
 				break;
 			}
