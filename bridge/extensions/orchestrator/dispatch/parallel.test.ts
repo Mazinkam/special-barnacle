@@ -184,9 +184,40 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 					return models.length === 1 ? proc({ exitCode: 1, stderr: "Service unavailable (503)" }) : proc({ model: opts.model });
 				},
 			});
-		expect(models).toEqual(["amazon-bedrock/global.anthropic.claude-opus-5-5", "openai-codex/gpt-6-astra"]);
+			expect(models).toEqual(["amazon-bedrock/global.anthropic.claude-opus-5-5", "openai-codex/gpt-6-astra"]);
 		expect(result.model).toBe("openai-codex/gpt-6-astra");
 		expect(events.some(([name, payload]) => name === "route_degraded" && payload.class === "transient")).toBe(true);
+	});
+
+	test("failover from A (transient 503/ECONNRESET) to B (succeeds): provider_error carries A's identity, the final dispatch_finished carries B's", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const models: string[] = [];
+		const [result] = await dispatchParallel(process.cwd(), "run", task(""),
+			{ security_review: { model: "vendor-a/model-a" } }, {} as never, null, 0, {
+				recordEvent: (event, payload) => { events.push([event, payload]); },
+				maxConcurrentDispatches: 1,
+				candidates: { security_review: [
+					{ model: "vendor-a/model-a", spec: "primary", source: "primary", qualified: true, reasons: [], effortControl: true },
+					{ model: "vendor-b/model-b", spec: "backup", source: "backup", qualified: true, reasons: [], effortControl: true },
+				] },
+				sleep: async () => {},
+				runProcess: async (opts) => {
+					models.push(opts.model);
+					return models.length === 1
+						? proc({ exitCode: 1, outcome: "failed", stderr: "read ECONNRESET" })
+						: proc({ model: opts.model });
+				},
+			});
+		expect(models).toEqual(["vendor-a/model-a", "vendor-b/model-b"]);
+		expect(result.model).toBe("vendor-b/model-b");
+		const providerErrorEvents = events.filter(([name]) => name === "provider_error").map(([, payload]) => payload);
+		expect(providerErrorEvents).toHaveLength(1);
+		expect(providerErrorEvents[0]).toMatchObject({ provider: "vendor-a", model: "model-a", error_code: "ECONNRESET" });
+		const finished = events.filter(([name]) => name === "dispatch_finished").map(([, payload]) => payload);
+		expect(finished).toHaveLength(2);
+		expect(finished[0]).toMatchObject({ provider: "vendor-a", provider_model: "model-a", failure_class: "transient", superseded_by_fallback: true });
+		const final = finished.find((f) => !f.superseded_by_fallback);
+		expect(final).toMatchObject({ outcome: "completed", provider: "vendor-b", provider_model: "model-b" });
 	});
 });
 

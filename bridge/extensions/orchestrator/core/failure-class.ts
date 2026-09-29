@@ -10,6 +10,15 @@ import { isQuotaError } from "../provider-fallback.ts";
 
 export type FailureClass = "ok" | "cancelled" | "quota" | "transient" | "stall" | "task";
 
+/**
+ * The vocabulary telemetry (`provider_error`/`dispatch_finished`'s `failure_class` field;
+ * see contract.json's `failure_class_values`) uses instead of `FailureClass`. This is a
+ * pure rename/refinement of `classifyFailure`'s decision, never a second rule table: every
+ * value here is derived from a `FailureClass` plus whether the attempt timed out (see
+ * `telemetryFailureClass`), not from re-running any pattern match of its own.
+ */
+export type TelemetryFailureClass = "cancelled" | "quota" | "transient" | "provider_stall" | "task";
+
 export interface AttemptSignals {
 	exitCode: number;
 	outcome: string;
@@ -20,9 +29,6 @@ export interface AttemptSignals {
 	toolInFlight: boolean;
 	cancelled: boolean;
 }
-
-export const TRANSIENT_ERROR_RE =
-	/service unavailable|\b5\d\d\b|overloaded|pending stream has been canceled|stream ended without a stop reason|fetch failed|ECONNRESET|ETIMEDOUT|socket hang up|throttl/i;
 
 const ORCHESTRATOR_LINE_RE =
 	/^\s*(\[orchestrator\]|⚠|taskId:|elapsedMs:|sinceLastProgressMs:|turns:|toolCalls:|repeatedToolCalls:|lastProgress:|nestedWorkers:|verified:|partialText:)/;
@@ -60,6 +66,33 @@ export function classifyFailure(s: AttemptSignals): FailureClass {
 	if (isTransientProviderError(text)) return "transient";
 	if (s.outcome === "timed_out" && s.timeoutReason === "inactivity" && !s.toolInFlight) return "stall";
 	return "task";
+}
+
+/**
+ * Rename layer from `classifyFailure`'s failover decision to the telemetry vocabulary
+ * (`provider_error`/`dispatch_finished`'s `failure_class`, contract.json's
+ * `failure_class_values`). `timedOut` distinguishes the two shapes telemetry has
+ * historically split "transient"/"stall" into: a transient provider error that also
+ * happened to time out reads as `provider_stall` (the dispatch never got a clean
+ * response before the watchdog killed it), while the same error on a non-timed-out
+ * attempt reads as `transient`. `stall` (inactivity timeout, no tool in flight) is
+ * always `provider_stall`. Everything else passes through unchanged. `wait_stall`
+ * (a watchdog kill mid wait-command) is NOT produced here: `classifyFailure` has no
+ * visibility into the in-flight tool's command shape (only a boolean), so callers
+ * that need to distinguish it must check `core/wait-stall.ts`'s `classifyTimeout`
+ * themselves, before falling back to this mapping — see `dispatch/provider-health.ts`.
+ */
+export function telemetryFailureClass(cls: FailureClass, timedOut: boolean): TelemetryFailureClass {
+	switch (cls) {
+		case "transient":
+			return timedOut ? "provider_stall" : "transient";
+		case "stall":
+			return "provider_stall";
+		case "ok":
+			return "task";
+		default:
+			return cls;
+	}
 }
 
 export function failureReason(s: AttemptSignals, max = 160): string {

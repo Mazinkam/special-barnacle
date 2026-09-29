@@ -4106,6 +4106,42 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 		}
 	});
 
+	test("failover from A (transient) to B (succeeds): provider_error carries A's identity, the final dispatch_finished carries B's", async () => {
+		const primary = "amazon-bedrock/global.anthropic.claude-opus-5-5";
+		const backup = "openai-codex/gpt-6-astra";
+		const registry = orchestrator.runRegistryForTest();
+		const session = { runId: "run", dir: "/tmp", cancellation: new RunCancellation(), log: () => {}, drainMessages: () => [] };
+		const context = registry.claim(session as never, {}, table, {}, { candidates: { security_review: [
+			{ model: primary, qualified: true, reasons: [], effortControl: true, spec: primary, source: "primary" },
+			{ model: backup, qualified: true, reasons: [], effortControl: true, spec: backup, source: "backup" },
+		] }, modelHealth: new ModelHealth() });
+		if (!context) throw new Error("test registry unexpectedly active");
+		try {
+			const events: Array<[string, Record<string, unknown>]> = [];
+			const models: string[] = [];
+			const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", task(""), { security_review: { model: primary } }, {} as never, 0, {
+				recordEvent: (e, p) => { events.push([e, p]); },
+				aliasTable: table,
+				runProcess: async (opts) => {
+					models.push(opts.model);
+					return models.length === 1 ? proc({ exitCode: 1, outcome: "failed", stderr: "read ECONNRESET" }) : proc({ model: opts.model });
+				},
+			});
+			expect(models).toEqual([primary, backup]);
+			expect(result.model).toBe(backup);
+			const providerErrorEvents = events.filter(([name]) => name === "provider_error").map(([, payload]) => payload);
+			expect(providerErrorEvents).toHaveLength(1);
+			expect(providerErrorEvents[0]).toMatchObject({ provider: "amazon-bedrock", model: "global.anthropic.claude-opus-5-5", error_code: "ECONNRESET" });
+			const finished = events.filter(([name]) => name === "dispatch_finished").map(([, payload]) => payload);
+			expect(finished).toHaveLength(2);
+			expect(finished[0]).toMatchObject({ provider: "amazon-bedrock", provider_model: "global.anthropic.claude-opus-5-5", failure_class: "transient", superseded_by_fallback: true });
+			const final = finished.find((f) => !f.superseded_by_fallback);
+			expect(final).toMatchObject({ outcome: "completed", provider: "openai-codex", provider_model: "gpt-6-astra" });
+		} finally {
+			registry.release(context);
+		}
+	});
+
 	test("no Bedrock twin: the original failure is returned, no redispatch", async () => {
 		let calls = 0;
 		const events: string[] = [];

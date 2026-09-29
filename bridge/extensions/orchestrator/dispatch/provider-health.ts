@@ -1,6 +1,7 @@
 import { isQuotaError } from "../provider-fallback.ts";
 import { isTransientProviderError } from "../core/transient-error.ts";
 import { classifyTimeout } from "../core/wait-stall.ts";
+import { classifyFailure, providerText, telemetryFailureClass, type AttemptSignals } from "../core/failure-class.ts";
 
 interface Evidence { message: string; timestamp: string }
 interface HealthInput {
@@ -10,9 +11,19 @@ interface HealthInput {
  toolInFlight?: { name: string; command?: string; waitPattern?: boolean };
  stderr?: string;
  model?: string;
+ stopReason?: string;
+ errorMessage?: string;
  nestedProviderErrors?: Evidence[];
 }
 
+/**
+ * `text` here is always `providerText()`-filtered (orchestrator diagnostic lines and the
+ * interruption report already dropped) before this runs, so it is a diagnostic sub-code over
+ * exactly the same evidence `classifyFailure` itself reads -- never a second classification
+ * table. It never decides quota/transient/task/stall on its own; `dispatchHealth` below always
+ * derives `failure_class` from `classifyFailure`/`telemetryFailureClass`, and only attaches
+ * whichever of these labels (if any) matches, purely as extra detail alongside that class.
+ */
 function errorCode(text: string): string | undefined {
  const bounded = text.slice(0, 16_384);
  if (isQuotaError(bounded)) return "quota";
@@ -40,14 +51,51 @@ function endpointHost(message: string): string | undefined {
  } catch { return undefined; }
 }
 
+/** `input.stderr` with the diagnostic tail (`\nnestedWorkers: ...`) that `dispatch-progress.ts`
+ *  appends dropped, bounded, and never containing the model's own prose -- the same slice both
+ *  `errorCode` and `classifyFailure` (via the `AttemptSignals` built below) read. */
+function ownStderr(input: HealthInput): string {
+ return (input.stderr ?? "").split("\nnestedWorkers:", 1)[0].slice(0, 16_384);
+}
+
 export function dispatchHealth(input: HealthInput): { outcome: string; timeout_reason?: string; failure_class?: string; provider?: string; model?: string; error_code?: string } {
- const ownStderr = (input.stderr ?? "").split("\nnestedWorkers:", 1)[0].slice(0, 16_384);
- const code = errorCode(ownStderr) ?? input.nestedProviderErrors?.map(e => errorCode(e.message)).find(Boolean);
- const failureClass = input.outcome === "cancelled" ? "cancelled"
-  : input.outcome === "timed_out" ? classifyTimeout(input) === "wait_stall" ? "wait_stall" : code || isTransientProviderError(ownStderr) || input.nestedProviderErrors?.some(e => isTransientProviderError(e.message.slice(0, 16_384))) ? "provider_stall" : "task"
-  : input.outcome === "completed" || input.outcome === "completed_after_process_error" ? undefined
-  : code === "quota" ? "quota" : isTransientProviderError(ownStderr) || input.nestedProviderErrors?.some(e => isTransientProviderError(e.message.slice(0, 16_384))) ? "transient" : "task";
+ const stderr = ownStderr(input);
+ const nestedMessages = (input.nestedProviderErrors ?? []).map(e => e.message.slice(0, 16_384));
+ // Same filtering `classifyFailure` applies internally (drop orchestrator-written diagnostic
+ // lines and the interruption report) before either the shared classifier or the `errorCode`
+ // diagnostic sub-code below ever look at the text -- one filter, read by both.
+ const filteredOwn = providerText(stderr, input.errorMessage);
+ const filteredNested = nestedMessages.map(m => providerText(m));
+ const code = errorCode(filteredOwn) ?? filteredNested.map(errorCode).find(Boolean);
  const identity = modelIdentity(input.model);
+
+ let failureClass: string | undefined;
+ if (input.outcome === "completed" || input.outcome === "completed_after_process_error") {
+  failureClass = undefined;
+ } else if (
+  input.outcome === "timed_out" &&
+  classifyTimeout({ outcome: input.outcome, timeoutReason: input.timeoutReason, toolInFlight: input.toolInFlight }) === "wait_stall"
+ ) {
+  // wait_stall (a watchdog kill mid wait-command) needs the in-flight tool's command shape,
+  // which `AttemptSignals` (a plain boolean) does not carry -- see `telemetryFailureClass`'s
+  // doc comment. `core/wait-stall.ts` is a distinct, already-shared classifier (also used by
+  // `pipeline/hierarchy.ts`), not a second copy of the provider-failure rule table.
+  failureClass = "wait_stall";
+ } else {
+  const signals: AttemptSignals = {
+   exitCode: input.exitCode,
+   outcome: input.outcome,
+   stderr: [stderr, ...nestedMessages].filter(Boolean).join("\n"),
+   errorMessage: input.errorMessage,
+   stopReason: input.stopReason,
+   timeoutReason: input.timeoutReason,
+   toolInFlight: Boolean(input.toolInFlight),
+   cancelled: input.outcome === "cancelled",
+  };
+  const cls = classifyFailure(signals);
+  failureClass = telemetryFailureClass(cls, input.outcome === "timed_out");
+ }
+
  return { outcome: input.outcome, ...(input.timeoutReason ? { timeout_reason: input.timeoutReason } : {}),
   ...(failureClass ? { failure_class: failureClass } : {}), ...(identity.provider ? { provider: identity.provider, provider_model: identity.model } : {}), ...(code ? { error_code: code } : {}) };
 }
@@ -63,13 +111,13 @@ export function recordProviderErrors(recordEvent: (event: string, payload: Recor
 export function providerErrors(input: HealthInput): Array<Record<string, unknown>> {
  const identity = modelIdentity(input.model);
  const evidence: Array<Evidence & { nested: boolean }> = (input.nestedProviderErrors ?? []).map(e => ({ ...e, nested: true }));
- const ownStderr = (input.stderr ?? "").split("\nnestedWorkers:", 1)[0].slice(0, 16_384);
- if (ownStderr && input.outcome !== "completed" && input.outcome !== "cancelled") {
-  evidence.push({ message: ownStderr, timestamp: new Date().toISOString(), nested: false });
+ const stderr = ownStderr(input);
+ if (stderr && input.outcome !== "completed" && input.outcome !== "cancelled") {
+  evidence.push({ message: stderr, timestamp: new Date().toISOString(), nested: false });
  }
  const grouped = new Map<string, Record<string, unknown>>();
  for (const entry of evidence) {
-  const code = errorCode(entry.message);
+  const code = errorCode(providerText(entry.message.slice(0, 16_384)));
   if (!code) continue;
   const host = endpointHost(entry.message);
   const key = JSON.stringify([entry.nested, code, host, identity.provider, identity.model]);
