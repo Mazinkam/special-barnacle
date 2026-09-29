@@ -47,33 +47,14 @@ export async function dispatchFlat(
 		resumedLeadTaskIds: [], retriedLeadTaskIds: [], resumedAttemptResults: [], pendingChecks: [] };
 }
 
-/** Fail-closed fence scan (strict ASCII CommonMark). True when a fence is open or any fence marker is ambiguous. */
-function fenceUnsafe(lines: string[]): boolean {
-	let fence: { ch: string; len: number } | undefined;
-	for (const line of lines) {
-		const marker = /^(\s*)(`{3}|~{3})/.exec(line);
-		if (marker) {
-			const prefix = marker[1]!;
-			if (/[^ \t]/.test(prefix) || prefix.replace(/\t/g, "    ").length >= 4) return true;
-		}
-		const m = /^ {0,3}(`{3,}|~{3,})([^\n]*)$/.exec(line);
-		if (!m) continue;
-		const ch = m[1]![0]!;
-		if (fence) {
-			if (ch === fence.ch && m[1]!.length >= fence.len && /^[ \t]*$/.test(m[2]!)) fence = undefined;
-		} else if (ch !== "`" || !m[2]!.includes("`")) {
-			fence = { ch, len: m[1]!.length };
-		}
-	}
-	return fence !== undefined;
-}
-
-const HTML_BLOCK_OPENER = /<!--|<pre|<script|<style|<textarea|<!\[cdata\[|<\?|<![a-z]/i;
+/** Any code-fence marker or line-initial angle bracket (HTML block start), at any indentation (incl. tabs/NBSP). */
+const FORBIDDEN_LINE = /^\s*(?:<|`{3,}|~{3,})/;
 
 /**
  * Byte-exact contract (no Markdown interpretation): after CRLF->LF and stripping trailing ASCII
  * whitespace, the last two lines are exactly `## Verdict` and `PASS` at column 0; the line before
- * the heading (if any) is empty; no fence is open or ambiguous and no HTML block opener precedes it.
+ * the heading (if any) is empty; and NO line anywhere begins with a code-fence marker or `<`
+ * (fences/HTML are not tracked, since HTML blocks desynchronise fence pairing in CommonMark).
  */
 function hasAffirmativePassVerdict(rawText: string): boolean {
 	const normalized = rawText.replace(/\r\n/g, "\n");
@@ -82,10 +63,8 @@ function hasAffirmativePassVerdict(rawText: string): boolean {
 	const lines = normalized.replace(/[ \t\n\r\f\v]+$/, "").split("\n");
 	const n = lines.length;
 	if (n < 2 || lines[n - 1] !== "PASS" || lines[n - 2] !== "## Verdict") return false;
-	const before = lines.slice(0, n - 2);
-	if (before.length > 0 && before[before.length - 1] !== "") return false;
-	if (HTML_BLOCK_OPENER.test(before.join("\n"))) return false;
-	return !fenceUnsafe(before);
+	if (n > 2 && lines[n - 3] !== "") return false;
+	return !lines.some((l) => FORBIDDEN_LINE.test(l));
 }
 
 function reviewTask(runId: string, goal: string, files: string[], checks: CheckRunResult[]): DispatchTask {
@@ -99,7 +78,8 @@ function reviewTask(runId: string, goal: string, files: string[], checks: CheckR
 			"", "## Changed files", ...files.map((f) => `- ${f}`),
 			"", "## Deterministic checks", ...checks.map((c) => `- ${c.name}: ${c.status}`),
 			"", "Output format: list blocking issues (if any) first, then a blank line, then a line reading exactly `## Verdict`, and on the FINAL line exactly `PASS` or `FAIL`.",
-			"No formatting on those two lines (no bold, emphasis, quotes, indentation, code fences or extra text), and nothing after the final line.",
+			"Do not use code fences (``` or ~~~) or raw HTML / angle-bracket tags anywhere in your output; quote code inline with single backticks.",
+			"No formatting on the verdict lines (no bold, emphasis, quotes, indentation or extra text), and nothing after the final line.",
 		].join("\n"),
 	};
 }

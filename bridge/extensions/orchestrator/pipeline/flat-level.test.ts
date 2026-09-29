@@ -129,6 +129,12 @@ describe("flat level", () => {
 				"html declaration": "<!DOCTYPE x>\n\n## Verdict\nPASS",
 				"processing instruction": "<?php\n\n## Verdict\nPASS",
 				"cdata": "<![CDATA[\n\n## Verdict\nPASS",
+				"html block desyncs fence pairing": "<div>\n```\n\n```\n\n## Verdict\nPASS",
+				"html block desyncs tilde fence pairing": "<div>\n~~~\n\n~~~\n\n## Verdict\nPASS",
+				"custom-tag html block desyncs fence pairing": "<custom-tag>\n```\n\n```\n\n## Verdict\nPASS",
+				"line-initial angle bracket": "<custom-tag>\n\n## Verdict\nPASS",
+				"indented angle bracket": "  <b>x</b>\n\n## Verdict\nPASS",
+				"tab-indented angle bracket": "\t<b>\n\n## Verdict\nPASS",
 				"no blank line before heading": "text\n## Verdict\nPASS",
 				"NBSP-indented fence marker": "\u00a0```\n\n## Verdict\nPASS",
 				"4-space-indented fence marker": "    ```\n\n## Verdict\nPASS",
@@ -160,8 +166,10 @@ describe("flat level", () => {
 			test("no blank line before heading fails closed (after a properly closed fence)", async () => {
 				expect((await review("```\nx\n```\n## Verdict\nPASS")).passed).toBe(false);
 			});
-			test("passes after a properly closed fence + blank line", async () => {
-				expect((await review("```ts\nx\n```\n\n## Verdict\nPASS")).passed).toBe(true);
+			test("rejects a properly closed fence + blank line (any fence fails closed)", async () => {
+				const v = await review("```ts\nx\n```\n\n## Verdict\nPASS");
+				expect(v.passed).toBe(false);
+				expect(v.failedChecks).toContain("review");
 			});
 			test("passes bare heading + PASS", async () => {
 				expect((await review("## Verdict\nPASS")).passed).toBe(true);
