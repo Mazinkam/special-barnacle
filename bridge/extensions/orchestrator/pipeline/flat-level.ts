@@ -56,7 +56,7 @@ function fenceUnsafe(lines: string[]): boolean {
 			const prefix = marker[1]!;
 			if (/[^ \t]/.test(prefix) || prefix.replace(/\t/g, "    ").length >= 4) return true;
 		}
-		const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+		const m = /^ {0,3}(`{3,}|~{3,})([^\n]*)$/.exec(line);
 		if (!m) continue;
 		const ch = m[1]![0]!;
 		if (fence) {
@@ -76,7 +76,10 @@ const HTML_BLOCK_OPENER = /<!--|<pre|<script|<style|<textarea|<!\[cdata\[|<\?|<!
  * the heading (if any) is empty; no fence is open or ambiguous and no HTML block opener precedes it.
  */
 function hasAffirmativePassVerdict(rawText: string): boolean {
-	const lines = rawText.replace(/\r\n/g, "\n").replace(/[ \t\n\r\f\v]+$/, "").split("\n");
+	const normalized = rawText.replace(/\r\n/g, "\n");
+	// Fail closed on any alternate line terminator or control char (CommonMark line endings, hidden fence info).
+	if (/[\r\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u2028\u2029]/.test(normalized)) return false;
+	const lines = normalized.replace(/[ \t\n\r\f\v]+$/, "").split("\n");
 	const n = lines.length;
 	if (n < 2 || lines[n - 1] !== "PASS" || lines[n - 2] !== "## Verdict") return false;
 	const before = lines.slice(0, n - 2);
