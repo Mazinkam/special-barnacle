@@ -18,4 +18,17 @@ describe("path-glob", () => {
 	test("matchesAny returns the matching globs", () => {
 		expect(matchesAny("src/auth/a.ts", ["**/auth/**", "**/*.py"])).toEqual(["**/auth/**"]);
 	});
+	test("translates wildcards inside brace alternatives", () => {
+		const alternatives = globToRegExp("{*,auth}.ts");
+		expect(alternatives.test("x.ts")).toBe(true);
+		expect(alternatives.test("auth.ts")).toBe(true);
+		expect(alternatives.test("a/x.ts")).toBe(false);
+		expect(globToRegExp("{auth?,other}.ts").test("authX.ts")).toBe(true);
+	});
+	test("treats an unmatched opening brace literally", () => {
+		expect(globToRegExp("a{b").test("a{b")).toBe(true);
+	});
+	test("escapes regex metacharacters literally", () => {
+		expect(globToRegExp("a+b(c).ts").test("a+b(c).ts")).toBe(true);
+	});
 });

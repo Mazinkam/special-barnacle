@@ -1,5 +1,9 @@
 /** Minimal, dependency-free glob → RegExp for repo-relative POSIX paths. */
 export function globToRegExp(glob: string): RegExp {
+	return new RegExp(`^${translateGlob(glob)}$`);
+}
+
+function translateGlob(glob: string): string {
 	let re = "";
 	for (let i = 0; i < glob.length; i++) {
 		const c = glob[i];
@@ -12,15 +16,15 @@ export function globToRegExp(glob: string): RegExp {
 		else if (c === "{") {
 			const end = glob.indexOf("}", i);
 			if (end < 0) { re += "\\{"; continue; }
-			re += `(?:${glob.slice(i + 1, end).split(",").map(escape).join("|")})`;
+			re += `(?:${glob.slice(i + 1, end).split(",").map(translateGlob).join("|")})`;
 			i = end;
 		} else re += escape(c);
 	}
-	return new RegExp(`^${re}$`);
+	return re;
 }
 
 function escape(s: string): string {
-	return s.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+	return s.replace(/[.*?+^${}()|[\]\\]/g, "\\$&");
 }
 
 export function matchesAny(path: string, globs: string[]): string[] {
