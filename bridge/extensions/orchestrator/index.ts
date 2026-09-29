@@ -3264,8 +3264,15 @@ export async function dispatchParallel(
 				capability: input._capability,
 				model: r.model ?? input.model,
 				exit_code: r.exitCode,
-				duration_ms: r.durationMs,
-				cost_usd: r.costUsd,
+				// This attempt's OWN duration/cost/turns only (never the fallback-merged sum) —
+				// see the `dispatchAttempt`/`nested_cost_usd` comments above: the returned
+				// `DispatchResult` (below) carries the cumulative totals across all attempts;
+				// dispatch_finished rows must stay per-attempt so Python-side aggregation
+				// (orchestrator/presentation/dashboard_data.py's provider-health rollup, which
+				// sums `cost_usd` over dispatch_finished rows) never double-counts a task that
+				// failed over more than once.
+				duration_ms: finalAttempt.durationMs,
+				cost_usd: finalAttempt.costUsd,
 				// This attempt's OWN nested cost only (see the `dispatchAttempt` comment above) — never
 				// the fallback-merged sum, so `economics.nested_residual_rows` reconciling per
 				// `(run_id, task_id, dispatch_attempt)` never double-books attempt 0's spend.
@@ -3275,7 +3282,7 @@ export async function dispatchParallel(
 				// "Nested cost semantics" section).
 				nested_rows_emitted: nestedRows.length,
 				dispatch_attempt: dispatchAttempt,
-				turns: r.usage.turns,
+				turns: finalAttempt.usage.turns,
 				stop_reason: r.stopReason,
 				log_dir: ACTIVE_RUN?.dir,
 			});

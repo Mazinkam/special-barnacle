@@ -89,6 +89,23 @@ def test_provider_error_accepts_bridge_normalized_values_and_legacy_unknown(tmp_
     assert [row.get('model') for row in persisted] == ['gpt-6.1/mini_v2', None]
 
 
+def test_provider_panel_sums_per_attempt_cost_across_two_failed_attempts_of_one_task():
+    # Phase 3 review B1: a task that fails over once (both attempts fail) must contribute the
+    # SUM of each attempt's OWN cost_usd, never the final row's cumulative-across-attempts value
+    # double-counted on top of the first row's own cost.
+    from orchestrator.presentation.dashboard_data import provider_health
+    rows = [
+        {'event': 'dispatch_finished', 'ts': '2026-01-08T11:00:00Z', 'run_id': 'r1', 'task_id': 't1',
+         'outcome': 'failed', 'failure_class': 'quota', 'dispatch_attempt': 0, 'cost_usd': 1.5,
+         'superseded_by_fallback': True},
+        {'event': 'dispatch_finished', 'ts': '2026-01-08T11:00:01Z', 'run_id': 'r1', 'task_id': 't1',
+         'outcome': 'failed', 'failure_class': 'quota', 'dispatch_attempt': 1, 'cost_usd': 2.5},
+    ]
+    panel = provider_health(rows, now=datetime(2026, 1, 8, 12, tzinfo=timezone.utc))
+    assert panel['failed_dispatches'] == 2
+    assert panel['failed_dispatch_cost_usd'] == 4.0
+
+
 def test_provider_panel_excludes_non_provider_failures_and_cancellations():
     from orchestrator.presentation.dashboard_data import provider_health
     rows = [{'event': 'dispatch_finished', 'ts': '2026-01-08T11:00:00Z',

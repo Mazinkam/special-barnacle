@@ -4156,6 +4156,32 @@ describe("codex -> Bedrock quota fallback (Phase A)", () => {
 		expect(events).not.toContain("route_degraded");
 	});
 
+	test("Phase 3 review B1: two failed attempts each emit their OWN cost_usd, so the sum across dispatch_finished rows equals the true total spend", async () => {
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const [result] = await orchestrator.dispatchParallel(process.cwd(), "run", task(""),
+			{ security_review: { model: "openai-codex/gpt-6-astra" } }, {} as never, 0, {
+				recordEvent: (e, p) => { events.push([e, p]); },
+				aliasTable: table,
+				runProcess: async (opts) => opts.model === "openai-codex/gpt-6-astra"
+					? proc({ exitCode: 1, stderr: "usage limit reached for this account", costUsd: 1.5, costReported: true })
+					: proc({ model: "amazon-bedrock/global.openai.gpt-6-astra", exitCode: 1, stderr: "usage limit reached for this account", costUsd: 2.5, costReported: true }),
+			});
+		const finished = events.filter(([e]) => e === "dispatch_finished").map(([, p]) => p);
+		expect(finished).toHaveLength(2);
+		// Each row carries ONLY its own attempt's cost — not the cumulative sum across attempts.
+		expect(finished[0]).toMatchObject({ dispatch_attempt: 0, cost_usd: 1.5, superseded_by_fallback: true });
+		expect(finished[1]).toMatchObject({ dispatch_attempt: 1, cost_usd: 2.5 });
+		expect(finished[1].superseded_by_fallback).toBeUndefined();
+		// The sum of dispatch_finished cost_usd rows equals the true actual spend (1.5 + 2.5 = 4),
+		// matching orchestrator/presentation/dashboard_data.py's provider-health rollup
+		// (`failed_dispatch_cost_usd`, which sums `cost_usd` over failed dispatch_finished rows).
+		// Before this fix the final row carried the CUMULATIVE 4 on top of the first row's 1.5,
+		// summing to 5.5 — double-counting the first attempt's spend.
+		expect(finished.reduce((sum, f) => sum + Number(f.cost_usd), 0)).toBe(4);
+		// The RETURNED DispatchResult still totals the true spend across both attempts.
+		expect(result.costUsd).toBe(4);
+	});
+
 	test("Phase 1 review T1/T2: each fallback attempt's dispatch_finished carries only its own nested cost, and detail rows never collide across attempts", async () => {
 		const events: Array<[string, Record<string, unknown>]> = [];
 		const calls: Record<string, unknown>[] = [];

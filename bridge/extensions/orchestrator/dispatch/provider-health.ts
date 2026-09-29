@@ -1,7 +1,7 @@
 import { isQuotaError } from "../provider-fallback.ts";
 import { isTransientProviderError } from "../core/transient-error.ts";
 import { classifyTimeout } from "../core/wait-stall.ts";
-import { classifyFailure, providerText, telemetryFailureClass, type AttemptSignals } from "../core/failure-class.ts";
+import { classifyFailure, providerText, telemetryFailureClass, attemptSignals, type AttemptSignals } from "../core/failure-class.ts";
 
 interface Evidence { message: string; timestamp: string }
 interface HealthInput {
@@ -82,16 +82,20 @@ export function dispatchHealth(input: HealthInput): { outcome: string; timeout_r
   // `pipeline/hierarchy.ts`), not a second copy of the provider-failure rule table.
   failureClass = "wait_stall";
  } else {
-  const signals: AttemptSignals = {
+  // Same shared construction `dispatch/failover.ts` uses (`attemptSignals`, core/failure-class.ts) --
+  // nested worker evidence is intentionally excluded from `stderr` here even though `errorCode`
+  // above may still fall back to it for a diagnostic `error_code`: nested evidence must never
+  // change `failure_class` out from under what failover already decided for this attempt.
+  const signals: AttemptSignals = attemptSignals({
    exitCode: input.exitCode,
    outcome: input.outcome,
-   stderr: [stderr, ...nestedMessages].filter(Boolean).join("\n"),
+   stderr,
    errorMessage: input.errorMessage,
    stopReason: input.stopReason,
    timeoutReason: input.timeoutReason,
    toolInFlight: Boolean(input.toolInFlight),
    cancelled: input.outcome === "cancelled",
-  };
+  });
   const cls = classifyFailure(signals);
   failureClass = telemetryFailureClass(cls, input.outcome === "timed_out");
  }

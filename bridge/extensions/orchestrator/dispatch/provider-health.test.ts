@@ -128,6 +128,16 @@ describe("one provider-failure classifier: failover's decision and telemetry's f
    input: { ...base, stderr: "TypeError: x is not a function" },
    signals: { exitCode: 1, outcome: "failed", stderr: "TypeError: x is not a function", toolInFlight: false, cancelled: false },
   },
+  {
+   // Regression for the B2 finding: a failed attempt whose ONLY evidence is a nested worker's
+   // provider error (no own stderr) must classify the same way failover does -- "task" here,
+   // since `dispatch/failover.ts` never sees `nestedProviderErrors` at all. Before the fix,
+   // `dispatchHealth` folded nested messages into the classification signals and this attempt
+   // read "transient" in telemetry while failover treated it as "task".
+   name: "nested-only evidence (own stderr empty)",
+   input: { ...base, stderr: "", nestedProviderErrors: [{ message: "read ECONNRESET", timestamp: "2026-01-01T00:00:00.000Z" }] },
+   signals: { exitCode: 1, outcome: "failed", stderr: "", toolInFlight: false, cancelled: false },
+  },
  ];
 
  test.each(rows.map((r) => [r.name, r] as const))("%s", (_name, row) => {

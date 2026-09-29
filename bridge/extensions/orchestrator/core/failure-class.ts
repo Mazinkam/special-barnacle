@@ -55,6 +55,20 @@ export function providerText(stderr: string, errorMessage?: string): string {
 	return [...lines, errorMessage ?? ""].filter(Boolean).join("\n");
 }
 
+/**
+ * Single construction point for the failure classifier's input shape, so `dispatch/failover.ts`
+ * (which decides real routing/failover behavior) and `dispatch/provider-health.ts`'s
+ * `dispatchHealth` (which decides the `dispatch_finished`/`provider_error` telemetry class) can
+ * never drift into classifying the same attempt two different ways from two different signal
+ * sets ("one classifier"). Both callers pass exactly the attempt's OWN stderr/errorMessage here --
+ * nested worker evidence (`provider-health.ts`'s `nestedProviderErrors`) is recorded separately
+ * (see `providerErrors()`) and may still drive a diagnostic `error_code` fallback there, but must
+ * never reach `classifyFailure` and change `failure_class`/the failover decision.
+ */
+export function attemptSignals(input: AttemptSignals): AttemptSignals {
+	return { ...input };
+}
+
 export function classifyFailure(s: AttemptSignals): FailureClass {
 	if (s.cancelled || s.outcome === "cancelled") return "cancelled";
 	if (s.exitCode === 0 && (s.outcome === "completed" || s.outcome === "completed_after_process_error")) return "ok";
