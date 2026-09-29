@@ -967,6 +967,7 @@
       "elapsed_source": "reported",
       "excluded_session_ingest_rows": 0,
       "finished_at": null,
+      "fix_rounds": null,
       "implementation_cost_usd": 0.8,
       "input_tokens": 5717180,
       "metered_calls": 3,
@@ -977,6 +978,7 @@
       },
       "overhead_cost_usd": 5.1430299999999995,
       "overhead_ratio": 0.8653885307662925,
+      "provider_retries": 0,
       "retries": 1,
       "rework_events": 1,
       "roles": [
@@ -1027,6 +1029,7 @@
       "elapsed_source": "reported",
       "excluded_session_ingest_rows": 0,
       "finished_at": null,
+      "fix_rounds": null,
       "implementation_cost_usd": 0.0,
       "input_tokens": 20000,
       "metered_calls": 1,
@@ -1037,6 +1040,7 @@
       },
       "overhead_cost_usd": 6.0,
       "overhead_ratio": 1.0,
+      "provider_retries": 0,
       "retries": 0,
       "rework_events": 0,
       "roles": [

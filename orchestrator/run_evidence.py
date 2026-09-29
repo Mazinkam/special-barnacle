@@ -369,6 +369,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
     status: dict[str, str] = {}
     retry_dispatches: dict[str, set[str]] = defaultdict(set)
     rework_events: dict[str, int] = defaultdict(int)
+    provider_retries: dict[str, int] = defaultdict(int)
     cap_hits: dict[str, list[dict]] = defaultdict(list)
     for e in unique_records(events):
         rid = e.get('run_id')
@@ -379,6 +380,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
             if e.get('ts'): terminal_event_ts.setdefault(rid, str(e['ts']))
             status[rid] = TERMINAL_EVENTS[kind]; terminal[rid] = {**terminal.get(rid, {}), **{k: v for k, v in _terminal_fields(e).items() if v is not None}}
         elif kind == 'dispatch_started' and e.get('retry_of'): retry_dispatches[rid].add(str(e.get('task_id') or e.get('retry_of')))
+        elif kind == 'dispatch_finished' and e.get('superseded_by_fallback') is True: provider_retries[rid] += 1
         elif kind in {'rework', 'decision_invalidated', 'merge_conflict_resolution'}: rework_events[rid] += 1
         elif kind == SPEND_CAP_EVENT: cap_hits[rid].append(spend_cap_breach(e))
 
@@ -518,6 +520,8 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
         # never merely because the run is old, and never for a run that has no ownership
         # evidence at all (historical runs predating this tracking stay 'incomplete').
         run_status = raw_status if raw_status != 'incomplete' else (classify_liveness(started_events.get(rid), liveness_check=liveness_check) or raw_status)
+        fix_rounds = _int_or_none(note.get('fix_rounds'))
+        if fix_rounds is None: fix_rounds = _int_or_none(note.get('retries'))
         result.append({
             'run_id': rid, 'cost_provenance': ACTUAL, 'status': run_status,
             'started_at': (term or {}).get('started_at') or started_events.get(rid, {}).get('started_at'),
@@ -534,7 +538,8 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
             'cache_write_tokens': sum(_int_or_none(r.get('cache_write_tokens')) or 0 for r in rows) if tokens_known else None,
             'dispatch_duration_ms_total': sum(known_durations) if known_durations else None, 'duration_missing_calls': len(rows) - len(known_durations),
             'tasks': len({str(r.get('task_id')) for r in rows if r.get('task_id') is not None}),
-            'roles': sorted({_role(r) for r in rows}), 'retries': retries, 'rework_events': rework_events[rid],
+            'roles': sorted({_role(r) for r in rows}), 'retries': retries, 'fix_rounds': fix_rounds, 'provider_retries': provider_retries[rid],
+            'rework_events': rework_events[rid],
             'verification': verdict or 'unknown', 'verification_rows': len(verifications[rid]), 'verified_tasks': len(verified_tasks),
             'decision_rows': decisions[rid], 'other_metric_rows': other_rows[rid], 'excluded_session_ingest_rows': excluded[rid],
             'spend_cap_hit': bool(cap_hits[rid]), 'spend_cap_hits': cap_hits[rid],
