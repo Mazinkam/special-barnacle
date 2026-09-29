@@ -67,7 +67,7 @@ import {
 
 type CheckRow = PendingCheckRow;
 
-/** One cancellable session tick at a time; injectable clock/scheduler and spawn keep tests deterministic. */
+/** Drives one cancellable poll loop via a parent-owned, cancellable timer scheduler (`scheduleTick`, defaulting to `setTimeout`/`clearTimeout`): each tick polls every still-pending check once and, if any remain pending, reschedules itself rather than sleeping or blocking; injectable clock/scheduler and spawn keep tests deterministic. */
 export async function waitForPendingChecks(checks: PendingCheck[], options: {
  cwd: string;
  cancellation: RunCancellation;
@@ -94,7 +94,7 @@ export async function waitForPendingChecks(checks: PendingCheck[], options: {
  })));
  publish();
  try {
-  // Continuations are scheduled by one session tick, not by a blocking poll/sleep loop.
+  // Continuations are scheduled via the cancellable timer (`schedule`/`scheduleTick` above), not by a blocking poll/sleep loop.
   const tick = async (): Promise<void> => {
    options.cancellation.throwIfCancelled();
    for (let i = 0; i < checks.length; i++) {

@@ -53,6 +53,50 @@ test("oversized report with a pending-check heading beyond the scan limit blocks
  expect(output.pendingChecks).toMatchObject([{ outcome: "unverified", reason: "truncated_checks" }]);
 });
 
+for (const [label, line] of [
+	["an ambiguous-provider line", "- glab gh run view 123"],
+	["an oversized line", `- gh run view 123 ${"x".repeat(600)}`],
+	["a malformed line", "- run invalid 42"],
+] as const) {
+	test(`a report whose Pending external checks section has only ${label} blocks dependents`, async () => {
+		const batches: DispatchTask[][] = [];
+		const output = await dispatchReconAndLeads({ runId: "r", goal: "g", plan, adapter: { lead: { model: "m" } }, architectResult: architect, evidenceMaxChars: 1000, maxLeads: 2, repoRoot: "/repo" }, {
+			dispatch: async (tasks) => { batches.push(tasks); return tasks.map((task) => result(task, task.taskId === "r-lead-0" ? `## Pending external checks\n${line}\nSTATUS: completed` : "STATUS: completed")); },
+			capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+			waitForChecks: async () => { throw new Error("a report with only invalid check lines must not be treated as having no checks"); },
+		});
+		expect(batches.map((batch) => batch.map((task) => task.taskId))).toEqual([["r-lead-0"]]);
+		expect(output.skippedLeads).toBe(1);
+		expect(output.pendingChecks).toMatchObject([{ outcome: "unverified", reason: "unparsed_checks" }]);
+	});
+}
+
+test("a replacement report whose Pending external checks section has only invalid lines also fails closed", async () => {
+	const batches: DispatchTask[][] = [];
+	const output = await dispatchReconAndLeads({ runId: "r", goal: "g", plan, adapter: { lead: { model: "m" } }, architectResult: architect, evidenceMaxChars: 1000, maxLeads: 2, repoRoot: "/repo", inWaveRecovery: true }, {
+		dispatch: async (tasks) => { batches.push(tasks); return tasks.map((t) => result(t, batches.length === 1 ? "## Pending external checks\n- gh run view 123\nSTATUS: completed" : "## Pending external checks\n- run invalid 42\nSTATUS: completed")); },
+		capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+		writeCheckDiagnostic: () => "/owned/external-check-failure.log",
+		waitForChecks: async (pending) => [{ check: pending[0], outcome: "failure", jobId: "456" }],
+	});
+	expect(batches).toHaveLength(2);
+	expect(output.skippedLeads).toBe(1);
+	expect(output.pendingChecks.some((c) => c.outcome === "success")).toBe(false);
+	expect(output.pendingChecks.some((c) => c.reason === "unparsed_checks")).toBe(true);
+});
+
+test("a Pending external checks section that legitimately says None still counts as no checks", async () => {
+	const batches: DispatchTask[][] = [];
+	const output = await dispatchReconAndLeads({ runId: "r", goal: "g", plan, adapter: { lead: { model: "m" } }, architectResult: architect, evidenceMaxChars: 1000, maxLeads: 2, repoRoot: "/repo" }, {
+		dispatch: async (tasks) => { batches.push(tasks); return tasks.map((task) => result(task, task.taskId === "r-lead-0" ? "## Pending external checks\nNone.\nSTATUS: completed" : "STATUS: completed")); },
+		capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
+		waitForChecks: async () => { throw new Error("a legitimately empty section must not be treated as having checks"); },
+	});
+	expect(batches.map((batch) => batch.map((task) => task.taskId))).toEqual([["r-lead-0"], ["r-lead-1"]]);
+	expect(output.skippedLeads).toBe(0);
+	expect(output.pendingChecks).toEqual([]);
+});
+
 test("HEAD changing while CI is polled blocks dependents despite a green old candidate", async () => {
  const batches: DispatchTask[][] = [];
  let head = "a".repeat(40);

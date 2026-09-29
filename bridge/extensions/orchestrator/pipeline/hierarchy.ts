@@ -43,7 +43,7 @@ import { mergePendingChecks, parsePendingChecks, type PendingCheck } from "../co
 import { CI_ID_RE, classifyTimeout, extractCiRefs } from "../core/wait-stall.ts";
 import type { CiPollResult } from "../core/ci-wait.ts";
 
-export interface ResolvedCheck extends Omit<CiPollResult, "reason"> { check: PendingCheck; candidateSha?: string | null; reason?: CiPollResult["reason"] | "candidate_changed" | "truncated_checks" }
+export interface ResolvedCheck extends Omit<CiPollResult, "reason"> { check: PendingCheck; candidateSha?: string | null; reason?: CiPollResult["reason"] | "candidate_changed" | "truncated_checks" | "unparsed_checks" }
 import { formatReconEvidence, planReconTasks } from "../recon.ts";
 import { METHOD, shortName } from "../models.ts";
 import { fmtElapsed } from "../run-ui.ts";
@@ -102,9 +102,18 @@ function checksToPoll(report: string, killed: PendingCheck[]): { checks: Pending
 	// The parser only scans the first 256 KiB. A missing heading in that prefix does
 	// not prove there are no checks later in an oversized report.
 	const truncatedReport = report.length > 256 * 1024;
-	return { checks, overflow: overflow || truncatedReport ? {
+	// Any OTHER parser problem (malformed line, ambiguous/unknown provider, an oversized single
+	// line) means at least one report line describing a real pending check was silently dropped
+	// instead of parsed. Fail closed exactly like truncation/overflow above, rather than letting a
+	// report whose "Pending external checks" section contains ONLY invalid entries read as "no
+	// checks" (which would let dependents proceed, and could let the final verdict be PASS,
+	// without anything ever actually being verified). `mr_provider_mismatch` is excluded: that
+	// problem fires on an otherwise-successfully-parsed check (only its MR reference was dropped),
+	// so it never represents a lost check.
+	const hasUnhandledParseProblem = parsed.problems.some((p) => p !== "truncated:max_checks" && p !== "mr_provider_mismatch");
+	return { checks, overflow: overflow || truncatedReport || hasUnhandledParseProblem ? {
 		check: overflow ?? checks.at(-1) ?? { provider: "github", kind: "run", id: "unknown", source: "report" },
-		outcome: "unverified", reason: "truncated_checks",
+		outcome: "unverified", reason: overflow || truncatedReport ? "truncated_checks" : "unparsed_checks",
 	} : undefined };
 }
 

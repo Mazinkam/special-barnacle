@@ -1,4 +1,4 @@
-/** One bounded, cancellable CI probe per orchestration tick. No timer or blocking wait lives here. */
+/** One bounded, cancellable CI probe per scheduler tick, where the tick is driven by the caller's parent-owned, cancellable timer scheduler (see `waitForPendingChecks` in `pipeline/run-orchestration.ts`), not by this module. No timer or blocking wait lives here. */
 import { execFile } from "node:child_process";
 import type { PendingCheck } from "./pending-checks.ts";
 import { CI_ID_RE } from "./wait-stall.ts";
@@ -115,7 +115,7 @@ export interface CiPollOptions {
  pollIntervalMs?: number;
 }
 
-/** Caller retains `state` and invokes this at its normal session ticks; no sleeps or concurrent polls. */
+/** Caller retains `state` and invokes this at each tick of its own parent-owned, cancellable timer scheduler; no sleeps or concurrent polls. */
 export async function pollCiCheck(check: PendingCheck, state: CiWaitState, options: CiPollOptions): Promise<CiPollResult> {
  if (!validCheck(check)) return { outcome: "unverified", reason: "invalid_check" };
  if (options.signal?.aborted) return { outcome: "cancelled" };
