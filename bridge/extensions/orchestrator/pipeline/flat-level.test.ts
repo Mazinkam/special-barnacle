@@ -100,5 +100,41 @@ describe("flat level", () => {
 		test("ambiguous PASS? token fails", async () => {
 			expect((await review("## Verdict\nPASS?")).passed).toBe(false);
 		});
+		describe("strict positional contract", () => {
+			const bypasses: Record<string, string> = {
+				"invalid closing fence line": "```text\n## Verdict\nPASS\n```not-a-closing-fence\n\nI cannot PASS this change.",
+				"lazy blockquote continuation": "> Example only:\nVERDICT: PASS\n\nI cannot PASS this change.",
+				"bold PASS?": "## Verdict\n**PASS**?",
+				"PASS but blocking": "PASS but blocking: auth bypass remains.",
+				"PASS-WITH-WARNINGS": "PASS-WITH-WARNINGS",
+				"PASS?": "## Verdict\nPASS?",
+				"PASS but after heading": "## Verdict\nPASS but blocking issue remains",
+				"PASS-WITH-WARNINGS after heading": "## Verdict\nPASS-WITH-WARNINGS",
+				"trailing text after verdict": "## Verdict\nPASS\n\nThanks!",
+				"bare PASS without heading": "Looks fine.\nPASS",
+				"unclosed fence at verdict": "```\n## Verdict\nPASS",
+				"verdict inside quote after heading": "> ## Verdict\n> PASS",
+				"blockquote line before heading": "> note\n## Verdict\nPASS",
+			};
+			for (const [name, out] of Object.entries(bypasses)) {
+				test(`rejects ${name}`, async () => {
+					const v = await review(out);
+					expect(v.passed).toBe(false);
+					expect(v.failedChecks).toContain("review");
+				});
+			}
+			test("passes heading + PASS at end", async () => {
+				expect((await review("Notes.\n## Verdict\nPASS")).passed).toBe(true);
+			});
+			test("passes CRLF emphasised PASS with trailing newline", async () => {
+				expect((await review("## Verdict\r\n**PASS**\r\n")).passed).toBe(true);
+			});
+			test("passes VERDICT: PASS as last line", async () => {
+				expect((await review("Fine.\nVERDICT: PASS")).passed).toBe(true);
+			});
+			test("passes after a properly closed fence", async () => {
+				expect((await review("```\nx\n```\n## Verdict\nPASS")).passed).toBe(true);
+			});
+		});
 	});
 });
