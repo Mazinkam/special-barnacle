@@ -47,6 +47,18 @@ export async function dispatchFlat(
 		resumedLeadTaskIds: [], retriedLeadTaskIds: [], resumedAttemptResults: [], pendingChecks: [] };
 }
 
+/** Affirmative PASS: `## Verdict` section whose first non-empty line starts with PASS, or a `VERDICT: PASS` line. */
+function hasAffirmativePassVerdict(rawText: string): boolean {
+	const lines = rawText.split(/\r?\n/);
+	for (let i = 0; i < lines.length; i++) {
+		if (/^\s*#{1,6}\s*Verdict\s*:?\s*$/i.test(lines[i]!)) {
+			const next = lines.slice(i + 1).find((l) => l.trim() !== "");
+			if (next !== undefined && /^\W*PASS\b/i.test(next.trim())) return true;
+		} else if (/^\s*VERDICT\s*:\s*PASS\b/i.test(lines[i]!)) return true;
+	}
+	return false;
+}
+
 function reviewTask(runId: string, goal: string, files: string[], checks: CheckRunResult[]): DispatchTask {
 	return {
 		taskId: `${runId}-review`,
@@ -73,7 +85,7 @@ export async function runFlatVerification(
 	if (failedChecks.length === 0 && input.level === "checked") {
 		[dispatch] = await deps.dispatch([reviewTask(input.runId, input.goal, input.files, results)]);
 		if (dispatch) await deps.captureDispatchCost(dispatch);
-		if (!dispatch || dispatch.exitCode !== 0 || hasExplicitFailVerdict(dispatch.stdout)) failedChecks.push("review");
+		if (!dispatch || dispatch.exitCode !== 0 || hasExplicitFailVerdict(dispatch.stdout) || !hasAffirmativePassVerdict(dispatch.stdout)) failedChecks.push("review");
 	}
 	const passed = failedChecks.length === 0 && results.length > 0;
 	if (results.length === 0) failedChecks.push("no deterministic checks ran");

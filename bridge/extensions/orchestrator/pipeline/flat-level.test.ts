@@ -49,4 +49,27 @@ describe("flat level", () => {
 			{ dispatch: async () => [], captureDispatchCost: async () => {}, recordOutcome: () => {} });
 		expect(v.skipped).toBe(true);
 	});
+	describe("checked: requires an affirmative PASS verdict", () => {
+		const review = (stdout: string) => runFlatVerification({ runId: "r1", level: "checked", files: ["src/a.ts"], checks: [{ name: "test", argv: ["x"], cwd: ".", source: "p" }], repoRoot: "/r", checkTimeoutMs: 1000, goal: "g" },
+			{ dispatch: async (tasks) => tasks.map((t) => ok(t.taskId, t.capability, stdout)), captureDispatchCost: async () => {}, recordOutcome: () => {},
+			  runChecks: async () => [{ name: "test", argv: ["x"], status: "pass", exitCode: 0, durationMs: 1, tail: "" }] });
+		test("empty reviewer output is not a pass", async () => {
+			const v = await review("");
+			expect(v.passed).toBe(false);
+			expect(v.failedChecks).toContain("review");
+		});
+		test("'unable to review' is not a pass", async () => {
+			const v = await review("I was unable to review this change.");
+			expect(v.passed).toBe(false);
+			expect(v.failedChecks).toContain("review");
+		});
+		test("## Verdict PASS passes", async () => {
+			const v = await review("Looks fine.\n## Verdict\nPASS");
+			expect(v.passed).toBe(true);
+			expect(v.failedChecks).toEqual([]);
+		});
+		test("VERDICT: PASS line passes", async () => {
+			expect((await review("VERDICT: PASS")).passed).toBe(true);
+		});
+	});
 });
