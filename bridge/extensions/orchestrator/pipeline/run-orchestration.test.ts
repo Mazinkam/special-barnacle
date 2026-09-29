@@ -1509,6 +1509,14 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode",
 		expect(summary!.files_changed as string[]).toContain("src/util/format.ts");
 	}, GIT_IO_TIMEOUT_MS);
 
+	test("escalated led QA that exits 0 with no check evidence is not reported as verified", async () => {
+		const { summary, result } = await runWith({ runChecks: failing, qaStdout: "all good" });
+		expect(summary!.verification_passed).toBe(false);
+		expect(result.kind).toBe("completed");
+		const report = (result as { report: { passedVerification: boolean } }).report;
+		expect(report.passedVerification).toBe(false);
+	}, GIT_IO_TIMEOUT_MS);
+
 	test("escalated run report.retries equals summary.fix_rounds and includes the prior round", async () => {
 		const { summary, result } = await runWith({ runChecks: failing });
 		const report = (result as { report: { retries: number } }).report;

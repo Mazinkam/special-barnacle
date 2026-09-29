@@ -57,7 +57,7 @@ import { telemetryWarning, type FlushReport, type QueueStats } from "../record-q
 import { collectBilledResults, dispatchHierarchical, summarizeReconWorkers, type HierarchyDeps } from "./hierarchy.ts";
 import { redactSecrets } from "../live-qa.ts";
 import { collectLeadAttempts, formatLeadAttemptLines } from "./lead-attempts.ts";
-import { runVerification, type RunVerificationOptions, type VerificationResult } from "./verify-loop.ts";
+import { evidenceStatusFor, parseCheckResults, runVerification, type RunVerificationOptions, type VerificationResult } from "./verify-loop.ts";
 import { runChecks } from "./check-runner.ts";
 import { dispatchFlat, runFlatVerification } from "./flat-level.ts";
 import {
@@ -1028,9 +1028,18 @@ export async function runOrchestration(
 	// On an escalated re-run (`carry`), a skipped verification (nothing left to verify, e.g. the led
 	// lead reverted the flat changes) is vacuous and must not launder the prior flat failure into a
 	// pass: treat it as unverified (FAIL), never as skipped/passed.
+	// The same holds for a QA that exited 0 but reported no check that actually ran to pass/fail
+	// (empty output, all skipped/unavailable): non-carry runs keep the T8 behaviour (passes, with
+	// evidence_status recorded), but after an escalation it is not evidence the flat failure is fixed.
+	const carryNoEvidence =
+		carry !== undefined &&
+		(lastVerification?.passed ?? false) &&
+		!(lastVerification?.skipped ?? false) &&
+		evidenceStatusFor(parseCheckResults(lastVerification?.dispatch?.stdout ?? "")) === "unverified_checks_unavailable";
 	const carrySkipped = carry !== undefined && (lastVerification?.skipped ?? false);
+	const carryUnverified = carrySkipped || carryNoEvidence;
 	const verificationSkipped = (lastVerification?.skipped ?? false) && !carrySkipped;
-	const passedVerification = (lastVerification?.passed ?? false) && !carrySkipped && (dispatchOk || finalDispatchOk);
+	const passedVerification = (lastVerification?.passed ?? false) && !carryUnverified && (dispatchOk || finalDispatchOk);
 	// The QA dispatch itself timing out (inactivity/absolute ceiling) is a distinct state from QA
 	// completing and reporting failing checks — the summary must say so instead of folding both
 	// into a plain FAIL (docs/architecture-review.md C5).
@@ -1038,7 +1047,11 @@ export async function runOrchestration(
 	// their distinct causes in the report instead of labeling a provider error a timeout.
 	const verificationTimedOut = lastVerification?.dispatch?.outcome === "timed_out";
 	const verificationProviderStall = lastVerification?.providerStall === true && !verificationTimedOut;
-	const failedChecks = carrySkipped && carry ? [`unverified after escalation from ${carry.fromLevel}: ${carry.reason}`] : (lastVerification?.failedChecks ?? []);
+	const failedChecks = carry && carrySkipped
+		? [`unverified after escalation from ${carry.fromLevel}: ${carry.reason}`]
+		: carry && carryNoEvidence
+			? [`unverified after escalation from ${carry.fromLevel}: no check evidence`]
+			: (lastVerification?.failedChecks ?? []);
 
 	// -----------------------------------------------------------------
 	// Step 3.5: Phase 3 opt-in Forge live-QA stage. Runs at most once, only when explicitly
