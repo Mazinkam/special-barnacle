@@ -23,3 +23,21 @@ def test_lower_bound_coverage_under_null():
         lb = paired_lower_bound(diffs, reps=2000, seed=rng.randint(0, 10**6))
         below += lb is None or lb <= 0
     assert below / trials >= 0.9
+
+
+def test_replaced_row_kept_until_replacement_is_terminal():
+    from bench.stats import task_means
+    old = {'attempt_id': 'a', 'task_id': 't', 'arm': 'x', 'verdict': 'unknown', 'execution_status': 'infra_error', 'replaced_by': 'a-r1'}
+    assert task_means([old], 'x')['t']['n'] == 1
+    new = {'attempt_id': 'a-r1', 'task_id': 't', 'arm': 'x', 'verdict': 'pass', 'execution_status': 'completed'}
+    m = task_means([old, new], 'x')['t']
+    assert m['n'] == 1 and m['pass_frac'] == 1.0
+
+
+def test_nonzero_exit_graded_pass_is_not_a_pass():
+    from bench.stats import task_means
+    rows = [{'attempt_id': 'a', 'task_id': 't', 'arm': 'x', 'verdict': 'pass', 'execution_status': 'failed'},
+            {'attempt_id': 'b', 'task_id': 't', 'arm': 'x', 'verdict': 'pass', 'execution_status': 'completed'},
+            {'attempt_id': 'c', 'task_id': 't', 'arm': 'x', 'verdict': 'pass'}]
+    m = task_means(rows, 'x')['t']
+    assert m['pass_frac'] == 2 / 3 and m['all_pass'] is False

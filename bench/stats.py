@@ -9,16 +9,23 @@ MIN_TASKS = 10
 _FAILED_STATUSES = {'timeout', 'budget_exceeded', 'infra_error', 'failed'}
 
 
+def active_rows(rows: list[dict]) -> list[dict]:
+    """Drop a replaced row only once its replacement has a terminal row in `rows`."""
+    terminal = {r.get('attempt_id') for r in rows if r.get('event') != 'started'}
+    return [r for r in rows if not (r.get('replaced_by') and r['replaced_by'] in terminal)]
+
+
 def task_means(rows: list[dict], arm: str) -> dict[str, dict]:
     by = defaultdict(list)
-    for r in rows:
-        if r.get('arm') == arm and 'replaced_by' not in r:
+    for r in active_rows(rows):
+        if r.get('arm') == arm:
             by[r['task_id']].append(r)
     out = {}
     for tid, rs in by.items():
-        passes = [r.get('verdict') == 'pass' for r in rs]
+        elapsed = [r['elapsed_ms'] for r in rs if r.get('elapsed_ms') is not None]
+        passes = [r.get('verdict') == 'pass' and r.get('execution_status') in (None, 'completed') for r in rs]
         out[tid] = {'pass_frac': sum(passes) / len(rs), 'all_pass': all(passes),
-                    'elapsed_ms': statistics.median(r['elapsed_ms'] for r in rs),
+                    'elapsed_ms': statistics.median(elapsed) if elapsed else None,
                     'cost_usd': sum(r.get('cost_usd') or 0 for r in rs),
                     'cost_complete': all(r.get('cost_complete') for r in rs), 'n': len(rs)}
     return out
@@ -61,7 +68,7 @@ def efficiency_summary(control: dict, candidate: dict, *, seed: int = 0) -> dict
     tasks = sorted(set(control) & set(candidate))
     def ratios(key, only_complete=False):
         xs = [candidate[t][key] / control[t][key] for t in tasks
-              if control[t][key] and (not only_complete or (control[t]['cost_complete'] and candidate[t]['cost_complete']))]
+              if control[t][key] and candidate[t][key] is not None and (not only_complete or (control[t]['cost_complete'] and candidate[t]['cost_complete']))]
         if len(xs) < MIN_TASKS:
             return {'n': len(xs), 'median_ratio': statistics.median(xs) if xs else None, 'ci': None}
         rng = random.Random(seed); boots = sorted(statistics.median(rng.choice(xs) for _ in xs) for _ in range(2000))
