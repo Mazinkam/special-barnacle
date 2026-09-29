@@ -173,7 +173,7 @@ def test_backfill_dry_run_default_and_repeat_write_is_idempotent(tmp_path: Path)
     root = tmp_path / 'state'
     run = root / 'runs' / 'r1'
     run.mkdir(parents=True)
-    (run / 'run.log').write_text('2026-01-08T11:00:00Z provider acme/model ECONNRESET\n')
+    (run / 'lead.stderr.log').write_text('2026-01-08T11:00:00Z provider acme/model ECONNRESET\n')
     (run / 'task.stderr.log').write_text('2026-01-08T11:01:00Z fetch failed\n')
     assert backfill(root)['candidates'] == 2
     assert not (root / 'events.jsonl').exists()
@@ -234,7 +234,7 @@ def test_backfill_matches_pending_stream_has_been_canceled(tmp_path: Path):
     root = tmp_path / 'state'
     run = root / 'runs' / 'r1'
     run.mkdir(parents=True)
-    (run / 'run.log').write_text('Error: pending stream has been canceled\n'
+    (run / 'task.stderr.log').write_text('Error: pending stream has been canceled\n'
                                  '2026-09-26T10:00:00Z Error: pending stream has been canceled\n')
     assert backfill(root) == {'candidates': 1, 'persisted': 0}
     assert backfill(root, write=True)['persisted'] == 1
@@ -257,6 +257,41 @@ def test_backfill_refuses_resolved_live_root_alias_before_read_or_write(tmp_path
         with pytest.raises(ValueError, match='live default state'):
             backfill(alias, write=True)
     assert not (live / 'events.jsonl').exists()
+
+
+def test_backfill_ignores_dated_run_log_prompt_echoes(tmp_path: Path):
+    root = tmp_path / 'state'
+    run = root / 'runs' / 'r1'
+    run.mkdir(parents=True)
+    (run / 'run.log').write_text('2026-09-28T09:00:00Z goal: handle getaddrinfo ENOTFOUND and HTTP 503 retries\n')
+    assert backfill(root) == {'candidates': 0, 'persisted': 0}
+    assert backfill(root, write=True) == {'candidates': 0, 'persisted': 0}
+    assert not (root / 'events.jsonl').exists()
+
+
+def _live_root_with_error(tmp_path: Path, monkeypatch) -> Path:
+    from scripts import backfill_provider_errors as module
+    live = tmp_path / 'live'
+    run = live / 'runs' / 'r1'
+    run.mkdir(parents=True)
+    (run / 'task.stderr.log').write_text('2026-09-26T10:00:00Z ECONNRESET\n')
+    monkeypatch.setattr(module, 'default_state_root', lambda: live)
+    return live
+
+
+def test_backfill_live_root_write_requires_allow_live_state_flag(tmp_path: Path, monkeypatch):
+    live = _live_root_with_error(tmp_path, monkeypatch)
+    assert backfill(live) == {'candidates': 1, 'persisted': 0}  # dry run stays allowed
+    with pytest.raises(ValueError, match='--allow-live-state'):
+        backfill(live, write=True)
+    assert not (live / 'events.jsonl').exists()
+
+
+def test_backfill_live_root_write_with_allow_live_state_flag(tmp_path: Path, monkeypatch):
+    live = _live_root_with_error(tmp_path, monkeypatch)
+    assert backfill(live, write=True, allow_live_state=True) == {'candidates': 1, 'persisted': 1}
+    assert backfill(live, write=True, allow_live_state=True) == {'candidates': 1, 'persisted': 0}
+    assert len(_rows(live)) == 1
 
 
 def test_backfill_refuses_symlinked_logs_and_write_without_explicit_directory(tmp_path: Path):

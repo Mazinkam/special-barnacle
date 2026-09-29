@@ -3,8 +3,9 @@
 
 Evidence comes from the harness's own structured error fields in runs/<run>/*.events.jsonl
 (assistant messages with stopReason "error", an errorMessage and an epoch-ms timestamp), never
-from model text. Dated run.log/*.stderr.log lines are only used for runs without such rows;
-undated lines are ignored because they carry no observation time.
+from model text. Dated *.stderr.log lines (the process's own stderr) are only used for runs
+without such rows; undated lines are ignored because they carry no observation time. run.log is
+never scanned: it echoes prompt text (e.g. "goal: ...") that can mention error strings.
 """
 from __future__ import annotations
 
@@ -185,11 +186,11 @@ def text_rows(root: Path, run: Path, path: Path) -> list[dict]:
     return rows
 
 
-def backfill(root: Path, *, write: bool = False) -> dict[str, int]:
+def backfill(root: Path, *, write: bool = False, allow_live_state: bool = False) -> dict[str, int]:
     """Scan only regular files below root/runs, never following a symlink out of root."""
     root = Path(root)
-    if write and root.resolve() == default_state_root().resolve():
-        raise ValueError('refusing to write the live default state directory')
+    if write and not allow_live_state and root.resolve() == default_state_root().resolve():
+        raise ValueError('refusing to write the live default state directory without --allow-live-state')
     if root.is_symlink() or not root.is_dir():
         raise ValueError('state directory must be an existing, non-symlink directory')
     records = []
@@ -207,7 +208,7 @@ def backfill(root: Path, *, write: bool = False) -> dict[str, int]:
             if structured:
                 continue  # Never double-count a run's evidence from its text logs.
             for path in files:
-                if path.name == 'run.log' or path.name.endswith('.stderr.log'):
+                if path.name.endswith('.stderr.log'):  # never run.log: it echoes prompt text
                     records.extend(text_rows(root, run, path))
     persisted = 0
     if write:
@@ -223,10 +224,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--state-dir', type=Path, help='Explicit state directory (required for --write)')
     parser.add_argument('--write', action='store_true', help='Opt in to appending normalized event records')
+    parser.add_argument('--allow-live-state', action='store_true',
+                        help='Explicitly allow --write against the live default state directory')
     args = parser.parse_args()
     if args.state_dir is None:
         parser.error('--state-dir is required; the default state root is never read or written')
-    print(backfill(args.state_dir, write=args.write))
+    try:
+        print(backfill(args.state_dir, write=args.write, allow_live_state=args.allow_live_state))
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == '__main__':
