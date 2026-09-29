@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { expandHome, loadBridgeConfig } from "./config.ts";
+import { expandHome, loadBridgeConfig, resolveStateRoot } from "./config.ts";
 import contract from "./contract.ts";
 
 const HOME = "/home/test-user";
@@ -134,5 +134,14 @@ describe("config.ts loadBridgeConfig state-root env precedence (2.3)", () => {
 	test("an empty-string canonical value falls back to the alias", () => {
 		const cfg = loadBridgeConfig({ [CANONICAL]: "", [ALIAS]: "/alias/state" }, HOME);
 		expect(cfg.stateRoot).toBe("/alias/state");
+	});
+});
+
+describe("resolveStateRoot", () => {
+	test("canonical variable wins over the deprecated alias", () => {
+		expect(resolveStateRoot({ CODING_AGENT_ORCHESTRATOR_HOME: "/exp/a", HUMAIN_ORCHESTRATOR_STATE_ROOT: "/old" })).toBe("/exp/a");
+	});
+	test("alias is used when canonical is unset", () => {
+		expect(resolveStateRoot({ HUMAIN_ORCHESTRATOR_STATE_ROOT: "/old" })).toBe("/old");
 	});
 });
