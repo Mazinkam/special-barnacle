@@ -946,6 +946,7 @@ export async function runOrchestration(
 		// post-escalation tree is the state worth reporting.
 		const thisRound = escalationResults.slice(roundStart);
 		allFiles = changedSince(`escalation retry ${retries}`, thisRound, [
+			...(carry?.priorResults ?? []),
 			...leadResults,
 			...escalationResults.slice(0, roundStart),
 		]).filter((f) => !externalFiles.includes(f));

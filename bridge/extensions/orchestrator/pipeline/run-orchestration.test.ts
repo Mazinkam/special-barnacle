@@ -1408,6 +1408,7 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode",
 		runChecks?: RunOrchestrationDeps["runChecks"];
 		extraFiles?: Record<string, string>;
 		onLead?: (repo: string) => void;
+		qaStdout?: string;
 	}) {
 		repo = makeRepo(opts.extraFiles);
 		const runId = "ht-orch-1700000000000-wf-e";
@@ -1446,7 +1447,7 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode",
 				if (impl) appendFileSync(join(repo, "src/util/format.ts"), `export const g${dispatched.length} = 1;\n`);
 				return {
 					taskId: t.taskId, capability: t.capability, model: "p/x", exitCode: 0,
-					stdout: impl ? IMPL_REPORT : t.capability.startsWith("lead") ? "STATUS: completed\n\nFiles Changed: None" : "PASS", stderr: "",
+					stdout: impl ? IMPL_REPORT : t.capability.startsWith("lead") ? "STATUS: completed\n\nFiles Changed: None" : (opts.qaStdout ?? "PASS"), stderr: "",
 					usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
 					durationMs: 1, costUsd: impl ? 0.25 : 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const,
 					filesChanged: impl ? ["src/util/format.ts"] : [],
@@ -1493,6 +1494,19 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode",
 		expect(result.kind).toBe("completed");
 		const report = (result as { report: { passedVerification: boolean } }).report;
 		expect(report.passedVerification).toBe(false);
+	}, GIT_IO_TIMEOUT_MS);
+
+	test("escalated led retry rescope keeps the flat attempt's files when git observation is unavailable", async () => {
+		const { summary } = await runWith({
+			args: { maxRetries: 2 },
+			runChecks: failing,
+			qaStdout: "## Verdict\nFAIL\n- test",
+			// Destroying .git during the led phase makes every later git snapshot fail, so scope
+			// falls back to claimed file paths (flat attempt claims live in carry.priorResults).
+			onLead: (r) => rmSync(join(r, ".git"), { recursive: true, force: true }),
+		});
+		expect(summary!.fix_rounds as number).toBeGreaterThanOrEqual(2);
+		expect(summary!.files_changed as string[]).toContain("src/util/format.ts");
 	}, GIT_IO_TIMEOUT_MS);
 
 	test("escalated run report.retries equals summary.fix_rounds and includes the prior round", async () => {
