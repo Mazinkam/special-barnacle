@@ -138,6 +138,14 @@ class TestMethod(unittest.TestCase):
         wf = data['rules']['workflow_policy']
         self.assertEqual(wf['mode'], 'off')
         self.assertEqual(wf['levels'], ['direct', 'checked', 'led', 'full'])
+        for replacement, match in (([], 'rules.workflow_policy'),):
+            bad = copy.deepcopy(data); bad['rules']['workflow_policy'] = replacement
+            with self.assertRaisesRegex(ValueError, match):
+                method._validate(bad)
+        for replacement, match in ((None, 'rules.workflow_policy.thresholds'),):
+            bad = copy.deepcopy(data); bad['rules']['workflow_policy']['thresholds'] = replacement
+            with self.assertRaisesRegex(ValueError, match):
+                method._validate(bad)
         for mutate, match in ((lambda d: d.__setitem__('mode', 'on'), 'workflow_policy.mode'),
                               (lambda d: d.__setitem__('levels', ['direct', 'full']), 'workflow_policy.levels'),
                               (lambda d: d['thresholds'].__setitem__('led_min_files', 0), 'led_min_files'),
