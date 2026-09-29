@@ -45,6 +45,15 @@ test("does not count the child diagnostic's replay of a nested error as new evid
  expect(entries[0]).toMatchObject({ error_code: "ECONNRESET", count: 1 });
 });
 
+test("does not replay the truncated nested-error tail line as an own provider_error row", () => {
+ // `ownStderr` (used for `error_code`/`providerErrors`, not for classification) still strips
+ // at `\nnestedWorkers:`, so the `[provider nested error] read ECONNRESET` line inside that
+ // tail never becomes a second, nested:false row -- even though it's real evidence for
+ // `failure_class` (via the unstripped `input.stderr` failover reads).
+ const entries = providerErrors({ ...base, stderr: "some text\nnestedWorkers: [...]\n[provider nested error] read ECONNRESET" });
+ expect(entries).toHaveLength(0);
+});
+
 test("keeps own and nested errors separate even when code and host match", () => {
  const entries = providerErrors({ ...base, stderr: "read ECONNRESET https://api.example.com/own", nestedProviderErrors: [
   { message: "read ECONNRESET https://api.example.com/nested", timestamp: "2026-01-01T00:00:00.000Z" },
@@ -137,6 +146,19 @@ describe("one provider-failure classifier: failover's decision and telemetry's f
    name: "nested-only evidence (own stderr empty)",
    input: { ...base, stderr: "", nestedProviderErrors: [{ message: "read ECONNRESET", timestamp: "2026-01-01T00:00:00.000Z" }] },
    signals: { exitCode: 1, outcome: "failed", stderr: "", toolInFlight: false, cancelled: false },
+  },
+  {
+   // Regression: `dispatch/failover.ts` builds `attemptSignals` from the attempt's FULL,
+   // unstripped `result.stderr` -- it never calls `ownStderr`. When that stderr carries the
+   // `\nnestedWorkers: ...` diagnostic tail dispatch-progress.ts appends, followed by a
+   // `[provider nested error] ...` replay line, `providerText` drops the `nestedWorkers:`
+   // line (matches `ORCHESTRATOR_LINE_RE`) but NOT the `[provider nested error]` line, so
+   // failover's own classifier sees "read ECONNRESET" and calls this "transient". Before the
+   // fix, `dispatchHealth` classified from `ownStderr(input)` (stripped at `\nnestedWorkers:`,
+   // dropping the nested-error line too) and disagreed, reading "task".
+   name: "tail nested-error line survives providerText (failover reads the same full stderr)",
+   input: { ...base, stderr: "some text\nnestedWorkers: [...]\n[provider nested error] read ECONNRESET" },
+   signals: { exitCode: 1, outcome: "failed", stderr: "some text\nnestedWorkers: [...]\n[provider nested error] read ECONNRESET", toolInFlight: false, cancelled: false },
   },
  ];
 

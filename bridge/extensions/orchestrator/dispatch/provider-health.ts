@@ -82,14 +82,18 @@ export function dispatchHealth(input: HealthInput): { outcome: string; timeout_r
   // `pipeline/hierarchy.ts`), not a second copy of the provider-failure rule table.
   failureClass = "wait_stall";
  } else {
-  // Same shared construction `dispatch/failover.ts` uses (`attemptSignals`, core/failure-class.ts) --
-  // nested worker evidence is intentionally excluded from `stderr` here even though `errorCode`
-  // above may still fall back to it for a diagnostic `error_code`: nested evidence must never
-  // change `failure_class` out from under what failover already decided for this attempt.
+  // Same shared construction `dispatch/failover.ts` uses (`attemptSignals`, core/failure-class.ts),
+  // fed the SAME unstripped `input.stderr` failover reads (never `ownStderr`'s tail-stripped
+  // slice): failover has no `ownStderr` step, so if this stripped the `\nnestedWorkers: ...`
+  // tail (and any `[provider nested error] ...` lines inside it) before classifying, this
+  // `failure_class` could disagree with the `FailureClass` failover already acted on for the
+  // exact same attempt. `ownStderr` still gates the diagnostic `error_code` above and the own
+  // (nested:false) `providerErrors()` row below, so nested evidence still never gets double-
+  // counted as this attempt's own row -- it just must never change `failure_class` itself.
   const signals: AttemptSignals = attemptSignals({
    exitCode: input.exitCode,
    outcome: input.outcome,
-   stderr,
+   stderr: input.stderr ?? "",
    errorMessage: input.errorMessage,
    stopReason: input.stopReason,
    timeoutReason: input.timeoutReason,
