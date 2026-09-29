@@ -82,12 +82,18 @@ def _cli_files(tmp_path, fake_cfg, tiny_suite):
     return cp, tiny_suite[0].source.parent
 
 
-def test_cli_rejects_tiered(tmp_path, tiny_suite, fake_cfg, capsys):
-    cli = _load_cli(); cp, suite = _cli_files(tmp_path, fake_cfg, tiny_suite)
+def test_cli_rejects_tiered(tmp_path, tiny_suite, fake_cfg, monkeypatch, capsys):
+    cli = _load_cli()
+    monkeypatch.setattr(cli, '_tiered_supported', lambda: False)
+    cp, suite = _cli_files(tmp_path, fake_cfg, tiny_suite)
     rc = cli.main(['--suite', str(suite), '--experiment-root', str(tmp_path / 'exp'), '--config', str(cp),
                    '--arms', 'direct,tiered', '--approve-usd', '100', '--no-sandbox'])
     assert rc != 0 and 'tiered' in capsys.readouterr().err
     assert not (tmp_path / 'exp').exists()
+
+
+def test_tiered_supported_once_workflow_policy_present():
+    assert _load_cli()._tiered_supported() is True
 
 
 def test_cli_refuses_fingerprint_mismatch(tmp_path, tiny_suite, fake_cfg, monkeypatch, capsys):
