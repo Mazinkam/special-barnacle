@@ -71,8 +71,10 @@ describe("flat level", () => {
 		test("VERDICT: PASS line passes", async () => {
 			expect((await review("VERDICT: PASS")).passed).toBe(true);
 		});
-		test("PASS with trailing text passes", async () => {
-			expect((await review("## Verdict\nPASS — ok")).passed).toBe(true);
+		test("PASS with trailing qualifier text fails closed (strict verdict contract)", async () => {
+			const v = await review("## Verdict\nPASS — ok");
+			expect(v.passed).toBe(false);
+			expect(v.failedChecks).toContain("review");
 		});
 		test("fenced example verdict does not satisfy the gate", async () => {
 			const v = await review("```text\n## Verdict\nPASS\n```\nI cannot PASS this change.");
