@@ -1038,7 +1038,7 @@ export async function runOrchestration(
 		files_changed: allFiles,
 		retries,
 		// Quality repair rounds (QA/escalation loop iterations). `retries` is kept for existing
-		// readers; `fix_rounds` is the explicit name the evaluation reads (spec §1.3).
+		// readers. `fix_rounds` is the explicit name the evaluation reads (spec §1.3).
 		fix_rounds: retries,
 		models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
 		log_dir: session.dir,
