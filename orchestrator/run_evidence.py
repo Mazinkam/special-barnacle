@@ -540,6 +540,7 @@ def summarize_runs(metrics: list[dict], events: list[dict], outcomes: list[dict]
             'tasks': len({str(r.get('task_id')) for r in rows if r.get('task_id') is not None}),
             'roles': sorted({_role(r) for r in rows}), 'retries': retries, 'fix_rounds': fix_rounds, 'provider_retries': provider_retries[rid],
             'rework_events': rework_events[rid],
+            'workflow': note.get('workflow') if isinstance(note.get('workflow'), dict) else None,
             'verification': verdict or 'unknown', 'verification_rows': len(verifications[rid]), 'verified_tasks': len(verified_tasks),
             'decision_rows': decisions[rid], 'other_metric_rows': other_rows[rid], 'excluded_session_ingest_rows': excluded[rid],
             'spend_cap_hit': bool(cap_hits[rid]), 'spend_cap_hits': cap_hits[rid],

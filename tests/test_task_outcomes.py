@@ -74,3 +74,9 @@ class SummaryTests(unittest.TestCase):
     def test_zero_passes_has_no_finite_cost_per_success(self):
         rows = [{'complexity_band': 'large', 'verification': 'fail', 'blocked': False, 'elapsed_ms': 10, 'cost_known_usd': 2.0, 'cost_complete': True, 'fix_rounds': 0, 'provider_retries': 0, 'delayed_bad_outcome': None}]
         self.assertIsNone(summarize_task_outcomes(rows)['large']['cost_per_verified_usd'])
+
+    def test_workflow_fields_from_summary(self):
+        [row] = task_outcomes([call('w')], [], [complete('w', verification_passed=True,
+                               workflow={'mode': 'enforce', 'planned': 'direct', 'final': 'led', 'escalations': 1})])
+        self.assertEqual((row['workflow_mode'], row['workflow_level_planned'], row['workflow_level_final'], row['workflow_escalations']),
+                         ('enforce', 'direct', 'led', 1))

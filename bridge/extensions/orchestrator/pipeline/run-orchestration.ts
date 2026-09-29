@@ -42,7 +42,10 @@ import { loadEfficiencyControls } from "../efficiency-flags.ts";
 import { pickModel } from "../core/routing.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 import { changedFilesSinceRunStart, gitDirtySnapshot, gitHead } from "../adapters/git-changes.ts";
-import { formatAdapterTable, shortName } from "../models.ts";
+import { formatAdapterTable, METHOD, shortName } from "../models.ts";
+import { resolveWorkflowMode } from "../workflow-mode.ts";
+import { collectWorkflowSignals, fsReader, listRepoFiles } from "../core/workflow-signals.ts";
+import { applyWorkflowOverride, routeWorkflow, type WorkflowDecision } from "../core/workflow-router.ts";
 import { planEscalation, type EscalationLeadInput } from "../escalation.ts";
 import { leadSizeOf, sizeLead, type LeadSizeDecision } from "../lead-sizing.ts";
 import { classifyRunOutcome, externalChangeFiles, parseLeadStatus, qaScopeEvidenceFor } from "../run-outcome.ts";
@@ -485,6 +488,35 @@ export async function runOrchestration(
 		source: leadDecision.source,
 	});
 	session.log(`lead size: ${leadDecision.size} → ${leadDecision.capability} on ${leadModel} (source: ${leadDecision.source})`);
+
+	// Workflow level (spec §3). `off` does nothing at all; `observe` records the plan only.
+	// Signal collection is advisory: any failure is logged and leaves `workflow` null (never aborts the run).
+	const workflowPolicy = METHOD.rules.workflow_policy;
+	const workflowMode = resolveWorkflowMode(workflowPolicy, deps.env);
+	for (const p of workflowMode.problems) session.log(`workflow: ${p}`);
+	let workflow: WorkflowDecision | null = null;
+	let workflowSignalMs = 0;
+	if (workflowMode.mode !== "off" && workflowPolicy) {
+		try {
+			const t0 = performance.now();
+			const root = resolve(cwd);
+			const files = listRepoFiles(root, workflowPolicy.signal_timeout_ms) ?? [];
+			const signals = collectWorkflowSignals({ goal: parsed.goal, files, reader: fsReader(root), triageRisk: effectiveRisk, taskClass: effectiveTaskClass, policy: workflowPolicy });
+			const decision = applyWorkflowOverride(routeWorkflow(signals, workflowPolicy), parsed.workflowLevel);
+			workflowSignalMs = Math.round(performance.now() - t0);
+			deps.recordEvent("workflow_level_planned", {
+				run_id: runId, mode: workflowMode.mode, level: decision.level, floor: decision.floor,
+				reasons: decision.reasons, uncertainty: decision.uncertainty, signal_ms: workflowSignalMs,
+				candidates: signals.candidates.length, packages: signals.packages, risk_path_hits: signals.riskPathHits,
+				checks: signals.checks.map((c) => c.name), override: decision.override ?? null,
+			});
+			workflow = decision;
+			session.log(`workflow: ${workflowMode.mode} → ${decision.level} (floor ${decision.floor}; ${decision.reasons.join("; ")}; ${workflowSignalMs}ms)`);
+		} catch (err) {
+			workflow = null;
+			session.log(`workflow: signal collection failed (${err instanceof Error ? err.message : String(err)}); continuing without a workflow plan`);
+		}
+	}
 
 	const needsArchitect = plan.topology.depth >= 2 && complexityNeedsArchitect(plan.complexity);
 	const leadCount = Number.isFinite(plan.topology.leads)
@@ -1028,6 +1060,7 @@ export async function runOrchestration(
 	}
 	if (finalChecks.length) session.setPendingChecks?.(finalChecks.map(({ check, outcome }) => ({ provider: check.provider, id: check.id, outcome: outcome === "cancelled" ? "unverified" : outcome, ...(check.mr ? { mr: check.mr } : {}) })));
 	const telemetry = await deps.completeRun(runId, {
+		...(workflow ? { workflow: { mode: workflowMode.mode, planned: workflow.level, final: workflow.level, escalations: 0, reasons: workflow.reasons, signal_ms: workflowSignalMs } } : {}),
 		success_rate: finalSucceededLeads / Math.max(1, leadAttempts.length),
 		verification_passed: passedVerification,
 		external_checks: finalChecks.map(({ check, outcome, reason, jobId }) => ({ provider: check.provider, id: check.id, outcome, reason, job_id: jobId })),

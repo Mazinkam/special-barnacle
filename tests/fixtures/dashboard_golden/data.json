@@ -1011,7 +1011,8 @@
         "tested_revision_dirty": null
       },
       "verification_rows": 1,
-      "verified_tasks": 1
+      "verified_tasks": 1,
+      "workflow": null
     },
     {
       "cache_write_tokens": 0,
@@ -1072,7 +1073,8 @@
         "tested_revision_dirty": null
       },
       "verification_rows": 0,
-      "verified_tasks": 0
+      "verified_tasks": 0,
+      "workflow": null
     }
   ],
   "spend_caps": {

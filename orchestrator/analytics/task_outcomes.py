@@ -59,6 +59,7 @@ def task_outcomes(metrics: list[dict], events: list[dict], outcomes: list[dict],
             continue  # decision-only evidence never counts as an outcome
         strata = _strata(by_run.get(rid, []))
         is_blocked = rid in blocked
+        wf = ev.get('workflow') or {}
         result.append({
             'run_id': rid,
             'execution_status': ev['status'] if ev['status'] in _EXECUTION else 'unknown',
@@ -73,6 +74,8 @@ def task_outcomes(metrics: list[dict], events: list[dict], outcomes: list[dict],
             'fix_rounds': ev.get('fix_rounds'),
             'provider_retries': ev.get('provider_retries', 0),
             'delayed_bad_outcome': ev['delayed_bad_outcome'],
+            'workflow_mode': wf.get('mode'), 'workflow_level_planned': wf.get('planned'),
+            'workflow_level_final': wf.get('final'), 'workflow_escalations': wf.get('escalations'),
         })
     return result
 
