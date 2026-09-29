@@ -94,6 +94,8 @@ export interface RunReport {
 	 *  (`pipeline/lead-attempts.ts`'s `formatLeadAttemptLines`), e.g. `lead-0: failed (inactivity) →
 	 *  retry-1 succeeded`. Empty when every lead succeeded on its first (only) attempt. */
 	leadAttemptLines: string[];
+	/** Final parsed lead STATUS values. Used only for terminal-summary UX; absent keeps legacy text. */
+	leadStatuses?: string[];
 	/** Files verified this run (after excluding files changed by someone else). */
 	filesChangedCount: number;
 	/** Files changed during the run that no lead reported changing (excluded from QA). */
@@ -187,21 +189,42 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 	}
 	// External CI is an independent gate, never a rewrite of QA's own verdict.
 	const externalChecks = report.externalChecks ?? [];
+	const leadStatuses = report.leadStatuses ?? [];
+	const hasBlockedLead = leadStatuses.includes("blocked");
+	const hasFailedLead = leadStatuses.includes("failed");
+	const partial = !report.blocked && !hasBlockedLead && !hasFailedLead && report.dispatchOk && leadStatuses.includes("partial");
+	const verificationPassed = verdict.startsWith("PASS");
+	const displayedReportLines = report.leadStatuses === undefined
+		? report.reportLines
+		: report.reportLines.filter((line) => !/^\s*STATUS\s*:/i.test(line));
+	const orchestrationBlocked = report.blocked || hasBlockedLead || externalChecks.some((check) => check.outcome !== "success");
+	const orchestrationFailed = !report.dispatchOk || hasFailedLead;
+	const actionLines = partial && !report.showFullReport ? displayedReportLines.filter((line) => /^\s*[-*]\s+/.test(line)).slice(0, 5) : [];
+	const verificationLabel = partial && verificationPassed ? "code verification" : "verification";
 	const summary = [
-		`Orchestration ${report.blocked || externalChecks.some((check) => check.outcome !== "success") ? "BLOCKED" : report.dispatchOk ? "complete" : "FAILED"} in ${fmtElapsed(report.elapsedMs)}.`,
+		`Orchestration ${orchestrationBlocked ? "BLOCKED" : orchestrationFailed ? "FAILED" : partial ? "partial" : "complete"} in ${fmtElapsed(report.elapsedMs)}.`,
+		...(partial && verificationPassed ? ["status note: code checks passed, but the requested scope is not fully closed."] : []),
 		`run_id: ${report.runId}`,
 		`leads: ${report.succeededLeads}/${report.totalLeads} ${report.blocked ? "blocked" : "succeeded"}${report.skippedLeads > 0 ? ` (+${report.skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${report.retries} · files: ${report.filesChangedCount} changed${report.externalFilesCount > 0 ? ` (+${report.externalFilesCount} changed by someone else, not verified)` : ""}`,
 		report.reconWorkersLine,
 		...(report.outOfTreeChangesLine ? [report.outOfTreeChangesLine] : []),
 		...(report.resumedLeadIds.length > 0 ? [`resumes: ${report.resumedLeadIds.length} (${report.resumedLeadIds.join(", ")})`] : []),
 		...report.leadAttemptLines,
-		`verification: ${verdict}`,
+		`${verificationLabel}: ${verdict}`,
+		...(partial ? [
+			"why partial:",
+			verificationPassed
+				? "- Code verification passed, but at least one lead reported STATUS: partial because some requested scope remains open."
+				: "- At least one lead reported STATUS: partial because some requested scope remains open.",
+			"- See 'open items from lead' below for the specific follow-up work.",
+			...(actionLines.length > 0 ? ["what still needs action:", ...actionLines] : []),
+		] : []),
 		...externalChecks.map((check) => `external check: ${check.provider} ${check.id} ${check.outcome}`),
 		`total cost: $${report.totalCostUsd.toFixed(4)} (${report.dispatchCount} dispatches${report.nestedCostUsd > 0 ? `; $${report.nestedCostUsd.toFixed(4)} of it in lead subagents` : ""})`,
 		...(report.dispatchOk ? [] : [`first failure: ${report.firstFailureLine}`]),
 		...(report.liveQa ? liveQaSummaryLines(report.liveQa.stage, report.liveQa.notRunReason, report.liveQa.hasUnknownCost) : []),
-		...(report.reportLines.length > 0
-			? ["", report.showFullReport ? "lead report:" : "open items from lead:", ...report.reportLines, ...(report.reportTruncated && report.hasLeadReports ? [`… full report: ${report.leadReportPath}`] : [])]
+		...(displayedReportLines.length > 0
+			? ["", report.showFullReport ? "lead report:" : "open items from lead:", ...displayedReportLines, ...(report.reportTruncated && report.hasLeadReports ? [`… full report: ${report.leadReportPath}`] : [])]
 			: report.hasLeadReports
 				? [`lead report: ${report.leadReportPath}`]
 				: []),

@@ -278,6 +278,68 @@ describe("core/report.ts buildRunSummary", () => {
 		expect(text).toContain(["", "open items from lead:", "- follow up on X", "- consider Y", "run log: /tmp/run.log"].join("\n"));
 	});
 
+	test("partial lead summary explains PASS vs partial and next action", () => {
+		const report: RunReport = {
+			...baseReport(),
+			leadStatuses: ["partial"],
+			succeededLeads: 1,
+			totalLeads: 1,
+			showFullReport: false,
+			reportLines: ["- gather dated Bedrock evidence", "- dry-run the backfill", "STATUS: partial"],
+			hasLeadReports: true,
+			leadReportPath: "run.log dir/lead-report.md",
+		};
+		const { text } = buildRunSummary(report);
+		expect(text).toContain("Orchestration partial in 1m05s.");
+		expect(text).toContain("code verification: PASS");
+		expect(text).toContain([
+			"why partial:",
+			"- Code verification passed, but at least one lead reported STATUS: partial because some requested scope remains open.",
+			"- See 'open items from lead' below for the specific follow-up work.",
+			"what still needs action:",
+			"- gather dated Bedrock evidence",
+			"- dry-run the backfill",
+		].join("\n"));
+		expect(text).not.toContain("\nSTATUS: partial\n");
+	});
+
+	test("partial lead summary: blocked status takes precedence", () => {
+		const { text } = buildRunSummary({ ...baseReport(), leadStatuses: ["partial", "blocked"], blocked: true });
+		expect(text).toContain("Orchestration BLOCKED in 1m05s.");
+		expect(text).not.toContain("Orchestration partial");
+	});
+
+	test("partial lead summary preserves a non-PASS verification verdict", () => {
+		const { text } = buildRunSummary({
+			...baseReport(),
+			leadStatuses: ["partial"],
+			passedVerification: false,
+			failedChecks: ["typecheck"],
+		});
+		expect(text).toContain("verification: FAIL (typecheck)");
+		expect(text).not.toContain("code verification: PASS");
+	});
+
+	test("partial with full report omits the action list", () => {
+		const { text } = buildRunSummary({
+			...baseReport(),
+			leadStatuses: ["partial"],
+			showFullReport: true,
+			reportLines: ["- follow up", "STATUS: partial"],
+		});
+		expect(text).not.toContain("what still needs action:");
+		expect(text).not.toContain("\\nSTATUS: partial\\n");
+	});
+
+	test("partial action list is capped at five bullets", () => {
+		const reportLines = Array.from({ length: 7 }, (_, index) => `- action ${index + 1}`);
+		const { text } = buildRunSummary({ ...baseReport(), leadStatuses: ["partial"], reportLines });
+		const actionList = text.split("what still needs action:\n")[1]?.split("\ntotal cost:")[0] ?? "";
+		expect(actionList).toContain("- action 5");
+		expect(actionList).not.toContain("- action 6");
+		expect(actionList).not.toContain("- action 7");
+	});
+
 	test("truncated report: full report shown inline, plus a pointer to the on-disk file", () => {
 		const report: RunReport = {
 			...baseReport(),

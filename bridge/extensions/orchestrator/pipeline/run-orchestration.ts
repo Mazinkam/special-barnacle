@@ -1104,6 +1104,7 @@ export async function runOrchestration(
 		skippedLeads,
 		retries,
 		leadAttemptLines,
+		leadStatuses: finalLeadStatuses,
 		resumedLeadIds: resumedLeadTaskIds.map((id) => id.replace(`${runId}-`, "")),
 		filesChangedCount: allFiles.length,
 		externalFilesCount: externalFiles.length,
