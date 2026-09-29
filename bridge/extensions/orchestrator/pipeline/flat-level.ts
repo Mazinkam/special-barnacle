@@ -47,24 +47,20 @@ export async function dispatchFlat(
 		resumedLeadTaskIds: [], retriedLeadTaskIds: [], resumedAttemptResults: [], pendingChecks: [] };
 }
 
-const stripEmphasis = (line: string): string => {
-	let t = line.trim();
-	for (;;) {
-		const m = /^(\*\*|__)(.*)\1$/.exec(t);
-		if (!m) return t;
-		t = m[2]!.trim();
-	}
-};
-
-/** True when a fenced code block (CommonMark rules) is still open after scanning `lines`. */
-function fenceOpenAfter(lines: string[]): boolean {
+/** Fail-closed fence scan (strict ASCII CommonMark). True when a fence is open or any fence marker is ambiguous. */
+function fenceUnsafe(lines: string[]): boolean {
 	let fence: { ch: string; len: number } | undefined;
 	for (const line of lines) {
+		const marker = /^(\s*)(`{3}|~{3})/.exec(line);
+		if (marker) {
+			const prefix = marker[1]!;
+			if (/[^ \t]/.test(prefix) || prefix.replace(/\t/g, "    ").length >= 4) return true;
+		}
 		const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
 		if (!m) continue;
 		const ch = m[1]![0]!;
 		if (fence) {
-			if (ch === fence.ch && m[1]!.length >= fence.len && m[2]!.trim() === "") fence = undefined;
+			if (ch === fence.ch && m[1]!.length >= fence.len && /^[ \t]*$/.test(m[2]!)) fence = undefined;
 		} else if (ch !== "`" || !m[2]!.includes("`")) {
 			fence = { ch, len: m[1]!.length };
 		}
@@ -72,31 +68,21 @@ function fenceOpenAfter(lines: string[]): boolean {
 	return fence !== undefined;
 }
 
+const HTML_BLOCK_OPENER = /<!--|<pre|<script|<style|<textarea|<!\[cdata\[|<\?|<![a-z]/i;
+
 /**
- * Strict positional contract (no Markdown parsing): the LAST line of the output is exactly `PASS`
- * (emphasis allowed) directly under a `## Verdict` heading, or exactly `VERDICT: PASS`; the verdict
- * is not inside an open fence or blockquote. Anything else is not an affirmative pass.
+ * Byte-exact contract (no Markdown interpretation): after CRLF->LF and stripping trailing ASCII
+ * whitespace, the last two lines are exactly `## Verdict` and `PASS` at column 0; the line before
+ * the heading (if any) is empty; no fence is open or ambiguous and no HTML block opener precedes it.
  */
 function hasAffirmativePassVerdict(rawText: string): boolean {
-	const lines = rawText.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").map((l) => l.trimEnd());
-	while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-	const last = lines.length - 1;
-	if (last < 0) return false;
-	const lastLine = lines[last]!;
-	if (/^(\t| {4})/.test(lastLine) || lastLine.trimStart().startsWith(">")) return false;
-	const body = stripEmphasis(lastLine);
-	let start: number; // first line of the verdict block
-	if (/^VERDICT:\s*(\*\*|__)?PASS(\*\*|__)?$/i.test(body)) {
-		start = last;
-	} else if (body === "PASS") {
-		let h = last - 1;
-		while (h >= 0 && lines[h]!.trim() === "") h--;
-		if (h < 0 || !/^ {0,3}#{1,3}[ \t]+verdict$/i.test(lines[h]!)) return false;
-		start = h;
-	} else return false;
-	if (start > 0 && lines[start - 1]!.trimStart().startsWith(">")) return false;
-	if (fenceOpenAfter(lines.slice(0, start))) return false;
-	return true;
+	const lines = rawText.replace(/\r\n/g, "\n").replace(/[ \t\n\r\f\v]+$/, "").split("\n");
+	const n = lines.length;
+	if (n < 2 || lines[n - 1] !== "PASS" || lines[n - 2] !== "## Verdict") return false;
+	const before = lines.slice(0, n - 2);
+	if (before.length > 0 && before[before.length - 1] !== "") return false;
+	if (HTML_BLOCK_OPENER.test(before.join("\n"))) return false;
+	return !fenceUnsafe(before);
 }
 
 function reviewTask(runId: string, goal: string, files: string[], checks: CheckRunResult[]): DispatchTask {
@@ -109,8 +95,8 @@ function reviewTask(runId: string, goal: string, files: string[], checks: CheckR
 			"", "## Goal", goal,
 			"", "## Changed files", ...files.map((f) => `- ${f}`),
 			"", "## Deterministic checks", ...checks.map((c) => `- ${c.name}: ${c.status}`),
-			"", "End your output with `## Verdict` on its own line and then, on the next line and as the LAST line of the output, exactly `PASS` or `FAIL` (nothing else on that line, nothing after it).",
-			"If the verdict is FAIL, list the blocking issues BEFORE the `## Verdict` heading.",
+			"", "Output format: list blocking issues (if any) first, then a blank line, then a line reading exactly `## Verdict`, and on the FINAL line exactly `PASS` or `FAIL`.",
+			"No formatting on those two lines (no bold, emphasis, quotes, indentation, code fences or extra text), and nothing after the final line.",
 		].join("\n"),
 	};
 }
