@@ -209,7 +209,7 @@ Regenerate `~/.local/state/coding-agent-orchestrator/dashboard.html` after use. 
 
 ### Performance evidence
 
-To evaluate whether the orchestrator is earning its keep, run `scripts/skill_vs_baseline.py`. It reads `metrics.jsonl`, partitions orchestrated work from session-log ingests, reprices orchestrated records at flat single-model baselines, and reports cost, success rate, cost-per-success, retry rate, and waste — for the orchestrator and each bracket. The script is observational: it writes nothing to the stream and does not change the dashboard.
+To evaluate whether the orchestrator is earning its keep, follow `docs/EVAL_BASELINE.md`: freeze a snapshot, then run `scripts/skill_vs_baseline.py --state-dir <snapshot>`. It excludes decision/route events from work, reports missing results as `unknown` (never `fail`), and prints one task outcome per run by complexity band with time/cost coverage. Flat-model repricing remains a cost sensitivity analysis, not a no-orchestration experiment; matched comparisons come from the benchmark in the tiered-workflows spec.
 
 The most recent calibrated numbers come from re-running `scripts/skill_vs_baseline.py` against the current `metrics.jsonl`; there is no separate calibrated-numbers file to refresh. The durable finding as of the first measurement: the orchestrator's routing savings came from reviews routed to cheaper tiers paying for stronger implementers. That measurement predates the 2026-09-24 finding that a frontier lead doing its own implementation was 49% of orchestrated spend; treat any prior ROI figure as historical until it is re-measured on matched cohorts (plan Phase E).
 
