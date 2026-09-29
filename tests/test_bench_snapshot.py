@@ -1,22 +1,11 @@
 import io, os, tarfile, subprocess
 import pytest
+from conftest import git, make_repo_at
 import bench.snapshot as snap
 from bench.snapshot import make_snapshot, tree_digest
 
-def git(cwd, *args):
-    return subprocess.run(['git', '-C', str(cwd), *args], check=True, capture_output=True, text=True).stdout.strip()
-
-def make_repo(tmp_path):
-    repo = tmp_path / 'src'; repo.mkdir()
-    git(repo, 'init', '-q'); git(repo, 'config', 'user.email', 't@t'); git(repo, 'config', 'user.name', 't')
-    (repo / 'a.txt').write_text('base\n'); git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'base')
-    base = git(repo, 'rev-parse', 'HEAD')
-    (repo / 'a.txt').write_text('SOLUTION\n'); git(repo, 'commit', '-qam', 'future solution')
-    git(repo, 'remote', 'add', 'origin', 'https://example.invalid/x.git')
-    return repo, base
-
 def test_snapshot_has_base_content_and_no_future_history(tmp_path):
-    repo, base = make_repo(tmp_path)
+    repo, base = make_repo_at(tmp_path)
     info = make_snapshot(repo, base, tmp_path / 'snap')
     assert (info.path / 'a.txt').read_text() == 'base\n'
     assert git(info.path, 'rev-list', '--count', 'HEAD') == '1'
@@ -24,7 +13,7 @@ def test_snapshot_has_base_content_and_no_future_history(tmp_path):
     assert 'SOLUTION' not in subprocess.run(['git', '-C', str(info.path), 'log', '--all', '-p'], capture_output=True, text=True).stdout
 
 def test_tree_digest_is_stable_and_content_sensitive(tmp_path):
-    repo, base = make_repo(tmp_path)
+    repo, base = make_repo_at(tmp_path)
     a = make_snapshot(repo, base, tmp_path / 's1'); b = make_snapshot(repo, base, tmp_path / 's2')
     assert tree_digest(a.path) == tree_digest(b.path)
     (b.path / 'a.txt').write_text('changed\n')
@@ -69,7 +58,7 @@ def test_make_snapshot_rejects_escaping_links(tmp_path, monkeypatch, entries):
     assert sorted(os.listdir(base)) == ['snap']
 
 def test_make_snapshot_keeps_in_tree_symlink(tmp_path):
-    repo, base = make_repo(tmp_path)
+    repo, base = make_repo_at(tmp_path)
     os.symlink('a.txt', repo / 'ok'); git(repo, 'add', 'ok'); git(repo, 'commit', '-qm', 'link')
     info = make_snapshot(repo, git(repo, 'rev-parse', 'HEAD'), tmp_path / 'snap')
     assert os.readlink(info.path / 'ok') == 'a.txt'
