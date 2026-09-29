@@ -1369,6 +1369,9 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow observe mode",
 
 describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode", () => {
 	const IMPL_REPORT = "done\n## Files Changed\n- src/util/format.ts\n\nSTATUS: completed";
+	// Real temp git repo + sync git calls: fresh-repo `git add -A` was measured stalling >5s on
+	// slow hosts, so these tests need an explicit timeout above bun's 5s default.
+	const GIT_IO_TIMEOUT_MS = 30_000;
 	let repo = "";
 	afterEach(() => { if (repo) rmSync(repo, { recursive: true, force: true }); repo = ""; });
 
@@ -1464,7 +1467,7 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode",
 		expect((summary!.workflow as { final: string }).final).toBe("direct");
 		expect(summary!.verification_passed).toBe(true);
 		expect(events.map(([e]) => e)).not.toContain("workflow_level_escalated");
-	});
+	}, GIT_IO_TIMEOUT_MS);
 
 	test("enforce direct: persistent failure escalates to led, keeps QA scope and prior cost", async () => {
 		const { dispatched, tasks, summary, events, completes } = await runWith({ runChecks: failing });
@@ -1478,7 +1481,7 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode",
 		expect(summary!.total_cost_usd as number).toBeGreaterThanOrEqual(0.5);
 		expect(summary!.fix_rounds as number).toBeGreaterThanOrEqual(1);
 		expect(completes).toBe(1);
-	});
+	}, GIT_IO_TIMEOUT_MS);
 
 	test("escalated led run that reverts the flat changes is not reported as verified", async () => {
 		const { summary, result, dispatched } = await runWith({
@@ -1490,24 +1493,24 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode",
 		expect(result.kind).toBe("completed");
 		const report = (result as { report: { passedVerification: boolean } }).report;
 		expect(report.passedVerification).toBe(false);
-	});
+	}, GIT_IO_TIMEOUT_MS);
 
 	test("escalated run report.retries equals summary.fix_rounds and includes the prior round", async () => {
 		const { summary, result } = await runWith({ runChecks: failing });
 		const report = (result as { report: { retries: number } }).report;
 		expect(summary!.fix_rounds as number).toBeGreaterThanOrEqual(1);
 		expect(report.retries).toBe(summary!.fix_rounds as number);
-	});
+	}, GIT_IO_TIMEOUT_MS);
 
 	test("escalated run total cost equals the sum of every dispatch cost", async () => {
 		const { summary, dispatchCostUsd } = await runWith({ runChecks: failing });
 		expect(summary!.total_cost_usd as number).toBeCloseTo(dispatchCostUsd, 6);
-	});
+	}, GIT_IO_TIMEOUT_MS);
 
 	test("enforce never runs flat for excluded task classes", async () => {
 		const { dispatched } = await runWith({ args: { taskClass: "investigation" }, runChecks: passing });
 		expect(dispatched).not.toContain("implementation_strong");
-	});
+	}, GIT_IO_TIMEOUT_MS);
 
 	test("enforce never runs flat for a risk-path goal even with --workflow direct", async () => {
 		const { dispatched, summary } = await runWith({
@@ -1518,5 +1521,5 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode",
 		expect(dispatched[0]).not.toBe("implementation_strong");
 		const wf = summary!.workflow as { planned: string; final: string };
 		expect([wf.planned, wf.final]).toEqual(["full", "full"]);
-	});
+	}, GIT_IO_TIMEOUT_MS);
 });
