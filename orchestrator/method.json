@@ -135,6 +135,21 @@
       "usd_by_capability": { "lead_small": 1.5, "lead": 4.0, "lead_large": 10.0, "architect": 2.0 },
       "default_usd": 1.0
     },
+    "workflow_policy": {
+      "summary": "Observable repository evidence picks the lightest workflow level; hard floors cannot be lowered; failures escalate upward with work carried forward.",
+      "mode": "off",
+      "levels": ["direct", "checked", "led", "full"],
+      "thresholds": { "led_min_files": 4, "led_min_packages": 3 },
+      "fix_rounds_per_level": 1,
+      "signal_timeout_ms": 5000,
+      "check_timeout_ms": 600000,
+      "excluded_task_classes": ["investigation", "qa_verification"],
+      "risk_path_globs": ["**/auth/**", "**/*auth*.*", "**/*secret*", "**/*credential*", "**/payments/**", "**/billing/**",
+                          ".github/workflows/**", ".gitlab-ci.yml", "**/package.json", "**/bun.lock", "**/bun.lockb", "**/package-lock.json",
+                          "**/pnpm-lock.yaml", "**/yarn.lock", "**/pyproject.toml", "**/requirements*.txt", "**/migrations/**", "**/*migration*.*"],
+      "interface_globs": ["**/*.d.ts", "**/schema*.json", "**/openapi*.json", "**/openapi*.yaml", "**/contract.json", "**/method.json", "**/index.ts", "**/__init__.py"],
+      "rationale": "Spec 2026-09-29 §3: coordination overhead should scale with evidence of scope and risk, not with an LLM complexity score."
+    },
     "model_requirements": {
       "default": { "min_context": 128000, "min_output": 16000, "effort_control": false },
       "groups": {

@@ -132,6 +132,20 @@ class TestMethod(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "default_tier"):
             method._validate(data)
 
+    def test_workflow_policy_shape_is_validated(self):
+        import copy
+        data = json.loads(method.METHOD_PATH.read_text())
+        wf = data['rules']['workflow_policy']
+        self.assertEqual(wf['mode'], 'off')
+        self.assertEqual(wf['levels'], ['direct', 'checked', 'led', 'full'])
+        for mutate, match in ((lambda d: d.__setitem__('mode', 'on'), 'workflow_policy.mode'),
+                              (lambda d: d.__setitem__('levels', ['direct', 'full']), 'workflow_policy.levels'),
+                              (lambda d: d['thresholds'].__setitem__('led_min_files', 0), 'led_min_files'),
+                              (lambda d: d.__setitem__('fix_rounds_per_level', -1), 'fix_rounds_per_level')):
+            bad = copy.deepcopy(data); mutate(bad['rules']['workflow_policy'])
+            with self.assertRaisesRegex(ValueError, match):
+                method._validate(bad)
+
     def test_no_haiku_in_family_presets(self):
         from orchestrator.dynamic_adapter import MODEL_FAMILY_PRESETS
         for preset in MODEL_FAMILY_PRESETS.values():

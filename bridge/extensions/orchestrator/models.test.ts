@@ -451,3 +451,10 @@ describe("method model failover rules", () => {
 		expect(METHOD.rules.model_failover.max_switches).toBe(4);
 	});
 });
+
+test("workflow_policy is readable and off by default", () => {
+	const wf = METHOD.rules.workflow_policy!;
+	expect(wf.mode).toBe("off");
+	expect(wf.levels).toEqual(["direct", "checked", "led", "full"]);
+	expect(wf.risk_path_globs).toContain("**/auth/**");
+});

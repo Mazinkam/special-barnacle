@@ -60,6 +60,20 @@ export interface ModelFailoverRule {
 	real_work_min_tool_calls: number;
 }
 
+export type WorkflowLevel = "direct" | "checked" | "led" | "full";
+export type WorkflowMode = "off" | "observe" | "enforce";
+export interface WorkflowPolicy {
+	mode: WorkflowMode;
+	levels: WorkflowLevel[];
+	thresholds: { led_min_files: number; led_min_packages: number };
+	fix_rounds_per_level: number;
+	signal_timeout_ms: number;
+	check_timeout_ms: number;
+	excluded_task_classes: string[];
+	risk_path_globs: string[];
+	interface_globs: string[];
+}
+
 interface MethodFile {
 	schema_version: number;
 	tiers: Tier[];
@@ -97,6 +111,7 @@ interface MethodFile {
 		};
 		model_requirements: ModelRequirementsRule;
 		model_failover: ModelFailoverRule;
+		workflow_policy?: WorkflowPolicy;
 	};
 }
 
