@@ -16,7 +16,7 @@ from bench.arms import arm_invocation, config_fingerprint
 from bench.contamination import scan_attempt, tool_locations
 from bench.grade import grade
 from bench.sandbox import sandbox_argv
-from bench.snapshot import make_snapshot
+from bench.prepared import SetupError, clone_tree, prepared_tree
 from bench.tools import preflight_tool_isolation, task_deny_roots
 from orchestrator.core.env import default_state_root
 
@@ -92,8 +92,9 @@ def _check_id(value: str, what: str) -> None:
 
 
 def run_experiment(tasks, cfg, arms, experiment_root: Path, *, approve_usd: float, sandbox: bool = True,
-                   launcher=subprocess.Popen) -> Path:
+                   launcher=subprocess.Popen, prepared_cache: Path | None = None) -> Path:
     root = Path(experiment_root)
+    cache = Path(prepared_cache) if prepared_cache is not None else root / 'prepared'
     if is_live_root(root):
         raise ValueError('refusing to use the live state root as an experiment root')
     by_id = {t.id: t for t in tasks}
@@ -126,7 +127,7 @@ def run_experiment(tasks, cfg, arms, experiment_root: Path, *, approve_usd: floa
         else:
             todo = a
         if todo is not None:
-            _append(journal, _run_one(by_id[a.task_id], todo, cfg, root, fingerprint, journal, sandbox, launcher))
+            _append(journal, _run_one(by_id[a.task_id], todo, cfg, root, fingerprint, journal, sandbox, launcher, cache))
     return journal
 
 
@@ -138,7 +139,8 @@ def _infra_row(a: Attempt, replaced_by) -> dict:
     return row
 
 
-def _run_one(task, a: Attempt, cfg, root: Path, fingerprint: str, journal: Path, sandbox: bool, launcher) -> dict:
+def _run_one(task, a: Attempt, cfg, root: Path, fingerprint: str, journal: Path, sandbox: bool, launcher,
+             cache: Path) -> dict:
     _check_id(a.attempt_id, 'attempt id')
     work = root / 'attempts' / a.attempt_id
     try:
@@ -148,17 +150,16 @@ def _run_one(task, a: Attempt, cfg, root: Path, fingerprint: str, journal: Path,
     if work.exists():   # leftover from an interrupted run of this very attempt
         shutil.rmtree(work)
     work.mkdir(parents=True, exist_ok=True)
-    base = make_snapshot(Path(task.repo), task.base_commit, work / 'base')
-    snap = make_snapshot(Path(task.repo), task.base_commit, work / 'tree')
     argv, env = arm_invocation(a.arm, task.goal, cfg, root)
-    for setup_argv in task.setup:
-        cmd = list(setup_argv)
-        if sandbox:   # network stays open for installs; only grading is offline
-            cmd = sandbox_argv(cmd, deny_read=task_deny_roots(task, root), allow_network=True)
-        try:
-            subprocess.run(cmd, cwd=snap.path, env={**os.environ, **env}, check=False, timeout=task.timeout_s)
-        except (subprocess.TimeoutExpired, OSError):
-            return _infra_row(a, None)
+    # One snapshot + setup per task for the whole experiment (bench/prepared.py); each attempt gets a clone.
+    # The prepared tree doubles as the pristine base for the grader's tamper comparison (read-only).
+    try:
+        base = prepared_tree(task, cache, sandbox=sandbox, deny_roots=task_deny_roots(task, root),
+                             env={**os.environ, **env})
+    except SetupError as exc:
+        return {**_infra_row(a, None), 'infra_reason': str(exc)[:500]}
+    snap = work / 'tree'
+    clone_tree(base, snap)
     argv = shlex.split(argv[0]) + argv[1:]           # allows "python fake_agent.py" style binaries
     if sandbox:
         argv = sandbox_argv(argv, deny_read=task_deny_roots(task, root), allow_network=True)
@@ -169,7 +170,7 @@ def _run_one(task, a: Attempt, cfg, root: Path, fingerprint: str, journal: Path,
     t0 = time.time()
     status = 'completed'
     with (work / 'agent.jsonl').open('wb') as out, (work / 'agent.stderr').open('wb') as err:
-        proc = launcher(argv, cwd=snap.path, env={**os.environ, **env}, stdout=out, stderr=err, start_new_session=True)
+        proc = launcher(argv, cwd=snap, env={**os.environ, **env}, stdout=out, stderr=err, start_new_session=True)
         try:
             while proc.poll() is None:
                 if time.time() - t0 > cfg.per_run_timeout_s:
@@ -190,7 +191,7 @@ def _run_one(task, a: Attempt, cfg, root: Path, fingerprint: str, journal: Path,
     contaminated, evidence = scan_attempt(work / 'agent.jsonl', [d for d in run_dirs if d.is_dir()], tool_locations(cfg))
     verdict, digest = 'unknown', None
     if status in ('completed', 'failed'):
-        g = grade(task, snap.path, base.path, work / 'grade', sandbox=sandbox)
+        g = grade(task, snap, base, work / 'grade', sandbox=sandbox)
         verdict, digest = g.verdict, g.tree_digest
         (work / 'grade.json').write_text(json.dumps(g.__dict__, default=str, indent=2))
     return {'attempt_id': a.attempt_id, 'task_id': a.task_id, 'arm': a.arm, 'k': a.k, 'execution_status': status,

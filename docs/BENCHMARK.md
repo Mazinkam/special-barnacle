@@ -42,8 +42,17 @@ the hidden checks come from that commit's test changes plus any acceptance check
 ## 3. Validate the suite (free)
 
 ```bash
-python3 scripts/bench_validate_tasks.py ~/orch-bench/suite --work ~/orch-bench/validate
+python3 scripts/bench_validate_tasks.py ~/orch-bench/suite --work ~/orch-bench/validate \
+  --prepared-cache ~/orch-bench/prepared
 ```
+
+**Prepared trees.** Each task's base snapshot plus its `setup` commands (e.g. `bun install`) is built
+once into `--prepared-cache` and marked READY only if setup succeeds; every later use (the validator's
+base grading, every benchmark attempt of every arm) gets an instant APFS clone. Pass the same
+`--prepared-cache` to `bench_validate_tasks.py` and `bench_run.py` so validation warms the cache and
+all arms start from the byte-identical environment. A failed setup in the runner is journaled as
+`infra_error` with an `infra_reason`, never silently ignored. Delete the cache directory to force a
+fresh install.
 
 A task is kept only if its base **fails** the hidden checks, its setup succeeds, and the reference
 patch applies and **passes 3/3** times. Everything else is quarantined with a reason in
@@ -132,6 +141,7 @@ that have any contaminated attempt. The primary analysis still uses all attempts
 
 ```bash
 python3 scripts/bench_run.py --suite ~/orch-bench/suite --experiment-root ~/orch-bench/exp-smoke \
+  --prepared-cache ~/orch-bench/prepared \
   --config ~/orch-bench/config.json --arms direct,current --split dev --approve-usd <printed estimate>
 python3 scripts/bench_report.py --journal ~/orch-bench/exp-smoke/journal.jsonl --candidates direct
 ```

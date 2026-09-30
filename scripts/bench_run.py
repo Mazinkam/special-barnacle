@@ -53,6 +53,7 @@ def main(argv=None) -> int:
     ap.add_argument('--approve-usd', required=True, type=float)
     ap.add_argument('--no-sandbox', action='store_true')
     ap.add_argument('--split', choices=('dev', 'holdout'))
+    ap.add_argument('--prepared-cache', type=Path, help='prepared base trees, shareable with bench_validate_tasks.py (default: <experiment-root>/prepared)')
     args = ap.parse_args(argv)
 
     arms = tuple(a for a in args.arms.split(',') if a)
@@ -92,7 +93,8 @@ def main(argv=None) -> int:
         # run_experiment validates the root (live state) and budget before creating anything
         if not meta_path.exists():
             _guard_then_write_meta(args, cfg, tasks, arms, fingerprint, ext_dir, meta_path)
-        run_experiment(tasks, cfg, arms, args.experiment_root, approve_usd=args.approve_usd, sandbox=not args.no_sandbox)
+        run_experiment(tasks, cfg, arms, args.experiment_root, approve_usd=args.approve_usd, sandbox=not args.no_sandbox,
+                       prepared_cache=args.prepared_cache)
     except ValueError as exc:
         print(f'error: {exc}', file=sys.stderr)
         return 2

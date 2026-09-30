@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bench.grade import grade  # noqa: E402
 from bench.manifest import TaskManifest, load_suite  # noqa: E402
+from bench.prepared import SetupError, prepared_tree  # noqa: E402
 from bench.snapshot import make_snapshot  # noqa: E402
 
 
@@ -44,19 +45,20 @@ def _reference_patch(task: TaskManifest) -> Path | None:
     return patch if patch.is_file() and suite in patch.parents else None
 
 
-def validate_task(task: TaskManifest, work: Path, *, repeats: int, sandbox: bool) -> str | None:
+def validate_task(task: TaskManifest, work: Path, *, repeats: int, sandbox: bool, cache: Path) -> str | None:
     """Return None when the task is valid, else the quarantine reason."""
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True)
+    # The base is the same prepared tree the benchmark runner clones for every attempt (bench/prepared.py),
+    # so validating it also warms the cache and proves the exact environment agents will get.
     try:
-        base = make_snapshot(Path(task.repo), task.base_commit, work / 'base')
+        base = prepared_tree(task, cache, sandbox=False)
+    except SetupError as exc:
+        return f'setup failed: {exc}'
     except (subprocess.CalledProcessError, ValueError, OSError) as exc:
         return f'snapshot failed: {exc}'
-    reason = _run_setup(task, base.path)
-    if reason:
-        return reason
-    if grade(task, base.path, base.path, work / 'g-base', sandbox=sandbox).verdict != 'fail':
+    if grade(task, base, base, work / 'g-base', sandbox=sandbox).verdict != 'fail':
         return 'base does not fail hidden checks'
     patch = _reference_patch(task)
     if patch is None:
@@ -68,16 +70,17 @@ def validate_task(task: TaskManifest, work: Path, *, repeats: int, sandbox: bool
     if reason:
         return reason
     for i in range(repeats):
-        if grade(task, ref.path, base.path, work / f'g-ref-{i}', sandbox=sandbox).verdict != 'pass':
+        if grade(task, ref.path, base, work / f'g-ref-{i}', sandbox=sandbox).verdict != 'pass':
             return f'reference failed hidden checks on repeat {i + 1} of {repeats}'
     return None
 
 
-def validate_suite(suite: Path, work: Path, *, repeats: int = 3, sandbox: bool = True) -> dict:
+def validate_suite(suite: Path, work: Path, *, repeats: int = 3, sandbox: bool = True, cache: Path | None = None) -> dict:
     work.mkdir(parents=True, exist_ok=True)
+    cache = Path(cache) if cache is not None else work / 'prepared'
     ok, quarantine, reasons = [], [], {}
     for task in load_suite(suite):
-        reason = validate_task(task, work / task.id, repeats=repeats, sandbox=sandbox)
+        reason = validate_task(task, work / task.id, repeats=repeats, sandbox=sandbox, cache=cache)
         if reason:
             quarantine.append(task.id)
             reasons[task.id] = reason
@@ -93,10 +96,11 @@ def main() -> int:
     p.add_argument('--work', type=Path, required=True, help='scratch directory for snapshots and grading')
     p.add_argument('--repeats', type=int, default=3, help='reference runs that must all pass (default 3)')
     p.add_argument('--no-sandbox', action='store_true', help='run hidden checks without sandbox-exec (tests only)')
+    p.add_argument('--prepared-cache', type=Path, help='prepared base trees, shareable with bench_run.py (default: <work>/prepared)')
     a = p.parse_args()
     if a.repeats < 1:
         p.error('--repeats must be at least 1')
-    result = validate_suite(a.suite, a.work, repeats=a.repeats, sandbox=not a.no_sandbox)
+    result = validate_suite(a.suite, a.work, repeats=a.repeats, sandbox=not a.no_sandbox, cache=a.prepared_cache)
     reasons = json.loads((a.work / 'validation.json').read_text())['reasons']
     print(json.dumps({**result, 'reasons': reasons}, indent=2))
     return 1 if result['quarantine'] else 0
