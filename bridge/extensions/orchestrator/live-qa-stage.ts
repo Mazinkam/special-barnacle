@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { AcceptanceResult } from "./core/run-result.ts";
-import { blockedAcceptance as blockedAcceptanceFor, parseAcceptanceManifest, redactAcceptance, type AcceptanceManifest } from "./live-qa-acceptance.ts";
+import { blockedAcceptance as blockedAcceptanceFor, distrustAcceptance, parseAcceptanceManifest, redactAcceptance, type AcceptanceManifest } from "./live-qa-acceptance.ts";
 import {
 	buildRunnerArgv,
 	gitRevParseHead,
@@ -196,10 +196,14 @@ function unavailableVerdict(reason: string): LiveQaVerdict {
  *  here would silently drop cost/usage evidence that a cancelled run legitimately produced. A
  *  verdict already `"unavailable"` is returned unchanged (nothing to force). */
 function forceCancelledVerdict(verdict: LiveQaVerdict): LiveQaVerdict {
-	if (verdict.verdict === "unavailable") return verdict;
+	if (verdict.verdict === "unavailable") {
+		return verdict.acceptance ? { ...verdict, acceptance: distrustAcceptance(verdict.acceptance, "unavailable") } : verdict;
+	}
 	return {
 		...verdict,
 		verdict: "unavailable",
+		// Acceptance evidence from a cancelled run is no more trustworthy than its verdict.
+		...(verdict.acceptance ? { acceptance: distrustAcceptance(verdict.acceptance, "unavailable") } : {}),
 		reasons: [
 			"run was cancelled; the runner's own verdict is never trusted after cancellation, even on a clean exit with pass-shaped artifacts",
 			...verdict.reasons,
@@ -428,7 +432,10 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 	// `session_id`/`exit_code` are left exactly as parsed (a cancelled run may still have incurred
 	// real, billable usage, and `liveQaCostRows` below reads all of those straight off `verdict`) --
 	// only `verdict`/`reasons` are overridden, and never to `pass`.
-	const verdict = runResult.cancelled ? forceCancelledVerdict(parsedVerdict) : parsedVerdict;
+	const forced = runResult.cancelled ? forceCancelledVerdict(parsedVerdict) : parsedVerdict;
+	// Defence in depth (an injected parser may bypass parseLiveQaSession's own demotion): acceptance
+	// evidence never survives a non-pass final verdict as `pass`.
+	const verdict = forced.acceptance ? { ...forced, acceptance: distrustAcceptance(forced.acceptance, forced.verdict) } : forced;
 
 	const stage: LiveQaStage = { adapterId: adapter.id, argv, scope, revision, verdict, required };
 	const costRows = liveQaCostRows({ runId, taskId, adapterId: adapter.id, verdict });

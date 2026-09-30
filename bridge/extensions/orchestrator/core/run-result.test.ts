@@ -209,6 +209,27 @@ describe("run result builders", () => {
 		expect(result.cost.complete).toBe(false);
 	});
 
+	test("codeVerification: all leads blocked (QA skipped) is not_run, never fail", () => {
+		const result = buildCompletedRunResult(minimalReport({ blocked: true, passedVerification: false, leadStatuses: ["blocked"] }));
+		expect(result.codeVerification).toBe("not_run");
+	});
+	test("codeVerification: QA dispatch timeout is not_run", () => {
+		const result = buildCompletedRunResult(minimalReport({ verificationTimedOut: true, passedVerification: false }));
+		expect(result.codeVerification).toBe("not_run");
+	});
+	test("codeVerification: QA provider stall is not_run", () => {
+		const result = buildCompletedRunResult(minimalReport({ verificationProviderStall: true, passedVerification: false }));
+		expect(result.codeVerification).toBe("not_run");
+	});
+	test("codeVerification: verificationSkipped stays skipped", () => {
+		const result = buildCompletedRunResult(minimalReport({ verificationSkipped: true, passedVerification: false }));
+		expect(result.codeVerification).toBe("skipped");
+	});
+	test("codeVerification: a real QA failure is fail", () => {
+		const result = buildCompletedRunResult(minimalReport({ passedVerification: false, failedChecks: ["tests"] }));
+		expect(result.codeVerification).toBe("fail");
+	});
+
 	test("terminal result for plan failure", () => {
 		const result = buildTerminalRunResult({ runId: "r", causes: ["plan_failed"], diagnostic: "TypeError",
 			costUsd: 0.0005, costComplete: true, runLog: "/l/run.log" });

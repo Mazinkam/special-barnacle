@@ -887,7 +887,51 @@ describe("live-qa session outcomes via the fake runner", () => {
 			writeFileSync(join(dirname(r.result.reportPath!), "results.md"), "| Step | Result |\n| --- | --- |\n| x | FAIL |\n");
 			const verdict = parse(r);
 			expect(verdict.verdict).toBe("fail");
-			expect(verdict.acceptance?.overall).toBe("pass");
+			// A passing acceptance.json is not trusted once the live-QA verdict itself is not pass.
+			expect(verdict.acceptance?.overall).toBe("blocked");
+			expect(verdict.acceptance?.criteria.every((c) => c.result === "blocked" && c.note === "live QA verdict fail; evidence not trusted")).toBe(true);
+		});
+
+		test("unavailable verdict (results.md BLOCKED) demotes a passing acceptance to blocked", async () => {
+			const r = await runFake("acceptance_pass");
+			writeFileSync(join(dirname(r.result.reportPath!), "results.md"), "| Step | Result |\n| --- | --- |\n| x | BLOCKED |\n");
+			const verdict = parse(r);
+			expect(verdict.verdict).toBe("unavailable");
+			expect(verdict.acceptance?.overall).toBe("blocked");
+			expect(verdict.acceptance?.criteria.map((c) => c.note)).toEqual([
+				"live QA verdict unavailable; evidence not trusted",
+				"live QA verdict unavailable; evidence not trusted",
+			]);
+		});
+
+		test("unavailable verdict (findings.json confinement failure) leaves acceptance blocked", async () => {
+			const r = await runFake("acceptance_pass");
+			const p = join(dirname(r.result.reportPath!), "findings.json");
+			const target = join(mkdir("orch-live-qa-outside-"), "findings.json");
+			writeFileSync(target, readFileSync(p));
+			rmSync(p);
+			symlinkSync(target, p);
+			const verdict = parse(r);
+			expect(verdict.verdict).toBe("unavailable");
+			expect(verdict.acceptance?.overall).toBe("blocked");
+			expect(verdict.acceptance?.criteria.every((c) => c.result === "blocked")).toBe(true);
+		});
+
+		test("non-zero exit (unavailable) demotes a passing acceptance to blocked", async () => {
+			const r = await runFake("acceptance_pass");
+			const verdict = parseLiveQaSession({ runnerCwd: r.runnerCwd, reportPath: r.result.reportPath, runnerRunId: r.result.runnerRunId, exitCode: 1, startedAtMs: r.startedAtMs, manifest });
+			expect(verdict.verdict).toBe("unavailable");
+			expect(verdict.acceptance?.overall).toBe("blocked");
+		});
+
+		test("genuine fail criterion stays fail under a non-pass verdict", async () => {
+			const r = await runFake("acceptance_409");
+			writeFileSync(join(dirname(r.result.reportPath!), "results.md"), "| Step | Result |\n| --- | --- |\n| x | FAIL |\n");
+			const verdict = parse(r);
+			expect(verdict.verdict).toBe("fail");
+			expect(verdict.acceptance?.overall).toBe("fail");
+			expect(verdict.acceptance?.criteria[0]?.result).toBe("fail");
+			expect(verdict.acceptance?.criteria[0]?.note).toContain("http.status: expected 422, observed 409");
 		});
 	});
 

@@ -15,7 +15,7 @@ import {
 	runLiveQaStage,
 	type RunLiveQaStageOptions,
 } from "./live-qa-stage.ts";
-import { liveQaCostRows, parseLiveQaSession, type LiveQaVerdict } from "./live-qa.ts";
+import { liveQaCostRows, parseLiveQaSession, runLiveQa, type LiveQaVerdict } from "./live-qa.ts";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-forge-qa.mjs", import.meta.url));
 
@@ -987,6 +987,23 @@ describe("acceptance manifest", () => {
 		} finally {
 			delete process.env.LIVE_QA_STAGE_TEST_API_TOKEN;
 		}
+	});
+
+	test("cancelled run with a passing acceptance.json: acceptance blocked, never pass", async () => {
+		const { options } = setup({ criteria: true }, JSON.stringify(manifest));
+		const m144 = { version: 1, issue: 144, criteria: [
+			{ id: "AC-3", text: "422", expected: { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" } },
+			{ id: "AC-5", text: "no side effects", manual: true },
+		] };
+		writeFileSync((options.request as { acceptancePath: string }).acceptancePath, JSON.stringify(m144));
+		process.env.FAKE_FORGE_MODE = "acceptance_pass";
+		options.deps = { runLiveQa: async (o) => ({ ...(await runLiveQa(o)), cancelled: true }) };
+		const result = await runLiveQaStage(options);
+		expect(result.cancelled).toBe(true);
+		expect(result.verdict).toBe("unavailable");
+		expect(result.acceptance?.overall).toBe("blocked");
+		expect(result.acceptance?.criteria.every((c) => c.result === "blocked" && c.note === "live QA verdict unavailable; evidence not trusted")).toBe(true);
+		expect(result.stage?.verdict.acceptance?.overall).toBe("blocked");
 	});
 
 	test("runner produced no session: acceptance is still present and blocked", async () => {

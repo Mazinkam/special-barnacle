@@ -112,6 +112,16 @@ export function enforceRunResultBounds(result: RunResultV1): RunResultV1 {
 	};
 }
 
+/** Mirrors `verificationVerdictFor`'s precedence: "fail" only for a QA run that really failed;
+ *  QA that never ran or never finished (all leads blocked, no dispatch, timeout, provider stall)
+ *  is "not_run". */
+function codeVerificationFor(report: RunReport): RunResultV1["codeVerification"] {
+	if (report.blocked || !report.verificationDispatchOk) return "not_run";
+	if (report.verificationSkipped) return "skipped";
+	if (report.verificationTimedOut || report.verificationProviderStall) return "not_run";
+	return report.passedVerification ? "pass" : "fail";
+}
+
 export function buildCompletedRunResult(report: RunReport): RunResultV1 {
 	const statuses = report.leadStatuses ?? [];
 	const external = report.externalChecks ?? [];
@@ -128,9 +138,7 @@ export function buildCompletedRunResult(report: RunReport): RunResultV1 {
 		runId: report.runId,
 		outcome: outcomeFromCauses(causes),
 		causes,
-		codeVerification: report.verificationSkipped ? "skipped"
-			: !report.verificationDispatchOk ? "not_run"
-			: report.passedVerification ? "pass" : "fail",
+		codeVerification: codeVerificationFor(report),
 		liveQa: {
 			verdict: stage?.verdict ?? "not_requested",
 			...(typeof row?.session_id === "string" ? { sessionId: row.session_id } : {}),

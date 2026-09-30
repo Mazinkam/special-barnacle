@@ -156,6 +156,22 @@ export function redactAcceptance(acceptance: AcceptanceResult, redact: Redact): 
 	};
 }
 
+function overallOf(criteria: CriterionResult[]): AcceptanceResult["overall"] {
+	return criteria.some((c) => c.result === "fail") ? "fail" : criteria.some((c) => c.result === "blocked") ? "blocked" : "pass";
+}
+
+/**
+ * Acceptance evidence is only as trustworthy as the live-QA session that produced it: whenever the
+ * final live-QA verdict is not `pass`, every `pass` criterion becomes `blocked` (a genuine `fail`
+ * stays `fail`) and `overall` is recomputed. Idempotent.
+ */
+export function distrustAcceptance(acceptance: AcceptanceResult, verdict: string): AcceptanceResult {
+	if (verdict === "pass") return acceptance;
+	const note = `live QA verdict ${verdict}; evidence not trusted`;
+	const criteria = acceptance.criteria.map((c) => (c.result === "pass" ? { ...c, result: "blocked" as const, note } : c));
+	return { overall: criteria.length === 0 ? (acceptance.overall === "fail" ? "fail" : "blocked") : overallOf(criteria), criteria };
+}
+
 /** Reported-criteria entries beyond this are never iterated: the whole result is blocked. */
 export const MAX_REPORTED_CRITERIA = 100;
 
@@ -269,6 +285,5 @@ export function evaluateAcceptance(
 			if (c.result === "pass") criteria[i] = { ...c, result: "blocked", note };
 		}
 	}
-	const overall = criteria.some((c) => c.result === "fail") ? "fail" : criteria.some((c) => c.result === "blocked") ? "blocked" : "pass";
-	return { overall, criteria };
+	return { overall: overallOf(criteria), criteria };
 }

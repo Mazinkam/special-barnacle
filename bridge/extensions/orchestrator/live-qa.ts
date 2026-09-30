@@ -29,7 +29,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import type { Stats } from "node:fs";
 import type { AcceptanceResult } from "./core/run-result.ts";
-import { blockedAcceptance, evaluateAcceptance, redactAcceptance, type AcceptanceManifest } from "./live-qa-acceptance.ts";
+import { blockedAcceptance, distrustAcceptance, evaluateAcceptance, redactAcceptance, type AcceptanceManifest } from "./live-qa-acceptance.ts";
 
 // -----------------------------------------------------------------------------
 // Config schema (v1)
@@ -1993,7 +1993,9 @@ function redactVerdict(verdict: LiveQaVerdict): LiveQaVerdict {
 		reasons: verdict.reasons.map(r),
 		findings: verdict.findings.map((f) => ({ ...f, title: r(f.title), fingerprint: r(f.fingerprint) })),
 		artifacts: verdict.artifacts.map(r),
-		...(verdict.acceptance ? { acceptance: redactAcceptance(verdict.acceptance, r) } : {}),
+		// Every parseLiveQaSession return passes through here, so this is the single place a non-pass
+		// verdict demotes acceptance evidence (pass -> blocked); acceptance never upgrades `verdict`.
+		...(verdict.acceptance ? { acceptance: distrustAcceptance(redactAcceptance(verdict.acceptance, r), verdict.verdict) } : {}),
 		usage: verdict.usage
 			? {
 				...verdict.usage,
