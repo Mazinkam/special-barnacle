@@ -36,6 +36,14 @@ def _model_args(model: str) -> list[str]:
     return ['--model', model]
 
 
+def injected_env_keys() -> tuple[str, ...]:
+    """Every environment variable `arm_invocation` may set. The agent's bash tool must never see these
+    (bench/agent_dir.py scrubs them) so its shell commands run in the environment of normal use."""
+    return ('CODING_AGENT_ORCHESTRATOR_HOME', 'HUMAIN_ORCHESTRATOR_STATE_ROOT', 'HUMAIN_ORCHESTRATOR_SKILL_ROOT',
+            'HUMAIN_ORCHESTRATOR_PROFILES_FILE', 'BENCH_EXPERIMENT_ID', AGENT_DIR_ENV,
+            'HUMAIN_ORCHESTRATOR_FOREGROUND', 'HUMAIN_ORCHESTRATOR_WORKFLOW_MODE')
+
+
 def arm_invocation(arm: str, goal: str, cfg: ExperimentConfig, experiment_root: Path) -> tuple[list[str], dict[str, str]]:
     if arm not in ARMS:
         raise ValueError(f'unknown arm {arm!r}; expected one of {ARMS}')
