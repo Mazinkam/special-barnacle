@@ -1,10 +1,13 @@
 """Trusted grading (spec §2.1): fresh copy, hidden files overlaid, no network, tamper check."""
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import hashlib
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,6 +22,48 @@ class GradeResult:
     checks: list = field(default_factory=list)
     tampered: list = field(default_factory=list)
     tree_digest: str = ''
+
+
+_CLONE_NOFOLLOW = 0x0001  # never follow a symlink at the source root
+
+
+def _clone(src: Path, dst: Path) -> bool:
+    """Copy-on-write clone of a whole tree with one clonefile(2) call (APFS). False when unavailable.
+
+    Grading copies the submitted tree, node_modules included, once per run; a byte copy of a large
+    monorepo took minutes and gigabytes per grade. A clone is near-instant, shares blocks until written,
+    and later writes to either side never affect the other.
+    """
+    if sys.platform != 'darwin':
+        return False
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+        clonefile = libc.clonefile
+    except (OSError, AttributeError):
+        return False
+    clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+    clonefile.restype = ctypes.c_int
+    return clonefile(os.fsencode(src), os.fsencode(dst), _CLONE_NOFOLLOW) == 0
+
+
+def copy_tree(src: Path, dst: Path) -> None:
+    """Copy `src` to a new `dst` without its top-level .git and without following symlinks.
+
+    Only the root .git carries repository history (snapshots have exactly one); walking a large
+    node_modules tree to hunt for nested ones cost more than the clone itself.
+    """
+    src, dst = Path(src), Path(dst)
+    if not _clone(src, dst):
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst, symlinks=True,
+                        ignore=lambda d, names: ['.git'] if Path(d) == src and '.git' in names else [])
+        return
+    git = dst / '.git'
+    if git.is_symlink() or git.is_file():
+        git.unlink()
+    elif git.is_dir():
+        shutil.rmtree(git)
 
 
 def _fingerprint(p: Path):
@@ -64,7 +109,7 @@ def grade(task: TaskManifest, submitted: Path, base: Path, work: Path, *, sandbo
                 if _unsafe(p) or _protected_fingerprint(submitted, p) != _protected_fingerprint(base, p)]
     if work.exists():
         shutil.rmtree(work)
-    shutil.copytree(submitted, work, symlinks=True, ignore=shutil.ignore_patterns('.git'))
+    copy_tree(submitted, work)
     hidden = task.source.parent / task.hidden_files
     _unlink_symlinks_under_overlay(hidden, work)
     shutil.copytree(hidden, work, symlinks=True, dirs_exist_ok=True)

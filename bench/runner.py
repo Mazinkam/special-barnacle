@@ -13,9 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bench.arms import arm_invocation, config_fingerprint
+from bench.contamination import scan_attempt, tool_locations
 from bench.grade import grade
-from bench.sandbox import default_deny_roots, sandbox_argv
+from bench.sandbox import sandbox_argv
 from bench.snapshot import make_snapshot
+from bench.tools import preflight_tool_isolation, task_deny_roots
 from orchestrator.core.env import default_state_root
 
 
@@ -103,6 +105,9 @@ def run_experiment(tasks, cfg, arms, experiment_root: Path, *, approve_usd: floa
     cap = cfg.per_run_usd_cap if cfg else 0.0
     if cfg is None or approve_usd < len(attempts) * cap:
         raise ValueError(f'approve at least ${len(attempts) * cap:.2f} (--approve-usd) for {len(attempts)} attempts')
+    problems = preflight_tool_isolation(cfg, list(by_id.values()), root)
+    if problems:
+        raise ValueError('tool isolation preflight failed:\n  ' + '\n  '.join(problems))
     root.mkdir(parents=True, exist_ok=True)
     fingerprint = config_fingerprint(cfg)
     journal, done, orphaned = _journal(root)
@@ -149,18 +154,17 @@ def _run_one(task, a: Attempt, cfg, root: Path, fingerprint: str, journal: Path,
     for setup_argv in task.setup:
         cmd = list(setup_argv)
         if sandbox:   # network stays open for installs; only grading is offline
-            cmd = sandbox_argv(cmd, deny_read=default_deny_roots([Path(task.repo), task.source.parent, root / 'journal.jsonl']),
-                               allow_network=True)
+            cmd = sandbox_argv(cmd, deny_read=task_deny_roots(task, root), allow_network=True)
         try:
             subprocess.run(cmd, cwd=snap.path, env={**os.environ, **env}, check=False, timeout=task.timeout_s)
         except (subprocess.TimeoutExpired, OSError):
             return _infra_row(a, None)
     argv = shlex.split(argv[0]) + argv[1:]           # allows "python fake_agent.py" style binaries
     if sandbox:
-        argv = sandbox_argv(argv, deny_read=default_deny_roots([Path(task.repo), task.source.parent, root / 'journal.jsonl']),
-                            allow_network=True)
+        argv = sandbox_argv(argv, deny_read=task_deny_roots(task, root), allow_network=True)
     state = root / 'state'
     known = {r['run_id'] for r in _outcome_rows(state)}
+    runs_before = _run_dirs(state)
     _append(journal, {'event': 'started', 'attempt_id': a.attempt_id})
     t0 = time.time()
     status = 'completed'
@@ -181,6 +185,9 @@ def _run_one(task, a: Attempt, cfg, root: Path, fingerprint: str, journal: Path,
         status = 'failed'
     elapsed_ms = int((time.time() - t0) * 1000)
     cost, complete, run = _run_cost(state, known)
+    fresh_ids = {r['run_id'] for r in _outcome_rows(state)} - known
+    run_dirs = sorted((_run_dirs(state) - runs_before) | {state / 'runs' / i for i in fresh_ids if i and '/' not in i})
+    contaminated, evidence = scan_attempt(work / 'agent.jsonl', [d for d in run_dirs if d.is_dir()], tool_locations(cfg))
     verdict, digest = 'unknown', None
     if status in ('completed', 'failed'):
         g = grade(task, snap.path, base.path, work / 'grade', sandbox=sandbox)
@@ -190,7 +197,13 @@ def _run_one(task, a: Attempt, cfg, root: Path, fingerprint: str, journal: Path,
             'verdict': verdict, 'elapsed_ms': elapsed_ms, 'cost_usd': cost, 'cost_complete': complete,
             'fix_rounds': run.get('fix_rounds'), 'provider_retries': run.get('provider_retries'),
             'run_id': run.get('run_id'), 'tree_digest': digest, 'config_fingerprint': fingerprint,
-            'scope_band': task.scope_band, 'risk': task.risk, 'split': task.split}
+            'scope_band': task.scope_band, 'risk': task.risk, 'split': task.split,
+            'contaminated': contaminated, 'contamination_evidence': evidence}
+
+
+def _run_dirs(state: Path) -> set:
+    runs = state / 'runs'
+    return {d for d in runs.iterdir() if d.is_dir()} if runs.is_dir() else set()
 
 
 def _group_alive(pgid: int) -> bool:

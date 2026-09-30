@@ -50,7 +50,34 @@ patch applies and **passes 3/3** times. Everything else is quarantined with a re
 `~/orch-bench/validate/validation.json`. Fix or drop quarantined tasks until the exit status is 0.
 Hidden checks run under `sandbox-exec` with no network.
 
-## 4. Freeze the configuration
+## 4. Build pinned tools (free; local build)
+
+The sandbox denies every agent read access to its task's repo (so it cannot `git log` its way to the
+solution). But the live `humain-terminal` is npm-linked into the humain-terminal checkout, and the
+orchestrator extension and its Python modules live in this repo, so for tasks on either repo the arms
+would crash inside the sandbox. Run both from pinned copies outside every repo instead:
+
+```bash
+python3 scripts/bench_tools.py --dest ~/orch-bench/tools \
+  --skill-repo ~/.local/share/agent-skills/hierarchical-agent-orchestrator --skill-rev main \
+  --ht-repo ~/Documents/Projects/humain-terminal --ht-rev main
+```
+
+- `~/orch-bench/tools/skill/`: `git archive` of the orchestrator at `--skill-rev` (no `.git`) plus
+  `PINNED.json` (`source_repo`, full `commit`, `tree_digest`).
+- `~/orch-bench/tools/ht/`: a humain-terminal local release. The script exports `git archive <ht-rev>`
+  into `~/orch-bench/tools/ht-src`, runs `npm ci` and `node scripts/local-release.mjs --out
+  ~/orch-bench/tools/ht --skip-check --skip-test --skip-bun-install --force` there, and writes
+  `PINNED.json` (`source_repo`, `commit`, `binary`) into `ht/` and next to the installed package. The
+  export is removed afterwards (`--keep-src` keeps it); nothing runs inside the real checkout, so
+  uncommitted work there is neither built nor disturbed. The release step still builds the standalone
+  Bun binary, so `bun` must be on `PATH`.
+- `--skip-ht` builds only the skill copy. `--force` replaces existing copies. A `--dest` inside any
+  git work tree, or inside either source repo, is refused.
+
+The script prints the `binary` and `skill_root` values for the config below.
+
+## 5. Freeze the configuration
 
 ```bash
 cp ~/.humain-terminal/agent/orchestrator-profiles.json ~/orch-bench/profiles-frozen.json
@@ -64,8 +91,8 @@ cp ~/.humain-terminal/agent/orchestrator-profiles.json ~/orch-bench/profiles-fro
   "experiment_id": "smoke-1",
   "seed": 1,
   "k": 1,
-  "binary": "humain-terminal",
-  "skill_root": "/Users/<you>/.local/share/agent-skills/hierarchical-agent-orchestrator",
+  "binary": "/Users/<you>/orch-bench/tools/ht/node/node_modules/@humain/terminal/dist/bundle/cli.js",
+  "skill_root": "/Users/<you>/orch-bench/tools/skill",
   "profiles_file": "/Users/<you>/orch-bench/profiles-frozen.json",
   "direct_model": "<provider/model bound to implementation_strong in /orchestrator-models show>",
   "direct_thinking": "high",
@@ -77,9 +104,31 @@ cp ~/.humain-terminal/agent/orchestrator-profiles.json ~/orch-bench/profiles-fro
 ```
 
 The `current` arm sets `HUMAIN_ORCHESTRATOR_WORKFLOW_MODE=off` and `tiered` sets `enforce`, so a
-saved `/orchestrator-models workflow` setting never leaks into an arm.
+saved `/orchestrator-models workflow` setting never leaks into an arm. Both orchestrated arms pass
+`--no-extensions -e <skill_root>/bridge/extensions/orchestrator`, so only the pinned copy's extension
+loads, whatever is installed under `~/.humain-terminal/agent/extensions`.
 
-## 5. Smoke run (PAID; explicit approval)
+The config fingerprint records the pinned `PINNED.json` contents (or, for a git checkout, `HEAD` and
+the dirty diff), the binary's resolved path and any `PINNED.json` beside it or up to two directories
+above it. Rebuilding the tools changes the fingerprint, and `bench_run.py` refuses to continue an
+experiment whose fingerprint changed.
+
+**Preflight.** Before any snapshot or spend, `bench_run.py` (and `bench.runner.run_experiment`)
+checks every task's denied roots (the task repo, the suite directory, the journal, the live state
+root and HT sessions) against the realpaths of the binary (every existing-file token, or `which` of the
+first), `skill_root` and `profiles_file`. Any tool equal to or inside a denied root aborts the run
+with one line per tool, task and root. The fix is always to build pinned copies (step 4).
+
+**Contamination flag.** The pinned copies must stay readable, and for tasks on this repo or
+humain-terminal they may contain the solution. After each attempt the runner scans the tool-call
+arguments (bash commands, read paths and so on, never prompts or tool results) of the attempt's
+`agent.jsonl` and of the child logs `state/runs/<run_id>/*.events.jsonl`. It looks for references to
+`skill_root`, to the directory holding the resolved binary, and to the pinned install root. Journal rows
+get `contaminated` and `contamination_evidence` (at most 5 short strings). `bench_report.py` shows
+contaminated counts per arm and adds a sensitivity line: the quality verdict recomputed without tasks
+that have any contaminated attempt. The primary analysis still uses all attempts.
+
+## 6. Smoke run (PAID; explicit approval)
 
 ```bash
 python3 scripts/bench_run.py --suite ~/orch-bench/suite --experiment-root ~/orch-bench/exp-smoke \
