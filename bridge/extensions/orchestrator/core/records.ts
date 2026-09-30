@@ -89,7 +89,7 @@ export function methodEffortFor(thinking: string | undefined): string {
 
 /**
  * The run's terminal outcome row (`completeRun`'s `run-complete` / `failRun`'s
- * `run-failed`, run/finalize.ts B4.6). Pure: takes the run's final summary
+ * `run-failed`, index.ts). Pure: takes the run's final summary
  * object and derives the training-eligible outcome from it — a blocked run
  * (stopped at a precondition) trains neither a verified success nor a
  * quality failure of the route.

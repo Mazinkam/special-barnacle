@@ -75,7 +75,7 @@ interface ChildAssistantMessage {
 }
 
 /** One raw `--mode json` protocol event. Untyped over the wire (see child-process.ts); only the fields every
- * absorb() call reads, plus the tool/message-lifecycle fields `RunSession.onChildEvent` (run/session.ts) reads
+ * absorb() call reads, plus the tool/message-lifecycle fields `RunSession.onChildEvent` (index.ts) reads
  * for the live status board, are declared here. */
 export interface ChildStreamEvent {
 	type?: string;

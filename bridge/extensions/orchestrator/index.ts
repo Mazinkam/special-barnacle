@@ -31,7 +31,8 @@ import { RunDiagnostics, type DiagnosticWriter } from "./run-diagnostics.ts";
 import { runLiveQaStage, type RunLiveQaStageResult } from "./live-qa-stage.ts";
 import { registerOrchestrateCommand, type OrchestrateDeps } from "./commands/orchestrate.ts";
 import { registerOrchestratorModelsCommand } from "./commands/orchestrator-models.ts";
-import { RunRegistry, type RunContext, type RunSessionLike } from "./run/context.ts";
+import { describeRunArtifact, RunRegistry, type RunContext, type RunSessionLike, type RunTiming } from "./run/context.ts";
+export { describeRunArtifact };
 import { resolveCandidates, usableModels, type Candidate } from "./adapters/model-router.ts";
 import { buildCatalog, parseModelFacts } from "./adapters/model-catalog.ts";
 import { dispatchWithFailover } from "./dispatch/failover.ts";
@@ -204,34 +205,6 @@ function shippedProfilesPath(): string {
 /** Where per-run logs land: `<STATE_ROOT>/runs/<runId>/`. */
 function runsDir(): string {
 	return join(STATE_ROOT.replace(/^~/, homedir()), "runs");
-}
-
-/** Manifest `python3 -m orchestrator.cli archive-runs --execute` leaves next to a run's `<name>.gz` files. */
-const ARCHIVE_MANIFEST = "archive.manifest.json";
-
-/**
- * Where a run diagnostic can be read *now*. The opt-in `archive-runs --execute` command replaces
- * the diagnostics of old completed runs with `<name>.gz` + a manifest (`run.log` itself is never
- * archived), so a path remembered from the progress board or an old notification may no longer
- * exist as-is. Returns the path unchanged while it is readable; otherwise a lookup/restore hint
- * instead of a silently broken link.
- */
-export function describeRunArtifact(path: string): string {
-	if (existsSync(path)) return path;
-	const runDir = dirname(path);
-	const name = basename(path);
-	const archived = join(runDir, `${name}.gz`);
-	let listed = false;
-	try {
-		const manifest = JSON.parse(readFileSync(join(runDir, ARCHIVE_MANIFEST), "utf-8"));
-		listed = manifest?.format_version === 1 && typeof manifest?.files?.[name] === "object";
-	} catch {
-		/* no readable manifest: the file was never archived by us */
-	}
-	if (listed && existsSync(archived)) {
-		return `${path} (archived as ${archived} — read with \`gunzip -c\`, or restore the run with \`python3 -m orchestrator.cli restore-run ${basename(runDir)}\`)`;
-	}
-	return `${path} (missing)`;
 }
 
 // Non-interactive runs (`--mode json -p`, CI, smoke tests) get a no-op UI whose
@@ -1855,14 +1828,8 @@ export function runCompletionOutcomeFor(runId: string, summary: Record<string, u
 	};
 }
 
-/** Terminal-boundary time fields written to the run outcome row. `elapsed_ms` is omitted
- *  (never `0`) when the caller has no session to derive it from — see `RunSession.terminalTiming`. */
-export interface RunTiming {
-	started_at: string;
-	finished_at: string;
-	elapsed_ms: number;
-	elapsed_source: "monotonic";
-}
+/** Terminal-boundary time fields written to the run outcome row: see `run/context.ts`. */
+export type { RunTiming };
 
 /**
  * Durable evidence that THIS process owns a run, cheap enough to capture with no syscalls

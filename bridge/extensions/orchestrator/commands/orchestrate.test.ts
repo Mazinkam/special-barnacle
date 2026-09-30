@@ -18,7 +18,7 @@ import { contextFileLabel, CONTEXT_SOURCE_MAX_CHARS, formatContextSource } from 
 import { RunRegistry, type RunSessionLike } from "../run/context.ts";
 import { RunCancellation } from "../cancellation.ts";
 import { minimalReport } from "../core/report-fixtures.ts";
-import type { RunSession } from "../run/session.ts";
+import type { RunSession } from "../index.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 
 /** Captures the handler `registerOrchestrateCommand` registers, without a real HT runtime. */
