@@ -154,3 +154,19 @@ experiment state root is populated, and the live state root is untouched
 
 Suite location, file hashes (`find ~/orch-bench/suite -type f | sort | xargs shasum -a 256`, never
 the hidden content), validation result, smoke-run result and cost.
+
+### Pilot suite (2026-09-30)
+
+- Location: `~/orch-bench/suite/` (outside every repo); 20 tasks, 84 files.
+- Composition: 16 replayed (forge 6, humain-terminal 5, this repo 5) + 4 synthetic (`syn-001` forge
+  secrets redaction, `syn-002` auth failure class, `syn-003` frontmatter fences, `syn-004` failover env
+  overrides). Bands 5/5/5/5; split 14 dev / 6 holdout; risk 6 low / 11 medium / 3 high.
+- Per-file hashes: `~/orch-bench/suite.sha256`; its own sha256
+  `0de7263fedf2a4e64676fb08597a11607baac6dde1bdc52f3955f7711e16af41`.
+- Validation: all 20 valid in one combined run on commit `80d4556` with a shared prepared cache
+  (`~/orch-bench/validation-final.json`), ~40 min. No swaps from the proposal.
+- Known weaknesses (from the authoring agents): seven goals name the interface the hidden tests check
+  (ht-001/002/003/005, orch-005, syn-002, syn-004); `ht-005` setup builds `packages/ai` with type errors
+  tolerated and one of its overlaid test files is not run (needs networked model data); `syn-003`
+  leaves closing-marker behaviour for `----`/`---x` unspecified; `syn-004` exercises only
+  `failoverConfig()` with no explicit rule.
