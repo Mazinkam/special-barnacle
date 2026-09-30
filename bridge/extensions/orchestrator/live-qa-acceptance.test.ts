@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { evaluateAcceptance, parseAcceptanceManifest, redactAcceptance } from "./live-qa-acceptance.ts";
+import { distrustAcceptance, evaluateAcceptance, parseAcceptanceManifest, redactAcceptance, type AcceptanceManifest } from "./live-qa-acceptance.ts";
 
 function valid144(): Record<string, unknown> {
 	return {
@@ -224,5 +224,78 @@ describe("redactAcceptance", () => {
 		expect(JSON.stringify(out)).not.toContain(hex);
 		expect(out.criteria[0]?.expected).toEqual({ sha: "[REDACTED]", n: 1 });
 		expect(out.criteria[0]?.observed).toEqual({ tree: "[REDACTED]", ok: true });
+	});
+});
+
+describe("evaluateAcceptance clipping", () => {
+	const manifest: AcceptanceManifest = { version: 1, issue: 1, criteria: [
+		{ id: "AC-1", text: "t", expected: { a: "x" } },
+		{ id: "AC-2", text: "t", expected: { b: "y" } },
+	] };
+	test("observed strings are clipped to 200 and agent notes to 300, with explicit markers", () => {
+		const r = evaluateAcceptance(manifest, { criteria: [
+			{ id: "AC-1", result: "PASS", observed: { a: "o".repeat(5000) }, note: "n".repeat(5000) },
+			{ id: "AC-2", result: "FAIL", note: "m".repeat(5000) },
+		] }, new Set());
+		expect(r.overall).toBe("fail");
+		const obs = r.criteria[0]!.observed!.a as string;
+		expect(obs.length).toBeLessThanOrEqual(200);
+		expect(obs).toContain("…[truncated");
+		const note1 = r.criteria[0]!.note!;
+		expect(note1.length).toBeLessThan(900);
+		expect(note1).toContain("…[truncated");
+		const note2 = r.criteria[1]!.note!;
+		expect(note2.length).toBeLessThanOrEqual("agent reported FAIL (agent note: )".length + 300);
+		expect(note2).toContain("…[truncated");
+	});
+	test("a secret straddling the 200-char observed clip is redacted first (no prefix left)", () => {
+		const secret = "SECRETSECRETSECRET";
+		const redact = (t: string) => t.split(secret).join("[REDACTED]");
+		const value = `${"o".repeat(185)}${secret}tail`;
+		const r = evaluateAcceptance(manifest, { criteria: [
+			{ id: "AC-1", result: "PASS", observed: { a: value }, note: value },
+			{ id: "AC-2", result: "PASS", observed: { b: "y" } },
+		] }, new Set(), redact);
+		expect(JSON.stringify(r)).not.toContain("SECRET");
+	});
+});
+
+describe("evaluateAcceptance unexpected ids", () => {
+	const manifest: AcceptanceManifest = { version: 1, issue: 1, criteria: [
+		{ id: "AC-1", text: "t", expected: { a: "x" } },
+		{ id: "AC-2", text: "t", expected: { b: "y" } },
+	] };
+	test("one fail + one unknown id => overall blocked, with the unexpected ids noted", () => {
+		const r = evaluateAcceptance(manifest, { criteria: [
+			{ id: "AC-1", result: "FAIL" },
+			{ id: "AC-2", result: "PASS", observed: { b: "y" } },
+			{ id: "AC-99", result: "PASS" },
+		] }, new Set());
+		expect(r.overall).toBe("blocked");
+		expect(r.criteria[0]?.result).toBe("fail");
+		expect(r.criteria[1]?.result).toBe("blocked");
+		expect(r.criteria[1]?.note).toContain("unexpected criterion ids: AC-99");
+	});
+	test("one fail + a malformed entry => overall blocked", () => {
+		const r = evaluateAcceptance(manifest, { criteria: [{ id: "AC-1", result: "FAIL" }, "junk"] }, new Set());
+		expect(r.overall).toBe("blocked");
+	});
+});
+
+describe("distrustAcceptance", () => {
+	const crit = (id: string, result: "pass" | "fail" | "blocked") => ({ id, result, artifacts: [] });
+	test("pass verdict leaves acceptance untouched", () => {
+		const a = { overall: "pass" as const, criteria: [crit("AC-1", "pass")] };
+		expect(distrustAcceptance(a, "pass")).toBe(a);
+	});
+	test("non-pass verdict: pass -> blocked, fail stays fail", () => {
+		const r = distrustAcceptance({ overall: "fail", criteria: [crit("AC-1", "pass"), crit("AC-2", "fail")] }, "unavailable");
+		expect(r.overall).toBe("fail");
+		expect(r.criteria.map((c) => c.result)).toEqual(["blocked", "fail"]);
+		expect(r.criteria[0]?.note).toBe("live QA verdict unavailable; evidence not trusted");
+	});
+	test("an already-blocked overall (e.g. unexpected ids) is never relaxed to fail", () => {
+		const r = distrustAcceptance({ overall: "blocked", criteria: [crit("AC-1", "pass"), crit("AC-2", "fail")] }, "fail");
+		expect(r.overall).toBe("blocked");
 	});
 });

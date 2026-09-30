@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { buildRunSummary, verificationVerdictFor, type RunReport } from "./report.ts";
 import { minimalReport } from "./report-fixtures.ts";
+import { buildCompletedRunResult, deriveCauses } from "./run-result.ts";
 import type { FlushReport } from "../record-queue.ts";
 
 const base = { blocked: false, dispatchOk: true, verificationSkipped: false, filesChangedCount: 3, passedVerification: true };
@@ -100,6 +101,30 @@ function baseReport(): RunReport {
 		telemetryReport: healthyTelemetry,
 	};
 }
+
+describe("summary banner agrees with RunResultV1.outcome", () => {
+	test("failed lead + unverified external check => banner FAILED and result.outcome failed", () => {
+		const report = minimalReport({
+			leadStatuses: ["completed", "failed"],
+			externalChecks: [{ provider: "github", id: "123", outcome: "unverified" }],
+		});
+		expect(buildRunSummary(report).text.split("\n")[0]).toStartWith("Orchestration FAILED in ");
+		expect(buildCompletedRunResult(report).outcome).toBe("failed");
+		expect(deriveCauses(report)).toEqual(["external_check", "dispatch_failed"]);
+	});
+	test("every outcome maps to its banner word", () => {
+		const cases: Array<[Partial<RunReport>, string]> = [
+			[{}, "complete"],
+			[{ leadStatuses: ["partial"] }, "partial"],
+			[{ leadStatuses: ["blocked"] }, "BLOCKED"],
+			[{ dispatchOk: false }, "FAILED"],
+		];
+		for (const [overrides, word] of cases) {
+			const report = minimalReport(overrides);
+			expect(buildRunSummary(report).text).toStartWith(`Orchestration ${word} in `);
+		}
+	});
+});
 
 describe("core/report.ts buildRunSummary", () => {
 	test("external outcome does not overwrite QA verdict, and unverified is never QA FAIL", () => {

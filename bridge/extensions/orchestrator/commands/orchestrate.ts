@@ -543,6 +543,10 @@ export function loadProvidedContext(
  * even though `/orchestrate` returned long before the run settled. `sendMessage` can
  * throw after the session has moved on (e.g. a later shutdown); that failure is not
  * this run's problem to surface, so it is swallowed and logged instead.
+ *
+ * `details.outcome` ("completed" | "failed" | "cancelled") and `details.costUsd` are LEGACY
+ * fields kept for existing consumers; `details.result` (RunResultV1) is authoritative for the
+ * outcome, causes, verification, live QA, acceptance, and cost. New consumers must read it.
  */
 function postRunMessage(
 	pi: ExtensionAPI,

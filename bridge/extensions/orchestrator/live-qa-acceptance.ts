@@ -3,7 +3,7 @@
  * checked against. Parsed strictly and prototype-safely; output objects are rebuilt from scratch.
  */
 
-import { RUN_RESULT_LIMITS, type AcceptanceResult, type CriterionResult } from "./core/run-result.ts";
+import { RUN_RESULT_CLIPS, RUN_RESULT_LIMITS, truncateMarked, type AcceptanceResult, type CriterionResult } from "./core/run-result.ts";
 
 export interface AcceptanceCriterion {
 	id: string;
@@ -115,7 +115,10 @@ function isPrimitive(v: unknown): v is Primitive {
 	return typeof v === "string" || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v));
 }
 
-function fmt(v: unknown): string {
+/** Display form of an expected/observed value for a mismatch note. Strings are redacted BEFORE
+ *  being clipped, so a secret straddling the clip point never leaves a prefix behind. */
+function fmt(v: unknown, redact: Redact): string {
+	if (typeof v === "string") return JSON.stringify(truncateMarked(redact(v), RUN_RESULT_CLIPS.observed));
 	if (isPrimitive(v)) return JSON.stringify(v);
 	if (v === null) return "null";
 	if (Array.isArray(v)) return "array";
@@ -163,13 +166,15 @@ function overallOf(criteria: CriterionResult[]): AcceptanceResult["overall"] {
 /**
  * Acceptance evidence is only as trustworthy as the live-QA session that produced it: whenever the
  * final live-QA verdict is not `pass`, every `pass` criterion becomes `blocked` (a genuine `fail`
- * stays `fail`) and `overall` is recomputed. Idempotent.
+ * stays `fail`) and `overall` is recomputed (never relaxed from `blocked`). Idempotent.
  */
 export function distrustAcceptance(acceptance: AcceptanceResult, verdict: string): AcceptanceResult {
 	if (verdict === "pass") return acceptance;
 	const note = `live QA verdict ${verdict}; evidence not trusted`;
 	const criteria = acceptance.criteria.map((c) => (c.result === "pass" ? { ...c, result: "blocked" as const, note } : c));
-	return { overall: criteria.length === 0 ? (acceptance.overall === "fail" ? "fail" : "blocked") : overallOf(criteria), criteria };
+	// Only ever tightens: an overall already `blocked` (e.g. unexpected ids) is never relaxed to `fail`.
+	const recomputed = criteria.length === 0 ? (acceptance.overall === "fail" ? "fail" : "blocked") : overallOf(criteria);
+	return { overall: acceptance.overall === "blocked" ? "blocked" : recomputed, criteria };
 }
 
 /** Reported-criteria entries beyond this are never iterated: the whole result is blocked. */
@@ -228,7 +233,8 @@ export function evaluateAcceptance(
 		const result = ownValue(entry, "result");
 		if (result !== "PASS" && result !== "FAIL" && result !== "BLOCKED") return blocked("result must be PASS, FAIL or BLOCKED");
 		const agentNote = ownValue(entry, "note");
-		const suffix = typeof agentNote === "string" && agentNote ? ` (agent note: ${agentNote})` : "";
+		// Redact the full agent note first, then clip with an explicit marker (never the reverse).
+		const suffix = typeof agentNote === "string" && agentNote ? ` (agent note: ${truncateMarked(redact(agentNote), RUN_RESULT_CLIPS.agentNote)})` : "";
 
 		if (c.expected) {
 			// Conservative: the agent's own FAIL/BLOCKED is never overridden by observed evidence;
@@ -246,8 +252,8 @@ export function evaluateAcceptance(
 					continue;
 				}
 				const got = ownValue(observedRaw, key);
-				if (isPrimitive(got)) observed[key] = typeof got === "string" ? fin(got) : got;
-				if (got !== want) mismatches.push(`${key}: expected ${fmt(want)}, observed ${fmt(got)}`);
+				if (isPrimitive(got)) observed[key] = typeof got === "string" ? truncateMarked(redact(got), RUN_RESULT_CLIPS.observed) : got;
+				if (got !== want) mismatches.push(`${key}: expected ${fmt(want, redact)}, observed ${fmt(got, redact)}`);
 			}
 			const base = { id: c.id, expected: { ...c.expected }, ...(Object.keys(observed).length ? { observed } : {}), artifacts: [] as string[] };
 			if (mismatches.length > 0) {
@@ -284,6 +290,9 @@ export function evaluateAcceptance(
 			const c = criteria[i] as CriterionResult;
 			if (c.result === "pass") criteria[i] = { ...c, result: "blocked", note };
 		}
+		// A report that does not match the manifest is untrustworthy as a whole: even a genuine
+		// `fail` criterion does not make the overall a clean `fail` -- it is `blocked`.
+		return { overall: "blocked", criteria };
 	}
 	return { overall: overallOf(criteria), criteria };
 }

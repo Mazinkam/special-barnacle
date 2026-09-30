@@ -189,9 +189,70 @@ describe("run result builders", () => {
 		const result = buildCompletedRunResult(minimalReport({ reportLines: ["- a", "prose", "* b"] }));
 		expect(result.openItems).toEqual(["a", "b"]);
 	});
-	test("51 report.openItems reach the bounds check unchanged and are rejected explicitly", () => {
+	test("51 report.openItems are capped at 50 with an explicit marker, not replaced", () => {
 		const result = buildCompletedRunResult(minimalReport({ openItems: Array.from({ length: 51 }, (_, i) => `i${i}`) }));
-		expect(result.diagnostics).toEqual(["result exceeded bounds: openItems 51 > 50"]);
+		expect(result.diagnostics).toEqual([]);
+		expect(result.openItems).toHaveLength(50);
+		expect(result.openItems.slice(0, 49)).toEqual(Array.from({ length: 49 }, (_, i) => `i${i}`));
+		expect(result.openItems[49]).toBe("…[2 more open items]");
+	});
+	test("50 report.openItems are kept as-is", () => {
+		const items = Array.from({ length: 50 }, (_, i) => `i${i}`);
+		expect(buildCompletedRunResult(minimalReport({ openItems: items })).openItems).toEqual(items);
+	});
+	test("60 open items of 3000 chars: acceptance intact, result under bounds, items explicitly clipped", () => {
+		const acceptance = { overall: "fail" as const, criteria: [
+			{ id: "AC-1", result: "fail" as const, expected: { status: 422 }, observed: { status: 409 }, artifacts: [], note: "status: expected 422, observed 409" },
+			{ id: "AC-2", result: "pass" as const, artifacts: ["report.md"] },
+		] };
+		const result = buildCompletedRunResult(minimalReport({
+			acceptance,
+			openItems: Array.from({ length: 60 }, (_, i) => `${i}:`.padEnd(3000, "x")),
+		}));
+		expect(result.acceptance).toEqual(acceptance);
+		expect(result.diagnostics).toEqual([]);
+		expect(result.openItems).toHaveLength(50);
+		expect(result.openItems[0]!.length).toBeLessThanOrEqual(500);
+		expect(result.openItems[0]!.startsWith("0:xxx")).toBe(true);
+		expect(result.openItems[0]).toContain("…[truncated");
+		expect(result.openItems[49]).toBe("…[11 more open items]");
+		expect(enforceRunResultBounds(result)).toEqual(result);
+		expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(RUN_RESULT_LIMITS.payloadBytes);
+	});
+	test("20 criteria x 10 long observed strings: overall/fail intact, ids/results/expected unclipped", () => {
+		const expected = Object.fromEntries(Array.from({ length: 10 }, (_, k) => [`k${k}`, "want"]));
+		const criteria = Array.from({ length: 20 }, (_, i) => ({
+			id: `AC-${i + 1}`,
+			result: (i === 0 ? "fail" : "blocked") as "fail" | "blocked",
+			expected,
+			observed: Object.fromEntries(Array.from({ length: 10 }, (_, k) => [`k${k}`, "o".repeat(2000)])),
+			artifacts: [],
+			note: "n".repeat(2000),
+		}));
+		const result = buildCompletedRunResult(minimalReport({ acceptance: { overall: "fail", criteria } }));
+		expect(result.diagnostics).toEqual([]);
+		expect(result.acceptance?.overall).toBe("fail");
+		expect(result.acceptance?.criteria.map((c) => c.id)).toEqual(criteria.map((c) => c.id));
+		expect(result.acceptance?.criteria.map((c) => c.result)).toEqual(criteria.map((c) => c.result));
+		expect(result.acceptance?.criteria.every((c) => JSON.stringify(c.expected) === JSON.stringify(expected))).toBe(true);
+		const observed = result.acceptance!.criteria[0]!.observed!.k0 as string;
+		expect(observed.length).toBeLessThanOrEqual(200);
+		expect(observed).toContain("…[truncated");
+		expect(result.acceptance!.criteria[0]!.note!.length).toBeLessThanOrEqual(500);
+		expect(enforceRunResultBounds(result)).toEqual(result);
+	});
+	test("long liveQa reasons, externalChecks strings and diagnostics are clipped to 500 with a marker", () => {
+		const long = "r".repeat(3000);
+		const result = buildCompletedRunResult(minimalReport({
+			dispatchOk: false,
+			firstFailureLine: long,
+			externalChecks: [{ provider: "github", id: "1", outcome: "failure", reason: long }],
+			liveQa: { stage: { verdict: "fail", required: true, reasons: [long], costRows: [], outcomeRow: null, stage: null, cancelled: false }, notRunReason: null, hasUnknownCost: false },
+		}));
+		for (const s of [result.liveQa.reasons[0]!, result.externalChecks[0]!.reason!, result.diagnostics[0]!]) {
+			expect(s.length).toBeLessThanOrEqual(500);
+			expect(s).toContain("…[truncated");
+		}
 	});
 
 	test("code verification is the pre-live-QA verdict; live Qa reported separately", () => {

@@ -17,7 +17,7 @@
  */
 import { telemetryHealthy, telemetryWarning, type FlushReport } from "../record-queue.ts";
 import { composeVerificationVerdict, liveQaSummaryLines, type RunLiveQaStageResult } from "../live-qa-stage.ts";
-import type { AcceptanceResult } from "./run-result.ts";
+import { deriveCauses, outcomeFromCauses, type AcceptanceResult, type RunOutcome } from "./run-result.ts";
 import { fmtElapsed } from "../run-ui.ts";
 
 export interface VerificationVerdictInput {
@@ -159,6 +159,14 @@ export interface RunReport {
 	outOfTreeChangesLine: string | null;
 }
 
+const BANNER_WORD: Record<RunOutcome, string> = {
+	complete: "complete",
+	partial: "partial",
+	blocked: "BLOCKED",
+	failed: "FAILED",
+	cancelled: "cancelled",
+};
+
 /**
  * Build the run summary text and its success/failure verdict from a
  * `RunReport`. Pure: every input is a field on `report`; the only
@@ -194,20 +202,17 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 	}
 	// External CI is an independent gate, never a rewrite of QA's own verdict.
 	const externalChecks = report.externalChecks ?? [];
-	const leadStatuses = report.leadStatuses ?? [];
-	const hasBlockedLead = leadStatuses.includes("blocked");
-	const hasFailedLead = leadStatuses.includes("failed");
-	const partial = !report.blocked && !hasBlockedLead && !hasFailedLead && report.dispatchOk && leadStatuses.includes("partial");
+	// The banner is RunResultV1's outcome (same cause derivation), never a separate computation.
+	const outcome = outcomeFromCauses(deriveCauses(report));
+	const partial = outcome === "partial";
 	const verificationPassed = verdict.startsWith("PASS");
 	const displayedReportLines = report.leadStatuses === undefined
 		? report.reportLines
 		: report.reportLines.filter((line) => !/^\s*STATUS\s*:/i.test(line));
-	const orchestrationBlocked = report.blocked || hasBlockedLead || externalChecks.some((check) => check.outcome !== "success");
-	const orchestrationFailed = !report.dispatchOk || hasFailedLead;
 	const actionLines = partial && !report.showFullReport ? displayedReportLines.filter((line) => /^\s*[-*]\s+/.test(line)).slice(0, 5) : [];
 	const verificationLabel = partial && verificationPassed ? "code verification" : "verification";
 	const summary = [
-		`Orchestration ${orchestrationBlocked ? "BLOCKED" : orchestrationFailed ? "FAILED" : partial ? "partial" : "complete"} in ${fmtElapsed(report.elapsedMs)}.`,
+		`Orchestration ${BANNER_WORD[outcome]} in ${fmtElapsed(report.elapsedMs)}.`,
 		...(partial && verificationPassed ? ["status note: code checks passed, but the requested scope is not fully closed."] : []),
 		`run_id: ${report.runId}`,
 		`leads: ${report.succeededLeads}/${report.totalLeads} ${report.blocked ? "blocked" : "succeeded"}${report.skippedLeads > 0 ? ` (+${report.skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${report.retries} · files: ${report.filesChangedCount} changed${report.externalFilesCount > 0 ? ` (+${report.externalFilesCount} changed by someone else, not verified)` : ""}`,

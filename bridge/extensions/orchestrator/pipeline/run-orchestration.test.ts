@@ -1262,13 +1262,14 @@ describe("pipeline/run-orchestration.ts runOrchestration: report.openItems (untr
 		expect(report.openItems).toEqual([]);
 	});
 
-	test("51 open-item bullets are not display-truncated and trip the bounds rejection", async () => {
+	test("51 open-item bullets are not display-truncated and are capped explicitly in the result", async () => {
 		const bullets = Array.from({ length: 51 }, (_, i) => `- item ${i}`).join("\n");
 		const report = await runWithLeadReport(`## Open items\n${bullets}\n\nSTATUS: done`);
 		expect(report.openItems).toHaveLength(51);
 		const result = buildCompletedRunResult(report);
-		expect(result.openItems).toEqual([]);
-		expect(result.diagnostics).toEqual(["result exceeded bounds: openItems 51 > 50"]);
+		expect(result.openItems).toHaveLength(50);
+		expect(result.openItems[49]).toBe("…[2 more open items]");
+		expect(result.diagnostics).toEqual([]);
 	});
 });
 
