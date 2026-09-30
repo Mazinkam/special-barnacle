@@ -1,0 +1,155 @@
+"""Eventually-consistent post-write dashboard: coalescing, correctness, crash safety, no deadlock."""
+from __future__ import annotations
+
+import json
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from orchestrator.app import refresh as refresh_module
+from orchestrator.app.refresh import SYNC_ENV, refresh_after_write
+from orchestrator.presentation import publish
+from orchestrator.presentation.dashboard_data import build_data
+from orchestrator.record_batch import write_batch
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def _event(i):
+    return {'stream': 'event', 'record_id': f'e{i}', 'event': 'note'}
+
+
+def _write(root, i):
+    return write_batch(root, [_event(i)], refresh=False)
+
+
+def _wait(cond, timeout=60):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond(): return
+        time.sleep(0.02)
+    raise AssertionError('timed out')
+
+
+def _strip(html):
+    return re.sub(r'"generated_at":\s*"[^"]*"', '', html)
+
+
+@pytest.fixture(autouse=True)
+def _async(monkeypatch):
+    monkeypatch.delenv(SYNC_ENV, raising=False)
+
+
+def test_burst_coalesces_into_bounded_renders_and_matches_sync_render(tmp_path):
+    counted = []
+
+    def counting(root, config): counted.append(1); return build_data(root, config)
+
+    with patch.object(refresh_module, '_spawn_renderer', lambda *a: None):  # writers never render
+        for i in range(25):
+            assert refresh_after_write(tmp_path, _write(tmp_path, i), config={})['ok']
+    assert counted == [] and not (tmp_path / 'dashboard.html').exists()
+    assert publish.render_until_current(tmp_path, {}, build_data=counting) == 1
+    assert publish.dashboard_is_current(tmp_path)
+    assert publish.render_until_current(tmp_path, {}, build_data=counting) == 0
+    assert len(counted) == 1
+    page = (tmp_path / 'dashboard.html').read_text()
+    publish.generate_dashboard(tmp_path, config={})
+    assert _strip((tmp_path / 'dashboard.html').read_text()) == _strip(page)
+
+
+def test_write_during_render_gets_second_pass_only(tmp_path):
+    _write(tmp_path, 0)
+    counted = []
+
+    def build(root, config):
+        counted.append(1)
+        if len(counted) == 1:
+            for i in range(1, 6): _write(tmp_path, i)  # burst lands mid-render
+        return build_data(root, config)
+
+    assert publish.render_until_current(tmp_path, {}, build_data=build) == 2
+    assert publish.dashboard_is_current(tmp_path)
+
+
+def test_receipt_reflects_version_before_build(tmp_path):
+    _write(tmp_path, 0)
+    before = publish.stream_version(tmp_path)
+
+    def build(root, config):
+        _write(tmp_path, 1)
+        return build_data(root, config)
+
+    publish.generate_dashboard(tmp_path, {}, build_data=build)
+    receipt = json.loads((tmp_path / 'dashboard.version.json').read_text())
+    assert receipt == before and not publish.dashboard_is_current(tmp_path)
+
+
+def test_failed_render_keeps_old_page_and_receipt_never_ahead(tmp_path):
+    _write(tmp_path, 0)
+    publish.generate_dashboard(tmp_path, {})
+    page, receipt = (tmp_path / 'dashboard.html').read_bytes(), (tmp_path / 'dashboard.version.json').read_bytes()
+    _write(tmp_path, 1)
+
+    def boom(d): raise RuntimeError('killed')
+
+    with patch.object(publish, 'render', boom), pytest.raises(RuntimeError):
+        publish.render_until_current(tmp_path, {})
+    assert (tmp_path / 'dashboard.html').read_bytes() == page
+    assert (tmp_path / 'dashboard.version.json').read_bytes() == receipt
+    assert publish.render_slot_free(tmp_path)  # lock released, later renders are not blocked
+    assert publish.render_until_current(tmp_path, {}) == 1
+
+
+def test_sigkilled_renderer_leaves_page_and_frees_locks(tmp_path):
+    _write(tmp_path, 0)
+    publish.generate_dashboard(tmp_path, {})
+    page = (tmp_path / 'dashboard.html').read_bytes()
+    _write(tmp_path, 1)
+    code = ("import sys,time\nfrom orchestrator.presentation import publish\n"
+            "def slow(root, config): open(sys.argv[1]+'/started','w').close(); time.sleep(60)\n"
+            "publish.render_until_current(sys.argv[1], {}, build_data=slow)\n")
+    p = subprocess.Popen([sys.executable, '-c', code, str(tmp_path)], cwd=REPO)
+    try:
+        _wait(lambda: (tmp_path / 'started').exists())
+        assert not publish.render_slot_free(tmp_path)
+        p.send_signal(signal.SIGKILL); p.wait()
+    finally:
+        p.kill()
+    assert (tmp_path / 'dashboard.html').read_bytes() == page
+    assert publish.render_slot_free(tmp_path)
+    assert publish.render_until_current(tmp_path, {}) == 1
+    assert publish.dashboard_is_current(tmp_path)
+
+
+def test_concurrent_writers_end_to_end_converge_without_deadlock(tmp_path):
+    def writer(base):
+        for i in range(base, base + 8):
+            assert refresh_after_write(tmp_path, _write(tmp_path, i), config={})['ok']
+
+    threads = [threading.Thread(target=writer, args=(b,)) for b in (0, 100, 200, 300)]
+    for t in threads: t.start()
+    for t in threads: t.join(60)
+    assert not any(t.is_alive() for t in threads)
+    _wait(lambda: publish.dashboard_is_current(tmp_path) and publish.render_slot_free(tmp_path))
+    page = (tmp_path / 'dashboard.html').read_text()
+    publish.generate_dashboard(tmp_path, config={})
+    assert _strip((tmp_path / 'dashboard.html').read_text()) == _strip(page)
+
+
+def test_sync_env_renders_inside_write_and_dashboard_command_always_renders(tmp_path, monkeypatch):
+    monkeypatch.setenv(SYNC_ENV, '1')
+    result = refresh_after_write(tmp_path, _write(tmp_path, 0), config={})
+    assert result['dashboard_updated'] and publish.dashboard_is_current(tmp_path)
+    renders = []
+    real = publish.render
+    with patch.object(publish, 'render', lambda d: renders.append(1) or real(d)):
+        publish.generate_dashboard(tmp_path, config={})
+    assert renders == [1]

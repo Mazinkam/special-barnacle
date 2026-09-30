@@ -14,6 +14,7 @@ seam) working after `build_data` moved out of that module.
 """
 from __future__ import annotations
 
+import fcntl
 from pathlib import Path
 from typing import Any, Callable
 
@@ -70,3 +71,40 @@ def generate_dashboard(state_dir=None, config: dict | None = None, *,
         write_text_atomic(out, render(data))
         write_json(root / 'dashboard.version.json', version)
         return out
+
+
+RENDER_LOCK = 'dashboard.render.lock'  # flock: held only by the one background renderer; the OS frees it on death
+
+
+def render_slot_free(root) -> bool:
+    """True when no background renderer is running (probe: take the flock non-blocking, drop it)."""
+    with (Path(root) / RENDER_LOCK).open('a') as f:
+        try: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError: return False
+        return True
+
+
+def render_until_current(root, config: dict | None = None, *, build_data=None) -> int:
+    """Background renderer body; return the number of renders done (0 if another renderer owns the slot).
+
+    Coalesces write bursts: it renders, releases the slot, then re-checks the receipt *after* release
+    and only exits when the page is current. A writer that probed the slot while we held it skipped
+    spawning, but its bytes were already on disk, so that post-release check sees them (no lost wakeup).
+    Each render goes through `generate_dashboard`, so the receipt is the version read before the build.
+    """
+    root = Path(root); renders = 0
+    while root.is_dir() and not dashboard_is_current(root):
+        with (root / RENDER_LOCK).open('a') as f:
+            try: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError: return renders
+            if dashboard_is_current(root): break
+            generate_dashboard(root, config, build_data=build_data, skip_if_current=True)
+            renders += 1
+    return renders
+
+
+if __name__ == '__main__':  # detached one-shot: `python -m orchestrator.presentation.publish <root>`, config JSON on stdin
+    import json, sys
+    try: _cfg = json.loads(sys.stdin.read() or 'null')
+    except ValueError: _cfg = None
+    render_until_current(sys.argv[1], _cfg)
