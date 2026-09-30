@@ -212,7 +212,11 @@ def build_route_stats(metrics:list[dict], outcomes:list[dict]|None=None, width:i
             'retry_rate':(retries/eff if eff else None) if has_retry else records.NO_DATA,
             'delayed_failure_rate':delayed_bad/delayed_total if delayed_total else None
         })
-    return sorted(result,key=lambda x:(x['task_class'],x['risk'],x['complexity_bucket'],x['capability'],x['effort'],str(x.get('topology_shape'))))
+    # Grouping fields may legitimately be None (e.g. a live-QA row whose agent never ran has no
+    # effort); order None after real values instead of failing the whole plan/dashboard.
+    def order(value):
+        return (value is None, '' if value is None else str(value))
+    return sorted(result,key=lambda x:tuple(order(x.get(k)) for k in ('task_class','risk','complexity_bucket','capability','effort','topology_shape')))
 
 
 def load_stats(root=None,width=2,decay_half_life_days:float|None=None):

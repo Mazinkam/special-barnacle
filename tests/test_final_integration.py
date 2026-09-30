@@ -242,3 +242,12 @@ def test_ingest_conflict_stderr_is_bounded_and_keeps_granularity_hint(tmp_path):
     assert lines[0].startswith('1 file(s) failed; first: GranularityConflict:')
     assert '--granularity session' in lines[0]
     assert json.loads(conflict.stdout)['failures'][0]['error'].endswith('nothing was written.')
+
+
+def test_route_stats_tolerate_missing_grouping_fields():
+    # A live-QA row whose agent never started records effort=None; it must not break planning.
+    live = {**call(run='Q'), 'capability_class': 'live_qa', 'effort': None}
+    rows = [call(), live]
+    stats = build_route_stats(rows)
+    assert [s['capability'] for s in stats] == ['implementation_fast', 'live_qa']
+    assert stats[1]['effort'] is None
