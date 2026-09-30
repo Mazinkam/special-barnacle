@@ -13,6 +13,7 @@ and install+import it from an isolated target directory.
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -41,50 +42,59 @@ REQUIRED_DATA_FILES = (
 
 
 def _packaging_tools_available() -> tuple[bool, str]:
-    # Use find_spec rather than actually importing: importing `setuptools` in
-    # this test process (which may already have imported stdlib `distutils`
-    # via pytest/other plugins) can trip setuptools' `_distutils_hack`
-    # consistency assertion. A subprocess build below does the real import
-    # in a clean interpreter.
-    import importlib.util
+    # Check installed distributions via metadata: importing or `find_spec`-ing
+    # `setuptools` trips its `_distutils_hack` (assertion if stdlib distutils is
+    # already loaded; KeyError('__file__') under pytest-xdist's execnet frames).
+    # The pip subprocess below does the real import in a clean interpreter.
+    from importlib import metadata
 
-    for mod in ("pip", "setuptools", "wheel"):
-        if importlib.util.find_spec(mod) is None:
-            return False, f"{mod} is not importable in this interpreter"
+    for dist in ("pip", "setuptools", "wheel"):
+        try:
+            metadata.version(dist)
+        except metadata.PackageNotFoundError:
+            return False, f"{dist} is not installed in this interpreter"
     return True, ""
 
 
 def _build_wheel(dest_dir: Path) -> Path:
-    """Build a wheel for the repo into dest_dir, returning its path.
+    """Build a wheel into dest_dir from a staged copy of the repo.
 
-    Uses --no-build-isolation (no `build` module / network-isolated build env
-    available) and --ignore-requires-python for robustness across whichever
-    interpreter this suite runs under; `requires-python` matches the 3.9.6
-    interpreter this repo is developed and tested on, so the flag is normally a
-    no-op here.
+    Only `orchestrator/` (minus __pycache__) and `pyproject.toml` are staged, so
+    pip neither copies the whole checkout (bench/, bridge/, node_modules, .git)
+    nor leaves build artefacts in it. Uses --no-build-isolation (no network) and
+    --ignore-requires-python for robustness across interpreters.
     """
+    stage = dest_dir / "src"
+    stage.mkdir()
+    shutil.copytree(
+        REPO_ROOT / "orchestrator", stage / "orchestrator",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    shutil.copy2(PYPROJECT, stage / "pyproject.toml")
+    out = dest_dir / "out"
     result = subprocess.run(
         [
             sys.executable,
             "-m",
             "pip",
             "wheel",
-            str(REPO_ROOT),
+            str(stage),
             "--no-deps",
             "--no-build-isolation",
             "--ignore-requires-python",
             "-w",
-            str(dest_dir),
+            str(out),
         ],
         capture_output=True,
         text=True,
+        env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
     )
     if result.returncode != 0:
         pytest.fail(
             f"wheel build failed (exit {result.returncode})\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
-    wheels = list(dest_dir.glob("*.whl"))
+    wheels = list(out.glob("*.whl"))
     assert len(wheels) == 1, f"expected exactly one wheel, found {wheels}"
     return wheels[0]
 
@@ -94,16 +104,7 @@ def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
     available, reason = _packaging_tools_available()
     if not available:
         pytest.skip(f"packaging tools unavailable: {reason}")
-    dest_dir = tmp_path_factory.mktemp("wheel-out")
-    wheel_path = _build_wheel(dest_dir)
-    # Guard against build artefacts leaking into the checkout (pip wheel with
-    # --no-build-isolation copies the source tree into a temp dir first, but
-    # be defensive in case that behaviour changes).
-    for leftover in ("build", *(p.name for p in REPO_ROOT.glob("*.egg-info"))):
-        leftover_path = REPO_ROOT / leftover
-        if leftover_path.exists():
-            shutil.rmtree(leftover_path, ignore_errors=True)
-    return wheel_path
+    return _build_wheel(tmp_path_factory.mktemp("wheel-out"))
 
 
 def test_wheel_contains_package_data_and_no_bridge_paths(built_wheel: Path) -> None:
@@ -136,6 +137,7 @@ def test_wheel_installs_and_imports_without_checkout(
         ],
         capture_output=True,
         text=True,
+        env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
     )
     assert result.returncode == 0, (
         f"pip install into --target failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
