@@ -146,8 +146,9 @@ Skip reconnaissance for a low-risk, well-localized change. Use only the workers 
 | Evidence | Level |
 |---|---|
 | explicit high/critical risk, or any `risk_path_globs` hit | full (hard floor) |
-| interface change across packages | full |
-| 4 or more candidate files, 3 or more packages, or unresolved scope | led |
+| interface change across packages | full (hard floor) |
+| unresolved scope (no candidate files) | led (hard floor) |
+| 4 or more candidate files or 3 or more packages | led |
 | exactly one low-risk file with adjacent tests and discovered checks, no interface change | direct |
 | anything else | checked |
 

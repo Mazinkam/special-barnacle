@@ -21,12 +21,15 @@ export function routeWorkflow(s: WorkflowSignals, policy: WorkflowPolicy): Workf
 		return { level: "full", floor: "full", uncertainty, reasons: [highRisk ? `explicit risk ${s.triageRisk}` : `protected path: ${s.riskPathHits[0]}`] };
 	}
 	if (s.interfaceHits.length > 0 && s.packages.length > 1) {
-		return { level: "full", floor: baseFloor, uncertainty, reasons: [`interface change across ${s.packages.length} packages`] };
+		// A cross-package contract change needs coordinated design: nothing may lower it.
+		return { level: "full", floor: "full", uncertainty, reasons: [`interface change across ${s.packages.length} packages`] };
 	}
 	const t = policy.thresholds;
 	if (s.ambiguous || s.candidates.length >= t.led_min_files || s.packages.length >= t.led_min_packages) {
 		const why = s.ambiguous ? "scope unresolved" : s.candidates.length >= t.led_min_files ? `${s.candidates.length} candidate files` : `${s.packages.length} packages`;
-		return { level: "led", floor: baseFloor, uncertainty, reasons: [why] };
+		// Unresolved scope is missing evidence, not evidence of a small change: floor at led.
+		// A large but resolved scope stays overridable (an explicit, informed user choice).
+		return { level: "led", floor: s.ambiguous ? "led" : baseFloor, uncertainty, reasons: [why] };
 	}
 	if (s.candidates.length === 1 && s.triageRisk === "low" && s.interfaceHits.length === 0 && s.testsNearby && s.checks.length > 0) {
 		return { level: "direct", floor: "direct", uncertainty, reasons: ["one localized low-risk file with adjacent tests and runnable checks"] };

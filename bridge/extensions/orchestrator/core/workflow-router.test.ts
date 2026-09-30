@@ -48,4 +48,20 @@ describe("applyWorkflowOverride", () => {
 		expect(d.level).toBe("led");
 		expect(d.override?.accepted).toBe(false);
 	});
+	test("unresolved scope has a led floor: --workflow checked rejected, full accepted", () => {
+		const amb = route({ candidates: [], ambiguous: true });
+		expect(amb.floor).toBe("led");
+		expect(applyWorkflowOverride(amb, "checked").override).toEqual({ requested: "checked", accepted: false, reason: "below hard floor led" });
+		expect(applyWorkflowOverride(amb, "full").level).toBe("full");
+	});
+	test("cross-package interface change has a full floor: --workflow direct rejected", () => {
+		const d = applyWorkflowOverride(route({ interfaceHits: ["x"], packages: [".", "pkg/b"] }), "direct");
+		expect([d.level, d.floor]).toEqual(["full", "full"]);
+		expect(d.override?.accepted).toBe(false);
+	});
+	test("many resolved files keep an overridable floor (explicit user choice)", () => {
+		const d = applyWorkflowOverride(route({ candidates: ["a", "b", "c", "d"] }), "checked");
+		expect(d.level).toBe("checked");
+		expect(d.override?.accepted).toBe(true);
+	});
 });
