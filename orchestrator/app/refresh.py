@@ -28,7 +28,7 @@ def refresh_after_write(root: str | Path, result: dict[str, Any], *, config: dic
     if result.get('error') is not None:
         return result
     try:
-        generate_dashboard(Path(root), config=config)
+        generate_dashboard(Path(root), config=config, skip_if_current=True)
         result['dashboard_updated'] = True
     except Exception as exc:  # noqa: BLE001 - records (and any ledger catch-up) are already durable
         result['ok'] = False

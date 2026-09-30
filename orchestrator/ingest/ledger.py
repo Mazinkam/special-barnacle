@@ -7,6 +7,7 @@ and writes alongside.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -67,6 +68,11 @@ class IngestLedger:
         self.tail_hash: Optional[str] = None
         self.full_scans = 0  # observability for tests/benchmarks
         self.staged: list[dict[str, Any]] = []
+        # events.jsonl promotion rows seen so far, valid through `_promo_offset` (see `_promotion_rows`)
+        self._promo_rows: list[dict[str, Any]] = []
+        self._promo_offset = 0
+        self._promo_identity: Optional[list[int]] = None
+        self._promo_tail_hash: Optional[str] = None
 
     # -- reading -------------------------------------------------------------------------------
     def _apply(self, row: dict[str, Any], keys: Optional[set[tuple[str, str]]]) -> None:
@@ -260,16 +266,40 @@ class IngestLedger:
                                                 or bindings[before]['source_identity'] != identity))):
                 raise ValueError(f'{source}: ambiguous session promotion binding; reconcile events.jsonl before retrying; '
                                  'nothing was written.')
-            bindings[before] = {'to_session_id': after, 'source_identity': identity}
+            bindings[before] = {'to_session_id': after, 'source_identity': list(identity)}
 
         path = self.path.with_name(STREAMS['event'])
-        end = 0
-        for row, end in iter_jsonl_from(path):  # noqa: B007 -- end is read after the loop, below
+        rows, end = self._promotion_rows(path)
+        for row in rows:
             apply(row)
         apply(self._complete_tail(end, path))
         for row in self.staged:
             apply(row)
         return bindings
+
+    def _promotion_rows(self, path: Path) -> tuple[list[dict[str, Any]], int]:
+        """Every complete promotion-event line of `path` in file order, and the complete-prefix end.
+
+        Walks only the suffix appended since the last call while the prefix is intact (same
+        dev/inode and same last line at the cached offset: the trust model `advance` applies to
+        metrics.jsonl); anything else re-reads from byte 0. Cached rows are never mutated.
+        """
+        if not path.exists():
+            self._promo_rows, self._promo_offset, self._promo_identity, self._promo_tail_hash = [], 0, None, None
+            return self._promo_rows, 0
+        with open_binary(path) as f:  # one handle: a rotation of the path cannot split identity, check and scan
+            stat = os.fstat(f.fileno())
+            identity = [stat.st_dev, stat.st_ino]
+            if (identity != self._promo_identity or stat.st_size < self._promo_offset
+                    or (self._promo_offset > 0 and tail_fingerprint(f, self._promo_offset) != self._promo_tail_hash)):
+                self._promo_rows, self._promo_offset, self._promo_identity = [], 0, identity
+            end = self._promo_offset
+            for row, end in iter_jsonl_from(f, self._promo_offset):  # noqa: B007 -- end is read after the loop
+                if isinstance(row, dict) and row.get('event') == PROMOTION_EVENT:
+                    self._promo_rows.append(row)
+            self._promo_offset = end
+            self._promo_tail_hash = tail_fingerprint(f, end)
+        return self._promo_rows, end
 
     def source_states(self, runtime: str, source: str | Path) -> dict[str, dict[str, Any]]:
         """Authoritative coverage per session for one source, never totals from other paths.

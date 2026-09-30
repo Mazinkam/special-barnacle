@@ -42,13 +42,19 @@ def dashboard_is_current(root):
 
 
 def generate_dashboard(state_dir=None, config: dict | None = None, *,
-                       build_data: Callable[..., Any] | None = None):
+                       build_data: Callable[..., Any] | None = None, skip_if_current: bool = False):
     """Render and atomically publish `dashboard.html`; return its path.
 
     The page is written to a same-directory temporary file and renamed into place, so an
     interrupted render (exception, crash, disk full) leaves the previously published complete
     page untouched and a later refresh catches up. The document is emitted in three chunks
     (head, data, tail) rather than one concatenated string to avoid an extra copy of the payload.
+
+    `skip_if_current=True` (post-write refresh only) returns the published page without rendering
+    when its receipt, checked under the lock, already equals the streams' current version: a
+    concurrent renderer that queued ahead of us already published everything we would, and a
+    duplicate-only write changed nothing. Time-relative fields (`generated_at`, provider health)
+    keep the earlier render's clock; the explicit `dashboard` command always renders.
     """
     build = build_data or _default_build_data
     root = Path(state_dir) if state_dir is not None else default_state_root()
@@ -57,8 +63,10 @@ def generate_dashboard(state_dir=None, config: dict | None = None, *,
     # a newer publication; writes during this render invalidate the pre-render receipt.
     with exclusive_file_lock(root / 'dashboard.lock'):
         version = stream_version(root)
-        data = build(root, config)
         out = root / 'dashboard.html'
+        if skip_if_current and out.exists() and read_json(root / 'dashboard.version.json', None) == version:
+            return out
+        data = build(root, config)
         write_text_atomic(out, render(data))
         write_json(root / 'dashboard.version.json', version)
         return out
