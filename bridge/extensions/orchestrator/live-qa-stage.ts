@@ -10,6 +10,12 @@
  * `forceCancelledVerdict` -- even when the runner exits 0 with fully valid pass artifacts.
  */
 
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdtempSync, openSync, readSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import type { AcceptanceResult } from "./core/run-result.ts";
+import { parseAcceptanceManifest, type AcceptanceManifest } from "./live-qa-acceptance.ts";
 import {
 	buildRunnerArgv,
 	gitRevParseHead,
@@ -36,6 +42,8 @@ export interface LiveQaStageRequest {
 	adapterId?: string;
 	/** `--live-qa-scope <scope>`, when given. */
 	scope?: string;
+	/** `--live-qa-acceptance <abs path>`, when given. */
+	acceptancePath?: string;
 }
 
 export interface RunLiveQaStageOptions {
@@ -45,6 +53,8 @@ export interface RunLiveQaStageOptions {
 	/** The candidate repository under test (the orchestrator's own `cwd`). */
 	cwd: string;
 	runId: string;
+	/** Per-run session dir where the validated `criteria.json` is staged. */
+	stagingPath?: string;
 	changedFiles: string[];
 	cancellation: LiveQaCancellationSignal;
 	onLine: (line: string) => void;
@@ -76,6 +86,81 @@ export interface RunLiveQaStageResult {
 	costRows: Record<string, unknown>[];
 	outcomeRow: Record<string, unknown> | null;
 	cancelled: boolean;
+	/** Present whenever an acceptance manifest was supplied; `blocked` when it was not (or could not be) evaluated. */
+	acceptance?: AcceptanceResult;
+}
+
+/** Acceptance manifests are tiny (<= 20 criteria); anything bigger is refused before reading. */
+export const MAX_ACCEPTANCE_MANIFEST_BYTES = 64 * 1024;
+
+/**
+ * Blocked acceptance for a stage that could not (fully) evaluate a supplied manifest. When the
+ * manifest parsed, every criterion id is reported `blocked` with the reason as its note. When it
+ * did not (unreadable/invalid, or the stage failed before the manifest was read) there are no
+ * trustworthy ids to report, so `criteria` is `[]` and the reason stays visible in the stage's
+ * `reasons`.
+ */
+function blockedAcceptance(manifest: AcceptanceManifest | undefined, reason: string): AcceptanceResult {
+	return {
+		overall: "blocked",
+		criteria: (manifest?.criteria ?? []).map((c) => ({ id: c.id, result: "blocked" as const, artifacts: [], note: redactSecrets(reason, process.env) })),
+	};
+}
+
+/** Bounded, fail-closed read of the (trusted-loop-supplied) manifest path: no symlinks
+ *  (O_NOFOLLOW), regular files only (fstat on the descriptor, so a FIFO/dir/device never blocks
+ *  or is read), size checked before reading, opened O_NONBLOCK. */
+function readAcceptanceManifestFile(path: string): string {
+	const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+	try {
+		const st = fstatSync(fd);
+		if (!st.isFile()) throw new Error("not a regular file");
+		if (st.size > MAX_ACCEPTANCE_MANIFEST_BYTES) {
+			throw new Error(`${st.size} bytes exceeds the ${MAX_ACCEPTANCE_MANIFEST_BYTES}-byte limit`);
+		}
+		const buf = Buffer.alloc(st.size);
+		let offset = 0;
+		while (offset < buf.length) {
+			const n = readSync(fd, buf, offset, buf.length - offset, offset);
+			if (n <= 0) break;
+			offset += n;
+		}
+		return buf.subarray(0, offset).toString("utf8");
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** Stages `criteria.json` without following or deleting anything. `stagingPath` (when given)
+ *  must already be a real directory (lstat: not a symlink) owned by this user; a fresh private
+ *  (0o700) `mkdtemp` subdir is created inside it and the file is created exclusively with
+ *  O_NOFOLLOW (0o600). Without a `stagingPath`, a fresh private tmpdir is used. Anything else
+ *  fails closed. Returns the file path. */
+function stageCriteriaFile(stagingPath: string | undefined, manifest: AcceptanceManifest): string {
+	let parent: string;
+	if (stagingPath === undefined) {
+		parent = mkdtempSync(join(tmpdir(), "orch-live-qa-"));
+	} else {
+		let st: ReturnType<typeof lstatSync>;
+		try {
+			st = lstatSync(stagingPath);
+		} catch (error) {
+			throw new Error(`staging path ${stagingPath} is not usable: ${(error as Error).message}`);
+		}
+		if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`staging path ${stagingPath} is not a real directory`);
+		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+		if (uid !== undefined && st.uid !== uid) throw new Error(`staging path ${stagingPath} is not owned by the current user`);
+		parent = stagingPath;
+	}
+	const dir = stagingPath === undefined ? parent : mkdtempSync(join(parent, "live-qa-criteria-"));
+	const path = join(dir, "criteria.json");
+	const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+	try {
+		writeSync(fd, JSON.stringify(manifest));
+	} finally {
+		closeSync(fd);
+	}
+	return path;
 }
 
 /** A `PreparedTestedRevision` for a stage that never got far enough to attempt the proof. */
@@ -210,6 +295,8 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 	}
 
 	const taskId = `${runId}-live-qa-stage`;
+	// Set once the manifest parses; lets every later failure report its criterion ids as blocked.
+	let acceptanceManifest: AcceptanceManifest | undefined;
 
 	// A failure before an adapter is selected: an explicit request counts as required (there is
 	// no adapter-level `required` flag to defer to yet).
@@ -230,6 +317,7 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 			costRows: [],
 			outcomeRow: buildOutcomeRow(runId, stage, env, null),
 			cancelled: false,
+			...(request.acceptancePath ? { acceptance: blockedAcceptance(acceptanceManifest, reason) } : {}),
 		};
 	};
 
@@ -278,6 +366,7 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 			costRows: [],
 			outcomeRow: buildOutcomeRow(runId, stage, env, adapter),
 			cancelled: false,
+			...(request.acceptancePath ? { acceptance: blockedAcceptance(acceptanceManifest, reason) } : {}),
 		};
 	};
 
@@ -292,7 +381,31 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 		return failAfterAdapterSelection(revision.reason ?? "tested-revision proof failed", scope, revision);
 	}
 
-	const argv = buildRunnerArgv(adapter, scope, revision.sha as string);
+	let criteriaPath: string | undefined;
+	if (request.acceptancePath) {
+		let raw: unknown;
+		try {
+			raw = JSON.parse(readAcceptanceManifestFile(request.acceptancePath));
+		} catch (error) {
+			const reason = `acceptance manifest unreadable: ${(error as Error).message}`;
+			return failAfterAdapterSelection(reason, scope, notStartedRevision("acceptance manifest unreadable"));
+		}
+		const manifest = parseAcceptanceManifest(raw);
+		if (!manifest.ok) {
+			return failAfterAdapterSelection(`acceptance manifest invalid: ${manifest.reason}`, scope, notStartedRevision("acceptance manifest invalid"));
+		}
+		acceptanceManifest = manifest.manifest;
+		if (adapter.criteria !== true) {
+			return failAfterAdapterSelection("adapter cannot take criteria", scope, notStartedRevision("adapter cannot take criteria"));
+		}
+		try {
+			criteriaPath = stageCriteriaFile(opts.stagingPath, manifest.manifest);
+		} catch (error) {
+			const reason = `acceptance manifest unreadable: could not stage criteria.json: ${(error as Error).message}`;
+			return failAfterAdapterSelection(reason, scope, notStartedRevision("acceptance manifest unreadable"));
+		}
+	}
+	const argv = buildRunnerArgv(adapter, scope, revision.sha as string, criteriaPath);
 	const startedAtMs = now();
 	const runResult = await run({ adapter, argv, signal: cancellation, onLine, onSpawn: opts.onSpawn });
 	const parsedVerdict = parseSession({
@@ -324,6 +437,7 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 		costRows,
 		outcomeRow,
 		cancelled: runResult.cancelled,
+		...(request.acceptancePath ? { acceptance: blockedAcceptance(acceptanceManifest, "acceptance.json was not evaluated") } : {}),
 	};
 }
 

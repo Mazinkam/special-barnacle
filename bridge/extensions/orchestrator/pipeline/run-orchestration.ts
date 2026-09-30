@@ -1084,7 +1084,8 @@ export async function runOrchestration(
 				`live QA: requesting Forge focused run${parsed.liveQaAdapterId ? ` (adapter ${parsed.liveQaAdapterId})` : ""}`,
 			);
 			liveQaStageResult = await runLiveQaStage({
-				request: { requested: true, adapterId: parsed.liveQaAdapterId, scope: parsed.liveQaScope },
+				request: { requested: true, adapterId: parsed.liveQaAdapterId, scope: parsed.liveQaScope, acceptancePath: parsed.liveQaAcceptance },
+				stagingPath: session.dir,
 				env: deps.env,
 				cwd,
 				runId,

@@ -47,6 +47,8 @@ export interface LiveQaAdapterConfig {
 	effort: "low" | "medium" | "high" | "xhigh";
 	local: true;
 	required: boolean;
+	/** Adapter can accept `--criteria <manifest.json>`. */
+	criteria?: true;
 }
 
 export interface LiveQaConfigProblem {
@@ -63,7 +65,7 @@ export interface ParsedLiveQaConfig {
 const TOP_LEVEL_KEYS = new Set(["version", "adapters"]);
 const ADAPTER_KEYS = new Set([
 	"id", "kind", "trusted", "runner_cwd", "argv_prefix", "flow", "slot",
-	"budget_minutes", "runtime", "model", "effort", "local", "required",
+	"budget_minutes", "runtime", "model", "effort", "local", "required", "criteria",
 ]);
 
 // Mirrors Forge's scripts/qa/cli.ts model-alias tables (MODELS at cli.ts:99, HUMAIN_NODE_MODELS
@@ -178,8 +180,11 @@ function parseAdapterEntry(
 	const requiredOk = requiredRaw === undefined || typeof requiredRaw === "boolean";
 	if (!requiredOk) problems.push({ adapter_id: id, field: "required", reason: "required must be a boolean" });
 
+	const criteriaOk = obj.criteria === undefined || obj.criteria === true;
+	if (!criteriaOk) problems.push({ adapter_id: id, field: "criteria", reason: "criteria must be literally true (or omitted)" });
+
 	const allOk = idOk && kindOk && trustedOk && runnerCwdOk && argvOk && flowOk && slotOk &&
-		budgetOk && runtimeOk && modelOk && effortOk && localOk && requiredOk && !hasUnknownKey;
+		budgetOk && runtimeOk && modelOk && effortOk && localOk && requiredOk && criteriaOk && !hasUnknownKey;
 	if (!allOk) return { adapter: null, problems };
 
 	return {
@@ -197,6 +202,7 @@ function parseAdapterEntry(
 			effort: obj.effort as LiveQaAdapterConfig["effort"],
 			local: true,
 			required: requiredRaw === undefined ? true : (requiredRaw as boolean),
+			...(obj.criteria === true ? { criteria: true as const } : {}),
 		},
 		problems,
 	};
@@ -314,7 +320,7 @@ export function validateScope(scope: unknown): ScopeValidation {
  * executed as `spawn(argv[0], argv.slice(1), {cwd: runner_cwd, shell: false})` — never a shell
  * string, so `scope` is one argv element regardless of its contents.
  */
-export function buildRunnerArgv(adapter: LiveQaAdapterConfig, scope: string, ref: string): string[] {
+export function buildRunnerArgv(adapter: LiveQaAdapterConfig, scope: string, ref: string, criteriaPath?: string): string[] {
 	return [
 		...adapter.argv_prefix,
 		"run",
@@ -327,6 +333,7 @@ export function buildRunnerArgv(adapter: LiveQaAdapterConfig, scope: string, ref
 		"--model", adapter.model,
 		"--effort", adapter.effort,
 		"--local",
+		...(criteriaPath ? ["--criteria", criteriaPath] : []),
 	];
 }
 
