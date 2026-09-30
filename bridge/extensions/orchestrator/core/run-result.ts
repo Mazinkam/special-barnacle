@@ -128,6 +128,9 @@ function violation(result: RunResultV1): string | null {
 	if (new Set(result.causes).size !== result.causes.length) return "causes contain duplicates";
 	if (result.causes.some((c) => !RUN_CAUSES.includes(c))) return "causes contain unknown values";
 	if (result.openItems.length > L.openItems) return `openItems ${result.openItems.length} > ${L.openItems}`;
+	if (result.liveQa.reasons.length > L.reasons) return `liveQa.reasons ${result.liveQa.reasons.length} > ${L.reasons}`;
+	if (result.diagnostics.length > L.diagnostics) return `diagnostics ${result.diagnostics.length} > ${L.diagnostics}`;
+	if (result.externalChecks.length > L.externalChecks) return `externalChecks ${result.externalChecks.length} > ${L.externalChecks}`;
 	const criteria = result.acceptance?.criteria ?? [];
 	if (criteria.length > L.criteria) return `criteria ${criteria.length} > ${L.criteria}`;
 	const artifacts = criteria.reduce((n, c) => n + c.artifacts.length, 0);

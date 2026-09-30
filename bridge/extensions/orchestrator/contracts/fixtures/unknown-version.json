@@ -1,0 +1,40 @@
+{
+  "schema": "orchestration-result",
+  "version": 2,
+  "runId": "ht-orch-unknown-version",
+  "outcome": "complete",
+  "causes": [],
+  "codeVerification": "pass",
+  "liveQa": {
+    "verdict": "pass",
+    "sessionId": "run-20260930-095418-ba63",
+    "testedCommit": "abc1234",
+    "reasons": []
+  },
+  "externalChecks": [],
+  "openItems": [],
+  "diagnostics": [],
+  "cost": {
+    "usd": 0.5,
+    "complete": true
+  },
+  "runLog": "/state/runs/ht-orch-complete/run.log",
+  "acceptance": {
+    "overall": "pass",
+    "criteria": [
+      {
+        "id": "ac-1",
+        "result": "pass",
+        "expected": {
+          "status": 200
+        },
+        "observed": {
+          "status": 200
+        },
+        "artifacts": [
+          "artifacts/ac-1.png"
+        ]
+      }
+    ]
+  }
+}

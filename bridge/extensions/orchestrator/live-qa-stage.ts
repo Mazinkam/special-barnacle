@@ -128,6 +128,62 @@ function readAcceptanceManifestFile(path: string): string {
 	}
 }
 
+type ManifestLoad = { ok: true; manifest: AcceptanceManifest } | { ok: false; reason: string; revisionReason: string };
+
+/** Reads (bounded, no symlinks) and strictly parses an acceptance manifest. */
+function loadAcceptanceManifest(path: string): ManifestLoad {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(readAcceptanceManifestFile(path));
+	} catch (error) {
+		return { ok: false, reason: `acceptance manifest unreadable: ${(error as Error).message}`, revisionReason: "acceptance manifest unreadable" };
+	}
+	const parsed = parseAcceptanceManifest(raw);
+	if (!parsed.ok) return { ok: false, reason: `acceptance manifest invalid: ${parsed.reason}`, revisionReason: "acceptance manifest invalid" };
+	return { ok: true, manifest: parsed.manifest };
+}
+
+type AdapterSelection = { ok: true; adapter: LiveQaAdapterConfig } | { ok: false; reason: string };
+
+/** The one adapter-selection rule: an explicit id must exist; otherwise exactly one valid adapter. */
+function selectLiveQaAdapter(config: ReturnType<typeof loadLiveQaConfig>, adapterId: string | undefined): AdapterSelection {
+	if (config.adapters.length === 0) {
+		const detail = config.problems.map((p) => p.reason).join("; ");
+		return { ok: false, reason: detail ? `no valid live-QA adapter is configured (${detail})` : "no valid live-QA adapter is configured" };
+	}
+	if (adapterId) {
+		const found = config.adapters.find((a) => a.id === adapterId);
+		return found
+			? { ok: true, adapter: found }
+			: { ok: false, reason: `unknown live-QA adapter id "${adapterId}" (configured: ${config.adapters.map((a) => a.id).join(", ")})` };
+	}
+	if (config.adapters.length === 1) return { ok: true, adapter: config.adapters[0] };
+	return {
+		ok: false,
+		reason: `ambiguous: ${config.adapters.length} valid live-QA adapters configured (${config.adapters.map((a) => a.id).join(", ")}); specify --live-qa-adapter <id>`,
+	};
+}
+
+/**
+ * Run-start check for `--live-qa-acceptance` (called before triage, so a bad manifest or an
+ * adapter that cannot take criteria never costs a dispatch): the manifest must read and parse,
+ * and the adapter the stage would select must declare `criteria: true`. The stage re-checks both
+ * later (the manifest is re-read then; this is not a trust handoff).
+ */
+export function preflightLiveQaAcceptance(input: {
+	env: Record<string, string | undefined>;
+	adapterId?: string;
+	acceptancePath: string;
+	loadLiveQaConfig?: typeof loadLiveQaConfig;
+}): { ok: true } | { ok: false; reason: string } {
+	const manifest = loadAcceptanceManifest(input.acceptancePath);
+	if (!manifest.ok) return { ok: false, reason: manifest.reason };
+	const selection = selectLiveQaAdapter((input.loadLiveQaConfig ?? loadLiveQaConfig)(input.env), input.adapterId);
+	if (!selection.ok) return { ok: false, reason: selection.reason };
+	if (selection.adapter.criteria !== true) return { ok: false, reason: "adapter cannot take criteria" };
+	return { ok: true };
+}
+
 /** Stages `criteria.json` without following or deleting anything. `stagingPath` (when given)
  *  must already be a real directory (lstat: not a symlink) owned by this user; a fresh private
  *  (0o700) `mkdtemp` subdir is created inside it and the file is created exclusively with
@@ -329,30 +385,9 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 		};
 	};
 
-	const config = load(env);
-	if (config.adapters.length === 0) {
-		const detail = config.problems.map((p) => p.reason).join("; ");
-		return failBeforeAdapter(
-			detail ? `no valid live-QA adapter is configured (${detail})` : "no valid live-QA adapter is configured",
-		);
-	}
-
-	let adapter: LiveQaAdapterConfig;
-	if (request.adapterId) {
-		const found = config.adapters.find((a) => a.id === request.adapterId);
-		if (!found) {
-			return failBeforeAdapter(
-				`unknown live-QA adapter id "${request.adapterId}" (configured: ${config.adapters.map((a) => a.id).join(", ")})`,
-			);
-		}
-		adapter = found;
-	} else if (config.adapters.length === 1) {
-		adapter = config.adapters[0];
-	} else {
-		return failBeforeAdapter(
-			`ambiguous: ${config.adapters.length} valid live-QA adapters configured (${config.adapters.map((a) => a.id).join(", ")}); specify --live-qa-adapter <id>`,
-		);
-	}
+	const selection = selectLiveQaAdapter(load(env), request.adapterId);
+	if (!selection.ok) return failBeforeAdapter(selection.reason);
+	const adapter = selection.adapter;
 
 	const required = adapter.required;
 
@@ -391,16 +426,9 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 
 	let criteriaPath: string | undefined;
 	if (request.acceptancePath) {
-		let raw: unknown;
-		try {
-			raw = JSON.parse(readAcceptanceManifestFile(request.acceptancePath));
-		} catch (error) {
-			const reason = `acceptance manifest unreadable: ${(error as Error).message}`;
-			return failAfterAdapterSelection(reason, scope, notStartedRevision("acceptance manifest unreadable"));
-		}
-		const manifest = parseAcceptanceManifest(raw);
+		const manifest = loadAcceptanceManifest(request.acceptancePath);
 		if (!manifest.ok) {
-			return failAfterAdapterSelection(`acceptance manifest invalid: ${manifest.reason}`, scope, notStartedRevision("acceptance manifest invalid"));
+			return failAfterAdapterSelection(manifest.reason, scope, notStartedRevision(manifest.revisionReason));
 		}
 		acceptanceManifest = manifest.manifest;
 		if (adapter.criteria !== true) {

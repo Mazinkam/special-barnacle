@@ -677,7 +677,7 @@ describe("commands/orchestrate.ts: RunResultV1 is posted before the terminal not
 			ui: { notify: (text: string) => { events.push({ kind: "notify", text }); }, confirm: () => Promise.resolve(true) },
 			sessionManager: { getEntries: () => [] },
 		} as unknown as ExtensionContext;
-		return { events, run: () => handler!("fix the login race", ctx), session };
+		return { events, run: (args = "fix the login race") => handler!(args, ctx), session };
 	}
 
 	function expectSendBeforeNotify(events: Ev[]): Ev {
@@ -700,6 +700,43 @@ describe("commands/orchestrate.ts: RunResultV1 is posted before the terminal not
 		const send = expectSendBeforeNotify(events);
 		expect(send.details.result.outcome).toBe("complete");
 		expect(send.details.outcome).toBe("completed");
+	});
+
+	test("invalid --live-qa-acceptance manifest (real pipeline): terminal aborted RunResultV1, triage never called", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "orch-cmd-acceptance-"));
+		const manifestPath = join(dir, "bad.acceptance.json");
+		writeFileSync(manifestPath, JSON.stringify({ version: 2 }));
+		let triageCalls = 0;
+		const { events, run } = harness(fakeRunSessionLike("placeholder"), {
+			env: { HUMAIN_ORCHESTRATOR_FOREGROUND: "1", HUMAIN_ORCHESTRATOR_LIVE_QA_CONFIG: join(dir, "missing-config.json") },
+			triageTask: async () => { triageCalls++; return null; },
+		});
+		try {
+			await run(`fix the login race --live-qa-scope verify --live-qa-acceptance ${manifestPath}`);
+			// Earlier run-start warnings may notify first; the terminal error notify follows the send.
+			const sends = events.filter((e) => e.kind === "send" && e.customType === "orchestrator-run");
+			expect(sends).toHaveLength(1);
+			const sendIdx = events.indexOf(sends[0]!);
+			const terminalIdx = events.findIndex((e) => e.kind === "notify" && (e.text ?? "").includes("acceptance manifest invalid"));
+			expect(terminalIdx).toBeGreaterThan(sendIdx);
+			const result = sends[0]!.details.result;
+			expect(result.version).toBe(1);
+			expect(result.causes).toEqual(["aborted"]);
+			expect(result.outcome).toBe("failed");
+			expect(result.diagnostics[0]).toContain("acceptance manifest invalid");
+			expect(triageCalls).toBe(0);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("--live-qa-acceptance without live QA is rejected as a flag error", async () => {
+		const { events, run } = harness();
+		let reached = false;
+		setRunOrchestrationForTest(async () => { reached = true; return { kind: "aborted", cause: "aborted", notifyText: "x", notifyType: "info" }; });
+		await run("fix the login race --live-qa-acceptance /a.json");
+		expect(reached).toBe(false);
+		expect(events.find((e) => e.kind === "notify")?.text).toContain("--live-qa-acceptance requires --live-qa or --live-qa-scope");
 	});
 
 	test("Plan failed abort", async () => {

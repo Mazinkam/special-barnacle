@@ -65,6 +65,7 @@ import {
 	candidateOwnedFilesForLiveQa,
 	liveQaCostRowsHaveUnknownCost,
 	liveQaKnownCostUsd,
+	preflightLiveQaAcceptance,
 	recordLiveQaStageResult,
 	runLiveQaStage,
 	type RunLiveQaStageResult,
@@ -412,6 +413,19 @@ export async function runOrchestration(
 
 	const efficiency = loadEfficiencyControls(deps.env);
 	for (const problem of efficiency.problems) ctx.ui.notify(problem, "warning");
+
+	// --live-qa-acceptance: validate the manifest and the selected adapter's criteria capability
+	// before anything is spent (triage included), the same up-front stance as --context files.
+	// A failure is a terminal `aborted` result; nothing is dispatched.
+	if (parsed.liveQa && parsed.liveQaAcceptance) {
+		const preflight = preflightLiveQaAcceptance({ env: deps.env, adapterId: parsed.liveQaAdapterId, acceptancePath: parsed.liveQaAcceptance });
+		if (!preflight.ok) {
+			const reason = redactSecrets(`live-QA acceptance check failed: ${preflight.reason}`, deps.env);
+			session.log(reason);
+			warnTelemetry(ctx, await deps.failRun(runId, reason, session.terminalTiming(), session.telemetryBaseline));
+			return { kind: "aborted", cause: "aborted", notifyText: `${reason}\nNothing was dispatched.`, notifyType: "error" };
+		}
+	}
 
 	// -----------------------------------------------------------------
 	// LLM triage: auto-fill missing task_class / complexity / risk via

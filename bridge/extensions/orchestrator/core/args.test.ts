@@ -196,4 +196,15 @@ describe("--live-qa-acceptance", () => {
 	test("reports a missing value", () => {
 		expect(parseArgs("Fix it --live-qa-acceptance").unknownFlags).toContain("--live-qa-acceptance (missing value)");
 	});
+	test("without --live-qa or --live-qa-scope: rejected", () => {
+		expect(parseArgs("Fix it --live-qa-acceptance /a.json").unknownFlags)
+			.toContain("--live-qa-acceptance requires --live-qa or --live-qa-scope");
+	});
+	test("with --live-qa: accepted", () => {
+		expect(parseArgs("Fix it --live-qa --live-qa-acceptance /a.json").unknownFlags).toEqual([]);
+	});
+	test("overridden by --no-live-qa: rejected", () => {
+		expect(parseArgs("Fix it --live-qa --no-live-qa --live-qa-acceptance /a.json").unknownFlags)
+			.toContain("--live-qa-acceptance requires --live-qa or --live-qa-scope");
+	});
 });

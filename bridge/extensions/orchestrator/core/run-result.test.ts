@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildCompletedRunResult, buildTerminalRunResult, enforceRunResultBounds, outcomeFromCauses, RUN_RESULT_LIMITS, type RunResultV1 } from "./run-result.ts";
 import { minimalReport } from "./report-fixtures.ts";
@@ -11,6 +11,9 @@ const base: RunResultV1 = {
 	externalChecks: [], openItems: [], diagnostics: [],
 	cost: { usd: 0.5, complete: true }, runLog: "/state/runs/ht-orch-1/run.log",
 };
+
+const VALID_FIXTURES = ["complete", "partial-external", "blocked-external", "cancelled", "crashed", "plan-failed"];
+const NEGATIVE_FIXTURES = ["oversized", "unknown-version"];
 
 describe("outcomeFromCauses", () => {
 	test("precedence cancelled > failed > blocked > partial > complete", () => {
@@ -120,13 +123,17 @@ function validate(schema: Schema, value: unknown, root: Schema, path = "$"): str
 describe("schema validation of fixtures", () => {
 	const dir = join(import.meta.dir, "..", "contracts");
 	const schema = JSON.parse(readFileSync(join(dir, "orchestration-result.v1.schema.json"), "utf8")) as Schema;
-	const names = ["complete", "partial-external", "blocked-external", "cancelled", "crashed", "plan-failed"];
-	for (const name of names) {
+	for (const name of VALID_FIXTURES) {
 		test(`${name}.json validates against the schema`, () => {
 			const fixture = JSON.parse(readFileSync(join(dir, "fixtures", `${name}.json`), "utf8"));
 			expect(validate(schema, fixture, schema)).toEqual([]);
 		});
 	}
+	test("oversized.json and unknown-version.json fail the schema", () => {
+		const load = (n: string) => JSON.parse(readFileSync(join(dir, "fixtures", `${n}.json`), "utf8"));
+		expect(validate(schema, load("oversized"), schema)).toContain("$.openItems: maxItems");
+		expect(validate(schema, load("unknown-version"), schema)).toContain("$.version: const");
+	});
 	test("a fixture with an extra property fails", () => {
 		const fixture = JSON.parse(readFileSync(join(dir, "fixtures", "complete.json"), "utf8"));
 		expect(validate(schema, { ...fixture, extra: 1 }, schema)).toContain("$: extra property extra");
@@ -144,13 +151,71 @@ describe("schema propertyNames", () => {
 
 describe("fixtures", () => {
 	const dir = join(import.meta.dir, "..", "contracts", "fixtures");
-	for (const name of ["complete", "partial-external", "blocked-external", "cancelled", "crashed", "plan-failed"]) {
+	const load = (name: string) => JSON.parse(readFileSync(join(dir, `${name}.json`), "utf8")) as RunResultV1;
+	test("every fixture on disk is covered: valid ones plus the two negative fixtures", () => {
+		const onDisk = readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5)).sort();
+		expect(onDisk).toEqual([...VALID_FIXTURES, ...NEGATIVE_FIXTURES].sort());
+	});
+	for (const name of VALID_FIXTURES) {
 		test(`${name}.json is in bounds and self-consistent`, () => {
-			const fixture = JSON.parse(readFileSync(join(dir, `${name}.json`), "utf8")) as RunResultV1;
+			const fixture = load(name);
 			expect(enforceRunResultBounds(fixture)).toEqual(fixture);
 			expect(fixture.outcome).toBe(outcomeFromCauses(fixture.causes));
 		});
 	}
+	test("oversized.json is replaced by enforceRunResultBounds", () => {
+		const fixture = load("oversized");
+		const bounded = enforceRunResultBounds(fixture);
+		expect(bounded).not.toEqual(fixture);
+		expect(bounded.openItems).toEqual([]);
+		expect(bounded.diagnostics).toEqual([`result exceeded bounds: openItems ${fixture.openItems.length} > ${RUN_RESULT_LIMITS.openItems}`]);
+		expect(bounded.acceptance).toEqual({ overall: "blocked", criteria: [] });
+		expect(bounded.liveQa.verdict).toBe("unavailable");
+	});
+	test("unknown-version.json is not a v1 result", () => {
+		const fixture = load("unknown-version") as unknown as { version: number };
+		expect(fixture.version).not.toBe(1);
+	});
+});
+
+describe("list limits (reasons / diagnostics / externalChecks)", () => {
+	test("RUN_RESULT_LIMITS declares 20 for each", () => {
+		expect(RUN_RESULT_LIMITS.reasons).toBe(20);
+		expect(RUN_RESULT_LIMITS.diagnostics).toBe(20);
+		expect(RUN_RESULT_LIMITS.externalChecks).toBe(20);
+	});
+	test("21 liveQa.reasons is a violation", () => {
+		const bounded = enforceRunResultBounds({ ...base, liveQa: { ...base.liveQa, reasons: Array.from({ length: 21 }, (_, i) => `r${i}`) } });
+		expect(bounded.diagnostics).toEqual(["result exceeded bounds: liveQa.reasons 21 > 20"]);
+	});
+	test("21 diagnostics is a violation", () => {
+		const bounded = enforceRunResultBounds({ ...base, diagnostics: Array.from({ length: 21 }, (_, i) => `d${i}`) });
+		expect(bounded.diagnostics).toEqual(["result exceeded bounds: diagnostics 21 > 20"]);
+	});
+	test("21 externalChecks is a violation", () => {
+		const bounded = enforceRunResultBounds({ ...base, externalChecks: Array.from({ length: 21 }, (_, i) => ({ provider: "github", id: `${i}`, outcome: "success" })) });
+		expect(bounded.diagnostics).toEqual(["result exceeded bounds: externalChecks 21 > 20"]);
+	});
+	test("20 of each is in bounds", () => {
+		const r = { ...base, liveQa: { ...base.liveQa, reasons: Array.from({ length: 20 }, () => "r") }, diagnostics: Array.from({ length: 20 }, () => "d"),
+			externalChecks: Array.from({ length: 20 }, (_, i) => ({ provider: "github", id: `${i}`, outcome: "success" })) };
+		expect(enforceRunResultBounds(r)).toEqual(r);
+	});
+	test("builder caps 25 reasons/diagnostics to 20 with a marker instead of replacing", () => {
+		const result = buildCompletedRunResult(minimalReport({
+			liveQa: { stage: { verdict: "fail", required: true, reasons: Array.from({ length: 25 }, (_, i) => `r${i}`), costRows: [], outcomeRow: null, stage: null, cancelled: false }, notRunReason: null, hasUnknownCost: false },
+		}));
+		expect(result.liveQa.reasons).toHaveLength(20);
+		expect(result.liveQa.reasons[19]).toBe("…[6 more reasons]");
+		expect(result.liveQa.verdict).toBe("fail");
+	});
+	test("schema declares maxItems 20 for the three lists and documents UTF-16 string length", () => {
+		const schema = JSON.parse(readFileSync(join(import.meta.dir, "..", "contracts", "orchestration-result.v1.schema.json"), "utf8"));
+		expect(schema.properties.liveQa.properties.reasons.maxItems).toBe(20);
+		expect(schema.properties.diagnostics.maxItems).toBe(20);
+		expect(schema.properties.externalChecks.maxItems).toBe(20);
+		expect(JSON.stringify(schema.$defs.str)).toContain("UTF-16");
+	});
 });
 
 describe("buildTerminalRunResult diagnostic truncation", () => {

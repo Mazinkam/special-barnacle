@@ -115,6 +115,10 @@ export function parseArgs(args: string): OrchestrateArgs {
 	// `--no-live-qa` always wins, regardless of flag order or how many times `--live-qa`/
 	// `--live-qa-scope` appeared.
 	if (out.liveQaOff) out.liveQa = false;
+	// An acceptance manifest is only ever evaluated by a live-QA run; without one it would be silently ignored.
+	if (out.liveQaAcceptance !== undefined && !out.liveQa) {
+		out.unknownFlags.push("--live-qa-acceptance requires --live-qa or --live-qa-scope");
+	}
 	return out;
 }
 

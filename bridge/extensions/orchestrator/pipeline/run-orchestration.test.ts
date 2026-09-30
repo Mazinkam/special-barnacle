@@ -1618,3 +1618,70 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode",
 		expect([wf.planned, wf.final]).toEqual(["full", "full"]);
 	}, GIT_IO_TIMEOUT_MS);
 });
+
+describe("pipeline/run-orchestration.ts: --live-qa-acceptance is validated before triage", () => {
+	const manifest = { version: 1, issue: 144, criteria: [{ id: "AC-1", text: "t", expected: { a: "x" } }] };
+
+	function setup(manifestRaw: string, adapterOverrides: Record<string, unknown>) {
+		const dir = mkdtempSync(join(tmpdir(), "orch-acceptance-preflight-"));
+		const acceptancePath = join(dir, "144.acceptance.json");
+		writeFileSync(acceptancePath, manifestRaw);
+		const configPath = join(dir, "live-qa.json");
+		writeFileSync(configPath, JSON.stringify({ version: 1, adapters: [{
+			id: "forge-focused", kind: "forge-qa", trusted: true, runner_cwd: dir, argv_prefix: [process.execPath, "/nonexistent.mjs"],
+			flow: "focused", budget_minutes: 30, runtime: "codex", model: "terra", effort: "medium", local: true, ...adapterOverrides,
+		}] }));
+		let triageCalls = 0;
+		let planCalls = 0;
+		let dispatchCalls = 0;
+		const failRunReasons: string[] = [];
+		const deps = fakeDeps({
+			env: { HUMAIN_ORCHESTRATOR_LIVE_QA_CONFIG: configPath },
+			triageTask: async () => { triageCalls++; return null; },
+			planRun: async () => { planCalls++; throw new Error("planRun must not be reached"); },
+			dispatchParallel: async () => { dispatchCalls++; return []; },
+			failRun: async (_runId, reason) => { failRunReasons.push(reason); return healthyTelemetry; },
+		});
+		// implementation/5/medium are the triage-triggering defaults.
+		const args = fakeArgs({ taskClass: "implementation", complexity: 5, risk: "medium", liveQa: true, liveQaScope: "verify", liveQaAcceptance: acceptancePath });
+		const run = async () => {
+			const adapter = fakeAdapter();
+			const session = fakeSession();
+			const { ctx } = fakeCtx();
+			return runOrchestration("ht-orch-1700000000000-accpre", "/tmp/cwd", args, adapter, fakeResolution(adapter), ctx, session, { ...claimed, session }, deps);
+		};
+		return { run, counts: () => ({ triageCalls, planCalls, dispatchCalls }), failRunReasons };
+	}
+
+	test("invalid manifest aborts before triage: nothing dispatched, cause aborted, error notify text", async () => {
+		const { run, counts, failRunReasons } = setup(JSON.stringify({ ...manifest, version: 2 }), { criteria: true });
+		const result = await run();
+		expect(result).toMatchObject({ kind: "aborted", cause: "aborted", notifyType: "error" });
+		expect((result as { notifyText: string }).notifyText).toContain("acceptance manifest invalid: version must be 1");
+		expect(counts()).toEqual({ triageCalls: 0, planCalls: 0, dispatchCalls: 0 });
+		expect(failRunReasons).toHaveLength(1);
+	});
+
+	test("unreadable manifest aborts before triage", async () => {
+		const { run, counts } = setup("{not json", { criteria: true });
+		const result = await run();
+		expect(result).toMatchObject({ kind: "aborted", cause: "aborted", notifyType: "error" });
+		expect((result as { notifyText: string }).notifyText).toContain("acceptance manifest unreadable");
+		expect(counts().triageCalls).toBe(0);
+	});
+
+	test("selected adapter without criteria capability aborts before triage", async () => {
+		const { run, counts } = setup(JSON.stringify(manifest), {});
+		const result = await run();
+		expect(result).toMatchObject({ kind: "aborted", cause: "aborted", notifyType: "error" });
+		expect((result as { notifyText: string }).notifyText).toContain("adapter cannot take criteria");
+		expect(counts()).toEqual({ triageCalls: 0, planCalls: 0, dispatchCalls: 0 });
+	});
+
+	test("valid manifest + criteria-capable adapter proceeds to triage", async () => {
+		const { run, counts } = setup(JSON.stringify(manifest), { criteria: true });
+		const result = await run();
+		expect(counts().triageCalls).toBe(1);
+		expect(result).toMatchObject({ kind: "aborted", cause: "plan_failed" });
+	});
+});

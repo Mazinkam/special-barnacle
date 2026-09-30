@@ -1,0 +1,92 @@
+{
+  "schema": "orchestration-result",
+  "version": 1,
+  "runId": "ht-orch-oversized",
+  "outcome": "complete",
+  "causes": [],
+  "codeVerification": "pass",
+  "liveQa": {
+    "verdict": "pass",
+    "sessionId": "run-20260930-095418-ba63",
+    "testedCommit": "abc1234",
+    "reasons": []
+  },
+  "externalChecks": [],
+  "openItems": [
+    "open item 0",
+    "open item 1",
+    "open item 2",
+    "open item 3",
+    "open item 4",
+    "open item 5",
+    "open item 6",
+    "open item 7",
+    "open item 8",
+    "open item 9",
+    "open item 10",
+    "open item 11",
+    "open item 12",
+    "open item 13",
+    "open item 14",
+    "open item 15",
+    "open item 16",
+    "open item 17",
+    "open item 18",
+    "open item 19",
+    "open item 20",
+    "open item 21",
+    "open item 22",
+    "open item 23",
+    "open item 24",
+    "open item 25",
+    "open item 26",
+    "open item 27",
+    "open item 28",
+    "open item 29",
+    "open item 30",
+    "open item 31",
+    "open item 32",
+    "open item 33",
+    "open item 34",
+    "open item 35",
+    "open item 36",
+    "open item 37",
+    "open item 38",
+    "open item 39",
+    "open item 40",
+    "open item 41",
+    "open item 42",
+    "open item 43",
+    "open item 44",
+    "open item 45",
+    "open item 46",
+    "open item 47",
+    "open item 48",
+    "open item 49",
+    "open item 50"
+  ],
+  "diagnostics": [],
+  "cost": {
+    "usd": 0.5,
+    "complete": true
+  },
+  "runLog": "/state/runs/ht-orch-complete/run.log",
+  "acceptance": {
+    "overall": "pass",
+    "criteria": [
+      {
+        "id": "ac-1",
+        "result": "pass",
+        "expected": {
+          "status": 200
+        },
+        "observed": {
+          "status": 200
+        },
+        "artifacts": [
+          "artifacts/ac-1.png"
+        ]
+      }
+    ]
+  }
+}

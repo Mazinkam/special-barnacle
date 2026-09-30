@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": ["schema", "version", "runId", "outcome", "causes", "codeVerification", "liveQa", "externalChecks", "openItems", "diagnostics", "cost", "runLog"],
   "$defs": {
-    "str": { "type": "string", "maxLength": 2048 },
+    "str": { "type": "string", "maxLength": 2048, "$comment": "maxLength counts UTF-16 code units (JS string.length), matching RUN_RESULT_LIMITS.stringChars; JSON Schema validators that count code points may accept slightly longer astral-plane strings, so consumers MUST apply the UTF-16 count." },
     "verdict3": { "enum": ["pass", "fail", "blocked"] },
     "scalarMap": {
       "type": "object",
@@ -53,7 +53,7 @@
         "verdict": { "enum": ["pass", "fail", "unavailable", "not_requested"] },
         "sessionId": { "$ref": "#/$defs/str" },
         "testedCommit": { "$ref": "#/$defs/str" },
-        "reasons": { "type": "array", "items": { "$ref": "#/$defs/str" } }
+        "reasons": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/str" } }
       }
     },
     "acceptance": {
@@ -68,6 +68,7 @@
     },
     "externalChecks": {
       "type": "array",
+      "maxItems": 20,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -81,7 +82,7 @@
       }
     },
     "openItems": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/str" } },
-    "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/str" } },
+    "diagnostics": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/str" } },
     "cost": {
       "type": "object",
       "additionalProperties": false,
