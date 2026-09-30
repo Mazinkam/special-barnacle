@@ -99,3 +99,55 @@ def test_unsafe_protected_paths_are_tampered(tmp_path):
     base = tree(tmp_path / 'base', keep__txt='k'); sub = tree(tmp_path / 'sub', keep__txt='k')
     r = grade(t, sub, base, tmp_path / 'work', sandbox=False)
     assert r.tampered == ['../base/keep.txt', '/etc/hosts'] and r.verdict == 'fail'
+
+
+# --- fast tree copy (APFS clone on macOS, copytree elsewhere) -------------------------------------------
+
+import time
+import pytest
+from bench import grade as grade_mod
+
+
+def _sample(root):
+    (root / 'pkg' / 'node_modules' / 'dep').mkdir(parents=True)
+    (root / 'pkg' / 'node_modules' / 'dep' / 'index.js').write_text('module.exports = 1\n')
+    (root / 'a.txt').write_text('A')
+    (root / '.git').mkdir(); (root / '.git' / 'HEAD').write_text('ref: x\n')
+    os.symlink('a.txt', root / 'link.txt')
+    os.symlink('/etc/hosts', root / 'abs-link')
+    return root
+
+
+def test_copy_tree_matches_copytree_semantics(tmp_path):
+    src = _sample(tmp_path / 'src'); dst = tmp_path / 'dst'
+    grade_mod.copy_tree(src, dst)
+    assert (dst / 'a.txt').read_text() == 'A'
+    assert (dst / 'pkg' / 'node_modules' / 'dep' / 'index.js').read_text() == 'module.exports = 1\n'
+    assert not (dst / '.git').exists()                       # history never reaches the graded tree
+    assert (dst / 'link.txt').is_symlink() and os.readlink(dst / 'link.txt') == 'a.txt'
+    assert (dst / 'abs-link').is_symlink() and os.readlink(dst / 'abs-link') == '/etc/hosts'   # never followed
+
+
+def test_copy_tree_is_independent_of_the_source(tmp_path):
+    src = _sample(tmp_path / 'src'); dst = tmp_path / 'dst'
+    grade_mod.copy_tree(src, dst)
+    (dst / 'a.txt').write_text('changed')
+    assert (src / 'a.txt').read_text() == 'A'
+
+
+def test_copy_tree_falls_back_when_clone_is_unavailable(tmp_path, monkeypatch):
+    src = _sample(tmp_path / 'src'); dst = tmp_path / 'dst'
+    monkeypatch.setattr(grade_mod, '_clone', lambda s, d: False)
+    grade_mod.copy_tree(src, dst)
+    assert (dst / 'a.txt').read_text() == 'A' and not (dst / '.git').exists() and (dst / 'link.txt').is_symlink()
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='APFS clonefile is macOS-only')
+def test_clone_is_used_and_fast_on_macos(tmp_path):
+    src = tmp_path / 'big'
+    for i in range(3000):
+        d = src / f'd{i % 50}'; d.mkdir(parents=True, exist_ok=True); (d / f'f{i}.js').write_text('x' * 2048)
+    t0 = time.monotonic(); assert grade_mod._clone(src, tmp_path / 'c1') is True; clone_s = time.monotonic() - t0
+    t0 = time.monotonic(); __import__('shutil').copytree(src, tmp_path / 'c2', symlinks=True); copy_s = time.monotonic() - t0
+    assert sum(1 for _ in (tmp_path / 'c1').rglob('*.js')) == 3000
+    assert clone_s < copy_s
