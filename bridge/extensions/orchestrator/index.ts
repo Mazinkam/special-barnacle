@@ -140,7 +140,7 @@ import {
 	type InterruptionReport,
 } from "./dispatch-progress.ts";
 import { RunCancellation } from "./cancellation.ts";
-import { applyObservation, applyWarnings, createProgressView, formatNestedWorkerRows, formatProgressLine, formatWarningLine } from "./run-ui.ts";
+import { applyObservation, applyWarnings, createProgressView, formatNestedWorkerRows, formatPendingCheckRows, MAX_PENDING_CHECKS, type PendingCheckRow, formatProgressLine, formatWarningLine } from "./run-ui.ts";
 import type { DispatchProgressView } from "./run-ui.ts";
 import type { ProgressObservation, TimeoutCheck } from "./dispatch-progress.ts";
 import { type FlushReport, type QueueStats, RecordQueue } from "./record-queue.ts";
@@ -928,6 +928,7 @@ export class RunSession {
 	/** Per-dispatch spend cap (method.json rules.dispatch_spend_cap). Replaceable in tests. */
 	spendCaps = new SpendCapTracker();
 	/** User messages queued while a run is live; drained at the next dispatch boundary. */
+	private pendingChecks: PendingCheckRow[] = [];
 	private queuedMessages: Array<{ text: string; queuedAt: number }> = [];
 	/** History of message batches we've folded into prompts, so the user can see delivery. */
 	private deliveryLog: Array<{ count: number; to: string; ts: number }> = [];
@@ -1191,6 +1192,12 @@ export class RunSession {
 		}, 250);
 	}
 
+	/** Replace the live external CI snapshot. An empty list removes it from the board. */
+	setPendingChecks(rows: PendingCheckRow[]): void {
+		this.pendingChecks = rows.slice(0, MAX_PENDING_CHECKS).map((row) => ({ ...row }));
+		this.render();
+	}
+
 	render(): void {
 		if (this.closed) return;
 		const now = Date.now();
@@ -1201,6 +1208,8 @@ export class RunSession {
 		const elapsed = fmtElapsed(now - this.startedAt);
 		const totalCost = this.totalCost();
 		const worktree = this.worktree;
+		const ciPending = this.pendingChecks.filter((row) => row.outcome === "pending").length;
+		const ciStatus = this.pendingChecks.length ? ` · ${ciPending} CI pending` : "";
 
 		// Compact status line for the bar: phase + headline numbers. The phase is
 		// most important when terminal (cancelled, failed) — keeping it visible
@@ -1210,7 +1219,7 @@ export class RunSession {
 		safeUi(() =>
 			this.ctx.ui.setStatus(
 				"orchestrator",
-				`orch ${this.phase} · ${elapsed} · ${running.length} running · ${failed} failed${wtShort} · $${totalCost.toFixed(3)}`,
+				`orch ${this.phase} · ${elapsed} · ${running.length} running · ${failed} failed${ciStatus}${wtShort} · $${totalCost.toFixed(3)}`,
 			),
 		);
 
@@ -1262,6 +1271,9 @@ export class RunSession {
 				lines.push(`    … ${done.length - 6} earlier in run.log`);
 			}
 		}
+
+		// External CI is informational; it does not change dispatch or run verdicts.
+		if (this.pendingChecks.length > 0) lines.push("", ...formatPendingCheckRows(this.pendingChecks));
 
 		// Message queue indicator — only when there is something queued.
 		if (this.queuedMessages.length > 0) {
