@@ -1316,12 +1316,15 @@ describe("pipeline/run-orchestration.ts runOrchestration: efficiency warnings", 
 });
 
 describe("pipeline/run-orchestration.ts runOrchestration workflow observe mode", () => {
-	async function runWith(env: Record<string, string>) {
+	async function runWith(env: Record<string, string>, workflowSetting?: string) {
 		const runId = "ht-orch-1700000000000-wf-a";
 		const session = fakeSession();
 		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
 		const adapter = fakeAdapter();
 		const resolved = fakeResolution(adapter);
+		if (workflowSetting !== undefined) {
+			(resolved as unknown as { profiles: { file: Record<string, unknown> } }).profiles.file = { version: 1, active_profile: "test-profile", profiles: {}, workflow_mode: workflowSetting };
+		}
 		const events: Array<[string, Record<string, unknown>]> = [];
 		let summary: Record<string, unknown> | undefined;
 		const deps = fakeDeps({
@@ -1358,6 +1361,20 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow observe mode",
 		expect(planned?.[1].mode).toBe("observe");
 		expect((summary?.workflow as { mode: string }).mode).toBe("observe");
 		expect(events.some(([e]) => e === "dispatch_plan_confirmed")).toBe(true);
+	});
+
+	test("the persisted orchestrator-profiles.json workflow_mode enables observe without any env var", async () => {
+		const { events, summary } = await runWith({}, "observe");
+		const planned = events.find(([e]) => e === "workflow_level_planned");
+		expect(planned?.[1].mode).toBe("observe");
+		expect(planned?.[1].mode_source).toBe("setting");
+		expect((summary?.workflow as { mode: string }).mode).toBe("observe");
+	});
+
+	test("the env var still overrides the persisted setting", async () => {
+		const { events, summary } = await runWith({ HUMAIN_ORCHESTRATOR_WORKFLOW_MODE: "off" }, "observe");
+		expect(events.map(([e]) => e)).not.toContain("workflow_level_planned");
+		expect(summary !== undefined && "workflow" in summary).toBe(false);
 	});
 
 	test("off mode emits no workflow event and no workflow summary key", async () => {

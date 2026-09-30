@@ -207,6 +207,12 @@ export interface ProfilesFile {
 	/** Providers to prefer, in order, when a bare alias exists on several. */
 	provider_preference?: string[];
 	profiles: Record<string, ProfileSpec>;
+	/**
+	 * Persisted workflow mode (`off|observe|enforce`), set with `/orchestrator-models workflow`.
+	 * Kept as the raw string: an invalid value is reported when a run resolves its mode
+	 * (workflow-mode.ts) and falls back to method.json, never blocking dispatch here.
+	 */
+	workflow_mode?: string;
 }
 
 export const DEFAULT_PROVIDER_PREFERENCE = ["openai-codex", "amazon-bedrock"];
@@ -234,6 +240,7 @@ export function parseProfilesFile(raw: unknown): { file: ProfilesFile; problems:
 	if (Array.isArray(r.provider_preference) && r.provider_preference.every((p) => typeof p === "string")) {
 		file.provider_preference = r.provider_preference as string[];
 	}
+	if (typeof r.workflow_mode === "string") file.workflow_mode = r.workflow_mode;
 	const profiles = r.profiles;
 	if (!profiles || typeof profiles !== "object") {
 		problems.push("missing \"profiles\" object");

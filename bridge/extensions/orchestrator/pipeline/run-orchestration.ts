@@ -509,7 +509,8 @@ export async function runOrchestration(
 	// Workflow level (spec §3). `off` does nothing at all; `observe` records the plan only.
 	// Signal collection is advisory: any failure is logged and leaves `workflow` null (never aborts the run).
 	const workflowPolicy = METHOD.rules.workflow_policy;
-	const workflowMode = resolveWorkflowMode(workflowPolicy, deps.env);
+	// Persisted `/orchestrator-models workflow` setting; `profiles.file` is absent in some test fakes.
+	const workflowMode = resolveWorkflowMode(workflowPolicy, deps.env, resolved.profiles?.file?.workflow_mode);
 	for (const p of workflowMode.problems) session.log(`workflow: ${p}`);
 	let workflow: WorkflowDecision | null = null;
 	let workflowSignalMs = 0;
@@ -527,13 +528,13 @@ export async function runOrchestration(
 				? { ...routed, level: atLeast(routed.level, carry.forceLevel), reasons: [...routed.reasons, `escalated from ${carry.fromLevel}: ${carry.reason}`] }
 				: routed;
 			deps.recordEvent("workflow_level_planned", {
-				run_id: runId, mode: workflowMode.mode, level: decision.level, floor: decision.floor,
+				run_id: runId, mode: workflowMode.mode, mode_source: workflowMode.source, level: decision.level, floor: decision.floor,
 				reasons: decision.reasons, uncertainty: decision.uncertainty, signal_ms: workflowSignalMs,
 				candidates: signals.candidates.length, packages: signals.packages, risk_path_hits: signals.riskPathHits,
 				checks: signals.checks.map((c) => c.name), override: decision.override ?? null,
 			});
 			workflow = decision;
-			session.log(`workflow: ${workflowMode.mode} → ${decision.level} (floor ${decision.floor}; ${decision.reasons.join("; ")}; ${workflowSignalMs}ms)`);
+			session.log(`workflow: ${workflowMode.mode} (${workflowMode.source}) → ${decision.level} (floor ${decision.floor}; ${decision.reasons.join("; ")}; ${workflowSignalMs}ms)`);
 		} catch (err) {
 			workflow = null;
 			workflowSignals = null;
