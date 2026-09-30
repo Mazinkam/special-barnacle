@@ -4789,6 +4789,30 @@ describe("A1 review fix: /orchestrator-models check and /orchestrate share one R
 		}
 	});
 });
+describe("/orchestrator-models is registered through commands/orchestrator-models.ts, never inlined", () => {
+	test("index.ts has no inline orchestrator-models handler and wires registerOrchestratorModelsCommand", () => {
+		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+		expect(source).not.toMatch(/registerCommand\("orchestrator-models"/);
+		expect(source).toContain("registerOrchestratorModelsCommand(pi,");
+	});
+
+	test("the registered handler is the modular one: `workflow` is a known subcommand", async () => {
+		let handler!: (args: string, ctx: never) => Promise<void>;
+		orchestrator.default({
+			on: () => {},
+			registerCommand: (name: string, command: { handler: typeof handler }) => {
+				if (name === "orchestrator-models") handler = command.handler;
+			},
+			registerTool: () => {},
+			sendMessage: () => {},
+		} as never);
+		const notices: Array<{ text: string; level: string }> = [];
+		const ctx = { ui: { notify: (text: string, level: string) => notices.push({ text, level }) } };
+		await handler("workflow", ctx as never);
+		expect(notices.some((n) => n.text.includes("Unknown subcommand"))).toBe(false);
+		expect(notices.some((n) => n.text.startsWith("workflow mode: "))).toBe(true);
+	});
+});
 describe("A1: /orchestrate is registered through the modular pipeline, never inlined", () => {
 	test("index.ts contains no inline orchestrate pipeline (exact-name registration) and wires commands/orchestrate.ts's registerOrchestrateCommand instead", () => {
 		const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
