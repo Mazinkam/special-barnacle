@@ -1434,7 +1434,7 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow observe mode",
 	});
 
 	test("off mode emits no workflow event and no workflow summary key", async () => {
-		const { events, summary } = await runWith({});
+		const { events, summary } = await runWith({ HUMAIN_ORCHESTRATOR_WORKFLOW_MODE: "off" });
 		expect(events.map(([e]) => e)).not.toContain("workflow_level_planned");
 		expect(summary !== undefined && "workflow" in summary).toBe(false);
 	});

@@ -452,9 +452,9 @@ describe("method model failover rules", () => {
 	});
 });
 
-test("workflow_policy is readable and off by default", () => {
+test("workflow_policy is readable and observe by default", () => {
 	const wf = METHOD.rules.workflow_policy!;
-	expect(wf.mode).toBe("off");
+	expect(wf.mode).toBe("observe");
 	expect(wf.levels).toEqual(["direct", "checked", "led", "full"]);
 	expect(wf.risk_path_globs).toContain("**/auth/**");
 });

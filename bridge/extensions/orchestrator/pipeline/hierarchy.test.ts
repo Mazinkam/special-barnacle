@@ -3,8 +3,7 @@ import { readFileSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { gitDirtySnapshot, gitHead, changedFilesSinceRunStart } from "../adapters/git-changes.ts";
-import { dispatchParallel } from "../dispatch/parallel.ts";
+import { gitDirtySnapshot, gitHead, changedFilesSinceRunStart, parseFilesChanged } from "../adapters/git-changes.ts";
 import { dispatchReconAndLeads, isTransientLeadFailure, collectBilledResults, summarizeReconWorkers } from "./hierarchy.ts";
 import { RunCancellation } from "../cancellation.ts";
 import { METHOD } from "../models.ts";
@@ -475,6 +474,8 @@ test("mention-only prose does not count as a reported conflict even when git cha
 	expect(events.filter((e) => e.event === "lead_edit_conflict")).toEqual([]);
 });
 
+const LEAD_REPORT = "## Files Changed\n- src/shared.ts\n\nSTATUS: completed";
+
 test("plain Files Changed entries travel through real dispatch parsing to reported conflicts, but phantom reports do not", async () => {
 	const cwd = mkdtempSync(join(tmpdir(), "lead-conflict-"));
 	try {
@@ -492,10 +493,13 @@ test("plain Files Changed entries travel through real dispatch parsing to report
 		const run = async () => {
 			events.length = 0;
 			return dispatchReconAndLeads({ ...baseInput(), repoRoot: cwd, plan: { ...plan, topology: { ...plan.topology, leads: 2 } }, architectResult, fileOwnershipMode: "report" }, {
-				dispatch: (tasks) => dispatchParallel(cwd, "run", tasks, adapter, {} as never, null, 0, {
-					recordEvent: () => {}, maxConcurrentDispatches: 2,
-					runProcess: async () => ({ exitCode: 0, stdout: "## Files Changed\n- src/shared.ts\n\nSTATUS: completed", finalText: "", rawStdout: "", stderr: "", personaCanMutate: true, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 }, costUsd: 0, costReported: true, durationMs: 1, outcome: "completed", processExitCode: 0 }),
-				}),
+				// Every lead reports the same edited file; filesChanged comes from the real report parser.
+				dispatch: async (tasks) => tasks.map((t) => ({
+					taskId: t.taskId, capability: t.capability, model: "m", exitCode: 0, stderr: "",
+					stdout: LEAD_REPORT,
+					usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+					durationMs: 1, costUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: parseFilesChanged(LEAD_REPORT),
+				})),
 				capture: async () => {}, setPhase: () => {}, throwIfCancelled: () => {},
 				observedChangedFiles: () => changedFilesSinceRunStart(cwd, head, before, []).changed,
 				recordEvent: (event, payload) => { events.push({ event, payload }); },

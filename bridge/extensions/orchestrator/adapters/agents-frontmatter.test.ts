@@ -57,7 +57,13 @@ describe("bridge/agents/*.md model: front matter", () => {
 		}
 	});
 
-	for (const [name, capability] of Object.entries(AGENT_NAME_TO_CAPABILITY)) {
+	// The lead persona carries no `model:` line: the lead's model is chosen per size by
+	// lead-sizing, so a single line could only ever be misleading.
+	test("orchestrator-lead.md has no model: line", () => {
+		expect(frontMatterModel(join(AGENTS_DIR, "orchestrator-lead.md"))).toBeNull();
+	});
+
+	for (const [name, capability] of Object.entries(AGENT_NAME_TO_CAPABILITY).filter(([n]) => n !== "orchestrator-lead")) {
 		test(`${name}.md's model: matches FALLBACK_ADAPTER["${capability}"] (the shipped premium profile's routing)`, () => {
 			const model = frontMatterModel(join(AGENTS_DIR, `${name}.md`));
 			expect(model).toBe(FALLBACK_ADAPTER[capability]?.model ?? null);

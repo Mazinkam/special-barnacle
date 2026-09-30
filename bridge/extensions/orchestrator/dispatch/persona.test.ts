@@ -1,22 +1,35 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { NO_BLOCKING_WAITS_RULE } from "../core/prompts.ts";
 import { resolvePersona } from "./persona.ts";
 
 const NO_PERSONA = "__no_persona__";
 
 describe("lead persona blocking-waits guidance", () => {
-	test("all lead personas forbid blocking waits and define pending-check reporting", () => {
-		for (const file of ["orchestrator-lead.md", "orch-architect.md", "orch-technical-lead.md"]) {
-			const persona = readFileSync(join(import.meta.dir, "..", "..", "..", "agents", file), "utf-8");
+	const personaText = (file: string) => readFileSync(join(import.meta.dir, "..", "..", "..", "agents", file), "utf-8");
+
+	test("architect and technical-lead personas forbid blocking waits and define pending-check reporting", () => {
+		for (const file of ["orch-architect.md", "orch-technical-lead.md"]) {
+			const persona = personaText(file);
 			const headings = persona.split("\n");
 			expect(headings).toContain("## Pending external checks");
 			expect(headings).toContain("## No blocking waits");
 			expect(persona).toContain("No blocking waits");
 			expect(persona).toContain("gh run watch");
 			expect(persona).toContain("glab ci status --live");
-			expect(persona).toContain("## Pending external checks");
 		}
+	});
+
+	// orchestrator-lead.md no longer repeats the rule: leadPrompt (core/prompts.ts) states it, and
+	// core/prompts.test.ts asserts every lead prompt contains NO_BLOCKING_WAITS_RULE. The persona
+	// must still define the report section the rule points at.
+	test("lead persona defines pending-check reporting and does not duplicate the rule leadPrompt states", () => {
+		const persona = personaText("orchestrator-lead.md");
+		expect(persona.split("\n")).toContain("## Pending external checks");
+		expect(persona).not.toContain("## No blocking waits");
+		expect(NO_BLOCKING_WAITS_RULE).toContain("gh run watch");
+		expect(NO_BLOCKING_WAITS_RULE).toContain("glab ci status --live");
 	});
 });
 

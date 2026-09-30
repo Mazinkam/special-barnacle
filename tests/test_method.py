@@ -144,7 +144,7 @@ class TestMethod(unittest.TestCase):
         import copy
         data = json.loads(method.METHOD_PATH.read_text())
         wf = data['rules']['workflow_policy']
-        self.assertEqual(wf['mode'], 'off')
+        self.assertEqual(wf['mode'], 'observe')
         self.assertEqual(wf['levels'], ['direct', 'checked', 'led', 'full'])
         for replacement, match in (([], 'rules.workflow_policy'),):
             bad = copy.deepcopy(data); bad['rules']['workflow_policy'] = replacement

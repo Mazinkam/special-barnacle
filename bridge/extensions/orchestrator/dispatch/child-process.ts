@@ -38,7 +38,8 @@ import { discoverAgents, type ExtensionContext, renderTaskWithContext, type Suba
 import { RunCancellation } from "../cancellation.ts";
 import { RunDiagnostics, type DiagnosticWriter } from "../run-diagnostics.ts";
 import { SpendCapTracker, capFor, type SpendCapVerdict } from "../spend-cap.ts";
-import { NestedCostTracker } from "../nested-cost.ts";
+import { NestedCostTracker, type NestedCallDetail } from "../nested-cost.ts";
+import { DispatchTelemetryTracker, type DispatchTelemetryFields } from "../dispatch-telemetry.ts";
 import { killProcessTree } from "../adapters/process-reaper.ts";
 import {
 	DispatchProgressTracker,
@@ -156,6 +157,8 @@ export interface SubagentProcessResult {
 	costUsd: number;
 	/** Spend of `subagent` calls the child made itself (not bridge dispatches); excluded from `costUsd`. */
 	nestedCostUsd?: number;
+	/** Per-task detail behind `nestedCostUsd` — see nested-cost.ts for the vantage-point/depth caveat. */
+	nestedCalls?: NestedCallDetail[];
 	/** True only when every received usage block explicitly reported a valid cost (including $0). */
 	costReported: boolean;
 	durationMs: number;
@@ -190,6 +193,8 @@ export interface SubagentProcessResult {
 	 * settle-then-exit.
 	 */
 	postEndGraceExpired?: true;
+	/** Observational-only per-dispatch telemetry (tool mix, peak context); never influences dispatch behaviour. */
+	telemetry?: DispatchTelemetryFields;
 }
 
 /** Default grace period (ms) a dispatch is given, after `agent_end` or an
@@ -555,6 +560,7 @@ export async function runSubagentProcess(opts: {
 		// function nor `session.onChildEvent` re-derives them independently.
 		const events = new ChildEventAccumulator();
 		const nestedCost = new NestedCostTracker();
+		const telemetryTracker = new DispatchTelemetryTracker();
 		/** Own turns plus the child's own subagent calls: what the dispatch has cost so far. */
 		const spentSoFar = () => events.usage.cost + nestedCost.total();
 		const nestedProviderErrors: Array<{ message: string; timestamp: string }> = [];
@@ -744,6 +750,7 @@ export async function runSubagentProcess(opts: {
 				usage: Object.assign({}, events.usage, { tool_calls: toolCalls }),
 				costUsd: events.usage.cost,
 				nestedCostUsd: nestedCost.total(),
+				nestedCalls: nestedCost.entries(),
 				costReported: events.costReported,
 				durationMs: Date.now() - startedAt,
 				stopReason: events.stopReason,
@@ -755,6 +762,7 @@ export async function runSubagentProcess(opts: {
 				nestedProviderErrors,
 				postCompletionError: outcome.status === "completed_after_process_error" ? outcome.note : undefined,
 				postEndGraceExpired: postEndGraceExpired ? true : undefined,
+				telemetry: telemetryTracker.fields(events.usage.turns),
 			});
 		};
 
@@ -807,6 +815,10 @@ export async function runSubagentProcess(opts: {
 					const verdict = session?.spendCaps.observe(taskId, opts.capability ?? "unknown", spentSoFar() + (opts.spendCapOffsetUsd ?? 0)) ?? "ok";
 					if (verdict !== "ok") handleSpendCap(verdict === "stop" && delta.turn.stopReason === "stop" ? "warn" : verdict);
 				}
+			}
+			if (delta.turn?.hadUsage) telemetryTracker.observeContextTokens((event as { message?: { usage?: { totalTokens?: number } } }).message?.usage?.totalTokens);
+			if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
+				telemetryTracker.observeToolCall(event.toolName, event.args);
 			}
 			if (nestedCost.observe(event)) {
 				session?.setNestedCost(taskId, nestedCost.total());
