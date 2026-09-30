@@ -15,7 +15,7 @@ import {
 	runLiveQaStage,
 	type RunLiveQaStageOptions,
 } from "./live-qa-stage.ts";
-import { liveQaCostRows, type LiveQaVerdict } from "./live-qa.ts";
+import { liveQaCostRows, parseLiveQaSession, type LiveQaVerdict } from "./live-qa.ts";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-forge-qa.mjs", import.meta.url));
 
@@ -847,6 +847,23 @@ describe("acceptance manifest", () => {
 		expect(result.acceptance).toEqual({ overall: "blocked", criteria: [] });
 	});
 
+	test("acceptance evaluation is carried on the stage result", async () => {
+		const m144 = { version: 1, issue: 144, criteria: [
+			{ id: "AC-3", text: "422", expected: { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" } },
+			{ id: "AC-5", text: "no side effects", manual: true },
+		] };
+		const { options } = setup({ criteria: true }, JSON.stringify(m144));
+		process.env.FAKE_FORGE_MODE = "acceptance_409";
+		const result = await runLiveQaStage(options);
+		expect(result.acceptance?.overall).toBe("fail");
+		expect(result.acceptance?.criteria[0]?.note).toContain("http.status: expected 422, observed 409");
+		const second = setup({ criteria: true }, JSON.stringify(m144));
+		process.env.FAKE_FORGE_MODE = "acceptance_pass";
+		const ok = await runLiveQaStage(second.options);
+		expect(ok.acceptance?.overall).toBe("pass");
+		expect(ok.verdict).toBe("pass");
+	});
+
 	test("unreadable manifest: unavailable, never spawned", async () => {
 		const { options, argvLog } = setup({ criteria: true }, "{not json");
 		const result = await runLiveQaStage(options);
@@ -949,5 +966,35 @@ describe("acceptance manifest", () => {
 		const result = await runLiveQaStage(options);
 		expect(result.reasons[0]).toContain("acceptance manifest unreadable");
 		expect(existsSync(argvLog)).toBe(false);
+	});
+	test("stage wrapper redacts every acceptance string (no git-id exemption), top-level and on the stage verdict", async () => {
+		const hex = "0123456789abcdef0123456789abcdef01234567";
+		process.env.LIVE_QA_STAGE_TEST_API_TOKEN = hex;
+		try {
+			const m = { version: 1, issue: 9, criteria: [{ id: "AC-1", text: "t", expected: { sha: hex } }] };
+			const { options } = setup({ criteria: true }, JSON.stringify(m));
+			const poisoned = {
+				overall: "fail" as const,
+				criteria: [{ id: "AC-1", result: "fail" as const, expected: { sha: hex }, observed: { tree: hex }, artifacts: [hex], note: `saw ${hex}` }],
+			};
+			options.deps = {
+				parseLiveQaSession: (o) => ({ ...parseLiveQaSession(o), acceptance: poisoned }),
+			};
+			const result = await runLiveQaStage(options);
+			expect(result.acceptance?.criteria[0]?.expected).toEqual({ sha: "[REDACTED]" });
+			expect(JSON.stringify(result.acceptance)).not.toContain(hex);
+			expect(JSON.stringify(result.stage?.verdict.acceptance)).not.toContain(hex);
+		} finally {
+			delete process.env.LIVE_QA_STAGE_TEST_API_TOKEN;
+		}
+	});
+
+	test("runner produced no session: acceptance is still present and blocked", async () => {
+		const { options } = setup({ criteria: true }, JSON.stringify(manifest));
+		process.env.FAKE_FORGE_MODE = "preflight_fail";
+		const result = await runLiveQaStage(options);
+		expect(result.verdict).toBe("unavailable");
+		expect(result.acceptance?.overall).toBe("blocked");
+		expect(result.acceptance?.criteria.map((c) => c.id)).toEqual(["AC-1", "AC-2"]);
 	});
 });

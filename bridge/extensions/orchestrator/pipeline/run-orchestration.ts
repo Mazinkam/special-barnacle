@@ -1245,6 +1245,7 @@ export async function runOrchestration(
 		stateRoot: deps.stateRoot,
 		telemetryReport: telemetry,
 		outOfTreeChangesLine: outOfTreeChangesSummaryLine(outOfTreeChanges),
+		...(liveQaStageResult?.acceptance ? { acceptance: liveQaStageResult.acceptance } : {}),
 		...(parsed.liveQa ? { liveQa: { stage: liveQaStageResult, notRunReason: liveQaNotRunReason, hasUnknownCost: liveQaHasUnknownCost } } : {}),
 	};
 	return { kind: "completed", report };

@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { AcceptanceResult } from "./core/run-result.ts";
-import { parseAcceptanceManifest, type AcceptanceManifest } from "./live-qa-acceptance.ts";
+import { blockedAcceptance as blockedAcceptanceFor, parseAcceptanceManifest, redactAcceptance, type AcceptanceManifest } from "./live-qa-acceptance.ts";
 import {
 	buildRunnerArgv,
 	gitRevParseHead,
@@ -101,10 +101,7 @@ export const MAX_ACCEPTANCE_MANIFEST_BYTES = 64 * 1024;
  * `reasons`.
  */
 function blockedAcceptance(manifest: AcceptanceManifest | undefined, reason: string): AcceptanceResult {
-	return {
-		overall: "blocked",
-		criteria: (manifest?.criteria ?? []).map((c) => ({ id: c.id, result: "blocked" as const, artifacts: [], note: redactSecrets(reason, process.env) })),
-	};
+	return manifest ? blockedAcceptanceFor(manifest, reason, (t) => redactSecrets(t, process.env)) : { overall: "blocked", criteria: [] };
 }
 
 /** Bounded, fail-closed read of the (trusted-loop-supplied) manifest path: no symlinks
@@ -272,9 +269,16 @@ function buildOutcomeRow(
 export async function runLiveQaStage(opts: RunLiveQaStageOptions): Promise<RunLiveQaStageResult> {
 	const result = await runLiveQaStageUnsanitized(opts);
 	const env = process.env;
+	// Acceptance strings are redacted with plain `redactSecrets` -- NOT `sanitizeForPersistence`,
+	// whose git-object-id exemption is keyed on object keys (`sha`, `tree`, ...) that a manifest's
+	// `expected`/`observed` keys can legally take, which would let a 40-hex secret through.
+	const redactText = (t: string) => redactSecrets(t, env);
+	const stage = result.stage === null ? null : sanitizeForPersistence(result.stage, env);
+	if (stage && result.stage?.verdict.acceptance) stage.verdict.acceptance = redactAcceptance(result.stage.verdict.acceptance, redactText);
 	return {
 		...result,
-		stage: result.stage === null ? null : sanitizeForPersistence(result.stage, env),
+		...(result.acceptance ? { acceptance: redactAcceptance(result.acceptance, redactText) } : {}),
+		stage,
 		reasons: sanitizeForPersistence(result.reasons, env),
 		costRows: sanitizeForPersistence(result.costRows, env),
 		outcomeRow: result.outcomeRow === null ? null : sanitizeForPersistence(result.outcomeRow, env),
@@ -415,6 +419,7 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 		exitCode: runResult.exitCode,
 		startedAtMs,
 		runnerFailure: runResult.failureReason ?? runResult.spawnError ?? runResult.tail,
+		...(acceptanceManifest ? { manifest: acceptanceManifest } : {}),
 	});
 	// A runner that receives SIGINT (because THIS run's own cancellation fired) but keeps running
 	// long enough to write out fully valid, pass-shaped artifacts and exit 0 anyway did not run to
@@ -437,7 +442,11 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 		costRows,
 		outcomeRow,
 		cancelled: runResult.cancelled,
-		...(request.acceptancePath ? { acceptance: blockedAcceptance(acceptanceManifest, "acceptance.json was not evaluated") } : {}),
+		...(verdict.acceptance
+			? { acceptance: verdict.acceptance }
+			: request.acceptancePath
+				? { acceptance: blockedAcceptance(acceptanceManifest, "acceptance.json was not evaluated") }
+				: {}),
 	};
 }
 

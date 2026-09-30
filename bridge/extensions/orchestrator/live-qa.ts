@@ -28,6 +28,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import type { Stats } from "node:fs";
+import type { AcceptanceResult } from "./core/run-result.ts";
+import { blockedAcceptance, evaluateAcceptance, redactAcceptance, type AcceptanceManifest } from "./live-qa-acceptance.ts";
 
 // -----------------------------------------------------------------------------
 // Config schema (v1)
@@ -1673,10 +1675,12 @@ export interface LiveQaVerdict {
 	artifacts: string[];
 	usage: LiveQaUsageV2 | null;
 	exit_code: number | null;
+	/** Present only when an acceptance manifest was supplied. Never upgrades `verdict`. */
+	acceptance?: AcceptanceResult;
 }
 
 const SESSION_DIR_NAME_RE = /^run-\d{8}-\d{6}-[0-9a-f]{4}$/;
-const SESSION_ARTIFACT_NAMES = ["report.md", "findings.json", "usage.json", "results.md", "stack.log"];
+const SESSION_ARTIFACT_NAMES = ["report.md", "findings.json", "usage.json", "results.md", "stack.log", "acceptance.json"];
 
 // A same-second write can legitimately land a filesystem mtime a few hundred ms "before"
 // `startedAtMs` even though the artifact was genuinely written by THIS invocation: `startedAtMs`
@@ -1989,6 +1993,7 @@ function redactVerdict(verdict: LiveQaVerdict): LiveQaVerdict {
 		reasons: verdict.reasons.map(r),
 		findings: verdict.findings.map((f) => ({ ...f, title: r(f.title), fingerprint: r(f.fingerprint) })),
 		artifacts: verdict.artifacts.map(r),
+		...(verdict.acceptance ? { acceptance: redactAcceptance(verdict.acceptance, r) } : {}),
 		usage: verdict.usage
 			? {
 				...verdict.usage,
@@ -2031,7 +2036,11 @@ export function parseLiveQaSession(opts: {
 	startedAtMs: number;
 	/** Redacted spawn/admission diagnostic from this invocation, never a foreign session. */
 	runnerFailure?: string;
+	/** When set, `acceptance.json` is read (same confinement/freshness bar as findings.json) and evaluated. */
+	manifest?: AcceptanceManifest;
 }): LiveQaVerdict {
+	// Set once acceptance.json has been evaluated; carried on every later return, never affecting `verdict`.
+	let acceptance: AcceptanceResult | undefined;
 	const unavailable = (reason: string, extra: Partial<LiveQaVerdict> = {}): LiveQaVerdict => redactVerdict({
 		verdict: "unavailable",
 		reasons: [reason],
@@ -2042,6 +2051,12 @@ export function parseLiveQaSession(opts: {
 		artifacts: [],
 		usage: null,
 		exit_code: opts.exitCode,
+		// With a manifest, EVERY return carries acceptance: an early unavailable return blocks it.
+		...(acceptance
+			? { acceptance }
+			: opts.manifest
+				? { acceptance: blockedAcceptance(opts.manifest, `live QA session unavailable: ${reason}`, (t) => redactSecrets(t, process.env)) }
+				: {}),
 		...extra,
 	});
 
@@ -2162,12 +2177,18 @@ export function parseLiveQaSession(opts: {
 	// stack.log) is simply omitted from `artifacts` rather than followed; at a REQUIRED artifact
 	// name (findings.json, usage.json when present) it makes the verdict "unavailable" below.
 	const confinedArtifacts = new Map<string, ConfinementResult & { ok: true }>();
+	let acceptanceConfinementFailure: string | null = null;
 	for (const name of SESSION_ARTIFACT_NAMES) {
 		const p = join(sessionDirReal, name);
 		try {
 			lstatSync(p);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			if (name === "acceptance.json") {
+				// Optional artifact: an inspection error blocks acceptance only, never the verdict.
+				acceptanceConfinementFailure = `could not inspect ${name}: ${(error as Error).message}`;
+				continue;
+			}
 			return unavailable(`could not inspect ${name}: ${(error as Error).message}`, {
 				session_id: sessionId, session_dir: relSessionDir,
 			});
@@ -2175,6 +2196,9 @@ export function parseLiveQaSession(opts: {
 		const confinement = checkConfined(p, sessionDirReal, name);
 		if (confinement.ok) {
 			confinedArtifacts.set(name, confinement);
+		} else if (name === "acceptance.json") {
+			// Optional artifact: never fails the verdict; only blocks the acceptance result below.
+			acceptanceConfinementFailure = confinement.reason;
 		} else if (name === "findings.json" || name === "usage.json" || name === "results.md") {
 			return unavailable(confinement.reason, { session_id: sessionId, session_dir: relSessionDir });
 		}
@@ -2196,6 +2220,53 @@ export function parseLiveQaSession(opts: {
 	const parsedFindings = parseFindingsEnvelope(findingsRead.content);
 	if (!parsedFindings.ok) {
 		return unavailable(parsedFindings.reason, { session_id: sessionId, session_dir: relSessionDir, artifacts });
+	}
+
+	// acceptance.json (only when a manifest was supplied): same confinement/freshness path as
+	// findings.json. Any failure blocks every criterion; it never throws and never changes `verdict`.
+	if (opts.manifest) {
+		const manifest = opts.manifest;
+		const redact = (t: string) => redactSecrets(t, process.env);
+		const blockAll = (reason: string): AcceptanceResult => blockedAcceptance(manifest, reason, redact);
+		// Only artifacts that are regular files, readable through the hardened descriptor read, and
+		// fresh for THIS invocation may back a manual criterion (a stale file or directory must not).
+		const usableArtifactNames = (): Set<string> => {
+			const names = new Set<string>();
+			for (const [name, c] of confinedArtifacts) {
+				// The result files themselves are never supporting evidence for a manual PASS.
+				if (name === "acceptance.json" || name === "findings.json") continue;
+				const read = readConfinedArtifact(c.real, sessionDirReal, name, c.lstat);
+				if (read.ok && isConfinedArtifactFresh(read.mtimeMs, name, c.real, opts.startedAtMs).ok) names.add(name);
+			}
+			return names;
+		};
+		const accConfinement = confinedArtifacts.get("acceptance.json");
+		if (!accConfinement) {
+			acceptance = blockAll(acceptanceConfinementFailure !== null
+				? `acceptance.json failed confinement: ${acceptanceConfinementFailure}`
+				: "session directory has no acceptance.json");
+		} else {
+			const accRead = readConfinedArtifact(accConfinement.real, sessionDirReal, "acceptance.json", accConfinement.lstat);
+			if (!accRead.ok) {
+				acceptance = blockAll(`acceptance.json failed confinement: ${accRead.reason}`);
+			} else {
+				const accFresh = isConfinedArtifactFresh(accRead.mtimeMs, "acceptance.json", accConfinement.real, opts.startedAtMs);
+				if (!accFresh.ok) {
+					acceptance = blockAll(accFresh.reason);
+				} else {
+					let parsedAcceptance: unknown;
+					let parseError: string | null = null;
+					try {
+						parsedAcceptance = JSON.parse(accRead.content);
+					} catch (error) {
+						parseError = `acceptance.json is not valid JSON: ${(error as Error).message}`;
+					}
+					acceptance = parseError !== null
+						? blockAll(parseError)
+						: evaluateAcceptance(manifest, parsedAcceptance, usableArtifactNames(), redact);
+				}
+			}
+		}
 	}
 
 	// usage.json is OPTIONAL (a run that never produced one is still a valid pass, see the
@@ -2222,6 +2293,7 @@ export function parseLiveQaSession(opts: {
 			session_id: sessionId, session_dir: relSessionDir,
 			findings: parsedFindings.findings, observations_count: observationsCount, artifacts, usage,
 			exit_code: opts.exitCode,
+			...(acceptance ? { acceptance } : {}),
 		});
 	}
 
@@ -2259,6 +2331,7 @@ export function parseLiveQaSession(opts: {
 			session_id: sessionId, session_dir: relSessionDir,
 			findings: parsedFindings.findings, observations_count: observationsCount, artifacts, usage,
 			exit_code: opts.exitCode,
+			...(acceptance ? { acceptance } : {}),
 		});
 	}
 	if (parsedResults.rows.includes("BLOCKED")) {
@@ -2274,6 +2347,7 @@ export function parseLiveQaSession(opts: {
 			session_id: sessionId, session_dir: relSessionDir,
 			findings: parsedFindings.findings, observations_count: observationsCount, artifacts, usage,
 			exit_code: opts.exitCode,
+			...(acceptance ? { acceptance } : {}),
 		});
 	}
 

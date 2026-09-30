@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseAcceptanceManifest } from "./live-qa-acceptance.ts";
+import { evaluateAcceptance, parseAcceptanceManifest, redactAcceptance } from "./live-qa-acceptance.ts";
 
 function valid144(): Record<string, unknown> {
 	return {
@@ -79,5 +79,150 @@ describe("parseAcceptanceManifest", () => {
 		reject({ version: 1, issue: 1, criteria: [{ id: "AC-1", text: "t", expected: { a: "x".repeat(201) } }] });
 		reject({ version: 1, issue: 1, criteria: [{ id: "AC-1", text: "t", expected: { Bad: 1 } }] });
 		reject(null);
+	});
+});
+
+const m144 = { version: 1, issue: 144, criteria: [
+	{ id: "AC-3", text: "422 invalid_state", expected: { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" } },
+	{ id: "AC-5", text: "no side effects", manual: true },
+] } as const;
+const ok422 = { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" };
+
+describe("evaluateAcceptance", () => {
+	test("409 cannot satisfy an expected 422", () => {
+		const r = evaluateAcceptance(m144 as never, { criteria: [
+			{ id: "AC-3", result: "PASS", observed: { "http.status": 409, "body.code": "project_source_repository_unavailable", "body.message": "Source project repository is unavailable" } },
+			{ id: "AC-5", result: "PASS", artifacts: ["results.md"] }] }, new Set(["results.md"]));
+		expect(r.overall).toBe("fail");
+		expect(r.criteria[0]?.result).toBe("fail");
+		expect(r.criteria[0]?.note).toContain("http.status: expected 422, observed 409");
+	});
+
+	test("contradictory agent result: matching observed but FAIL is fail, but BLOCKED is blocked", () => {
+		const run = (result: string) => evaluateAcceptance(m144 as never, { criteria: [
+			{ id: "AC-3", result, observed: ok422 },
+			{ id: "AC-5", result: "PASS", artifacts: ["results.md"] }] }, new Set(["results.md"]));
+		expect(run("FAIL").criteria[0]?.result).toBe("fail");
+		expect(run("FAIL").overall).toBe("fail");
+		expect(run("BLOCKED").criteria[0]?.result).toBe("blocked");
+		expect(run("BLOCKED").overall).toBe("blocked");
+		expect(run("PASS").criteria[0]?.result).toBe("pass");
+	});
+
+	test("manual criterion without a confined artifact is blocked", () => {
+		const r = evaluateAcceptance(m144 as never, { criteria: [
+			{ id: "AC-3", result: "PASS", observed: ok422 },
+			{ id: "AC-5", result: "PASS", artifacts: ["../../etc/passwd"] }] }, new Set(["results.md"]));
+		expect(r.criteria[1]?.result).toBe("blocked");
+		expect(r.overall).toBe("blocked");
+	});
+
+	test("missing criterion is blocked; unexpected id blocks overall", () => {
+		const missing = evaluateAcceptance(m144 as never, { criteria: [{ id: "AC-3", result: "PASS", observed: ok422 }] }, new Set(["results.md"]));
+		expect(missing.criteria[1]?.result).toBe("blocked");
+		expect(missing.criteria[1]?.note).toContain("not reported");
+		expect(missing.overall).toBe("blocked");
+		const extra = evaluateAcceptance(m144 as never, { criteria: [
+			{ id: "AC-3", result: "PASS", observed: ok422 },
+			{ id: "AC-5", result: "PASS", artifacts: ["results.md"] },
+			{ id: "AC-9", result: "PASS" }] }, new Set(["results.md"]));
+		expect(extra.overall).toBe("blocked");
+		expect(JSON.stringify(extra)).toContain("unexpected criterion ids");
+	});
+
+	test("exact 422 evidence passes", () => {
+		const r = evaluateAcceptance(m144 as never, { criteria: [
+			{ id: "AC-3", result: "PASS", observed: ok422 },
+			{ id: "AC-5", result: "PASS", artifacts: ["results.md"] }] }, new Set(["results.md"]));
+		expect(r.overall).toBe("pass");
+		expect(r.criteria.map((c) => c.result)).toEqual(["pass", "pass"]);
+		expect(r.criteria[1]?.artifacts).toEqual(["results.md"]);
+	});
+
+	test("malformed or hostile reported shapes are blocked, never thrown", () => {
+		for (const bad of [null, "x", 5, {}, { criteria: "no" }, { criteria: [null, 3] }]) {
+			const r = evaluateAcceptance(m144 as never, bad, new Set());
+			expect(r.overall).toBe("blocked");
+			expect(r.criteria).toHaveLength(2);
+		}
+		const proto = JSON.parse('{"criteria":[{"id":"AC-3","result":"PASS","observed":{"__proto__":{"http.status":422}}},{"id":"AC-5","result":"PASS","artifacts":["results.md"]}]}');
+		const r = evaluateAcceptance(m144 as never, proto, new Set(["results.md"]));
+		expect(r.criteria[0]?.result).toBe("blocked");
+	});
+
+	test("present null and object values fail, while an absent key is blocked", () => {
+		const manifest = { version: 1, issue: 1, criteria: [{ id: "AC-1", text: "status", expected: { "http.status": 422 } }] };
+		const evaluate = (observed: Record<string, unknown>) => evaluateAcceptance(manifest as never, { criteria: [
+			{ id: "AC-1", result: "PASS", observed },
+		] }, new Set());
+
+		const nullValue = evaluate({ "http.status": null });
+		expect(nullValue.criteria[0]?.result).toBe("fail");
+		expect(nullValue.criteria[0]?.note).toContain("http.status: expected 422, observed null");
+
+		const objectValue = evaluate({ "http.status": { a: 1 } });
+		expect(objectValue.criteria[0]?.result).toBe("fail");
+		expect(objectValue.criteria[0]?.note).toContain("http.status: expected 422, observed object");
+
+		const secretValue = evaluate({ "http.status": { secret: "x" } });
+		expect(secretValue.criteria[0]?.note).toContain("http.status: expected 422, observed object");
+		expect(secretValue.criteria[0]?.note).not.toContain("secret");
+
+		const absent = evaluate({});
+		expect(absent.criteria[0]?.result).toBe("blocked");
+	});
+
+	test("missing observed key is blocked", () => {
+		const r = evaluateAcceptance(m144 as never, { criteria: [
+			{ id: "AC-3", result: "PASS", observed: { "http.status": 422 } },
+			{ id: "AC-5", result: "FAIL" }] }, new Set());
+		expect(r.criteria[0]?.result).toBe("blocked");
+		expect(r.criteria[1]?.result).toBe("fail");
+		expect(r.overall).toBe("fail");
+	});
+
+	test("more than 100 reported criteria: blocked, not iterated", () => {
+		const many = Array.from({ length: 101 }, (_, i) => ({ id: `AC-${i % 5 + 1}`, result: "PASS" }));
+		const r = evaluateAcceptance(m144 as never, { criteria: many }, new Set());
+		expect(r.overall).toBe("blocked");
+		expect(r.criteria.every((c) => c.result === "blocked" && (c.note ?? "").includes("too many reported criteria"))).toBe(true);
+	});
+
+	test("per-criterion artifacts are capped at RUN_RESULT_LIMITS.artifacts", () => {
+		const names = Array.from({ length: 80 }, (_, i) => `a${i}.log`);
+		const r = evaluateAcceptance(m144 as never, { criteria: [
+			{ id: "AC-3", result: "PASS", observed: { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" } },
+			{ id: "AC-5", result: "PASS", artifacts: names }] }, new Set(names));
+		expect(r.criteria[1]?.artifacts.length).toBe(50);
+		expect(r.criteria[1]?.result).toBe("pass");
+	});
+
+	test("redaction happens before clipping: a secret straddling the clip boundary leaves no prefix", () => {
+		const redact = (t: string) => t.split("s3cr3t-value-abcdefghijk").join("[REDACTED]");
+		const lead = "http.status: expected 422, observed 409 (agent note: ";
+		const filler = "x".repeat(2040 - lead.length);
+		const r = evaluateAcceptance(m144 as never, { criteria: [
+			{ id: "AC-3", result: "PASS", note: `${filler}s3cr3t-value-abcdefghijk tail`, observed: { "http.status": 409, "body.code": "invalid_state", "body.message": "invalid state" } },
+			{ id: "AC-5", result: "FAIL" }] }, new Set(), redact);
+		const note = r.criteria[0]?.note ?? "";
+		expect(note).not.toContain("s3cr");
+		expect(note.length).toBeLessThanOrEqual(2048);
+		const observedLong = evaluateAcceptance(m144 as never, { criteria: [
+			{ id: "AC-3", result: "PASS", observed: { "http.status": 422, "body.code": "invalid_state", "body.message": `${"y".repeat(2040)}s3cr3t-value-abcdefghijk` } },
+			{ id: "AC-5", result: "FAIL" }] }, new Set(), redact);
+		expect(JSON.stringify(observedLong)).not.toContain("s3cr");
+	});
+});
+
+describe("redactAcceptance", () => {
+	test("redacts notes, expected, observed strings and artifact names; no git-id exemption", () => {
+		const hex = "0123456789abcdef0123456789abcdef01234567";
+		const redact = (t: string) => t.split(hex).join("[REDACTED]");
+		const out = redactAcceptance({ overall: "fail", criteria: [{
+			id: "AC-1", result: "fail", note: `n ${hex}`, expected: { sha: hex, n: 1 }, observed: { tree: hex, ok: true }, artifacts: [hex],
+		}] }, redact);
+		expect(JSON.stringify(out)).not.toContain(hex);
+		expect(out.criteria[0]?.expected).toEqual({ sha: "[REDACTED]", n: 1 });
+		expect(out.criteria[0]?.observed).toEqual({ tree: "[REDACTED]", ok: true });
 	});
 });
