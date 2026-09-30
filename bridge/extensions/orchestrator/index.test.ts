@@ -87,6 +87,8 @@ process.env.PYTHONDONTWRITEBYTECODE = "1";
 // Main forwards the bridge state root to every Python call, including batches.
 const pythonStateRoot = testStateRoot;
 process.env.CODING_AGENT_ORCHESTRATOR_HOME = pythonStateRoot;
+// Tests read dashboard.html right after a write; the Python writer otherwise renders it in a detached process.
+process.env.ORCHESTRATOR_DASHBOARD_SYNC = "1";
 const orchestrator = await import("./index.ts");
 afterAll(() => {
 	rmSync(testStateRoot, { recursive: true, force: true });
