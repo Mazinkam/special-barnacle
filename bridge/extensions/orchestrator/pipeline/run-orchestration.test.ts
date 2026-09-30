@@ -9,7 +9,7 @@ import { runOrchestration, writeLeadReportsDiagnostic, type RunOrchestrationDeps
 import { buildRunSummary } from "../core/report.ts";
 import { buildCompletedRunResult } from "../core/run-result.ts";
 import { RunCancellation } from "../cancellation.ts";
-import type { RunSession } from "../run/session.ts";
+import type { RunSession } from "../index.ts";
 import type { RunContext } from "../run/context.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 import type { OrchestrateArgs } from "../core/args.ts";

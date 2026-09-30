@@ -34,8 +34,7 @@ import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 import { policyIdFor } from "../adapters/adapter-resolver.ts";
 import { formatAdapterTable, userLayerWarnings } from "../models.ts";
 import { safeUi } from "../run/ui-sink.ts";
-import type { RunTiming } from "../run/session.ts";
-import type { RunContext, RunRegistry, RunSessionLike } from "../run/context.ts";
+import type { RunContext, RunRegistry, RunSessionLike, RunTiming } from "../run/context.ts";
 import type { FlushReport, QueueStats } from "../record-queue.ts";
 import { runOrchestration as defaultRunOrchestration, warnTelemetry, type RunOrchestrationDeps } from "../pipeline/run-orchestration.ts";
 

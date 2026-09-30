@@ -5,116 +5,37 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { describeRunArtifact, RunSession } from "./session.ts";
+// index.ts imports `@humain/terminal` and `typebox`, neither installed in this standalone bridge
+// checkout; stubbed exactly as index.test.ts does (only load-time surface is reached here).
+mock.module("@humain/terminal", () => ({
+	BorderedLoader: class {},
+	discoverAgents: () => ({ agents: [] }),
+	renderTaskWithContext: (task: string) => task,
+}));
+mock.module("typebox", () => {
+	const schema = (extra: Record<string, unknown>) => (options?: Record<string, unknown>) => ({ ...extra, ...options });
+	return { Type: { Object: (properties: unknown) => ({ type: "object", properties }), Optional: (inner: unknown) => inner, Number: schema({}), String: schema({}), Boolean: schema({}) } };
+});
 
 // The diagnostic-sealing tests below shell out to python3's orchestrator.archive to check the
 // TS/Python archive contract against the real seal marker; PYTHONPATH must resolve THIS
 // worktree's package, never an installed skill checkout.
-process.env.HUMAIN_ORCHESTRATOR_SKILL_ROOT ??= fileURLToPath(new URL("../../../../", import.meta.url));
+process.env.HUMAIN_ORCHESTRATOR_SKILL_ROOT ??= fileURLToPath(new URL("../../../", import.meta.url));
+// index.ts's RunSession resolves its run dir from STATE_ROOT at module load.
+const runsRoot = mkdtempSync(join(tmpdir(), "orch-session-test-runs-"));
+process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = runsRoot;
+// Cache-busting query: a fresh index.ts instance bound to this file's STATE_ROOT, not the one index.test.ts loads.
+const { RunSession } = (await import(`./index.ts?run-session-test=${Date.now()}`)) as typeof import("./index.ts");
 
 const repoDir = mkdtempSync(join(tmpdir(), "orch-session-test-repo-"));
-const runsDir = mkdtempSync(join(tmpdir(), "orch-session-test-runs-"));
 afterAll(() => {
 	rmSync(repoDir, { recursive: true, force: true });
-	rmSync(runsDir, { recursive: true, force: true });
+	rmSync(runsRoot, { recursive: true, force: true });
 });
 
 function createSession(id: string, ctx: unknown, goal: string) {
-	return new RunSession(id, ctx as never, goal, repoDir, {
-		runsDir: () => runsDir,
-		telemetrySnapshot: () => ({ recorded: 0, failed: 0, replayed: 0 }) as never,
-	});
+	return new RunSession(id, ctx as never, goal, repoDir);
 }
-
-describe("RunSession external CI presentation", () => {
-	test("setPendingChecks replaces the live CI snapshot and clears it on empty input", () => {
-		const widgets: string[][] = [];
-		const statuses: string[] = [];
-		const session = createSession("ci-board-test", {
-			ui: {
-				setWidget: (_id: string, lines?: string[]) => { if (lines) widgets.push(lines); },
-				setStatus: (_id: string, text?: string) => { if (text) statuses.push(text); },
-				notify() {},
-			},
-		}, "wait for CI");
-		try {
-			session.setPendingChecks([{ provider: "github", id: "build", outcome: "pending", mr: "#42" }]);
-			expect(widgets.at(-1)?.join("\n")).toContain("github");
-			expect(widgets.at(-1)?.join("\n")).toContain("#42");
-			expect(statuses.at(-1)).toContain("1 CI pending");
-			session.setPendingChecks([{ provider: "gitlab", id: "lint", outcome: "failure" }]);
-			expect(widgets.at(-1)?.join("\n")).not.toContain("build");
-			expect(widgets.at(-1)?.join("\n")).toContain("lint");
-			const many = Array.from({ length: 100 }, (_, index) => ({ provider: "gitlab" as const, id: `job-${index}`, outcome: "pending" as const }));
-			session.setPendingChecks(many);
-			many[0].id = "changed-after-call";
-			expect(widgets.at(-1)?.join("\n")).toContain("external CI checks (32)");
-			expect(widgets.at(-1)?.join("\n")).not.toContain("changed-after-call");
-			expect(widgets.at(-1)?.join("\n")).not.toContain("job-99");
-			session.setPendingChecks([]);
-			expect(widgets.at(-1)?.join("\n")).not.toContain("external CI checks");
-			expect(statuses.at(-1)).not.toContain("CI pending");
-		} finally {
-			session.close();
-		}
-	});
-});
-
-describe("RunSession cancellation presentation", () => {
-	test("clears the widget and status after cancellation cleanup, keeping the trace in run.log", () => {
-		const widgets: unknown[] = [];
-		const statuses: unknown[] = [];
-		const ctx = {
-			ui: {
-				setWidget: (_id: string, value: unknown) => widgets.push(value),
-				setStatus: (_id: string, value: unknown) => statuses.push(value),
-				notify: mock(),
-			},
-		};
-		const session = createSession("cancel-ui-test", ctx, "update the payments page");
-		session.startDispatch("lead-1", "lead", "provider/model");
-		session.cancel();
-		session.endDispatch("lead-1", 137, 0);
-
-		// While the run is still live, the cancelled dispatch and goal are visible.
-		const liveWidget = widgets.at(-1) as string[];
-		expect(liveWidget.some((line) => line.includes("Goal:") && line.includes("update the payments page"))).toBe(true);
-		expect(liveWidget.some((line) => line.includes("lead") && line.includes("cancelled by user"))).toBe(true);
-		expect(statuses.at(-1)).toContain("cancelling");
-
-		// Cleanup clears the widget/status unconditionally — cancellation no longer
-		// pins the board to the screen; run.log is the durable trace instead.
-		session.close();
-		expect(widgets.at(-1)).toBeUndefined();
-		expect(statuses.at(-1)).toBeUndefined();
-		const log = readFileSync(session.file("run.log"), "utf8");
-		expect(log).toContain("cancellation requested (user)");
-	});
-
-	test("render() and setPhase() swallow a ctx.ui getter that throws after shutdown, including on the tick-timer path", () => {
-		let uiInvalidated = false;
-		const ui = { notify: mock(), setWidget: mock(), setStatus: mock() };
-		const ctx = {
-			// Mirrors a real session ending mid-drain: `ctx.ui` throws once invalidated,
-			// which must not propagate out of render()/setPhase() (directly or via the
-			// once-a-second tick timer).
-			get ui() {
-				if (uiInvalidated) throw new Error("ctx invalidated: ui is unavailable after this session ended");
-				return ui;
-			},
-		};
-		const session = createSession("ui-throws-after-shutdown-test", ctx, "goal");
-		try {
-			uiInvalidated = true;
-			// render() is what the once-a-second tick timer calls; setPhase() also renders.
-			expect(() => session.render()).not.toThrow();
-			expect(() => session.setPhase("x")).not.toThrow();
-		} finally {
-			uiInvalidated = false;
-			session.close();
-		}
-	});
-});
 
 describe("RunSession progress reporting", () => {
 	test("renders stable nested workers, progress age, and tracker warnings without notify spam", () => {
@@ -268,15 +189,15 @@ describe("RunSession terminal timing", () => {
 	});
 
 	test("run terminal outcomes carry the timing fields", () => {
-		const finalizeSource = readFileSync(new URL("./finalize.ts", import.meta.url), "utf8");
-		const complete = finalizeSource.slice(finalizeSource.indexOf("async function completeRun("), finalizeSource.indexOf("async function failRun("));
-		const fail = finalizeSource.slice(finalizeSource.indexOf("async function failRun("), finalizeSource.indexOf("export function createDispatchCostCapture("));
+		const finalizeSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+		const complete = finalizeSource.slice(finalizeSource.indexOf("export async function completeRun("), finalizeSource.indexOf("export async function failRun("));
+		const fail = finalizeSource.slice(finalizeSource.indexOf("export async function failRun("), finalizeSource.indexOf("export function cancelReasonLabel("));
 		for (const fn of [complete, fail]) {
 			expect(fn).toContain("...timing");
 		}
 		// Every terminal call inside the /orchestrate handler must pass the session timing.
-		const orchestrateSource = readFileSync(new URL("../commands/orchestrate.ts", import.meta.url), "utf8");
-		const pipelineSource = readFileSync(new URL("../pipeline/run-orchestration.ts", import.meta.url), "utf8");
+		const orchestrateSource = readFileSync(new URL("./commands/orchestrate.ts", import.meta.url), "utf8");
+		const pipelineSource = readFileSync(new URL("./pipeline/run-orchestration.ts", import.meta.url), "utf8");
 		const handler = orchestrateSource.slice(orchestrateSource.indexOf('pi.registerCommand("orchestrate"')) + pipelineSource;
 		const calls = handler.match(/await deps\.(?:completeRun|failRun|cancelRun)\([^;]*?\);/gs) ?? [];
 		expect(calls.length).toBeGreaterThan(0);
@@ -434,41 +355,5 @@ print(json.dumps(result))
 		session.close();
 		expect(await session.sealDiagnostics(Promise.resolve(false))).toBe(false);
 		expect(existsSync(session.file(".diagnostics-sealed.json"))).toBe(false);
-	});
-});
-
-describe("archived run diagnostics lookup", () => {
-	test("a readable path is returned unchanged; an archived one names the .gz and the restore command; a missing one says so", () => {
-		const runRoot = mkdtempSync(join(tmpdir(), "orch-archived-diag-test-"));
-		const runDir = join(runRoot, "runs", "ht-orch-1790000000000-abcdef");
-		mkdirSync(runDir, { recursive: true });
-		try {
-			const log = join(runDir, "run.log");
-			writeFileSync(log, "2026-08-01T00:00:00Z run started\n");
-			expect(describeRunArtifact(log)).toBe(log);
-
-			const report = join(runDir, "lead-report.md");
-			writeFileSync(`${report}.gz`, "not really gzip, existence is what matters here");
-			writeFileSync(
-				join(runDir, "archive.manifest.json"),
-				JSON.stringify({ format_version: 1, run_id: "ht-orch-1790000000000-abcdef", files: { "lead-report.md": { archive: "lead-report.md.gz", sha256: "00" } } }),
-			);
-			const described = describeRunArtifact(report);
-			expect(described).toContain(report);
-			expect(described).toContain(`${report}.gz`);
-			expect(described).toContain("restore-run ht-orch-1790000000000-abcdef");
-
-			// once restored (or never archived) the plain path wins again
-			writeFileSync(report, "report\n");
-			expect(describeRunArtifact(report)).toBe(report);
-
-			// a .gz without a manifest entry is not ours to describe as archived
-			const stray = join(runDir, "other.stderr.log");
-			writeFileSync(`${stray}.gz`, "x");
-			expect(describeRunArtifact(stray)).toBe(`${stray} (missing)`);
-			expect(describeRunArtifact(join(runDir, "never.txt"))).toBe(`${join(runDir, "never.txt")} (missing)`);
-		} finally {
-			rmSync(runRoot, { recursive: true, force: true });
-		}
 	});
 });

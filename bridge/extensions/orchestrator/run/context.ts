@@ -16,13 +16,51 @@
  * which requires knowing its shape.
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+
 import type { AliasTable, BindingSource } from "../models.ts";
 import type { RunTags } from "../core/records.ts";
 import type { RunCancellation } from "../cancellation.ts";
 import type { QueueStats } from "../record-queue.ts";
-import type { RunTiming } from "./session.ts";
 import type { Candidate } from "../adapters/model-router.ts";
 import type { ModelHealth } from "./model-health.ts";
+/** Time fields recorded at the run's terminal boundary (complete/fail/cancel/crash). */
+export interface RunTiming {
+	started_at: string;
+	finished_at: string;
+	elapsed_ms: number;
+	elapsed_source: "monotonic";
+}
+
+/** Manifest `python3 -m orchestrator.cli archive-runs --execute` leaves next to a run's `<name>.gz` files. */
+const ARCHIVE_MANIFEST = "archive.manifest.json";
+
+/**
+ * Where a run diagnostic can be read *now*. The opt-in `archive-runs --execute` command replaces
+ * the diagnostics of old completed runs with `<name>.gz` + a manifest (`run.log` itself is never
+ * archived), so a path remembered from the progress board or an old notification may no longer
+ * exist as-is. Returns the path unchanged while it is readable; otherwise a lookup/restore hint
+ * instead of a silently broken link.
+ */
+export function describeRunArtifact(path: string): string {
+	if (existsSync(path)) return path;
+	const runDir = dirname(path);
+	const name = basename(path);
+	const archived = join(runDir, `${name}.gz`);
+	let listed = false;
+	try {
+		const manifest = JSON.parse(readFileSync(join(runDir, ARCHIVE_MANIFEST), "utf-8"));
+		listed = manifest?.format_version === 1 && typeof manifest?.files?.[name] === "object";
+	} catch {
+		/* no readable manifest: the file was never archived by us */
+	}
+	if (listed && existsSync(archived)) {
+		return `${path} (archived as ${archived} — read with \`gunzip -c\`, or restore the run with \`python3 -m orchestrator.cli restore-run ${basename(runDir)}\`)`;
+	}
+	return `${path} (missing)`;
+}
+
 export type PendingCheckRow = { provider: "gitlab" | "github"; id: string; outcome: "pending" | "success" | "failure" | "unverified"; mr?: string };
 
 /**

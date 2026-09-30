@@ -20,30 +20,38 @@ import type { DispatchTask, PlanResponse } from "../core/prompts.ts";
 // to load the module; this test never exercises the real `discoverAgents` (it injects
 // `discoverAgentsFn` instead), so the stub's own behaviour is irrelevant here.
 mock.module("@humain/terminal", () => ({
+	BorderedLoader: class {},
 	discoverAgents: () => ({ agents: [] }),
 	renderTaskWithContext: (task: string) => task,
 }));
 
+// index.ts (RunSession) also pulls in `typebox`, absent from this standalone checkout; index.test.ts
+// stubs it the same way (only `Type` schema construction is reached at load).
+mock.module("typebox", () => {
+	const schema = (extra: Record<string, unknown>) => (options?: Record<string, unknown>) => ({ ...extra, ...options });
+	return { Type: { Object: (properties: unknown) => ({ type: "object", properties }), Optional: (inner: unknown) => inner, Number: schema({}), String: schema({}), Boolean: schema({}) } };
+});
+
 const { guardChildStreamHandler, runSubagentProcess } = await import("./child-process.ts");
-const { RunSession } = await import("../run/session.ts");
+// index.ts's RunSession resolves its run dir from STATE_ROOT at module load.
+const runsRoot = mkdtempSync(join(tmpdir(), "orch-child-process-runs-"));
+process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = runsRoot;
+// Cache-busting query: a fresh index.ts instance bound to this file's STATE_ROOT, not the one index.test.ts loads.
+const { RunSession } = (await import(`../index.ts?child-process-test=${Date.now()}`)) as typeof import("../index.ts");
 
 const NO_PERSONA = "__no_persona__";
 
 const repoDir = mkdtempSync(join(tmpdir(), "orch-child-process-test-"));
-const runsDir = mkdtempSync(join(tmpdir(), "orch-child-process-runs-"));
 afterAll(() => {
 	rmSync(repoDir, { recursive: true, force: true });
-	rmSync(runsDir, { recursive: true, force: true });
+	rmSync(runsRoot, { recursive: true, force: true });
 });
 
 function createSession(id: string) {
 	const ctx = {
 		ui: { setWidget: () => {}, setStatus: () => {}, notify: () => {} },
 	};
-	return new RunSession(id, ctx as never, "persona error test", repoDir, {
-		runsDir: () => runsDir,
-		telemetrySnapshot: () => ({ recorded: 0, failed: 0, replayed: 0 }) as never,
-	});
+	return new RunSession(id, ctx as never, "persona error test", repoDir);
 }
 
 /** A `--mode json` script that immediately emits a minimal `result` event and exits 0. */
@@ -130,10 +138,7 @@ describe("runSubagentProcess process/event handling", () => {
 				notify: mock(),
 			},
 		};
-		return new RunSession(id, ctx as never, "progress timeout test", repoDir, {
-			runsDir: () => runsDir,
-			telemetrySnapshot: () => ({ recorded: 0, failed: 0, replayed: 0 }) as never,
-		});
+		return new RunSession(id, ctx as never, "progress timeout test", repoDir);
 	}
 
 	function runLead(code: string, taskId: string, timeouts: { inactivityMs: number; maxMs: number }, session?: InstanceType<typeof RunSession>) {

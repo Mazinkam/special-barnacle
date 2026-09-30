@@ -5,7 +5,7 @@ import type { DispatchTask } from "../core/prompts.ts";
 import { parseFailedChecks, runVerification, type VerifyDeps, hasExplicitFailVerdict, qaVerificationOutcomeFor } from "./verify-loop.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import type { RunContext } from "../run/context.ts";
-import type { RunSession } from "../run/session.ts";
+import type { RunSession } from "../index.ts";
 
 function fakeCaptureOpts(): CaptureOpts {
 	return {
