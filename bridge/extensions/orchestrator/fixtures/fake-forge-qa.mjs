@@ -22,6 +22,8 @@
 //                        with genuinely valid artifacts and a clean exit, must never be trusted
 //                        as a completed pass by the STAGE layer (live-qa-stage.ts), which is the
 //                        only layer that knows the run was cancelled at all.
+//   acceptance_pass    - like pass, plus acceptance.json (#144 manifest shape) with exact 422 evidence
+//   acceptance_409     - like pass, plus acceptance.json whose AC-3 observed http.status is 409
 //   no_usage           - exit 0, session with report.md + findings.json, no usage.json
 //   codex_unknown_cost - exit 0, usage.json with agent.costSource "unknown", costMicrocents null
 //   leaky              - exit 0, pass-shaped session, but first logs lines containing a
@@ -82,7 +84,7 @@ const MODELS = new Set(["luna", "terra", "astra", "sol"]);
 const HUMAIN_NODE_MODELS = new Set(["m3", "m3preview", "glm", "glm52", "qwen"]);
 const CLAUDE_CODE_MODELS = new Set(["sonnet", "opus", "haiku", "fable"]);
 const ALLOWED_FLAGS = new Set([
-	"--slot", "--ref", "--budget", "--model", "--effort", "--runtime", "--local", "--flag", "--keep", "--verbose",
+	"--slot", "--ref", "--budget", "--model", "--effort", "--runtime", "--local", "--flag", "--keep", "--verbose", "--criteria",
 ]);
 
 function usageError(reason) {
@@ -165,7 +167,22 @@ function writeSession(opts) {
 	if (opts.results !== null) {
 		writeFileSync(join(durable, "results.md"), opts.results !== undefined ? opts.results : RESULTS_MD_PASS);
 	}
+	if (opts.acceptance !== undefined) {
+		writeFileSync(join(durable, "acceptance.json"), JSON.stringify(opts.acceptance));
+	}
 	return join(durable, "report.md");
+}
+
+// acceptance.json matching the #144 manifest used in the tests (AC-3 expected, AC-5 manual).
+function acceptance144(status) {
+	return {
+		criteria: [
+			status === 409
+				? { id: "AC-3", result: "PASS", observed: { "http.status": 409, "body.code": "project_source_repository_unavailable", "body.message": "Source project repository is unavailable" } }
+				: { id: "AC-3", result: "PASS", observed: { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" } },
+			{ id: "AC-5", result: "PASS", artifacts: ["results.md"] },
+		],
+	};
 }
 
 function baseUsage(overrides = {}) {
@@ -208,6 +225,12 @@ switch (mode) {
 	case "slot_contention":
 	case "pass": {
 		const reportPath = writeSession({ findings: [], usage: baseUsage() });
+		finish(0, reportPath);
+		break;
+	}
+	case "acceptance_pass":
+	case "acceptance_409": {
+		const reportPath = writeSession({ findings: [], usage: baseUsage(), acceptance: acceptance144(mode === "acceptance_409" ? 409 : 422) });
 		finish(0, reportPath);
 		break;
 	}

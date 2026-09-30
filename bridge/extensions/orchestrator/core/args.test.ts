@@ -169,3 +169,42 @@ test("--workflow parses a level and rejects others", () => {
 	expect(bad.workflowLevel).toBeUndefined();
 	expect(bad.unknownFlags).toContain("--workflow tiny");
 });
+
+describe("--live-qa-acceptance", () => {
+	test("a following dash-token (even -y) is not consumed as the value", () => {
+		const parsed = parseArgs("--live-qa-acceptance -y task");
+		expect(parsed.unknownFlags).toContain("--live-qa-acceptance (missing value)");
+		expect(parsed.liveQaAcceptance).toBeUndefined();
+	});
+	test("followed by another flag: missing value, the next flag is not consumed", () => {
+		const parsed = parseArgs("Fix it --live-qa-acceptance --live-qa-scope s");
+		expect(parsed.unknownFlags).toContain("--live-qa-acceptance (missing value)");
+		expect(parsed.liveQaAcceptance).toBeUndefined();
+		expect(parsed.liveQaScope).toBe("s");
+	});
+	test("usage text documents the flag", () => {
+		expect(usageText("/p")).toContain("--live-qa-acceptance");
+	});
+	test("takes an absolute path and implies nothing else", () => {
+		const parsed = parseArgs('Fix it --live-qa-acceptance /runs/r/context/144.acceptance.json --live-qa-scope "s"');
+		expect(parsed.liveQaAcceptance).toBe("/runs/r/context/144.acceptance.json");
+		expect(parsed.unknownFlags).toEqual([]);
+	});
+	test("rejects a relative path", () => {
+		expect(parseArgs("Fix it --live-qa-acceptance rel.json").unknownFlags).toContain("--live-qa-acceptance rel.json (expected an absolute path)");
+	});
+	test("reports a missing value", () => {
+		expect(parseArgs("Fix it --live-qa-acceptance").unknownFlags).toContain("--live-qa-acceptance (missing value)");
+	});
+	test("without --live-qa or --live-qa-scope: rejected", () => {
+		expect(parseArgs("Fix it --live-qa-acceptance /a.json").unknownFlags)
+			.toContain("--live-qa-acceptance requires --live-qa or --live-qa-scope");
+	});
+	test("with --live-qa: accepted", () => {
+		expect(parseArgs("Fix it --live-qa --live-qa-acceptance /a.json").unknownFlags).toEqual([]);
+	});
+	test("overridden by --no-live-qa: rejected", () => {
+		expect(parseArgs("Fix it --live-qa --no-live-qa --live-qa-acceptance /a.json").unknownFlags)
+			.toContain("--live-qa-acceptance requires --live-qa or --live-qa-scope");
+	});
+});

@@ -761,6 +761,180 @@ describe("live-qa session outcomes via the fake runner", () => {
 		expect(verdict.verdict).toBe("unavailable");
 	});
 
+	describe("acceptance.json", () => {
+		const manifest = { version: 1 as const, issue: 144, criteria: [
+			{ id: "AC-3", text: "422 invalid_state", expected: { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" } },
+			{ id: "AC-5", text: "no side effects", manual: true as const },
+		] };
+		const parse = (r: Awaited<ReturnType<typeof runFake>>, withManifest = true) =>
+			parseLiveQaSession({ runnerCwd: r.runnerCwd, reportPath: r.result.reportPath, runnerRunId: r.result.runnerRunId, exitCode: r.result.exitCode, startedAtMs: r.startedAtMs, ...(withManifest ? { manifest } : {}) });
+
+		test("acceptance_pass: acceptance passes", async () => {
+			const verdict = parse(await runFake("acceptance_pass"));
+			expect(verdict.verdict).toBe("pass");
+			expect(verdict.acceptance?.overall).toBe("pass");
+		});
+
+		test("acceptance_409: acceptance fails but the live-QA verdict is untouched", async () => {
+			const verdict = parse(await runFake("acceptance_409"));
+			expect(verdict.verdict).toBe("pass");
+			expect(verdict.acceptance?.overall).toBe("fail");
+			expect(verdict.acceptance?.criteria[0]?.note).toContain("http.status: expected 422, observed 409");
+		});
+
+		test("no manifest: acceptance.json is ignored", async () => {
+			const verdict = parse(await runFake("acceptance_pass"), false);
+			expect(verdict.verdict).toBe("pass");
+			expect(verdict.acceptance).toBeUndefined();
+		});
+
+		test("manifest but no acceptance.json: blocked", async () => {
+			const verdict = parse(await runFake("pass"));
+			expect(verdict.acceptance?.overall).toBe("blocked");
+			expect(verdict.acceptance?.criteria.every((c) => c.result === "blocked")).toBe(true);
+		});
+
+		test("symlinked acceptance.json: blocked with confinement reason, not thrown", async () => {
+			const r = await runFake("acceptance_pass");
+			const p = join(dirname(r.result.reportPath!), "acceptance.json");
+			const target = join(mkdir("orch-live-qa-outside-"), "acceptance.json");
+			writeFileSync(target, readFileSync(p));
+			rmSync(p);
+			symlinkSync(target, p);
+			const verdict = parse(r);
+			expect(verdict.acceptance?.overall).toBe("blocked");
+			expect(verdict.acceptance?.criteria[0]?.note).toContain("acceptance.json failed confinement");
+		});
+
+		test("manifest + missing findings.json: unavailable AND acceptance blocked with the reason", async () => {
+			const verdict = parse(await runFake("incomplete"));
+			expect(verdict.verdict).toBe("unavailable");
+			expect(verdict.acceptance?.overall).toBe("blocked");
+			expect(verdict.acceptance?.criteria.map((c) => c.id)).toEqual(["AC-3", "AC-5"]);
+			expect(verdict.acceptance?.criteria[0]?.note).toContain("findings.json");
+		});
+
+		test("manifest + no session at all (preflight failure): acceptance still blocked", async () => {
+			const verdict = parse(await runFake("preflight_fail"));
+			expect(verdict.verdict).toBe("unavailable");
+			expect(verdict.acceptance?.overall).toBe("blocked");
+		});
+
+		test("no manifest + unavailable: no acceptance key", async () => {
+			const verdict = parse(await runFake("incomplete"), false);
+			expect(verdict.acceptance).toBeUndefined();
+		});
+
+		test("env-style secret straddling the 2048 clip boundary leaves no prefix", async () => {
+			const secret = "s3cr3t-value-abcdefghijk";
+			process.env.LIVE_QA_TEST_API_TOKEN = secret;
+			try {
+				const r = await runFake("acceptance_pass");
+				const lead = "http.status: expected 422, observed 409 (agent note: ";
+				writeFileSync(join(dirname(r.result.reportPath!), "acceptance.json"), JSON.stringify({ criteria: [
+					{ id: "AC-3", result: "PASS", note: `${"x".repeat(2040 - lead.length)}${secret} tail`, observed: { "http.status": 409, "body.code": "invalid_state", "body.message": "invalid state" } },
+					{ id: "AC-5", result: "FAIL" },
+				] }));
+				const verdict = parse(r);
+				expect(JSON.stringify(verdict.acceptance)).not.toContain("s3cr");
+			} finally {
+				delete process.env.LIVE_QA_TEST_API_TOKEN;
+			}
+		});
+
+		test("manual PASS citing only acceptance.json (or findings.json) is blocked", async () => {
+			for (const cited of ["acceptance.json", "findings.json"]) {
+				const r = await runFake("acceptance_pass");
+				writeFileSync(join(dirname(r.result.reportPath!), "acceptance.json"), JSON.stringify({ criteria: [
+					{ id: "AC-3", result: "PASS", observed: { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" } },
+					{ id: "AC-5", result: "PASS", artifacts: [cited] },
+				] }));
+				const verdict = parse(r);
+				expect(verdict.acceptance?.criteria[1]?.result).toBe("blocked");
+				expect(verdict.acceptance?.overall).toBe("blocked");
+			}
+		});
+
+		test("manual PASS citing a directory stack.log is blocked", async () => {
+			const r = await runFake("acceptance_pass");
+			const dir = dirname(r.result.reportPath!);
+			rmSync(join(dir, "stack.log"), { force: true });
+			mkdirSync(join(dir, "stack.log"));
+			writeFileSync(join(dir, "acceptance.json"), JSON.stringify({ criteria: [
+				{ id: "AC-3", result: "PASS", observed: { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" } },
+				{ id: "AC-5", result: "PASS", artifacts: ["stack.log"] },
+			] }));
+			const verdict = parse(r);
+			expect(verdict.acceptance?.criteria[1]?.result).toBe("blocked");
+			expect(verdict.acceptance?.overall).toBe("blocked");
+		});
+
+		test("manual PASS citing a stale stack.log is blocked", async () => {
+			const r = await runFake("acceptance_pass");
+			const dir = dirname(r.result.reportPath!);
+			writeFileSync(join(dir, "stack.log"), "old");
+			utimesSync(join(dir, "stack.log"), new Date(946684800000), new Date(946684800000));
+			writeFileSync(join(dir, "acceptance.json"), JSON.stringify({ criteria: [
+				{ id: "AC-3", result: "PASS", observed: { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" } },
+				{ id: "AC-5", result: "PASS", artifacts: ["stack.log"] },
+			] }));
+			const verdict = parse(r);
+			expect(verdict.acceptance?.criteria[1]?.result).toBe("blocked");
+		});
+
+		test("acceptance never upgrades a failing verdict", async () => {
+			const r = await runFake("acceptance_pass");
+			writeFileSync(join(dirname(r.result.reportPath!), "results.md"), "| Step | Result |\n| --- | --- |\n| x | FAIL |\n");
+			const verdict = parse(r);
+			expect(verdict.verdict).toBe("fail");
+			// A passing acceptance.json is not trusted once the live-QA verdict itself is not pass.
+			expect(verdict.acceptance?.overall).toBe("blocked");
+			expect(verdict.acceptance?.criteria.every((c) => c.result === "blocked" && c.note === "live QA verdict fail; evidence not trusted")).toBe(true);
+		});
+
+		test("unavailable verdict (results.md BLOCKED) demotes a passing acceptance to blocked", async () => {
+			const r = await runFake("acceptance_pass");
+			writeFileSync(join(dirname(r.result.reportPath!), "results.md"), "| Step | Result |\n| --- | --- |\n| x | BLOCKED |\n");
+			const verdict = parse(r);
+			expect(verdict.verdict).toBe("unavailable");
+			expect(verdict.acceptance?.overall).toBe("blocked");
+			expect(verdict.acceptance?.criteria.map((c) => c.note)).toEqual([
+				"live QA verdict unavailable; evidence not trusted",
+				"live QA verdict unavailable; evidence not trusted",
+			]);
+		});
+
+		test("unavailable verdict (findings.json confinement failure) leaves acceptance blocked", async () => {
+			const r = await runFake("acceptance_pass");
+			const p = join(dirname(r.result.reportPath!), "findings.json");
+			const target = join(mkdir("orch-live-qa-outside-"), "findings.json");
+			writeFileSync(target, readFileSync(p));
+			rmSync(p);
+			symlinkSync(target, p);
+			const verdict = parse(r);
+			expect(verdict.verdict).toBe("unavailable");
+			expect(verdict.acceptance?.overall).toBe("blocked");
+			expect(verdict.acceptance?.criteria.every((c) => c.result === "blocked")).toBe(true);
+		});
+
+		test("non-zero exit (unavailable) demotes a passing acceptance to blocked", async () => {
+			const r = await runFake("acceptance_pass");
+			const verdict = parseLiveQaSession({ runnerCwd: r.runnerCwd, reportPath: r.result.reportPath, runnerRunId: r.result.runnerRunId, exitCode: 1, startedAtMs: r.startedAtMs, manifest });
+			expect(verdict.verdict).toBe("unavailable");
+			expect(verdict.acceptance?.overall).toBe("blocked");
+		});
+
+		test("genuine fail criterion stays fail under a non-pass verdict", async () => {
+			const r = await runFake("acceptance_409");
+			writeFileSync(join(dirname(r.result.reportPath!), "results.md"), "| Step | Result |\n| --- | --- |\n| x | FAIL |\n");
+			const verdict = parse(r);
+			expect(verdict.verdict).toBe("fail");
+			expect(verdict.acceptance?.overall).toBe("fail");
+			expect(verdict.acceptance?.criteria[0]?.result).toBe("fail");
+			expect(verdict.acceptance?.criteria[0]?.note).toContain("http.status: expected 422, observed 409");
+		});
+	});
+
 	test("spawn ENOENT is unavailable, never a pass, and reports spawnError", async () => {
 		const runnerCwd = mkdir("orch-live-qa-enoent-");
 		const adapter = fakeAdapter(runnerCwd, { argv_prefix: ["/nonexistent/definitely-not-a-binary"] });

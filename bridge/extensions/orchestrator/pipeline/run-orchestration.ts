@@ -15,9 +15,9 @@
  * `buildRunSummary`, so `commands/orchestrate.ts` keeps ownership of the
  * final `notify`/`postRunMessage` pair. A handful of *earlier* stops (the
  * user declining a confirmation, triage/plan failing outright) are not
- * "the run's summary" — they already fully log, `failRun`, and notify
- * themselves, exactly as they did inline, and are reported back as
- * `{ kind: "aborted" }` so the caller does nothing further for them.
+ * "the run's summary" — they still log and `failRun` themselves, but no longer
+ * notify: they return `{ kind: "aborted", cause, notifyText, notifyType }`,
+ * and the caller posts the RunResultV1 and then sends that notify.
  *
  * pipeline/* must not import index.ts; every seam is a required field on
  * `deps` instead, same as `pipeline/hierarchy.ts` and `pipeline/verify-loop.ts`.
@@ -65,6 +65,7 @@ import {
 	candidateOwnedFilesForLiveQa,
 	liveQaCostRowsHaveUnknownCost,
 	liveQaKnownCostUsd,
+	preflightLiveQaAcceptance,
 	recordLiveQaStageResult,
 	runLiveQaStage,
 	type RunLiveQaStageResult,
@@ -235,6 +236,10 @@ export interface RunCompleted {
  */
 export interface RunAborted {
 	kind: "aborted";
+	cause: "plan_failed" | "aborted";
+	/** Terminal text the caller notifies AFTER posting the run result message. */
+	notifyText: string;
+	notifyType: "info" | "error";
 }
 
 export type RunOrchestrationResult = RunCompleted | RunAborted;
@@ -409,6 +414,19 @@ export async function runOrchestration(
 	const efficiency = loadEfficiencyControls(deps.env);
 	for (const problem of efficiency.problems) ctx.ui.notify(problem, "warning");
 
+	// --live-qa-acceptance: validate the manifest and the selected adapter's criteria capability
+	// before anything is spent (triage included), the same up-front stance as --context files.
+	// A failure is a terminal `aborted` result; nothing is dispatched.
+	if (parsed.liveQa && parsed.liveQaAcceptance) {
+		const preflight = preflightLiveQaAcceptance({ env: deps.env, adapterId: parsed.liveQaAdapterId, acceptancePath: parsed.liveQaAcceptance });
+		if (!preflight.ok) {
+			const reason = redactSecrets(`live-QA acceptance check failed: ${preflight.reason}`, deps.env);
+			session.log(reason);
+			warnTelemetry(ctx, await deps.failRun(runId, reason, session.terminalTiming(), session.telemetryBaseline));
+			return { kind: "aborted", cause: "aborted", notifyText: `${reason}\nNothing was dispatched.`, notifyType: "error" };
+		}
+	}
+
 	// -----------------------------------------------------------------
 	// LLM triage: auto-fill missing task_class / complexity / risk via
 	// the cheapest available model. Skip when the user supplied all
@@ -446,8 +464,7 @@ export async function runOrchestration(
 					: "cancelled by user after triage";
 				session.log(reason);
 				warnTelemetry(ctx, await deps.failRun(runId, reason, session.terminalTiming(), session.telemetryBaseline));
-				ctx.ui.notify("Cancelled.", "info");
-				return { kind: "aborted" };
+				return { kind: "aborted", cause: "aborted", notifyText: "Cancelled.", notifyType: "info" };
 			}
 		} else {
 			ctx.ui.notify(
@@ -478,8 +495,7 @@ export async function runOrchestration(
 		if (session.cancellation.isCancelled) throw err;
 		session.log(`plan failed: ${(err as Error).message}`);
 		warnTelemetry(ctx, await deps.failRun(runId, `plan failed: ${(err as Error).message}`, session.terminalTiming(), session.telemetryBaseline));
-		ctx.ui.notify(`Plan failed: ${(err as Error).message}`, "error");
-		return { kind: "aborted" };
+		return { kind: "aborted", cause: "plan_failed", notifyText: `Plan failed: ${(err as Error).message}`, notifyType: "error" };
 	}
 
 	// Lead sizing (method.json rules.lead_sizing): triage's complexity and
@@ -581,8 +597,7 @@ export async function runOrchestration(
 			: "cancelled by user at plan confirmation";
 		session.log(reason);
 		warnTelemetry(ctx, await deps.failRun(runId, reason, session.terminalTiming(), session.telemetryBaseline));
-		ctx.ui.notify("Cancelled.", "info");
-		return { kind: "aborted" };
+		return { kind: "aborted", cause: "aborted", notifyText: "Cancelled.", notifyType: "info" };
 	}
 
 	// Step 2: Dispatch.
@@ -1083,7 +1098,8 @@ export async function runOrchestration(
 				`live QA: requesting Forge focused run${parsed.liveQaAdapterId ? ` (adapter ${parsed.liveQaAdapterId})` : ""}`,
 			);
 			liveQaStageResult = await runLiveQaStage({
-				request: { requested: true, adapterId: parsed.liveQaAdapterId, scope: parsed.liveQaScope },
+				request: { requested: true, adapterId: parsed.liveQaAdapterId, scope: parsed.liveQaScope, acceptancePath: parsed.liveQaAcceptance },
+				stagingPath: session.dir,
 				env: deps.env,
 				cwd,
 				runId,
@@ -1171,7 +1187,20 @@ export async function runOrchestration(
 	// Prefer the final successful attempt's stdout — a lead retried after a failed dispatch or a
 	// failed verification speaks through its LAST attempt, not a discarded failed one.
 	const firstReport = leadAttempts.find((l) => l.succeeded)?.final.stdout.trim() ?? "";
-	const openItems = /##\s*Open items\s*\n([\s\S]*?)(?=\n##\s|$)/i.exec(firstReport)?.[1]?.trim();
+	const OPEN_ITEMS_RE = /##\s*Open items\s*\n([\s\S]*?)(?=\n##\s|$)/i;
+	const openItems = OPEN_ITEMS_RE.exec(firstReport)?.[1]?.trim();
+	// Untruncated structured open items for RunResultV1 (bullets of every successful lead's final attempt).
+	const openItemList: string[] = [];
+	for (const lead of leadAttempts) {
+		if (!lead.succeeded) continue;
+		const section = OPEN_ITEMS_RE.exec(lead.final.stdout.trim())?.[1] ?? "";
+		for (const line of section.split("\n")) {
+			if (!/^\s*[-*]\s+/.test(line)) continue;
+			const item = line.replace(/^\s*[-*]\s+/, "").trim();
+			if (!item || /^(none|n\/a)\.?$/i.test(item) || openItemList.includes(item)) continue;
+			openItemList.push(item);
+		}
+	}
 	const showFullReport = allFiles.length === 0 && firstReport;
 	const reportLines = showFullReport
 		? firstReport.split("\n").slice(0, 40)
@@ -1215,12 +1244,13 @@ export async function runOrchestration(
 		verificationTimedOut,
 		verificationProviderStall,
 		failedChecks,
-		externalChecks: finalChecks.map(({ check, outcome }) => ({ provider: check.provider, id: check.id, outcome: outcome === "cancelled" ? "unverified" as const : outcome })),
+		externalChecks: finalChecks.map(({ check, outcome, reason }) => ({ provider: check.provider, id: check.id, outcome: outcome === "cancelled" ? "unverified" as const : outcome, ...(reason ? { reason } : {}) })),
 		totalCostUsd: totalCost,
 		dispatchCount: billedResults.length + (triageCost.usd > 0 ? 1 : 0) + (carry?.priorResults.length ?? 0),
 		nestedCostUsd: nestedCost,
 		firstFailureLine,
 		reportLines,
+		openItems: openItemList,
 		showFullReport: Boolean(showFullReport),
 		reportTruncated: Boolean(reportTruncated),
 		hasLeadReports: leadReportWritten,
@@ -1229,6 +1259,7 @@ export async function runOrchestration(
 		stateRoot: deps.stateRoot,
 		telemetryReport: telemetry,
 		outOfTreeChangesLine: outOfTreeChangesSummaryLine(outOfTreeChanges),
+		...(liveQaStageResult?.acceptance ? { acceptance: liveQaStageResult.acceptance } : {}),
 		...(parsed.liveQa ? { liveQa: { stage: liveQaStageResult, notRunReason: liveQaNotRunReason, hasUnknownCost: liveQaHasUnknownCost } } : {}),
 	};
 	return { kind: "completed", report };

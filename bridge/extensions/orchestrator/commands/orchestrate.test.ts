@@ -17,6 +17,7 @@ import {
 import { contextFileLabel, CONTEXT_SOURCE_MAX_CHARS, formatContextSource } from "../core/context.ts";
 import { RunRegistry, type RunSessionLike } from "../run/context.ts";
 import { RunCancellation } from "../cancellation.ts";
+import { minimalReport } from "../core/report-fixtures.ts";
 import type { RunSession } from "../run/session.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 
@@ -519,7 +520,7 @@ describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (
 		let release!: () => void;
 		const gate = new Promise<void>((r) => { release = r; });
 		let finished = false;
-		setRunOrchestrationForTest(async () => { await gate; finished = true; return { kind: "aborted" }; });
+		setRunOrchestrationForTest(async () => { await gate; finished = true; return { kind: "aborted", cause: "aborted", notifyText: "Cancelled.", notifyType: "info" }; });
 
 		let settled = false;
 		const handlerDone = getHandler()("fix the login race", ctx).then(() => { settled = true; });
@@ -541,7 +542,7 @@ describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (
 		const { ctx } = fakeCtx();
 		let release!: () => void;
 		const gate = new Promise<void>((r) => { release = r; });
-		setRunOrchestrationForTest(async () => { await gate; return { kind: "aborted" }; });
+		setRunOrchestrationForTest(async () => { await gate; return { kind: "aborted", cause: "aborted", notifyText: "Cancelled.", notifyType: "info" }; });
 		await getHandler()("fix the login race", ctx);
 		release();
 	});
@@ -563,7 +564,7 @@ describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (
 		let runOrchestrationCalls = 0;
 		setRunOrchestrationForTest(async () => {
 			runOrchestrationCalls++;
-			return { kind: "aborted" };
+			return { kind: "aborted", cause: "aborted", notifyText: "Cancelled.", notifyType: "info" };
 		});
 
 		await getHandler()("fix the login race condition in the auth module", ctx);
@@ -587,7 +588,7 @@ describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (
 		let captured: { goal: string; complexity: number; risk: string; leadSize?: string; models: { profile?: string } } | undefined;
 		setRunOrchestrationForTest(async (_id, _cwd, parsed) => {
 			captured = parsed;
-			return { kind: "aborted" };
+			return { kind: "aborted", cause: "aborted", notifyText: "Cancelled.", notifyType: "info" };
 		});
 
 		await getHandler()("/orchestrate /orchestrate --profile lean --complexity 8 --risk high --lead-size large repair confidential auth flow", ctx);
@@ -612,7 +613,7 @@ describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (
 		let captured: { goal: string; risk: string; force: boolean; models: { profile?: string } } | undefined;
 		setRunOrchestrationForTest(async (_id, _cwd, parsed) => {
 			captured = parsed;
-			return { kind: "aborted" };
+			return { kind: "aborted", cause: "aborted", notifyText: "Cancelled.", notifyType: "info" };
 		});
 
 		await getHandler()("repair --risk high the --profile secret flow --force", ctx);
@@ -637,7 +638,7 @@ describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (
 		let capturedParsed: { goal: string; taskClass: string; complexity: number; risk: string } | undefined;
 		setRunOrchestrationForTest(async (_runId, _cwd, parsed) => {
 			capturedParsed = parsed;
-			return { kind: "aborted" };
+			return { kind: "aborted", cause: "aborted", notifyText: "Cancelled.", notifyType: "info" };
 		});
 
 		await getHandler()("fix the login race condition in the auth module --task-class bugfix --complexity 7 --risk high", ctx);
@@ -647,5 +648,137 @@ describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (
 		expect(capturedParsed?.taskClass).toBe("bugfix");
 		expect(capturedParsed?.complexity).toBe(7);
 		expect(capturedParsed?.risk).toBe("high");
+	});
+});
+
+describe("commands/orchestrate.ts: RunResultV1 is posted before the terminal notify", () => {
+	afterEach(() => {
+		setRunOrchestrationForTest(null);
+	});
+
+	type Ev = { kind: "send" | "notify"; customType?: string; details?: any; text?: string };
+
+	function harness(session: RunSessionLike = fakeRunSessionLike("placeholder"), overrides: Partial<OrchestrateDeps> = {}) {
+		const events: Ev[] = [];
+		let handler: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+		const pi = {
+			registerCommand: (_n: string, def: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) => { handler = def.handler; },
+			sendMessage: (m: { customType: string; details: unknown }) => { events.push({ kind: "send", customType: m.customType, details: m.details }); },
+		} as unknown as ExtensionAPI;
+		const { deps } = baseDeps({
+			resolveAdapter: async () => healthyResolution(fakeAdapter()),
+			createSession: () => session,
+			env: { HUMAIN_ORCHESTRATOR_FOREGROUND: "1" },
+			...overrides,
+		});
+		registerOrchestrateCommand(pi, deps);
+		const ctx = {
+			hasUI: true,
+			ui: { notify: (text: string) => { events.push({ kind: "notify", text }); }, confirm: () => Promise.resolve(true) },
+			sessionManager: { getEntries: () => [] },
+		} as unknown as ExtensionContext;
+		return { events, run: (args = "fix the login race") => handler!(args, ctx), session };
+	}
+
+	function expectSendBeforeNotify(events: Ev[]): Ev {
+		const sends = events.filter((e) => e.kind === "send" && e.customType === "orchestrator-run");
+		expect(sends).toHaveLength(1);
+		expect(events.filter((e) => e.kind === "send")).toHaveLength(1);
+		const send = events.findIndex((e) => e.kind === "send");
+		const notify = events.findIndex((e) => e.kind === "notify");
+		expect(send).toBeGreaterThanOrEqual(0);
+		expect(notify).toBeGreaterThan(send);
+		expect(events[send].customType).toBe("orchestrator-run");
+		expect(events[send].details.result.version).toBe(1);
+		return events[send];
+	}
+
+	test("completed run", async () => {
+		const { events, run } = harness();
+		setRunOrchestrationForTest(async () => ({ kind: "completed", report: minimalReport() }));
+		await run();
+		const send = expectSendBeforeNotify(events);
+		expect(send.details.result.outcome).toBe("complete");
+		expect(send.details.outcome).toBe("completed");
+	});
+
+	test("invalid --live-qa-acceptance manifest (real pipeline): terminal aborted RunResultV1, triage never called", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "orch-cmd-acceptance-"));
+		const manifestPath = join(dir, "bad.acceptance.json");
+		writeFileSync(manifestPath, JSON.stringify({ version: 2 }));
+		let triageCalls = 0;
+		const { events, run } = harness(fakeRunSessionLike("placeholder"), {
+			env: { HUMAIN_ORCHESTRATOR_FOREGROUND: "1", HUMAIN_ORCHESTRATOR_LIVE_QA_CONFIG: join(dir, "missing-config.json") },
+			triageTask: async () => { triageCalls++; return null; },
+		});
+		try {
+			await run(`fix the login race --live-qa-scope verify --live-qa-acceptance ${manifestPath}`);
+			// Earlier run-start warnings may notify first; the terminal error notify follows the send.
+			const sends = events.filter((e) => e.kind === "send" && e.customType === "orchestrator-run");
+			expect(sends).toHaveLength(1);
+			const sendIdx = events.indexOf(sends[0]!);
+			const terminalIdx = events.findIndex((e) => e.kind === "notify" && (e.text ?? "").includes("acceptance manifest invalid"));
+			expect(terminalIdx).toBeGreaterThan(sendIdx);
+			const result = sends[0]!.details.result;
+			expect(result.version).toBe(1);
+			expect(result.causes).toEqual(["aborted"]);
+			expect(result.outcome).toBe("failed");
+			expect(result.diagnostics[0]).toContain("acceptance manifest invalid");
+			expect(triageCalls).toBe(0);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("--live-qa-acceptance without live QA is rejected as a flag error", async () => {
+		const { events, run } = harness();
+		let reached = false;
+		setRunOrchestrationForTest(async () => { reached = true; return { kind: "aborted", cause: "aborted", notifyText: "x", notifyType: "info" }; });
+		await run("fix the login race --live-qa-acceptance /a.json");
+		expect(reached).toBe(false);
+		expect(events.find((e) => e.kind === "notify")?.text).toContain("--live-qa-acceptance requires --live-qa or --live-qa-scope");
+	});
+
+	test("Plan failed abort", async () => {
+		const { events, run } = harness();
+		setRunOrchestrationForTest(async () => ({ kind: "aborted", cause: "plan_failed", notifyText: "Plan failed: boom", notifyType: "error" }));
+		await run();
+		const send = expectSendBeforeNotify(events);
+		expect(send.details.result.causes).toEqual(["plan_failed"]);
+		expect(events.find((e) => e.kind === "notify")?.text).toBe("Plan failed: boom");
+	});
+
+	test("user cancel", async () => {
+		const session: RunSessionLike = { ...fakeRunSessionLike("placeholder"), cancelReason: "user" };
+		const { events, run } = harness(session);
+		setRunOrchestrationForTest(async () => { session.cancellation.cancel(); throw new Error("cancelled"); });
+		await run();
+		const send = expectSendBeforeNotify(events);
+		expect(send.details.result.causes).toEqual(["cancelled_user"]);
+	});
+
+	test("crash", async () => {
+		const { events, run } = harness();
+		setRunOrchestrationForTest(async () => { throw new Error("kaboom"); });
+		await run();
+		const send = expectSendBeforeNotify(events);
+		expect(send.details.result.causes).toEqual(["crashed"]);
+	});
+
+	test("user cancel still posts once before notify when deps.cancelRun rejects", async () => {
+		const session: RunSessionLike = { ...fakeRunSessionLike("placeholder"), cancelReason: "user" };
+		const { events, run } = harness(session, { cancelRun: async () => { throw new Error("telemetry down"); } });
+		setRunOrchestrationForTest(async () => { session.cancellation.cancel(); throw new Error("cancelled"); });
+		await run();
+		const send = expectSendBeforeNotify(events);
+		expect(send.details.result.causes).toEqual(["cancelled_user"]);
+	});
+
+	test("crash still posts once before notify when deps.failRun rejects", async () => {
+		const { events, run } = harness(undefined, { failRun: async () => { throw new Error("telemetry down"); } });
+		setRunOrchestrationForTest(async () => { throw new Error("kaboom"); });
+		await run();
+		const send = expectSendBeforeNotify(events);
+		expect(send.details.result.causes).toEqual(["crashed"]);
 	});
 });

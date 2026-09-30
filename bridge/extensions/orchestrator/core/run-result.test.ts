@@ -1,0 +1,365 @@
+import { describe, expect, test } from "bun:test";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { buildCompletedRunResult, buildTerminalRunResult, enforceRunResultBounds, outcomeFromCauses, RUN_RESULT_LIMITS, type RunResultV1 } from "./run-result.ts";
+import { minimalReport } from "./report-fixtures.ts";
+
+const base: RunResultV1 = {
+	schema: "orchestration-result", version: 1, runId: "ht-orch-1",
+	outcome: "complete", causes: [], codeVerification: "pass",
+	liveQa: { verdict: "pass", sessionId: "run-20260930-095418-ba63", reasons: [] },
+	externalChecks: [], openItems: [], diagnostics: [],
+	cost: { usd: 0.5, complete: true }, runLog: "/state/runs/ht-orch-1/run.log",
+};
+
+const VALID_FIXTURES = ["complete", "partial-external", "blocked-external", "cancelled", "crashed", "plan-failed"];
+const NEGATIVE_FIXTURES = ["oversized", "unknown-version"];
+
+describe("outcomeFromCauses", () => {
+	test("precedence cancelled > failed > blocked > partial > complete", () => {
+		expect(outcomeFromCauses([])).toBe("complete");
+		expect(outcomeFromCauses(["lead_partial"])).toBe("partial");
+		expect(outcomeFromCauses(["lead_partial", "external_check"])).toBe("blocked");
+		expect(outcomeFromCauses(["external_check", "dispatch_failed"])).toBe("failed");
+		expect(outcomeFromCauses(["crashed"])).toBe("failed");
+		expect(outcomeFromCauses(["plan_failed"])).toBe("failed");
+		expect(outcomeFromCauses(["aborted"])).toBe("failed");
+		expect(outcomeFromCauses(["dispatch_failed", "cancelled_user"])).toBe("cancelled");
+	});
+});
+
+describe("enforceRunResultBounds", () => {
+	test("in-bounds result is returned unchanged", () => {
+		expect(enforceRunResultBounds(base)).toEqual(base);
+	});
+	test("over-limit result is replaced by a minimal result that names the violation", () => {
+		const big = { ...base, openItems: Array.from({ length: RUN_RESULT_LIMITS.openItems + 1 }, (_, i) => `item ${i}`) };
+		const bounded = enforceRunResultBounds(big);
+		expect(bounded.openItems).toEqual([]);
+		expect(bounded.diagnostics).toEqual(["result exceeded bounds: openItems 51 > 50"]);
+		expect(bounded.codeVerification).toBe("pass");
+		expect(bounded.liveQa.verdict).toBe("unavailable");
+		expect(bounded.acceptance).toEqual({ overall: "blocked", criteria: [] });
+	});
+	test("string over 2048 chars is a violation", () => {
+		const bounded = enforceRunResultBounds({ ...base, diagnostics: ["x".repeat(2049)] });
+		expect(bounded.diagnostics[0]).toContain("string longer than 2048");
+	});
+});
+
+describe("enforceRunResultBounds object keys", () => {
+	test("an over-long key in an acceptance expected/observed map is a violation", () => {
+		const longKey = "k".repeat(2049);
+		for (const field of ["expected", "observed"] as const) {
+			const bounded = enforceRunResultBounds({
+				...base,
+				acceptance: { overall: "pass", criteria: [{ id: "c1", result: "pass", artifacts: [], [field]: { [longKey]: 1 } }] },
+			});
+			expect(bounded.diagnostics[0]).toContain("string longer than 2048");
+			expect(bounded.acceptance).toEqual({ overall: "blocked", criteria: [] });
+		}
+	});
+	test("a key of exactly 2048 chars is in bounds", () => {
+		const ok = { ...base, acceptance: { overall: "pass" as const, criteria: [{ id: "c1", result: "pass" as const, artifacts: [], expected: { ["k".repeat(2048)]: 1 } }] } };
+		expect(enforceRunResultBounds(ok)).toEqual(ok);
+	});
+});
+
+describe("enforceRunResultBounds causes", () => {
+	test("oversized duplicate causes yield a replacement that is itself in bounds", () => {
+		const bad = { ...base, outcome: "failed" as const, causes: Array.from({ length: 8000 }, () => "crashed" as const) };
+		expect(Buffer.byteLength(JSON.stringify(bad))).toBeGreaterThan(RUN_RESULT_LIMITS.payloadBytes);
+		const bounded = enforceRunResultBounds(bad);
+		expect(bounded.causes).toEqual(["crashed"]);
+		expect(bounded.outcome).toBe("failed");
+		expect(enforceRunResultBounds(bounded)).toEqual(bounded);
+	});
+	test("unknown causes are dropped from the replacement", () => {
+		const bounded = enforceRunResultBounds({ ...base, causes: ["bogus" as never, "lead_partial"] });
+		expect(bounded.causes).toEqual(["lead_partial"]);
+		expect(bounded.outcome).toBe("partial");
+		expect(enforceRunResultBounds(bounded)).toEqual(bounded);
+	});
+});
+
+// Minimal structural validator: only the keywords the schema uses.
+type Schema = Record<string, any>;
+function validate(schema: Schema, value: unknown, root: Schema, path = "$"): string[] {
+	if (schema.$ref) {
+		const target = (schema.$ref as string).replace("#/", "").split("/").reduce((n: any, k) => n[k], root);
+		return validate(target, value, root, path);
+	}
+	const errs: string[] = [];
+	if ("const" in schema && value !== schema.const) errs.push(`${path}: const`);
+	if (schema.enum && !schema.enum.includes(value)) errs.push(`${path}: enum`);
+	if (schema.oneOf) {
+		const n = schema.oneOf.filter((s: Schema) => validate(s, value, root, path).length === 0).length;
+		if (n !== 1) errs.push(`${path}: oneOf matched ${n}`);
+	}
+	if (schema.type) {
+		const actual = Array.isArray(value) ? "array" : value === null ? "null" : typeof value;
+		if (actual !== schema.type) return [...errs, `${path}: type ${actual} != ${schema.type}`];
+	}
+	if (typeof value === "string" && schema.maxLength !== undefined && value.length > schema.maxLength) errs.push(`${path}: maxLength`);
+	if (typeof value === "number" && schema.minimum !== undefined && value < schema.minimum) errs.push(`${path}: minimum`);
+	if (Array.isArray(value)) {
+		if (schema.maxItems !== undefined && value.length > schema.maxItems) errs.push(`${path}: maxItems`);
+		if (schema.uniqueItems && new Set(value.map((v) => JSON.stringify(v))).size !== value.length) errs.push(`${path}: uniqueItems`);
+		if (schema.items) value.forEach((v, i) => errs.push(...validate(schema.items, v, root, `${path}[${i}]`)));
+	}
+	if (value && typeof value === "object" && !Array.isArray(value)) {
+		const obj = value as Record<string, unknown>;
+		for (const r of schema.required ?? []) if (!(r in obj)) errs.push(`${path}: missing ${r}`);
+		for (const [k, v] of Object.entries(obj)) {
+			if (schema.propertyNames?.maxLength !== undefined && k.length > schema.propertyNames.maxLength) errs.push(`${path}: propertyNames maxLength ${k.slice(0, 10)}`);
+			if (schema.properties?.[k]) errs.push(...validate(schema.properties[k], v, root, `${path}.${k}`));
+			else if (schema.additionalProperties === false) errs.push(`${path}: extra property ${k}`);
+			else if (typeof schema.additionalProperties === "object") errs.push(...validate(schema.additionalProperties, v, root, `${path}.${k}`));
+		}
+	}
+	return errs;
+}
+
+describe("schema validation of fixtures", () => {
+	const dir = join(import.meta.dir, "..", "contracts");
+	const schema = JSON.parse(readFileSync(join(dir, "orchestration-result.v1.schema.json"), "utf8")) as Schema;
+	for (const name of VALID_FIXTURES) {
+		test(`${name}.json validates against the schema`, () => {
+			const fixture = JSON.parse(readFileSync(join(dir, "fixtures", `${name}.json`), "utf8"));
+			expect(validate(schema, fixture, schema)).toEqual([]);
+		});
+	}
+	test("oversized.json and unknown-version.json fail the schema", () => {
+		const load = (n: string) => JSON.parse(readFileSync(join(dir, "fixtures", `${n}.json`), "utf8"));
+		expect(validate(schema, load("oversized"), schema)).toContain("$.openItems: maxItems");
+		expect(validate(schema, load("unknown-version"), schema)).toContain("$.version: const");
+	});
+	test("a fixture with an extra property fails", () => {
+		const fixture = JSON.parse(readFileSync(join(dir, "fixtures", "complete.json"), "utf8"));
+		expect(validate(schema, { ...fixture, extra: 1 }, schema)).toContain("$: extra property extra");
+	});
+});
+
+describe("schema propertyNames", () => {
+	const schema = JSON.parse(readFileSync(join(import.meta.dir, "..", "contracts", "orchestration-result.v1.schema.json"), "utf8")) as Schema;
+	test("scalarMap rejects a key longer than 2048 and accepts 2048", () => {
+		const map = { $ref: "#/$defs/scalarMap" };
+		expect(validate(map, { ["k".repeat(2049)]: 1 }, schema).length).toBe(1);
+		expect(validate(map, { ["k".repeat(2048)]: 1 }, schema)).toEqual([]);
+	});
+});
+
+describe("fixtures", () => {
+	const dir = join(import.meta.dir, "..", "contracts", "fixtures");
+	const load = (name: string) => JSON.parse(readFileSync(join(dir, `${name}.json`), "utf8")) as RunResultV1;
+	test("every fixture on disk is covered: valid ones plus the two negative fixtures", () => {
+		const onDisk = readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5)).sort();
+		expect(onDisk).toEqual([...VALID_FIXTURES, ...NEGATIVE_FIXTURES].sort());
+	});
+	for (const name of VALID_FIXTURES) {
+		test(`${name}.json is in bounds and self-consistent`, () => {
+			const fixture = load(name);
+			expect(enforceRunResultBounds(fixture)).toEqual(fixture);
+			expect(fixture.outcome).toBe(outcomeFromCauses(fixture.causes));
+		});
+	}
+	test("oversized.json is replaced by enforceRunResultBounds", () => {
+		const fixture = load("oversized");
+		const bounded = enforceRunResultBounds(fixture);
+		expect(bounded).not.toEqual(fixture);
+		expect(bounded.openItems).toEqual([]);
+		expect(bounded.diagnostics).toEqual([`result exceeded bounds: openItems ${fixture.openItems.length} > ${RUN_RESULT_LIMITS.openItems}`]);
+		expect(bounded.acceptance).toEqual({ overall: "blocked", criteria: [] });
+		expect(bounded.liveQa.verdict).toBe("unavailable");
+	});
+	test("unknown-version.json is not a v1 result", () => {
+		const fixture = load("unknown-version") as unknown as { version: number };
+		expect(fixture.version).not.toBe(1);
+	});
+});
+
+describe("list limits (reasons / diagnostics / externalChecks)", () => {
+	test("RUN_RESULT_LIMITS declares 20 for each", () => {
+		expect(RUN_RESULT_LIMITS.reasons).toBe(20);
+		expect(RUN_RESULT_LIMITS.diagnostics).toBe(20);
+		expect(RUN_RESULT_LIMITS.externalChecks).toBe(20);
+	});
+	test("21 liveQa.reasons is a violation", () => {
+		const bounded = enforceRunResultBounds({ ...base, liveQa: { ...base.liveQa, reasons: Array.from({ length: 21 }, (_, i) => `r${i}`) } });
+		expect(bounded.diagnostics).toEqual(["result exceeded bounds: liveQa.reasons 21 > 20"]);
+	});
+	test("21 diagnostics is a violation", () => {
+		const bounded = enforceRunResultBounds({ ...base, diagnostics: Array.from({ length: 21 }, (_, i) => `d${i}`) });
+		expect(bounded.diagnostics).toEqual(["result exceeded bounds: diagnostics 21 > 20"]);
+	});
+	test("21 externalChecks is a violation", () => {
+		const bounded = enforceRunResultBounds({ ...base, externalChecks: Array.from({ length: 21 }, (_, i) => ({ provider: "github", id: `${i}`, outcome: "success" })) });
+		expect(bounded.diagnostics).toEqual(["result exceeded bounds: externalChecks 21 > 20"]);
+	});
+	test("20 of each is in bounds", () => {
+		const r = { ...base, liveQa: { ...base.liveQa, reasons: Array.from({ length: 20 }, () => "r") }, diagnostics: Array.from({ length: 20 }, () => "d"),
+			externalChecks: Array.from({ length: 20 }, (_, i) => ({ provider: "github", id: `${i}`, outcome: "success" })) };
+		expect(enforceRunResultBounds(r)).toEqual(r);
+	});
+	test("builder caps 25 reasons/diagnostics to 20 with a marker instead of replacing", () => {
+		const result = buildCompletedRunResult(minimalReport({
+			liveQa: { stage: { verdict: "fail", required: true, reasons: Array.from({ length: 25 }, (_, i) => `r${i}`), costRows: [], outcomeRow: null, stage: null, cancelled: false }, notRunReason: null, hasUnknownCost: false },
+		}));
+		expect(result.liveQa.reasons).toHaveLength(20);
+		expect(result.liveQa.reasons[19]).toBe("…[6 more reasons]");
+		expect(result.liveQa.verdict).toBe("fail");
+	});
+	test("schema declares maxItems 20 for the three lists and documents UTF-16 string length", () => {
+		const schema = JSON.parse(readFileSync(join(import.meta.dir, "..", "contracts", "orchestration-result.v1.schema.json"), "utf8"));
+		expect(schema.properties.liveQa.properties.reasons.maxItems).toBe(20);
+		expect(schema.properties.diagnostics.maxItems).toBe(20);
+		expect(schema.properties.externalChecks.maxItems).toBe(20);
+		expect(JSON.stringify(schema.$defs.str)).toContain("UTF-16");
+	});
+});
+
+describe("buildTerminalRunResult diagnostic truncation", () => {
+	const input = { runId: "r", causes: ["crashed" as const], costUsd: 0, costComplete: true, runLog: "/l" };
+	test("a 5000-char diagnostic is explicitly marked and within 2048 chars, unchanged by bounds", () => {
+		const result = buildTerminalRunResult({ ...input, diagnostic: "d".repeat(5000) });
+		const d = result.diagnostics[0]!;
+		const marker = `…[truncated ${5000 - (2048 - `…[truncated ${5000} chars]`.length)} chars]`;
+		expect(d.length).toBeLessThanOrEqual(2048);
+		expect(d.endsWith(marker)).toBe(true);
+		expect(d.startsWith("d".repeat(100))).toBe(true);
+		expect(result.diagnostics[0]).not.toContain("result exceeded bounds");
+		expect(enforceRunResultBounds(result)).toEqual(result);
+	});
+	test("a diagnostic of exactly 2048 chars is untouched", () => {
+		expect(buildTerminalRunResult({ ...input, diagnostic: "d".repeat(2048) }).diagnostics[0]).toBe("d".repeat(2048));
+	});
+});
+
+describe("run result builders", () => {
+	test("#144 shape: partial lead + unparsed external check => blocked with both causes", () => {
+		const result = buildCompletedRunResult(minimalReport({
+			leadStatuses: ["partial"],
+			externalChecks: [{ provider: "github", id: "unknown", outcome: "unverified", reason: "unparsed_checks" }],
+		}));
+		expect(result.causes).toEqual(["lead_partial", "external_check"]);
+		expect(result.outcome).toBe("blocked");
+		expect(result.externalChecks[0]?.reason).toBe("unparsed_checks");
+	});
+
+	test("openItems come from report.openItems when defined, not from reportLines", () => {
+		const result = buildCompletedRunResult(minimalReport({ reportLines: ["- Files Changed bullet"], showFullReport: true, openItems: ["real item"] }));
+		expect(result.openItems).toEqual(["real item"]);
+	});
+	test("openItems fall back to reportLines bullets when report.openItems is undefined", () => {
+		const result = buildCompletedRunResult(minimalReport({ reportLines: ["- a", "prose", "* b"] }));
+		expect(result.openItems).toEqual(["a", "b"]);
+	});
+	test("51 report.openItems are capped at 50 with an explicit marker, not replaced", () => {
+		const result = buildCompletedRunResult(minimalReport({ openItems: Array.from({ length: 51 }, (_, i) => `i${i}`) }));
+		expect(result.diagnostics).toEqual([]);
+		expect(result.openItems).toHaveLength(50);
+		expect(result.openItems.slice(0, 49)).toEqual(Array.from({ length: 49 }, (_, i) => `i${i}`));
+		expect(result.openItems[49]).toBe("…[2 more open items]");
+	});
+	test("50 report.openItems are kept as-is", () => {
+		const items = Array.from({ length: 50 }, (_, i) => `i${i}`);
+		expect(buildCompletedRunResult(minimalReport({ openItems: items })).openItems).toEqual(items);
+	});
+	test("60 open items of 3000 chars: acceptance intact, result under bounds, items explicitly clipped", () => {
+		const acceptance = { overall: "fail" as const, criteria: [
+			{ id: "AC-1", result: "fail" as const, expected: { status: 422 }, observed: { status: 409 }, artifacts: [], note: "status: expected 422, observed 409" },
+			{ id: "AC-2", result: "pass" as const, artifacts: ["report.md"] },
+		] };
+		const result = buildCompletedRunResult(minimalReport({
+			acceptance,
+			openItems: Array.from({ length: 60 }, (_, i) => `${i}:`.padEnd(3000, "x")),
+		}));
+		expect(result.acceptance).toEqual(acceptance);
+		expect(result.diagnostics).toEqual([]);
+		expect(result.openItems).toHaveLength(50);
+		expect(result.openItems[0]!.length).toBeLessThanOrEqual(500);
+		expect(result.openItems[0]!.startsWith("0:xxx")).toBe(true);
+		expect(result.openItems[0]).toContain("…[truncated");
+		expect(result.openItems[49]).toBe("…[11 more open items]");
+		expect(enforceRunResultBounds(result)).toEqual(result);
+		expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(RUN_RESULT_LIMITS.payloadBytes);
+	});
+	test("20 criteria x 10 long observed strings: overall/fail intact, ids/results/expected unclipped", () => {
+		const expected = Object.fromEntries(Array.from({ length: 10 }, (_, k) => [`k${k}`, "want"]));
+		const criteria = Array.from({ length: 20 }, (_, i) => ({
+			id: `AC-${i + 1}`,
+			result: (i === 0 ? "fail" : "blocked") as "fail" | "blocked",
+			expected,
+			observed: Object.fromEntries(Array.from({ length: 10 }, (_, k) => [`k${k}`, "o".repeat(2000)])),
+			artifacts: [],
+			note: "n".repeat(2000),
+		}));
+		const result = buildCompletedRunResult(minimalReport({ acceptance: { overall: "fail", criteria } }));
+		expect(result.diagnostics).toEqual([]);
+		expect(result.acceptance?.overall).toBe("fail");
+		expect(result.acceptance?.criteria.map((c) => c.id)).toEqual(criteria.map((c) => c.id));
+		expect(result.acceptance?.criteria.map((c) => c.result)).toEqual(criteria.map((c) => c.result));
+		expect(result.acceptance?.criteria.every((c) => JSON.stringify(c.expected) === JSON.stringify(expected))).toBe(true);
+		const observed = result.acceptance!.criteria[0]!.observed!.k0 as string;
+		expect(observed.length).toBeLessThanOrEqual(200);
+		expect(observed).toContain("…[truncated");
+		expect(result.acceptance!.criteria[0]!.note!.length).toBeLessThanOrEqual(500);
+		expect(enforceRunResultBounds(result)).toEqual(result);
+	});
+	test("long liveQa reasons, externalChecks strings and diagnostics are clipped to 500 with a marker", () => {
+		const long = "r".repeat(3000);
+		const result = buildCompletedRunResult(minimalReport({
+			dispatchOk: false,
+			firstFailureLine: long,
+			externalChecks: [{ provider: "github", id: "1", outcome: "failure", reason: long }],
+			liveQa: { stage: { verdict: "fail", required: true, reasons: [long], costRows: [], outcomeRow: null, stage: null, cancelled: false }, notRunReason: null, hasUnknownCost: false },
+		}));
+		for (const s of [result.liveQa.reasons[0]!, result.externalChecks[0]!.reason!, result.diagnostics[0]!]) {
+			expect(s.length).toBeLessThanOrEqual(500);
+			expect(s).toContain("…[truncated");
+		}
+	});
+
+	test("code verification is the pre-live-QA verdict; live Qa reported separately", () => {
+		const result = buildCompletedRunResult(minimalReport({
+			passedVerification: true,
+			liveQa: {
+				stage: { verdict: "fail", required: true, reasons: ["confirmed finding"], costRows: [],
+					outcomeRow: { session_id: "run-x", tested_revision: "8a3817feef" }, stage: null, cancelled: false },
+				notRunReason: null,
+				hasUnknownCost: true,
+			},
+		}));
+		expect(result.codeVerification).toBe("pass");
+		expect(result.liveQa).toEqual({ verdict: "fail", sessionId: "run-x", testedCommit: "8a3817feef", reasons: ["confirmed finding"] });
+		expect(result.cost.complete).toBe(false);
+	});
+
+	test("codeVerification: all leads blocked (QA skipped) is not_run, never fail", () => {
+		const result = buildCompletedRunResult(minimalReport({ blocked: true, passedVerification: false, leadStatuses: ["blocked"] }));
+		expect(result.codeVerification).toBe("not_run");
+	});
+	test("codeVerification: QA dispatch timeout is not_run", () => {
+		const result = buildCompletedRunResult(minimalReport({ verificationTimedOut: true, passedVerification: false }));
+		expect(result.codeVerification).toBe("not_run");
+	});
+	test("codeVerification: QA provider stall is not_run", () => {
+		const result = buildCompletedRunResult(minimalReport({ verificationProviderStall: true, passedVerification: false }));
+		expect(result.codeVerification).toBe("not_run");
+	});
+	test("codeVerification: verificationSkipped stays skipped", () => {
+		const result = buildCompletedRunResult(minimalReport({ verificationSkipped: true, passedVerification: false }));
+		expect(result.codeVerification).toBe("skipped");
+	});
+	test("codeVerification: a real QA failure is fail", () => {
+		const result = buildCompletedRunResult(minimalReport({ passedVerification: false, failedChecks: ["tests"] }));
+		expect(result.codeVerification).toBe("fail");
+	});
+
+	test("terminal result for plan failure", () => {
+		const result = buildTerminalRunResult({ runId: "r", causes: ["plan_failed"], diagnostic: "TypeError",
+			costUsd: 0.0005, costComplete: true, runLog: "/l/run.log" });
+		expect(result).toMatchObject({ outcome: "failed", codeVerification: "not_run", liveQa: { verdict: "not_requested" },
+			diagnostics: ["TypeError"] });
+	});
+});

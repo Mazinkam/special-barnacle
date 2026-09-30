@@ -17,6 +17,7 @@
  */
 import { telemetryHealthy, telemetryWarning, type FlushReport } from "../record-queue.ts";
 import { composeVerificationVerdict, liveQaSummaryLines, type RunLiveQaStageResult } from "../live-qa-stage.ts";
+import { deriveCauses, outcomeFromCauses, type AcceptanceResult, type RunOutcome } from "./run-result.ts";
 import { fmtElapsed } from "../run-ui.ts";
 
 export interface VerificationVerdictInput {
@@ -113,7 +114,9 @@ export interface RunReport {
 	 *  recognizing any specific check (`FAIL (unparsed)`). */
 	failedChecks: string[];
 	/** Parent-owned external CI results; unverified/failure never implies PASS. */
-	externalChecks?: Array<{ provider: "gitlab" | "github"; id: string; outcome: "pending" | "success" | "failure" | "unverified" }>;
+	externalChecks?: Array<{ provider: "gitlab" | "github"; id: string; outcome: "pending" | "success" | "failure" | "unverified"; reason?: string }>;
+	/** Acceptance verdict (populated by a later task); absent unless requested. */
+	acceptance?: AcceptanceResult;
 	totalCostUsd: number;
 	/** Number of billed dispatches (architect/workers/leads/verification/escalation + triage, when triage spent anything). */
 	dispatchCount: number;
@@ -122,6 +125,8 @@ export interface RunReport {
 	firstFailureLine: string;
 	/** Excerpt lines from the first successful lead's report (full report, or just its Open items). */
 	reportLines: string[];
+	/** Untruncated bullet items from the `## Open items` section of each lead's final successful attempt (deduped, "None"/"N/A" excluded). Feeds RunResultV1; `reportLines` is display-capped. */
+	openItems?: string[];
 	/** True when `reportLines` is the full report (no files changed) rather than just Open items. */
 	showFullReport: boolean;
 	/** True when the full report shown was truncated to 40 lines. */
@@ -153,6 +158,14 @@ export interface RunReport {
 	 */
 	outOfTreeChangesLine: string | null;
 }
+
+const BANNER_WORD: Record<RunOutcome, string> = {
+	complete: "complete",
+	partial: "partial",
+	blocked: "BLOCKED",
+	failed: "FAILED",
+	cancelled: "cancelled",
+};
 
 /**
  * Build the run summary text and its success/failure verdict from a
@@ -189,20 +202,17 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 	}
 	// External CI is an independent gate, never a rewrite of QA's own verdict.
 	const externalChecks = report.externalChecks ?? [];
-	const leadStatuses = report.leadStatuses ?? [];
-	const hasBlockedLead = leadStatuses.includes("blocked");
-	const hasFailedLead = leadStatuses.includes("failed");
-	const partial = !report.blocked && !hasBlockedLead && !hasFailedLead && report.dispatchOk && leadStatuses.includes("partial");
+	// The banner is RunResultV1's outcome (same cause derivation), never a separate computation.
+	const outcome = outcomeFromCauses(deriveCauses(report));
+	const partial = outcome === "partial";
 	const verificationPassed = verdict.startsWith("PASS");
 	const displayedReportLines = report.leadStatuses === undefined
 		? report.reportLines
 		: report.reportLines.filter((line) => !/^\s*STATUS\s*:/i.test(line));
-	const orchestrationBlocked = report.blocked || hasBlockedLead || externalChecks.some((check) => check.outcome !== "success");
-	const orchestrationFailed = !report.dispatchOk || hasFailedLead;
 	const actionLines = partial && !report.showFullReport ? displayedReportLines.filter((line) => /^\s*[-*]\s+/.test(line)).slice(0, 5) : [];
 	const verificationLabel = partial && verificationPassed ? "code verification" : "verification";
 	const summary = [
-		`Orchestration ${orchestrationBlocked ? "BLOCKED" : orchestrationFailed ? "FAILED" : partial ? "partial" : "complete"} in ${fmtElapsed(report.elapsedMs)}.`,
+		`Orchestration ${BANNER_WORD[outcome]} in ${fmtElapsed(report.elapsedMs)}.`,
 		...(partial && verificationPassed ? ["status note: code checks passed, but the requested scope is not fully closed."] : []),
 		`run_id: ${report.runId}`,
 		`leads: ${report.succeededLeads}/${report.totalLeads} ${report.blocked ? "blocked" : "succeeded"}${report.skippedLeads > 0 ? ` (+${report.skippedLeads} not started: dependency failed or blocked)` : ""} · retries: ${report.retries} · files: ${report.filesChangedCount} changed${report.externalFilesCount > 0 ? ` (+${report.externalFilesCount} changed by someone else, not verified)` : ""}`,
@@ -219,7 +229,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 			"- See 'open items from lead' below for the specific follow-up work.",
 			...(actionLines.length > 0 ? ["what still needs action:", ...actionLines] : []),
 		] : []),
-		...externalChecks.map((check) => `external check: ${check.provider} ${check.id} ${check.outcome}`),
+		...externalChecks.map((check) => `external check: ${check.provider} ${check.id} ${check.outcome}${check.reason ? ` (${check.reason})` : ""}`),
 		`total cost: $${report.totalCostUsd.toFixed(4)} (${report.dispatchCount} dispatches${report.nestedCostUsd > 0 ? `; $${report.nestedCostUsd.toFixed(4)} of it in lead subagents` : ""})`,
 		...(report.dispatchOk ? [] : [`first failure: ${report.firstFailureLine}`]),
 		...(report.liveQa ? liveQaSummaryLines(report.liveQa.stage, report.liveQa.notRunReason, report.liveQa.hasUnknownCost) : []),
@@ -230,6 +240,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 				: []),
 		`run log: ${report.runLogPath}`,
 		`ledger: ${report.stateRoot}/metrics.jsonl`,
+		"result_contract: v1",
 		...telemetryWarning(report.telemetryReport),
 	];
 	const text = summary.join("\n");

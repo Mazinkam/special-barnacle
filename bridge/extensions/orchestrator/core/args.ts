@@ -72,6 +72,8 @@ export interface OrchestrateArgs {
 	liveQaAdapterId?: string;
 	/** `--live-qa-scope <scope>`; may be a double-quoted, multi-word value. */
 	liveQaScope?: string;
+	/** `--live-qa-acceptance <abs path>`: acceptance manifest handed to a criteria-capable adapter. */
+	liveQaAcceptance?: string;
 	/** Flags we did not recognize -- reported instead of silently swallowed. */
 	unknownFlags: string[];
 }
@@ -113,13 +115,17 @@ export function parseArgs(args: string): OrchestrateArgs {
 	// `--no-live-qa` always wins, regardless of flag order or how many times `--live-qa`/
 	// `--live-qa-scope` appeared.
 	if (out.liveQaOff) out.liveQa = false;
+	// An acceptance manifest is only ever evaluated by a live-QA run; without one it would be silently ignored.
+	if (out.liveQaAcceptance !== undefined && !out.liveQa) {
+		out.unknownFlags.push("--live-qa-acceptance requires --live-qa or --live-qa-scope");
+	}
 	return out;
 }
 
 const KNOWN_FLAGS = new Set([
 	"--task-class", "--complexity", "--risk", "--quality-floor", "--cost-aggressiveness",
 	"--fan-out", "--max-retries", "--interactive", "--context", "--with-last-reply",
-	"--force", "--live-qa", "--no-live-qa", "--live-qa-adapter", "--live-qa-scope",
+	"--force", "--live-qa", "--no-live-qa", "--live-qa-adapter", "--live-qa-scope", "--live-qa-acceptance",
 	"--yes", "-y", "--check", "--live", "--profile", "--lead-size", "--workflow", "--effort",
 	"--cheap", "--mid", "--premium", "--frontier", "--model",
 ]);
@@ -192,6 +198,12 @@ function consumeFlag(tokens: string[], start: number, out: OrchestrateArgs): num
 			case "--live-qa": out.liveQa = true; break;
 			case "--no-live-qa": out.liveQaOff = true; break;
 			case "--live-qa-adapter": if (next) { out.liveQaAdapterId = next; i++; } break;
+			case "--live-qa-acceptance": {
+				if (next && next.startsWith("/")) { out.liveQaAcceptance = next; i++; }
+				else if (!next || next.startsWith("-")) out.unknownFlags.push("--live-qa-acceptance (missing value)");
+				else { out.unknownFlags.push(`--live-qa-acceptance ${next} (expected an absolute path)`); i++; }
+				break;
+			}
 			case "--live-qa-scope": {
 				if (next === undefined) {
 					out.unknownFlags.push("--live-qa-scope (missing value)");
@@ -283,6 +295,7 @@ export function usageText(profilesPath: string): string {
 		"       [--quality-floor F] [--cost-aggressiveness C] [--max-retries R] [--interactive]\n" +
 		"       [--context FILE ...] [--with-last-reply] [--force]\n" +
 		"       [--live-qa | --no-live-qa] [--live-qa-adapter ID] [--live-qa-scope SCOPE]\n" +
+		"       [--live-qa-acceptance /abs/path/to/manifest.json]\n" +
 		"ALIAS is a short name (fable-5-1, opus-5-5, sonnet-5, gpt-6-sol, gpt-6-luna, astra) or provider/model. Profiles: " + profilesPath + "  (see /orchestrator-models)\n" +
 		"--context FILE (repeatable) and --with-last-reply attach material the goal refers to; goals that look like they refer to outside context without either are stopped before triage unless --force is given."
 	);

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,13 +15,13 @@ import {
 	runLiveQaStage,
 	type RunLiveQaStageOptions,
 } from "./live-qa-stage.ts";
-import { liveQaCostRows, type LiveQaVerdict } from "./live-qa.ts";
+import { liveQaCostRows, parseLiveQaSession, runLiveQa, type LiveQaVerdict } from "./live-qa.ts";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-forge-qa.mjs", import.meta.url));
 
 const tmpDirs: string[] = [];
 const trackedPids: number[] = [];
-const mutatedEnvKeys = ["FAKE_FORGE_MODE", "FAKE_FORGE_PIDFILE", "FAKE_SECRET_ENV_VAR", "PROBE_API_TOKEN", "PROBE_API_SECRET"] as const;
+const mutatedEnvKeys = ["FAKE_FORGE_MODE", "FAKE_FORGE_PIDFILE", "FAKE_FORGE_ARGV_LOG", "FAKE_SECRET_ENV_VAR", "PROBE_API_TOKEN", "PROBE_API_SECRET"] as const;
 const savedEnv: Record<string, string | undefined> = {};
 for (const key of mutatedEnvKeys) savedEnv[key] = process.env[key];
 
@@ -777,5 +777,241 @@ describe("S3: persistence-boundary sanitization (sanitizeForPersistence)", () =>
 		expect(serialized).not.toContain(hex40);
 		expect(serialized).not.toContain(hex64);
 		expect(serialized).toContain("[REDACTED]");
+	});
+});
+
+// -----------------------------------------------------------------------------
+// Acceptance manifest / criteria capability
+// -----------------------------------------------------------------------------
+
+describe("acceptance manifest", () => {
+	const manifest = {
+		version: 1,
+		issue: 144,
+		criteria: [
+			{ id: "AC-1", text: "identity", expected: { identity: "other" } },
+			{ id: "AC-2", text: "no side records", manual: true },
+		],
+	};
+
+	function setup(adapterOverrides: Record<string, unknown>, manifestRaw: string) {
+		const runnerCwd = initRepo();
+		commitFile(runnerCwd, "a.ts", "export const a = 1;\n");
+		const configPath = writeConfig(validAdapterConfig(runnerCwd, adapterOverrides));
+		const dir = mkdir("orch-live-qa-stage-acceptance-");
+		const acceptancePath = join(dir, "144.acceptance.json");
+		writeFileSync(acceptancePath, manifestRaw);
+		const argvLog = join(dir, "argv.json");
+		process.env.FAKE_FORGE_MODE = "pass";
+		process.env.FAKE_FORGE_ARGV_LOG = argvLog;
+		const stagingPath = join(dir, "session");
+		mkdirSync(stagingPath, { recursive: true });
+		const options = baseOptions({
+			env: { HUMAIN_ORCHESTRATOR_LIVE_QA_CONFIG: configPath },
+			cwd: runnerCwd,
+			runId: "run-acc",
+			stagingPath,
+			request: { requested: true, scope: "verify", acceptancePath },
+		});
+		return { options, argvLog, stagingPath, acceptancePath };
+	}
+
+	test("adapter without criteria capability: unavailable, never spawned", async () => {
+		const { options, argvLog } = setup({}, JSON.stringify(manifest));
+		const result = await runLiveQaStage(options);
+		expect(result.verdict).toBe("unavailable");
+		expect(result.reasons).toContain("adapter cannot take criteria");
+		expect(existsSync(argvLog)).toBe(false);
+		expect(result.acceptance?.overall).toBe("blocked");
+		expect(result.acceptance?.criteria.map((c) => c.id)).toEqual(["AC-1", "AC-2"]);
+		expect(result.acceptance?.criteria.every((c) => c.result === "blocked" && (c.note ?? "").includes("adapter cannot take criteria"))).toBe(true);
+	});
+
+	test("criteria-capable adapter: manifest staged and --criteria passed", async () => {
+		const { options, stagingPath } = setup({ criteria: true }, JSON.stringify(manifest));
+		const result = await runLiveQaStage(options);
+		const idx = result.stage?.argv.indexOf("--criteria") ?? -1;
+		expect(idx).toBeGreaterThan(-1);
+		const criteriaPath = result.stage?.argv[idx + 1] as string;
+		expect(criteriaPath.startsWith(stagingPath)).toBe(true);
+		expect(JSON.parse(readFileSync(criteriaPath, "utf8"))).toEqual(manifest);
+	});
+
+	test("invalid manifest: unavailable with the parser reason, never spawned", async () => {
+		const { options, argvLog } = setup({ criteria: true }, JSON.stringify({ ...manifest, version: 2 }));
+		const result = await runLiveQaStage(options);
+		expect(result.verdict).toBe("unavailable");
+		expect(result.reasons[0]).toContain("acceptance manifest invalid: version must be 1");
+		expect(existsSync(argvLog)).toBe(false);
+		// Unparsed manifest => no ids to report; the reason stays visible in `reasons`.
+		expect(result.acceptance).toEqual({ overall: "blocked", criteria: [] });
+	});
+
+	test("acceptance evaluation is carried on the stage result", async () => {
+		const m144 = { version: 1, issue: 144, criteria: [
+			{ id: "AC-3", text: "422", expected: { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" } },
+			{ id: "AC-5", text: "no side effects", manual: true },
+		] };
+		const { options } = setup({ criteria: true }, JSON.stringify(m144));
+		process.env.FAKE_FORGE_MODE = "acceptance_409";
+		const result = await runLiveQaStage(options);
+		expect(result.acceptance?.overall).toBe("fail");
+		expect(result.acceptance?.criteria[0]?.note).toContain("http.status: expected 422, observed 409");
+		const second = setup({ criteria: true }, JSON.stringify(m144));
+		process.env.FAKE_FORGE_MODE = "acceptance_pass";
+		const ok = await runLiveQaStage(second.options);
+		expect(ok.acceptance?.overall).toBe("pass");
+		expect(ok.verdict).toBe("pass");
+	});
+
+	test("unreadable manifest: unavailable, never spawned", async () => {
+		const { options, argvLog } = setup({ criteria: true }, "{not json");
+		const result = await runLiveQaStage(options);
+		expect(result.verdict).toBe("unavailable");
+		expect(result.reasons[0]).toContain("acceptance manifest unreadable");
+		expect(existsSync(argvLog)).toBe(false);
+	});
+	test("stagingPath that is a symlink to another dir is never followed: target untouched, unavailable, never spawned", async () => {
+		const { options, argvLog, stagingPath } = setup({ criteria: true }, JSON.stringify(manifest));
+		const targetDir = mkdir("orch-live-qa-victim-");
+		writeFileSync(join(targetDir, "criteria.json"), "keep me");
+		rmSync(stagingPath, { recursive: true });
+		symlinkSync(targetDir, stagingPath);
+		const result = await runLiveQaStage(options);
+		expect(result.verdict).toBe("unavailable");
+		expect(readFileSync(join(targetDir, "criteria.json"), "utf8")).toBe("keep me");
+		expect(readdirSync(targetDir)).toEqual(["criteria.json"]);
+		expect(existsSync(argvLog)).toBe(false);
+		expect(result.acceptance?.overall).toBe("blocked");
+	});
+
+	test("normal staging: --criteria path is a private subdir inside stagingPath, existing files untouched", async () => {
+		const { options, stagingPath } = setup({ criteria: true }, JSON.stringify(manifest));
+		writeFileSync(join(stagingPath, "criteria.json"), "stale");
+		const result = await runLiveQaStage(options);
+		const idx = result.stage?.argv.indexOf("--criteria") ?? -1;
+		const criteriaPath = result.stage?.argv[idx + 1] as string;
+		expect(criteriaPath.startsWith(`${stagingPath}/live-qa-criteria-`)).toBe(true);
+		expect(JSON.parse(readFileSync(criteriaPath, "utf8"))).toEqual(manifest);
+		expect(readFileSync(join(stagingPath, "criteria.json"), "utf8")).toBe("stale");
+	});
+
+	test("failure-path acceptance notes are redacted before clipping (no secret prefix at the 2048 boundary)", async () => {
+		const secret = "s3cr3t-value-abcdefghijk";
+		// A nonexistent staging path is reported (twice) in the staging failure reason, so each extra
+		// character of path moves the LAST secret occurrence by 2 chars. Tune the first component's
+		// length (<= NAME_MAX) until the secret straddles the 2048-char clip boundary.
+		const build = (firstLen: number) => {
+			const { options } = setup({ criteria: true }, JSON.stringify(manifest));
+			const base = (options as { stagingPath: string }).stagingPath;
+			(options as { stagingPath: string }).stagingPath = join(base, "a".repeat(firstLen), "b".repeat(200), "c".repeat(200), "d".repeat(200), secret);
+			return options;
+		};
+		const locate = async (firstLen: number) => (await runLiveQaStage(build(firstLen))).reasons[0]?.lastIndexOf(secret) ?? -1;
+		const at100 = await locate(100);
+		expect(at100).toBeGreaterThan(0);
+		const firstLen = 100 + Math.round((2030 - at100) / 2);
+		expect(firstLen).toBeLessThanOrEqual(255);
+		const idx = await locate(firstLen);
+		expect(idx).toBeLessThan(2047);
+		expect(idx + secret.length).toBeGreaterThan(2049);
+		const components = firstLen;
+		process.env.LIVE_QA_TEST_API_TOKEN = secret;
+		try {
+			const result = await runLiveQaStage(build(components));
+			expect(result.acceptance?.overall).toBe("blocked");
+			expect(JSON.stringify(result.acceptance)).not.toContain("s3cr");
+		} finally {
+			delete process.env.LIVE_QA_TEST_API_TOKEN;
+		}
+	});
+
+	test("no stagingPath: criteria.json goes into a fresh mkdtemp dir", async () => {
+		const { options } = setup({ criteria: true }, JSON.stringify(manifest));
+		delete (options as { stagingPath?: string }).stagingPath;
+		const result = await runLiveQaStage(options);
+		const idx = result.stage?.argv.indexOf("--criteria") ?? -1;
+		const criteriaPath = result.stage?.argv[idx + 1] as string;
+		expect(criteriaPath).toMatch(/orch-live-qa-[A-Za-z0-9]{6}[\\/]criteria\.json$/);
+		expect(criteriaPath).not.toContain("run-acc");
+		rmSync(join(criteriaPath, ".."), { recursive: true, force: true });
+	});
+
+	test("oversize manifest: unreadable, never spawned", async () => {
+		const big = JSON.stringify({ ...manifest, pad: "x".repeat(70 * 1024) });
+		const { options, argvLog } = setup({ criteria: true }, big);
+		const result = await runLiveQaStage(options);
+		expect(result.verdict).toBe("unavailable");
+		expect(result.reasons[0]).toContain("acceptance manifest unreadable");
+		expect(existsSync(argvLog)).toBe(false);
+		expect(result.acceptance?.overall).toBe("blocked");
+	});
+
+	test("manifest path that is a directory: unreadable, never spawned", async () => {
+		const { options, argvLog, acceptancePath } = setup({ criteria: true }, "{}");
+		rmSync(acceptancePath);
+		mkdirSync(acceptancePath);
+		const result = await runLiveQaStage(options);
+		expect(result.verdict).toBe("unavailable");
+		expect(result.reasons[0]).toContain("acceptance manifest unreadable");
+		expect(existsSync(argvLog)).toBe(false);
+	});
+
+	test("manifest path that is a symlink: unreadable, never spawned", async () => {
+		const { options, argvLog, acceptancePath } = setup({ criteria: true }, JSON.stringify(manifest));
+		const real = `${acceptancePath}.real`;
+		writeFileSync(real, JSON.stringify(manifest));
+		rmSync(acceptancePath);
+		symlinkSync(real, acceptancePath);
+		const result = await runLiveQaStage(options);
+		expect(result.reasons[0]).toContain("acceptance manifest unreadable");
+		expect(existsSync(argvLog)).toBe(false);
+	});
+	test("stage wrapper redacts every acceptance string (no git-id exemption), top-level and on the stage verdict", async () => {
+		const hex = "0123456789abcdef0123456789abcdef01234567";
+		process.env.LIVE_QA_STAGE_TEST_API_TOKEN = hex;
+		try {
+			const m = { version: 1, issue: 9, criteria: [{ id: "AC-1", text: "t", expected: { sha: hex } }] };
+			const { options } = setup({ criteria: true }, JSON.stringify(m));
+			const poisoned = {
+				overall: "fail" as const,
+				criteria: [{ id: "AC-1", result: "fail" as const, expected: { sha: hex }, observed: { tree: hex }, artifacts: [hex], note: `saw ${hex}` }],
+			};
+			options.deps = {
+				parseLiveQaSession: (o) => ({ ...parseLiveQaSession(o), acceptance: poisoned }),
+			};
+			const result = await runLiveQaStage(options);
+			expect(result.acceptance?.criteria[0]?.expected).toEqual({ sha: "[REDACTED]" });
+			expect(JSON.stringify(result.acceptance)).not.toContain(hex);
+			expect(JSON.stringify(result.stage?.verdict.acceptance)).not.toContain(hex);
+		} finally {
+			delete process.env.LIVE_QA_STAGE_TEST_API_TOKEN;
+		}
+	});
+
+	test("cancelled run with a passing acceptance.json: acceptance blocked, never pass", async () => {
+		const { options } = setup({ criteria: true }, JSON.stringify(manifest));
+		const m144 = { version: 1, issue: 144, criteria: [
+			{ id: "AC-3", text: "422", expected: { "http.status": 422, "body.code": "invalid_state", "body.message": "invalid state" } },
+			{ id: "AC-5", text: "no side effects", manual: true },
+		] };
+		writeFileSync((options.request as { acceptancePath: string }).acceptancePath, JSON.stringify(m144));
+		process.env.FAKE_FORGE_MODE = "acceptance_pass";
+		options.deps = { runLiveQa: async (o) => ({ ...(await runLiveQa(o)), cancelled: true }) };
+		const result = await runLiveQaStage(options);
+		expect(result.cancelled).toBe(true);
+		expect(result.verdict).toBe("unavailable");
+		expect(result.acceptance?.overall).toBe("blocked");
+		expect(result.acceptance?.criteria.every((c) => c.result === "blocked" && c.note === "live QA verdict unavailable; evidence not trusted")).toBe(true);
+		expect(result.stage?.verdict.acceptance?.overall).toBe("blocked");
+	});
+
+	test("runner produced no session: acceptance is still present and blocked", async () => {
+		const { options } = setup({ criteria: true }, JSON.stringify(manifest));
+		process.env.FAKE_FORGE_MODE = "preflight_fail";
+		const result = await runLiveQaStage(options);
+		expect(result.verdict).toBe("unavailable");
+		expect(result.acceptance?.overall).toBe("blocked");
+		expect(result.acceptance?.criteria.map((c) => c.id)).toEqual(["AC-1", "AC-2"]);
 	});
 });

@@ -10,6 +10,12 @@
  * `forceCancelledVerdict` -- even when the runner exits 0 with fully valid pass artifacts.
  */
 
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, mkdtempSync, openSync, readSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import type { AcceptanceResult } from "./core/run-result.ts";
+import { blockedAcceptance as blockedAcceptanceFor, distrustAcceptance, parseAcceptanceManifest, redactAcceptance, type AcceptanceManifest } from "./live-qa-acceptance.ts";
 import {
 	buildRunnerArgv,
 	gitRevParseHead,
@@ -36,6 +42,8 @@ export interface LiveQaStageRequest {
 	adapterId?: string;
 	/** `--live-qa-scope <scope>`, when given. */
 	scope?: string;
+	/** `--live-qa-acceptance <abs path>`, when given. */
+	acceptancePath?: string;
 }
 
 export interface RunLiveQaStageOptions {
@@ -45,6 +53,8 @@ export interface RunLiveQaStageOptions {
 	/** The candidate repository under test (the orchestrator's own `cwd`). */
 	cwd: string;
 	runId: string;
+	/** Per-run session dir where the validated `criteria.json` is staged. */
+	stagingPath?: string;
 	changedFiles: string[];
 	cancellation: LiveQaCancellationSignal;
 	onLine: (line: string) => void;
@@ -76,6 +86,134 @@ export interface RunLiveQaStageResult {
 	costRows: Record<string, unknown>[];
 	outcomeRow: Record<string, unknown> | null;
 	cancelled: boolean;
+	/** Present whenever an acceptance manifest was supplied; `blocked` when it was not (or could not be) evaluated. */
+	acceptance?: AcceptanceResult;
+}
+
+/** Acceptance manifests are tiny (<= 20 criteria); anything bigger is refused before reading. */
+export const MAX_ACCEPTANCE_MANIFEST_BYTES = 64 * 1024;
+
+/**
+ * Blocked acceptance for a stage that could not (fully) evaluate a supplied manifest. When the
+ * manifest parsed, every criterion id is reported `blocked` with the reason as its note. When it
+ * did not (unreadable/invalid, or the stage failed before the manifest was read) there are no
+ * trustworthy ids to report, so `criteria` is `[]` and the reason stays visible in the stage's
+ * `reasons`.
+ */
+function blockedAcceptance(manifest: AcceptanceManifest | undefined, reason: string): AcceptanceResult {
+	return manifest ? blockedAcceptanceFor(manifest, reason, (t) => redactSecrets(t, process.env)) : { overall: "blocked", criteria: [] };
+}
+
+/** Bounded, fail-closed read of the (trusted-loop-supplied) manifest path: no symlinks
+ *  (O_NOFOLLOW), regular files only (fstat on the descriptor, so a FIFO/dir/device never blocks
+ *  or is read), size checked before reading, opened O_NONBLOCK. */
+function readAcceptanceManifestFile(path: string): string {
+	const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+	try {
+		const st = fstatSync(fd);
+		if (!st.isFile()) throw new Error("not a regular file");
+		if (st.size > MAX_ACCEPTANCE_MANIFEST_BYTES) {
+			throw new Error(`${st.size} bytes exceeds the ${MAX_ACCEPTANCE_MANIFEST_BYTES}-byte limit`);
+		}
+		const buf = Buffer.alloc(st.size);
+		let offset = 0;
+		while (offset < buf.length) {
+			const n = readSync(fd, buf, offset, buf.length - offset, offset);
+			if (n <= 0) break;
+			offset += n;
+		}
+		return buf.subarray(0, offset).toString("utf8");
+	} finally {
+		closeSync(fd);
+	}
+}
+
+type ManifestLoad = { ok: true; manifest: AcceptanceManifest } | { ok: false; reason: string; revisionReason: string };
+
+/** Reads (bounded, no symlinks) and strictly parses an acceptance manifest. */
+function loadAcceptanceManifest(path: string): ManifestLoad {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(readAcceptanceManifestFile(path));
+	} catch (error) {
+		return { ok: false, reason: `acceptance manifest unreadable: ${(error as Error).message}`, revisionReason: "acceptance manifest unreadable" };
+	}
+	const parsed = parseAcceptanceManifest(raw);
+	if (!parsed.ok) return { ok: false, reason: `acceptance manifest invalid: ${parsed.reason}`, revisionReason: "acceptance manifest invalid" };
+	return { ok: true, manifest: parsed.manifest };
+}
+
+type AdapterSelection = { ok: true; adapter: LiveQaAdapterConfig } | { ok: false; reason: string };
+
+/** The one adapter-selection rule: an explicit id must exist; otherwise exactly one valid adapter. */
+function selectLiveQaAdapter(config: ReturnType<typeof loadLiveQaConfig>, adapterId: string | undefined): AdapterSelection {
+	if (config.adapters.length === 0) {
+		const detail = config.problems.map((p) => p.reason).join("; ");
+		return { ok: false, reason: detail ? `no valid live-QA adapter is configured (${detail})` : "no valid live-QA adapter is configured" };
+	}
+	if (adapterId) {
+		const found = config.adapters.find((a) => a.id === adapterId);
+		return found
+			? { ok: true, adapter: found }
+			: { ok: false, reason: `unknown live-QA adapter id "${adapterId}" (configured: ${config.adapters.map((a) => a.id).join(", ")})` };
+	}
+	if (config.adapters.length === 1) return { ok: true, adapter: config.adapters[0] };
+	return {
+		ok: false,
+		reason: `ambiguous: ${config.adapters.length} valid live-QA adapters configured (${config.adapters.map((a) => a.id).join(", ")}); specify --live-qa-adapter <id>`,
+	};
+}
+
+/**
+ * Run-start check for `--live-qa-acceptance` (called before triage, so a bad manifest or an
+ * adapter that cannot take criteria never costs a dispatch): the manifest must read and parse,
+ * and the adapter the stage would select must declare `criteria: true`. The stage re-checks both
+ * later (the manifest is re-read then; this is not a trust handoff).
+ */
+export function preflightLiveQaAcceptance(input: {
+	env: Record<string, string | undefined>;
+	adapterId?: string;
+	acceptancePath: string;
+	loadLiveQaConfig?: typeof loadLiveQaConfig;
+}): { ok: true } | { ok: false; reason: string } {
+	const manifest = loadAcceptanceManifest(input.acceptancePath);
+	if (!manifest.ok) return { ok: false, reason: manifest.reason };
+	const selection = selectLiveQaAdapter((input.loadLiveQaConfig ?? loadLiveQaConfig)(input.env), input.adapterId);
+	if (!selection.ok) return { ok: false, reason: selection.reason };
+	if (selection.adapter.criteria !== true) return { ok: false, reason: "adapter cannot take criteria" };
+	return { ok: true };
+}
+
+/** Stages `criteria.json` without following or deleting anything. `stagingPath` (when given)
+ *  must already be a real directory (lstat: not a symlink) owned by this user; a fresh private
+ *  (0o700) `mkdtemp` subdir is created inside it and the file is created exclusively with
+ *  O_NOFOLLOW (0o600). Without a `stagingPath`, a fresh private tmpdir is used. Anything else
+ *  fails closed. Returns the file path. */
+function stageCriteriaFile(stagingPath: string | undefined, manifest: AcceptanceManifest): string {
+	let parent: string;
+	if (stagingPath === undefined) {
+		parent = mkdtempSync(join(tmpdir(), "orch-live-qa-"));
+	} else {
+		let st: ReturnType<typeof lstatSync>;
+		try {
+			st = lstatSync(stagingPath);
+		} catch (error) {
+			throw new Error(`staging path ${stagingPath} is not usable: ${(error as Error).message}`);
+		}
+		if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`staging path ${stagingPath} is not a real directory`);
+		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+		if (uid !== undefined && st.uid !== uid) throw new Error(`staging path ${stagingPath} is not owned by the current user`);
+		parent = stagingPath;
+	}
+	const dir = stagingPath === undefined ? parent : mkdtempSync(join(parent, "live-qa-criteria-"));
+	const path = join(dir, "criteria.json");
+	const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+	try {
+		writeSync(fd, JSON.stringify(manifest));
+	} finally {
+		closeSync(fd);
+	}
+	return path;
 }
 
 /** A `PreparedTestedRevision` for a stage that never got far enough to attempt the proof. */
@@ -114,10 +252,14 @@ function unavailableVerdict(reason: string): LiveQaVerdict {
  *  here would silently drop cost/usage evidence that a cancelled run legitimately produced. A
  *  verdict already `"unavailable"` is returned unchanged (nothing to force). */
 function forceCancelledVerdict(verdict: LiveQaVerdict): LiveQaVerdict {
-	if (verdict.verdict === "unavailable") return verdict;
+	if (verdict.verdict === "unavailable") {
+		return verdict.acceptance ? { ...verdict, acceptance: distrustAcceptance(verdict.acceptance, "unavailable") } : verdict;
+	}
 	return {
 		...verdict,
 		verdict: "unavailable",
+		// Acceptance evidence from a cancelled run is no more trustworthy than its verdict.
+		...(verdict.acceptance ? { acceptance: distrustAcceptance(verdict.acceptance, "unavailable") } : {}),
 		reasons: [
 			"run was cancelled; the runner's own verdict is never trusted after cancellation, even on a clean exit with pass-shaped artifacts",
 			...verdict.reasons,
@@ -187,9 +329,16 @@ function buildOutcomeRow(
 export async function runLiveQaStage(opts: RunLiveQaStageOptions): Promise<RunLiveQaStageResult> {
 	const result = await runLiveQaStageUnsanitized(opts);
 	const env = process.env;
+	// Acceptance strings are redacted with plain `redactSecrets` -- NOT `sanitizeForPersistence`,
+	// whose git-object-id exemption is keyed on object keys (`sha`, `tree`, ...) that a manifest's
+	// `expected`/`observed` keys can legally take, which would let a 40-hex secret through.
+	const redactText = (t: string) => redactSecrets(t, env);
+	const stage = result.stage === null ? null : sanitizeForPersistence(result.stage, env);
+	if (stage && result.stage?.verdict.acceptance) stage.verdict.acceptance = redactAcceptance(result.stage.verdict.acceptance, redactText);
 	return {
 		...result,
-		stage: result.stage === null ? null : sanitizeForPersistence(result.stage, env),
+		...(result.acceptance ? { acceptance: redactAcceptance(result.acceptance, redactText) } : {}),
+		stage,
 		reasons: sanitizeForPersistence(result.reasons, env),
 		costRows: sanitizeForPersistence(result.costRows, env),
 		outcomeRow: result.outcomeRow === null ? null : sanitizeForPersistence(result.outcomeRow, env),
@@ -210,6 +359,8 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 	}
 
 	const taskId = `${runId}-live-qa-stage`;
+	// Set once the manifest parses; lets every later failure report its criterion ids as blocked.
+	let acceptanceManifest: AcceptanceManifest | undefined;
 
 	// A failure before an adapter is selected: an explicit request counts as required (there is
 	// no adapter-level `required` flag to defer to yet).
@@ -230,33 +381,13 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 			costRows: [],
 			outcomeRow: buildOutcomeRow(runId, stage, env, null),
 			cancelled: false,
+			...(request.acceptancePath ? { acceptance: blockedAcceptance(acceptanceManifest, reason) } : {}),
 		};
 	};
 
-	const config = load(env);
-	if (config.adapters.length === 0) {
-		const detail = config.problems.map((p) => p.reason).join("; ");
-		return failBeforeAdapter(
-			detail ? `no valid live-QA adapter is configured (${detail})` : "no valid live-QA adapter is configured",
-		);
-	}
-
-	let adapter: LiveQaAdapterConfig;
-	if (request.adapterId) {
-		const found = config.adapters.find((a) => a.id === request.adapterId);
-		if (!found) {
-			return failBeforeAdapter(
-				`unknown live-QA adapter id "${request.adapterId}" (configured: ${config.adapters.map((a) => a.id).join(", ")})`,
-			);
-		}
-		adapter = found;
-	} else if (config.adapters.length === 1) {
-		adapter = config.adapters[0];
-	} else {
-		return failBeforeAdapter(
-			`ambiguous: ${config.adapters.length} valid live-QA adapters configured (${config.adapters.map((a) => a.id).join(", ")}); specify --live-qa-adapter <id>`,
-		);
-	}
+	const selection = selectLiveQaAdapter(load(env), request.adapterId);
+	if (!selection.ok) return failBeforeAdapter(selection.reason);
+	const adapter = selection.adapter;
 
 	const required = adapter.required;
 
@@ -278,6 +409,7 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 			costRows: [],
 			outcomeRow: buildOutcomeRow(runId, stage, env, adapter),
 			cancelled: false,
+			...(request.acceptancePath ? { acceptance: blockedAcceptance(acceptanceManifest, reason) } : {}),
 		};
 	};
 
@@ -292,7 +424,24 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 		return failAfterAdapterSelection(revision.reason ?? "tested-revision proof failed", scope, revision);
 	}
 
-	const argv = buildRunnerArgv(adapter, scope, revision.sha as string);
+	let criteriaPath: string | undefined;
+	if (request.acceptancePath) {
+		const manifest = loadAcceptanceManifest(request.acceptancePath);
+		if (!manifest.ok) {
+			return failAfterAdapterSelection(manifest.reason, scope, notStartedRevision(manifest.revisionReason));
+		}
+		acceptanceManifest = manifest.manifest;
+		if (adapter.criteria !== true) {
+			return failAfterAdapterSelection("adapter cannot take criteria", scope, notStartedRevision("adapter cannot take criteria"));
+		}
+		try {
+			criteriaPath = stageCriteriaFile(opts.stagingPath, manifest.manifest);
+		} catch (error) {
+			const reason = `acceptance manifest unreadable: could not stage criteria.json: ${(error as Error).message}`;
+			return failAfterAdapterSelection(reason, scope, notStartedRevision("acceptance manifest unreadable"));
+		}
+	}
+	const argv = buildRunnerArgv(adapter, scope, revision.sha as string, criteriaPath);
 	const startedAtMs = now();
 	const runResult = await run({ adapter, argv, signal: cancellation, onLine, onSpawn: opts.onSpawn });
 	const parsedVerdict = parseSession({
@@ -302,6 +451,7 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 		exitCode: runResult.exitCode,
 		startedAtMs,
 		runnerFailure: runResult.failureReason ?? runResult.spawnError ?? runResult.tail,
+		...(acceptanceManifest ? { manifest: acceptanceManifest } : {}),
 	});
 	// A runner that receives SIGINT (because THIS run's own cancellation fired) but keeps running
 	// long enough to write out fully valid, pass-shaped artifacts and exit 0 anyway did not run to
@@ -310,7 +460,10 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 	// `session_id`/`exit_code` are left exactly as parsed (a cancelled run may still have incurred
 	// real, billable usage, and `liveQaCostRows` below reads all of those straight off `verdict`) --
 	// only `verdict`/`reasons` are overridden, and never to `pass`.
-	const verdict = runResult.cancelled ? forceCancelledVerdict(parsedVerdict) : parsedVerdict;
+	const forced = runResult.cancelled ? forceCancelledVerdict(parsedVerdict) : parsedVerdict;
+	// Defence in depth (an injected parser may bypass parseLiveQaSession's own demotion): acceptance
+	// evidence never survives a non-pass final verdict as `pass`.
+	const verdict = forced.acceptance ? { ...forced, acceptance: distrustAcceptance(forced.acceptance, forced.verdict) } : forced;
 
 	const stage: LiveQaStage = { adapterId: adapter.id, argv, scope, revision, verdict, required };
 	const costRows = liveQaCostRows({ runId, taskId, adapterId: adapter.id, verdict });
@@ -324,6 +477,11 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 		costRows,
 		outcomeRow,
 		cancelled: runResult.cancelled,
+		...(verdict.acceptance
+			? { acceptance: verdict.acceptance }
+			: request.acceptancePath
+				? { acceptance: blockedAcceptance(acceptanceManifest, "acceptance.json was not evaluated") }
+				: {}),
 	};
 }
 

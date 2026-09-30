@@ -1,0 +1,26 @@
+{
+  "schema": "orchestration-result",
+  "version": 1,
+  "runId": "ht-orch-crashed",
+  "outcome": "failed",
+  "causes": [
+    "crashed"
+  ],
+  "codeVerification": "not_run",
+  "liveQa": {
+    "verdict": "unavailable",
+    "reasons": [
+      "orchestrator crashed"
+    ]
+  },
+  "externalChecks": [],
+  "openItems": [],
+  "diagnostics": [
+    "TypeError: '<' not supported"
+  ],
+  "cost": {
+    "usd": 0.5,
+    "complete": true
+  },
+  "runLog": "/state/runs/ht-orch-crashed/run.log"
+}

@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "orchestration-result/v1",
+  "title": "RunResultV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "runId", "outcome", "causes", "codeVerification", "liveQa", "externalChecks", "openItems", "diagnostics", "cost", "runLog"],
+  "$defs": {
+    "str": { "type": "string", "maxLength": 2048, "$comment": "maxLength counts UTF-16 code units (JS string.length), matching RUN_RESULT_LIMITS.stringChars; JSON Schema validators that count code points may accept slightly longer astral-plane strings, so consumers MUST apply the UTF-16 count." },
+    "verdict3": { "enum": ["pass", "fail", "blocked"] },
+    "scalarMap": {
+      "type": "object",
+      "propertyNames": { "maxLength": 2048 },
+      "additionalProperties": {
+        "oneOf": [
+          { "type": "string", "maxLength": 2048 },
+          { "type": "number" },
+          { "type": "boolean" }
+        ]
+      }
+    },
+    "criterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "result", "artifacts"],
+      "properties": {
+        "id": { "$ref": "#/$defs/str" },
+        "result": { "$ref": "#/$defs/verdict3" },
+        "expected": { "$ref": "#/$defs/scalarMap" },
+        "observed": { "$ref": "#/$defs/scalarMap" },
+        "artifacts": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/str" } },
+        "note": { "$ref": "#/$defs/str" }
+      }
+    }
+  },
+  "properties": {
+    "schema": { "const": "orchestration-result" },
+    "version": { "const": 1 },
+    "runId": { "$ref": "#/$defs/str" },
+    "outcome": { "enum": ["complete", "partial", "blocked", "failed", "cancelled"] },
+    "causes": {
+      "type": "array",
+      "maxItems": 9,
+      "uniqueItems": true,
+      "items": { "enum": ["lead_partial", "lead_blocked", "external_check", "dispatch_failed", "plan_failed", "crashed", "cancelled_user", "cancelled_shutdown", "aborted"] }
+    },
+    "codeVerification": { "enum": ["pass", "fail", "skipped", "not_run"] },
+    "liveQa": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "reasons"],
+      "properties": {
+        "verdict": { "enum": ["pass", "fail", "unavailable", "not_requested"] },
+        "sessionId": { "$ref": "#/$defs/str" },
+        "testedCommit": { "$ref": "#/$defs/str" },
+        "reasons": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/str" } }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["overall", "criteria"],
+      "$comment": "Total artifacts across all criteria must be <= 50 (RUN_RESULT_LIMITS.artifacts). JSON Schema cannot express this cross-item sum; the emitter enforces it via enforceRunResultBounds and consumers MUST apply the same check.",
+      "properties": {
+        "overall": { "$ref": "#/$defs/verdict3" },
+        "criteria": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/criterion" } }
+      }
+    },
+    "externalChecks": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider", "id", "outcome"],
+        "properties": {
+          "provider": { "$ref": "#/$defs/str" },
+          "id": { "$ref": "#/$defs/str" },
+          "outcome": { "$ref": "#/$defs/str" },
+          "reason": { "$ref": "#/$defs/str" }
+        }
+      }
+    },
+    "openItems": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/str" } },
+    "diagnostics": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/str" } },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["usd", "complete"],
+      "properties": {
+        "usd": { "type": "number", "minimum": 0 },
+        "complete": { "type": "boolean" }
+      }
+    },
+    "runLog": { "$ref": "#/$defs/str" }
+  }
+}

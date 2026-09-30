@@ -7,6 +7,7 @@ import type { ExtensionContext } from "@humain/terminal";
 
 import { runOrchestration, writeLeadReportsDiagnostic, type RunOrchestrationDeps } from "./run-orchestration.ts";
 import { buildRunSummary } from "../core/report.ts";
+import { buildCompletedRunResult } from "../core/run-result.ts";
 import { RunCancellation } from "../cancellation.ts";
 import type { RunSession } from "../run/session.ts";
 import type { RunContext } from "../run/context.ts";
@@ -178,9 +179,10 @@ describe("pipeline/run-orchestration.ts runOrchestration", () => {
 			deps,
 		);
 
-		expect(result).toEqual({ kind: "aborted" });
+		expect(result).toEqual({ kind: "aborted", cause: "plan_failed", notifyText: "Plan failed: boom", notifyType: "error" });
 		expect(failRunCalls).toBe(1);
-		expect(notifications.some((n) => n.text === "Plan failed: boom" && n.level === "error")).toBe(true);
+		// The caller notifies (after posting the result message); the pipeline no longer does.
+		expect(notifications.some((n) => n.text === "Plan failed: boom")).toBe(false);
 	});
 
 	test("declining the dispatch confirmation aborts the run without dispatching anything", async () => {
@@ -232,10 +234,10 @@ describe("pipeline/run-orchestration.ts runOrchestration", () => {
 			deps,
 		);
 
-		expect(result).toEqual({ kind: "aborted" });
+		expect(result).toEqual({ kind: "aborted", cause: "aborted", notifyText: "Cancelled.", notifyType: "info" });
 		expect(dispatchCalls).toBe(0);
 		expect(failRunCalls).toBe(1);
-		expect(notifications.some((n) => n.text === "Cancelled." && n.level === "info")).toBe(true);
+		expect(notifications.some((n) => n.text === "Cancelled.")).toBe(false);
 	});
 });
 
@@ -252,7 +254,8 @@ describe("pipeline/run-orchestration.ts out-of-tree warning (A6/N2)", () => {
 		expect(result.kind).toBe("aborted");
 		expect(events).toContain("live_extension_tree");
 		expect(notifications.some((n) => n.level === "warning" && n.text.includes("Live extension tree:"))).toBe(true);
-		expect(notifications.some((n) => n.level === "error" && n.text.includes("plan marker"))).toBe(true);
+		expect(result).toMatchObject({ kind: "aborted", cause: "plan_failed", notifyType: "error" });
+		expect((result as { notifyText: string }).notifyText).toContain("plan marker");
 	});
 	test("a lead editing another git worktree leaves this run at zero files but warns and names that worktree", async () => {
 		const tmp = mkdtempSync(join(tmpdir(), "orch-out-of-tree-"));
@@ -1217,6 +1220,59 @@ describe("pipeline/run-orchestration.ts runOrchestration elapsedMs (B4.7)", () =
 	});
 });
 
+describe("pipeline/run-orchestration.ts runOrchestration: report.openItems (untruncated, Open items section only)", () => {
+	async function runWithLeadReport(stdout: string) {
+		const runId = "ht-orch-open-items-abcdef";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const plan: PlanResponse = {
+			plan_id: "plan-123456789012", run_id: runId, task_class: "bugfix", complexity: 3, risk: "medium",
+			topology: { depth: 1, leads: 1, workers: 0, shape: "flat" },
+			route: {
+				selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+				mode: "auto", history_sufficient: true, explanation: {},
+			},
+			effective_quality_floor: 0.5, cost_aggressiveness: 0.5,
+		};
+		const deps = fakeDeps({
+			planRun: async () => plan,
+			dispatchParallel: async (_cwd, _runId, tasks) => tasks.map((t) => ({
+				taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0, stdout, stderr: "",
+				usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+				durationMs: 1, costUsd: 0, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+			})),
+		});
+		const result = await runOrchestration(runId, "/tmp/cwd-not-a-git-repo", fakeArgs(), adapter, resolved, ctx, session, { ...claimed, session }, deps);
+		if (result.kind !== "completed") throw new Error(`expected completed, got ${result.kind}`);
+		return result.report;
+	}
+
+	test("Files Changed bullets never appear in openItems, even when the full report is shown", async () => {
+		const report = await runWithLeadReport("## Files Changed\n- src/a.ts\n* src/b.ts\n\n## Open items\n- first\n* second\n- first\n\nSTATUS: done");
+		expect(report.showFullReport).toBe(true);
+		expect(report.openItems).toEqual(["first", "second"]);
+		expect(buildCompletedRunResult(report).openItems).toEqual(["first", "second"]);
+	});
+
+	test("a lone None item yields no open items", async () => {
+		const report = await runWithLeadReport("## Open items\n- None\n\nSTATUS: done");
+		expect(report.openItems).toEqual([]);
+	});
+
+	test("51 open-item bullets are not display-truncated and are capped explicitly in the result", async () => {
+		const bullets = Array.from({ length: 51 }, (_, i) => `- item ${i}`).join("\n");
+		const report = await runWithLeadReport(`## Open items\n${bullets}\n\nSTATUS: done`);
+		expect(report.openItems).toHaveLength(51);
+		const result = buildCompletedRunResult(report);
+		expect(result.openItems).toHaveLength(50);
+		expect(result.openItems[49]).toBe("…[2 more open items]");
+		expect(result.diagnostics).toEqual([]);
+	});
+});
+
 describe("pipeline/run-orchestration.ts runOrchestration: efficiency warnings", () => {
 	test("removed scoped_leads env warns at run start", async () => {
 		const session = fakeSession();
@@ -1561,4 +1617,71 @@ describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode",
 		const wf = summary!.workflow as { planned: string; final: string };
 		expect([wf.planned, wf.final]).toEqual(["full", "full"]);
 	}, GIT_IO_TIMEOUT_MS);
+});
+
+describe("pipeline/run-orchestration.ts: --live-qa-acceptance is validated before triage", () => {
+	const manifest = { version: 1, issue: 144, criteria: [{ id: "AC-1", text: "t", expected: { a: "x" } }] };
+
+	function setup(manifestRaw: string, adapterOverrides: Record<string, unknown>) {
+		const dir = mkdtempSync(join(tmpdir(), "orch-acceptance-preflight-"));
+		const acceptancePath = join(dir, "144.acceptance.json");
+		writeFileSync(acceptancePath, manifestRaw);
+		const configPath = join(dir, "live-qa.json");
+		writeFileSync(configPath, JSON.stringify({ version: 1, adapters: [{
+			id: "forge-focused", kind: "forge-qa", trusted: true, runner_cwd: dir, argv_prefix: [process.execPath, "/nonexistent.mjs"],
+			flow: "focused", budget_minutes: 30, runtime: "codex", model: "terra", effort: "medium", local: true, ...adapterOverrides,
+		}] }));
+		let triageCalls = 0;
+		let planCalls = 0;
+		let dispatchCalls = 0;
+		const failRunReasons: string[] = [];
+		const deps = fakeDeps({
+			env: { HUMAIN_ORCHESTRATOR_LIVE_QA_CONFIG: configPath },
+			triageTask: async () => { triageCalls++; return null; },
+			planRun: async () => { planCalls++; throw new Error("planRun must not be reached"); },
+			dispatchParallel: async () => { dispatchCalls++; return []; },
+			failRun: async (_runId, reason) => { failRunReasons.push(reason); return healthyTelemetry; },
+		});
+		// implementation/5/medium are the triage-triggering defaults.
+		const args = fakeArgs({ taskClass: "implementation", complexity: 5, risk: "medium", liveQa: true, liveQaScope: "verify", liveQaAcceptance: acceptancePath });
+		const run = async () => {
+			const adapter = fakeAdapter();
+			const session = fakeSession();
+			const { ctx } = fakeCtx();
+			return runOrchestration("ht-orch-1700000000000-accpre", "/tmp/cwd", args, adapter, fakeResolution(adapter), ctx, session, { ...claimed, session }, deps);
+		};
+		return { run, counts: () => ({ triageCalls, planCalls, dispatchCalls }), failRunReasons };
+	}
+
+	test("invalid manifest aborts before triage: nothing dispatched, cause aborted, error notify text", async () => {
+		const { run, counts, failRunReasons } = setup(JSON.stringify({ ...manifest, version: 2 }), { criteria: true });
+		const result = await run();
+		expect(result).toMatchObject({ kind: "aborted", cause: "aborted", notifyType: "error" });
+		expect((result as { notifyText: string }).notifyText).toContain("acceptance manifest invalid: version must be 1");
+		expect(counts()).toEqual({ triageCalls: 0, planCalls: 0, dispatchCalls: 0 });
+		expect(failRunReasons).toHaveLength(1);
+	});
+
+	test("unreadable manifest aborts before triage", async () => {
+		const { run, counts } = setup("{not json", { criteria: true });
+		const result = await run();
+		expect(result).toMatchObject({ kind: "aborted", cause: "aborted", notifyType: "error" });
+		expect((result as { notifyText: string }).notifyText).toContain("acceptance manifest unreadable");
+		expect(counts().triageCalls).toBe(0);
+	});
+
+	test("selected adapter without criteria capability aborts before triage", async () => {
+		const { run, counts } = setup(JSON.stringify(manifest), {});
+		const result = await run();
+		expect(result).toMatchObject({ kind: "aborted", cause: "aborted", notifyType: "error" });
+		expect((result as { notifyText: string }).notifyText).toContain("adapter cannot take criteria");
+		expect(counts()).toEqual({ triageCalls: 0, planCalls: 0, dispatchCalls: 0 });
+	});
+
+	test("valid manifest + criteria-capable adapter proceeds to triage", async () => {
+		const { run, counts } = setup(JSON.stringify(manifest), { criteria: true });
+		const result = await run();
+		expect(counts().triageCalls).toBe(1);
+		expect(result).toMatchObject({ kind: "aborted", cause: "plan_failed" });
+	});
 });
