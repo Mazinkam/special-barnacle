@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from bench.agent_dir import prepare_agent_dir
 from bench.arms import arm_invocation, config_fingerprint
 from bench.contamination import scan_attempt, tool_locations
 from bench.grade import grade
@@ -110,6 +111,7 @@ def run_experiment(tasks, cfg, arms, experiment_root: Path, *, approve_usd: floa
     if problems:
         raise ValueError('tool isolation preflight failed:\n  ' + '\n  '.join(problems))
     root.mkdir(parents=True, exist_ok=True)
+    prepare_agent_dir(root, Path(cfg.skill_root))   # before any attempt: every arm reads its personas here
     fingerprint = config_fingerprint(cfg)
     journal, done, orphaned = _journal(root)
     for a in attempts:

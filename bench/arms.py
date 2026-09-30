@@ -7,6 +7,8 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from bench.agent_dir import AGENT_DIR_ENV, agent_dir_path
+
 from bench.tools import primary_binary
 
 ARMS = ('direct', 'current', 'tiered')
@@ -41,7 +43,9 @@ def arm_invocation(arm: str, goal: str, cfg: ExperimentConfig, experiment_root: 
     env = {'CODING_AGENT_ORCHESTRATOR_HOME': state, 'HUMAIN_ORCHESTRATOR_STATE_ROOT': state,
            'HUMAIN_ORCHESTRATOR_SKILL_ROOT': str(cfg.skill_root),
            'HUMAIN_ORCHESTRATOR_PROFILES_FILE': str(cfg.profiles_file),
-           'BENCH_EXPERIMENT_ID': cfg.experiment_id}
+           'BENCH_EXPERIMENT_ID': cfg.experiment_id,
+           # personas from the pinned skill copy, credentials from the user (bench/agent_dir.py)
+           AGENT_DIR_ENV: str(agent_dir_path(experiment_root))}
     base = [cfg.binary, '--mode', 'json', '-p', '--no-session']
     if arm == 'direct':
         return [*base, *_model_args(cfg.direct_model), '--thinking', cfg.direct_thinking,
