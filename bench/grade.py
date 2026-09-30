@@ -49,21 +49,23 @@ def _clone(src: Path, dst: Path) -> bool:
 def copy_tree(src: Path, dst: Path) -> None:
     """Copy `src` to a new `dst` without its top-level .git and without following symlinks.
 
-    Only the root .git carries repository history (snapshots have exactly one); walking a large
-    node_modules tree to hunt for nested ones cost more than the clone itself.
+    Each top-level entry except `.git` is cloned on its own, so the snapshot's .git (git objects for
+    the whole tree) is never materialized and never has to be deleted. Only the root .git carries
+    repository history (snapshots have exactly one).
     """
     src, dst = Path(src), Path(dst)
-    if not _clone(src, dst):
-        if dst.exists():
-            shutil.rmtree(dst)
-        shutil.copytree(src, dst, symlinks=True,
-                        ignore=lambda d, names: ['.git'] if Path(d) == src and '.git' in names else [])
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.mkdir(parents=True)
+    try:
+        entries = [e for e in os.scandir(src) if e.name != '.git']
+    except OSError:
+        entries = None
+    if entries is not None and all(_clone(Path(e.path), dst / e.name) for e in entries):
         return
-    git = dst / '.git'
-    if git.is_symlink() or git.is_file():
-        git.unlink()
-    elif git.is_dir():
-        shutil.rmtree(git)
+    shutil.rmtree(dst)
+    shutil.copytree(src, dst, symlinks=True,
+                    ignore=lambda d, names: ['.git'] if Path(d) == src and '.git' in names else [])
 
 
 def _fingerprint(p: Path):

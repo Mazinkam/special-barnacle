@@ -103,7 +103,7 @@ def test_unsafe_protected_paths_are_tampered(tmp_path):
 
 # --- fast tree copy (APFS clone on macOS, copytree elsewhere) -------------------------------------------
 
-import time
+from pathlib import Path
 import pytest
 from bench import grade as grade_mod
 
@@ -143,11 +143,13 @@ def test_copy_tree_falls_back_when_clone_is_unavailable(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform != 'darwin', reason='APFS clonefile is macOS-only')
-def test_clone_is_used_and_fast_on_macos(tmp_path):
-    src = tmp_path / 'big'
-    for i in range(3000):
-        d = src / f'd{i % 50}'; d.mkdir(parents=True, exist_ok=True); (d / f'f{i}.js').write_text('x' * 2048)
-    t0 = time.monotonic(); assert grade_mod._clone(src, tmp_path / 'c1') is True; clone_s = time.monotonic() - t0
-    t0 = time.monotonic(); __import__('shutil').copytree(src, tmp_path / 'c2', symlinks=True); copy_s = time.monotonic() - t0
-    assert sum(1 for _ in (tmp_path / 'c1').rglob('*.js')) == 3000
-    assert clone_s < copy_s
+def test_clone_path_is_used_on_macos(tmp_path, monkeypatch):
+    # Deterministic: assert the clone path handled every entry and copytree never ran (no timing race).
+    src = _sample(tmp_path / 'src')
+    cloned = []
+    real_clone = grade_mod._clone
+    monkeypatch.setattr(grade_mod, '_clone', lambda s, d: cloned.append(Path(s).name) or real_clone(s, d))
+    monkeypatch.setattr(grade_mod.shutil, 'copytree', lambda *a, **k: (_ for _ in ()).throw(AssertionError('copytree used')))
+    grade_mod.copy_tree(src, tmp_path / 'dst')
+    assert sorted(cloned) == ['a.txt', 'abs-link', 'link.txt', 'pkg']      # every entry except .git
+    assert (tmp_path / 'dst' / 'pkg' / 'node_modules' / 'dep' / 'index.js').exists()
