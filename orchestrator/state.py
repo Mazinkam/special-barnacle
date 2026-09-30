@@ -95,7 +95,7 @@ def _replay_into(state:dict[str,Any], events:Path, offset:int, replayed:int, see
 
 def _publish(root:Path, state:dict[str,Any], offset:int, replayed:int)->dict[str,Any]:
     state['checkpoint']=_checkpoint(root/STREAMS['event'],offset,replayed)
-    write_json(root/LEDGER_FILE,state); return state
+    write_json(root/LEDGER_FILE,state,compact=True); return state
 
 def replay_ledger(root: str|Path, *, full:bool=False)->dict[str,Any]:
     """Bring the ledger up to the complete prefix of events.jsonl. Caller must hold `writer_lock`.
