@@ -16,6 +16,9 @@ def test_orchestrated_arms_run_in_foreground_with_isolated_root(tmp_path):
     for arm, mode in (('current', 'off'), ('tiered', 'enforce')):
         argv, env = arm_invocation(arm, 'Fix X', cfg(tmp_path), tmp_path / 'exp')
         assert argv[-1] == '/orchestrate --profile premium Fix X'
+        ext = str(tmp_path / 'bridge' / 'extensions' / 'orchestrator')
+        assert argv[-4:-1] == ['--no-extensions', '-e', ext]   # only the pinned copy's extension, right before the prompt
+        assert env['HUMAIN_ORCHESTRATOR_SKILL_ROOT'] == str(tmp_path)
         assert env['HUMAIN_ORCHESTRATOR_FOREGROUND'] == '1'
         assert env['CODING_AGENT_ORCHESTRATOR_HOME'] == str(tmp_path / 'exp' / 'state')
         assert env['HUMAIN_ORCHESTRATOR_STATE_ROOT'] == str(tmp_path / 'exp' / 'state')

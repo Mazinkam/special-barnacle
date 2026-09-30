@@ -46,7 +46,9 @@ def arm_invocation(arm: str, goal: str, cfg: ExperimentConfig, experiment_root: 
                 '--no-extensions', '--no-skills', '--no-prompt-templates', goal], env
     env['HUMAIN_ORCHESTRATOR_FOREGROUND'] = '1'
     env['HUMAIN_ORCHESTRATOR_WORKFLOW_MODE'] = 'enforce' if arm == 'tiered' else 'off'
-    return [*base, ' '.join(['/orchestrate', *cfg.orchestrate_flags, goal])], env
+    # load only the pinned skill copy's extension, never whatever is installed in ~/.humain-terminal
+    extension = str(Path(cfg.skill_root) / 'bridge' / 'extensions' / 'orchestrator')
+    return [*base, '--no-extensions', '-e', extension, ' '.join(['/orchestrate', *cfg.orchestrate_flags, goal])], env
 
 
 def config_fingerprint(cfg: ExperimentConfig) -> str:
