@@ -97,7 +97,7 @@ def render_until_current(root, config: dict | None = None, *, build_data=None) -
         with (root / RENDER_LOCK).open('a') as f:
             try: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError: return renders
-            if dashboard_is_current(root): break
+            if dashboard_is_current(root): continue  # not break: a write probing the held slot now must be seen after release
             generate_dashboard(root, config, build_data=build_data, skip_if_current=True)
             renders += 1
     return renders

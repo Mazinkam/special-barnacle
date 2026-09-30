@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import signal
 import subprocess
@@ -153,3 +154,25 @@ def test_sync_env_renders_inside_write_and_dashboard_command_always_renders(tmp_
     with patch.object(publish, 'render', lambda d: renders.append(1) or real(d)):
         publish.generate_dashboard(tmp_path, config={})
     assert renders == [1]
+
+
+def test_write_landing_after_in_lock_check_is_not_lost(tmp_path):
+    """Lost wakeup: the renderer finds the page current *under* the slot lock, then a write lands and its
+    writer probes the (still held) slot and skips spawning. The renderer must re-check after release."""
+    _write(tmp_path, 0)
+    real, calls = publish.dashboard_is_current, []
+
+    def racing(root):
+        calls.append(1)
+        if len(calls) == 2:  # the in-lock check: another renderer just published, then a write lands
+            publish.generate_dashboard(tmp_path, {})
+            current = real(root)
+            _write(tmp_path, 1)
+            assert not publish.render_slot_free(tmp_path)  # so that writer's refresh spawns nothing
+            return current
+        return real(root)
+
+    with patch.object(publish, 'dashboard_is_current', racing):
+        publish.render_until_current(tmp_path, {})
+    assert publish.dashboard_is_current(tmp_path)
+
