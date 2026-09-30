@@ -72,3 +72,53 @@ def test_tree_digest_does_not_follow_symlinks(tmp_path):
     assert tree_digest(d) == d1
     os.remove(d / 'lnk'); (d / 'lnk').write_text('one')
     assert tree_digest(d) != d1
+
+
+# --- worktree_digest: git's view of the tree (ignored build output excluded), repo left untouched ----------
+
+from bench.snapshot import worktree_digest
+
+
+def _git_state(repo):
+    objects = sorted(str(p.relative_to(repo)) for p in (repo / '.git' / 'objects').rglob('*') if p.is_file())
+    return objects, (repo / '.git' / 'index').read_bytes()
+
+
+def _snap_with_ignored_dir(tmp_path, name):
+    (tmp_path / name).mkdir()
+    repo, base = make_repo_at(tmp_path / name)
+    info = make_snapshot(repo, base, tmp_path / name / 'snap')
+    (info.path / '.gitignore').write_text('node_modules/\n')
+    git(info.path, 'add', '.gitignore'); git(info.path, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'ignore')
+    (info.path / 'node_modules' / 'dep').mkdir(parents=True)
+    (info.path / 'node_modules' / 'dep' / 'index.js').write_text('1')
+    return info.path
+
+
+def test_worktree_digest_tracks_real_changes_only(tmp_path):
+    a = _snap_with_ignored_dir(tmp_path, 'a')
+    b = _snap_with_ignored_dir(tmp_path, 'b')
+    assert worktree_digest(a) == worktree_digest(b)                  # same content, different clones
+    start = worktree_digest(a)
+    (a / 'node_modules' / 'dep' / 'index.js').write_text('2')         # ignored build output
+    assert worktree_digest(a) == start
+    (a / 'new.txt').write_text('agent file')                           # untracked, not ignored
+    with_new = worktree_digest(a)
+    assert with_new != start
+    (a / 'a.txt').write_text('edited')                                 # tracked edit
+    assert worktree_digest(a) not in (start, with_new)
+    (a / 'a.txt').unlink()                                             # tracked deletion
+    assert worktree_digest(a) not in (start, with_new)
+
+
+def test_worktree_digest_never_writes_to_the_repo(tmp_path):
+    a = _snap_with_ignored_dir(tmp_path, 'a')
+    (a / 'new.txt').write_text('agent file')
+    before = _git_state(a)
+    worktree_digest(a)
+    assert _git_state(a) == before
+
+
+def test_worktree_digest_falls_back_without_git(tmp_path):
+    d = tmp_path / 'plain'; d.mkdir(); (d / 'x.txt').write_text('x')
+    assert worktree_digest(d) == tree_digest(d)

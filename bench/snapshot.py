@@ -5,7 +5,9 @@ import hashlib
 import io
 import os
 import posixpath
+import shutil
 import subprocess
+import tempfile
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,3 +81,32 @@ def tree_digest(path: Path) -> str:
         h.update(len(rel).to_bytes(4, 'big') + rel + kind)
         h.update(len(data).to_bytes(8, 'big') + data)
     return h.hexdigest()
+
+
+def worktree_digest(path: Path) -> str:
+    """Identity of a graded tree as git sees it: tracked files plus untracked, non-ignored files.
+
+    `tree_digest` reads every byte, node_modules included (436 s on a 1.6 GB monorepo tree, per grade).
+    Ignored build output comes from the shared prepared tree and is identical across arms, so git's view is
+    the meaningful identity. The repository is never modified: a throwaway index and object directory are
+    used, with the repo's own objects as a read-only alternate. Trees without a .git fall back to
+    `tree_digest`.
+    """
+    root = Path(path)
+    gitdir = root / '.git'
+    if not gitdir.is_dir():
+        return tree_digest(root)
+    with tempfile.TemporaryDirectory(prefix='bench-digest-') as tmp:
+        objects = Path(tmp) / 'objects'
+        objects.mkdir()
+        env = {**_ENV, 'GIT_INDEX_FILE': str(Path(tmp) / 'index'), 'GIT_OBJECT_DIRECTORY': str(objects),
+               'GIT_ALTERNATE_OBJECT_DIRECTORIES': str(gitdir / 'objects')}
+        # Seed the throwaway index with the repo's own (if any) so unchanged files are recognised by size and
+        # mtime instead of being re-hashed; clones keep mtimes but not inodes, hence checkStat=minimal.
+        if (gitdir / 'index').is_file():
+            shutil.copyfile(gitdir / 'index', Path(tmp) / 'index')
+        base = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.checkStat=minimal',
+                '-c', 'core.trustctime=false', '-C', str(root)]
+        subprocess.run([*base, 'add', '-A', '--', '.'], check=True, capture_output=True, env=env)
+        tree = subprocess.run([*base, 'write-tree'], check=True, capture_output=True, env=env).stdout.decode().strip()
+    return f'git-tree:{tree}'

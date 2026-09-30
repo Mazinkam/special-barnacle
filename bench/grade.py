@@ -13,7 +13,7 @@ from pathlib import Path
 
 from bench.manifest import TaskManifest
 from bench.sandbox import sandbox_argv
-from bench.snapshot import tree_digest
+from bench.snapshot import worktree_digest
 
 
 @dataclass
@@ -106,7 +106,7 @@ def _unlink_symlinks_under_overlay(hidden: Path, work: Path) -> None:
 
 
 def grade(task: TaskManifest, submitted: Path, base: Path, work: Path, *, sandbox: bool = True) -> GradeResult:
-    digest = tree_digest(submitted)
+    digest = worktree_digest(submitted)
     tampered = [p for p in task.protected_paths
                 if _unsafe(p) or _protected_fingerprint(submitted, p) != _protected_fingerprint(base, p)]
     if work.exists():
