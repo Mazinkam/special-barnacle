@@ -1874,20 +1874,31 @@ describe("S1c: filter DRIVER config guard (authoritative -- runs before check-at
 describe("Performance: the check-attr/ls-files/ls-tree preflight scales to thousands of files", () => {
 	test("a repository with ~5000 tracked files completes prepareTestedRevision in well under 5s", () => {
 		const dir = initRepo();
-		const gitCwd = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		// Fixture cost, not product cost, dominated this test: 5000 writeFileSync + `git add` (10k loose
+		// objects) took 60s+ on a busy machine. Build one pack with `git fast-import`, let git check the
+		// files out, and refresh the index so the timed `git status` sees a normal (non-racy) repo.
+		const branch = git(dir, "symbolic-ref", "HEAD").trim();
+		let stream = `commit ${branch}\ncommitter t <t@example.com> 0 +0000\ndata 5\nbulk\n`;
 		for (let i = 0; i < 5000; i++) {
-			writeFileSync(join(dir, `file-${i}.txt`), `content ${i}\n`);
+			const content = `content ${i}\n`;
+			stream += `M 100644 inline file-${i}.txt\ndata ${content.length}\n${content}\n`;
 		}
-		gitCwd("add", "-A");
-		gitCwd("commit", "-q", "-m", "bulk add 5000 files");
+		execFileSync("git", ["fast-import", "--quiet"], { cwd: dir, input: stream, stdio: ["pipe", "pipe", "pipe"] });
+		git(dir, "reset", "--hard", "-q");
+		git(dir, "update-index", "--refresh");
+		// Removing 5000 files can exceed the 5s afterEach budget under load; reap in the background.
+		tmpDirs.splice(tmpDirs.indexOf(dir), 1);
 
 		const start = Date.now();
 		const result = prepareTestedRevision({ candidateCwd: dir, runnerCwd: dir, runId: "test-perf-5000", changedFiles: [] });
 		const elapsed = Date.now() - start;
+		Bun.spawn(["rm", "-rf", dir]);
 
 		expect(result.ok).toBe(true);
 		expect(elapsed).toBeLessThan(5000);
-	}, 30_000);
+	// Timeout covers only fixture setup (checking out 5000 files, fixed cost that grows with machine load:
+	// 37s at load avg >100); the product bound asserted above stays 5s.
+	}, 120_000);
 });
 
 describe("S1b: no-network git -- lazy/promisor fetch never runs a repo-controlled transport command", () => {

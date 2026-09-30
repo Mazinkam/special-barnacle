@@ -2756,12 +2756,11 @@ describe("dispatch records (T6)", () => {
 describe("factual verification evidence helpers", () => {
 	test("testedRevisionFor reports the HEAD sha and dirty state for a git worktree", () => {
 		const dir = mkdtempSync(join(tmpdir(), "orch-tested-revision-"));
-		const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+		// Identity via env and gpgsign via -c: three fewer git spawns than `git config` (each ~0.3s on a busy box).
+		const ident = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com" };
+		const git = (...args: string[]) => execFileSync("git", ["-c", "commit.gpgsign=false", ...args], { cwd: dir, stdio: "pipe", env: ident });
 		try {
 			git("init", "-q");
-			git("config", "user.email", "t@example.com");
-			git("config", "user.name", "t");
-			git("config", "commit.gpgsign", "false");
 			writeFileSync(join(dir, "a.ts"), "export const a = 1;\n");
 			git("add", "a.ts");
 			git("commit", "-q", "-m", "init");

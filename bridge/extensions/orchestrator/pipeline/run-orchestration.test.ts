@@ -257,7 +257,11 @@ describe("pipeline/run-orchestration.ts out-of-tree warning (A6/N2)", () => {
 		expect(result).toMatchObject({ kind: "aborted", cause: "plan_failed", notifyType: "error" });
 		expect((result as { notifyText: string }).notifyText).toContain("plan marker");
 	});
-	test("a lead editing another git worktree leaves this run at zero files but warns and names that worktree", async () => {
+	// Each scenario runs real `git status`/`rev-parse` subprocesses (~15 per runOrchestration), so the
+	// former single test doing six runs took 3-4s unloaded and tripped the 5s default under load.
+	// One fixture + one run per test keeps each test well inside its budget.
+	type ForeignCase = { claims: string[]; localEdit: boolean; earlierCommands: number };
+	const withForeignWorktree = async (cases: ForeignCase[], tail?: "prose" | "nested") => {
 		const tmp = mkdtempSync(join(tmpdir(), "orch-out-of-tree-"));
 		const repo = join(tmp, "repo");
 		const other = join(tmp, "other-worktree");
@@ -281,13 +285,7 @@ describe("pipeline/run-orchestration.ts out-of-tree warning (A6/N2)", () => {
 				},
 				effective_quality_floor: 0.5, cost_aggressiveness: 0.5,
 			};
-			for (const { claims, localEdit, earlierCommands } of [
-				{ claims: [] as string[], localEdit: false, earlierCommands: 0 },
-				{ claims: ["a.ts"], localEdit: false, earlierCommands: 0 },
-				{ claims: ["a.ts"], localEdit: true, earlierCommands: 0 },
-				// A foreign cd as command 21 in the bounded log must not be lost to the first 20.
-				{ claims: [] as string[], localEdit: false, earlierCommands: 20 },
-			]) {
+			for (const { claims, localEdit, earlierCommands } of cases) {
 				const session = fakeSession();
 				// The child actually issued the command; assistant prose is not tool evidence.
 				const commandEvent = (command: string) => JSON.stringify({ type: "tool_execution_start", toolName: "bash", args: { command } });
@@ -331,7 +329,8 @@ describe("pipeline/run-orchestration.ts out-of-tree warning (A6/N2)", () => {
 				expect(events).toContain("out_of_tree_changes");
 			}
 			// A bare report claim that the lead visited another worktree is not an edit.
-			rmSync(join(tmp, `${runId}-lead-0.events.jsonl`));
+			if (tail === "prose") {
+			rmSync(join(tmp, `${runId}-lead-0.events.jsonl`), { force: true });
 			const proseSession = fakeSession();
 			proseSession.file = (name: string) => join(tmp, name);
 			const proseCtx = fakeCtx();
@@ -348,6 +347,8 @@ describe("pipeline/run-orchestration.ts out-of-tree warning (A6/N2)", () => {
 			expect(proseResult.kind).toBe("completed");
 			if (proseResult.kind === "completed") expect(proseResult.report.outOfTreeChangesLine).toBeNull();
 			expect(proseCtx.notifications.some((n) => n.text.includes("changes outside run tree:"))).toBe(false);
+			}
+			if (tail === "nested") {
 			// A run may start in a subdirectory. A lead cd'ing to its repository root
 			// has not left the run tree and must not produce the foreign-worktree warning.
 			const nested = join(repo, "src");
@@ -368,10 +369,22 @@ describe("pipeline/run-orchestration.ts out-of-tree warning (A6/N2)", () => {
 			expect(result.kind).toBe("completed");
 			if (result.kind === "completed") expect(result.report.outOfTreeChangesLine).toBeNull();
 			expect(notifications.some((n) => n.text.includes("changes outside run tree:"))).toBe(false);
+			}
 		} finally {
 			rmSync(tmp, { recursive: true, force: true });
 		}
-	});
+	};
+	test("a lead editing another git worktree leaves this run at zero files but warns and names that worktree (no claims)", () =>
+		withForeignWorktree([{ claims: [], localEdit: false, earlierCommands: 0 }]));
+	test("a lead editing another git worktree: claimed file in the foreign tree only", () =>
+		withForeignWorktree([{ claims: ["a.ts"], localEdit: false, earlierCommands: 0 }]));
+	test("a lead editing another git worktree: plus an unrelated local edit counts one local file", () =>
+		withForeignWorktree([{ claims: ["a.ts"], localEdit: true, earlierCommands: 0 }]));
+	// A foreign cd as command 21 in the bounded log must not be lost to the first 20.
+	test("a lead editing another git worktree: foreign cd as the 21st logged command is still found", () =>
+		withForeignWorktree([{ claims: [], localEdit: false, earlierCommands: 20 }]));
+	test("a bare report claim that the lead visited another worktree is not an edit", () => withForeignWorktree([], "prose"));
+	test("a run starting in a subdirectory whose lead cds to the repo root is not out of tree", () => withForeignWorktree([], "nested"));
 });
 
 describe("pipeline/run-orchestration.ts runOrchestration QA skip when no lead succeeded (C4)", () => {
