@@ -80,6 +80,14 @@ class TestMethod(unittest.TestCase):
             self.assertRegex(text, rf"\|\s*{band['min']}[–-]{band['max']}\s*\|\s*{band['workers']}\s*\|")
         self.assertIn("orchestrator/method.json", text)
 
+    def test_skill_md_quotes_workflow_policy(self):
+        text = (ROOT / "SKILL.md").read_text()
+        wf = method.load_method()["rules"]["workflow_policy"]
+        self.assertIn("rules.workflow_policy", text)
+        self.assertIn(f"{wf['thresholds']['led_min_files']} or more candidate files", text)
+        self.assertIn(f"{wf['thresholds']['led_min_packages']} or more packages", text)
+        self.assertIn("HUMAIN_ORCHESTRATOR_WORKFLOW_MODE", text)
+
     def test_lead_capabilities_and_tiers(self):
         self.assertEqual(method.tier_of("lead_small"), "mid")
         self.assertEqual(method.tier_of("lead"), "premium")
@@ -131,6 +139,28 @@ class TestMethod(unittest.TestCase):
         data["rules"]["dispatch_spend_cap"]["default_tier"] = "bogus"
         with self.assertRaisesRegex(ValueError, "default_tier"):
             method._validate(data)
+
+    def test_workflow_policy_shape_is_validated(self):
+        import copy
+        data = json.loads(method.METHOD_PATH.read_text())
+        wf = data['rules']['workflow_policy']
+        self.assertEqual(wf['mode'], 'off')
+        self.assertEqual(wf['levels'], ['direct', 'checked', 'led', 'full'])
+        for replacement, match in (([], 'rules.workflow_policy'),):
+            bad = copy.deepcopy(data); bad['rules']['workflow_policy'] = replacement
+            with self.assertRaisesRegex(ValueError, match):
+                method._validate(bad)
+        for replacement, match in ((None, 'rules.workflow_policy.thresholds'),):
+            bad = copy.deepcopy(data); bad['rules']['workflow_policy']['thresholds'] = replacement
+            with self.assertRaisesRegex(ValueError, match):
+                method._validate(bad)
+        for mutate, match in ((lambda d: d.__setitem__('mode', 'on'), 'workflow_policy.mode'),
+                              (lambda d: d.__setitem__('levels', ['direct', 'full']), 'workflow_policy.levels'),
+                              (lambda d: d['thresholds'].__setitem__('led_min_files', 0), 'led_min_files'),
+                              (lambda d: d.__setitem__('fix_rounds_per_level', -1), 'fix_rounds_per_level')):
+            bad = copy.deepcopy(data); mutate(bad['rules']['workflow_policy'])
+            with self.assertRaisesRegex(ValueError, match):
+                method._validate(bad)
 
     def test_no_haiku_in_family_presets(self):
         from orchestrator.dynamic_adapter import MODEL_FAMILY_PRESETS

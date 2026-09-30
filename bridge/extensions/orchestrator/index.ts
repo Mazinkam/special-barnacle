@@ -35,6 +35,7 @@ import { resolveCandidates, usableModels, type Candidate } from "./adapters/mode
 import { buildCatalog, parseModelFacts } from "./adapters/model-catalog.ts";
 import { dispatchWithFailover } from "./dispatch/failover.ts";
 import { failoverConfig } from "./dispatch/failover-policy.ts";
+import { resolveStateRoot } from "./config.ts";
 import { ModelHealth } from "./run/model-health.ts";
 import type { ModelHealth as ModelHealthType } from "./run/model-health.ts";
 import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
@@ -161,9 +162,9 @@ import { assignCanary, canaryTelemetryFields, parseModelCanaries, type CanaryAss
 const SKILL_ROOT =
 	process.env.HUMAIN_ORCHESTRATOR_SKILL_ROOT ??
 	"~/.local/share/agent-skills/hierarchical-agent-orchestrator";
-const STATE_ROOT =
-	process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT ??
-	"~/.local/state/coding-agent-orchestrator";
+// One resolver for both runtimes (config.ts / orchestrator/core/env.py): canonical
+// CODING_AGENT_ORCHESTRATOR_HOME, then aliases, then the contract default.
+const STATE_ROOT = resolveStateRoot(process.env);
 const PYTHON = process.env.HUMAIN_ORCHESTRATOR_PYTHON ?? "python3";
 /**
  * Model configuration lives in one file: `orchestrator-profiles.json`

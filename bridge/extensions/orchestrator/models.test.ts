@@ -451,3 +451,31 @@ describe("method model failover rules", () => {
 		expect(METHOD.rules.model_failover.max_switches).toBe(4);
 	});
 });
+
+test("workflow_policy is readable and off by default", () => {
+	const wf = METHOD.rules.workflow_policy!;
+	expect(wf.mode).toBe("off");
+	expect(wf.levels).toEqual(["direct", "checked", "led", "full"]);
+	expect(wf.risk_path_globs).toContain("**/auth/**");
+});
+
+describe("parseProfilesFile workflow_mode", () => {
+	const base = { version: 1, active_profile: "p", profiles: { p: {} } };
+	test("keeps a valid workflow_mode with no problems", () => {
+		const { file, problems } = parseProfilesFile({ ...base, workflow_mode: "observe" });
+		expect(file.workflow_mode).toBe("observe");
+		expect(problems).toEqual([]);
+	});
+	test("an invalid value is kept for run-time reporting and never blocks dispatch", () => {
+		const { file, problems } = parseProfilesFile({ ...base, workflow_mode: "sometimes" });
+		expect(file.workflow_mode).toBe("sometimes");
+		expect(problems).toEqual([]);
+	});
+	test("absent key stays absent", () => {
+		expect("workflow_mode" in parseProfilesFile(base).file).toBe(false);
+	});
+	test("a non-string value is dropped", () => {
+		expect("workflow_mode" in parseProfilesFile({ ...base, workflow_mode: 3 }).file).toBe(false);
+	});
+});
+

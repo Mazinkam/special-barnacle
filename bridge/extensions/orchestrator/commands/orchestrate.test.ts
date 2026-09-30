@@ -506,6 +506,46 @@ describe("commands/orchestrate.ts: a successful claim reaches runOrchestration (
 		setRunOrchestrationForTest(null);
 	});
 
+	test("HUMAIN_ORCHESTRATOR_FOREGROUND=1 makes the handler await the run", async () => {
+		const { pi, getHandler } = fakePi();
+		const session = fakeRunSessionLike("placeholder");
+		const { deps } = baseDeps({
+			resolveAdapter: async () => healthyResolution(fakeAdapter()),
+			createSession: () => session,
+			env: { HUMAIN_ORCHESTRATOR_FOREGROUND: "1" },
+		});
+		registerOrchestrateCommand(pi, deps);
+		const { ctx } = fakeCtx();
+		let release!: () => void;
+		const gate = new Promise<void>((r) => { release = r; });
+		let finished = false;
+		setRunOrchestrationForTest(async () => { await gate; finished = true; return { kind: "aborted" }; });
+
+		let settled = false;
+		const handlerDone = getHandler()("fix the login race", ctx).then(() => { settled = true; });
+		await new Promise((r) => setTimeout(r, 20));
+		expect(settled).toBe(false);
+		release();
+		await handlerDone;
+		expect(finished).toBe(true);
+	});
+
+	test("without the switch the handler returns before the run settles", async () => {
+		const { pi, getHandler } = fakePi();
+		const { deps } = baseDeps({
+			resolveAdapter: async () => healthyResolution(fakeAdapter()),
+			createSession: () => fakeRunSessionLike("placeholder"),
+			env: {},
+		});
+		registerOrchestrateCommand(pi, deps);
+		const { ctx } = fakeCtx();
+		let release!: () => void;
+		const gate = new Promise<void>((r) => { release = r; });
+		setRunOrchestrationForTest(async () => { await gate; return { kind: "aborted" }; });
+		await getHandler()("fix the login race", ctx);
+		release();
+	});
+
 	test("recordRunStarted is called exactly once, right after a successful claim, with the run id and session file", async () => {
 		const { pi, getHandler } = fakePi();
 		const adapter = fakeAdapter();

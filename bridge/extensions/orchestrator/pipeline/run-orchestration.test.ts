@@ -1,6 +1,6 @@
-import { describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync, spawnSync } from "node:child_process";
+import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionContext } from "@humain/terminal";
@@ -13,7 +13,7 @@ import type { RunContext } from "../run/context.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 import type { OrchestrateArgs } from "../core/args.ts";
 import type { FlushReport } from "../record-queue.ts";
-import type { PlanResponse } from "../core/prompts.ts";
+import type { DispatchTask, PlanResponse } from "../core/prompts.ts";
 
 /** A `RunSession` fake with only the surface `runOrchestration` touches on the
  *  paths under test: no timers, no disk I/O. Cast past the real class's
@@ -1313,4 +1313,252 @@ describe("pipeline/run-orchestration.ts runOrchestration: efficiency warnings", 
 		expect(notifications.some((n) => n.text.includes("efficiency_switch_unsupported") || n.text.includes("not supported"))).toBe(false);
 		expect(recordedEvents.some((e) => e.event === "efficiency_switch_unsupported")).toBe(false);
 	});
+});
+
+describe("pipeline/run-orchestration.ts runOrchestration workflow observe mode", () => {
+	async function runWith(env: Record<string, string>, workflowSetting?: string) {
+		const runId = "ht-orch-1700000000000-wf-a";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		if (workflowSetting !== undefined) {
+			(resolved as unknown as { profiles: { file: Record<string, unknown> } }).profiles.file = { version: 1, active_profile: "test-profile", profiles: {}, workflow_mode: workflowSetting };
+		}
+		const events: Array<[string, Record<string, unknown>]> = [];
+		let summary: Record<string, unknown> | undefined;
+		const deps = fakeDeps({
+			env,
+			planRun: async () => ({
+				plan_id: "plan-123456789012", run_id: runId, task_class: "bugfix", complexity: 3, risk: "medium",
+				topology: { depth: 1, leads: 1, workers: 0, shape: "flat" },
+				route: {
+					selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+					recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+					mode: "auto", history_sufficient: true, explanation: {},
+				},
+				effective_quality_floor: 0.5,
+				cost_aggressiveness: 0.5,
+			}),
+			recordEvent: (e, p) => { events.push([e, p]); },
+			completeRun: async (_id, s) => { summary = s; return healthyTelemetry; },
+			dispatchParallel: async (_cwd, _runId2, tasks) => tasks.map((t) => ({
+				taskId: t.taskId, capability: t.capability, model: "p/lead", exitCode: 0,
+				stdout: t.capability === "lead" ? "STATUS: completed\n\nFiles Changed: None" : "PASS", stderr: "",
+				usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+				durationMs: 1, costUsd: 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const, filesChanged: [],
+			})),
+		});
+		await runOrchestration(
+			runId, "/tmp/cwd-not-a-git-repo", fakeArgs({ goal: "Fix src/a.ts" }), adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+		return { events, summary };
+	}
+
+	test("observe mode records workflow_level_planned and a workflow summary without changing dispatch", async () => {
+		const { events, summary } = await runWith({ HUMAIN_ORCHESTRATOR_WORKFLOW_MODE: "observe" });
+		const planned = events.find(([e]) => e === "workflow_level_planned");
+		expect(planned?.[1].mode).toBe("observe");
+		expect((summary?.workflow as { mode: string }).mode).toBe("observe");
+		expect(events.some(([e]) => e === "dispatch_plan_confirmed")).toBe(true);
+	});
+
+	test("the persisted orchestrator-profiles.json workflow_mode enables observe without any env var", async () => {
+		const { events, summary } = await runWith({}, "observe");
+		const planned = events.find(([e]) => e === "workflow_level_planned");
+		expect(planned?.[1].mode).toBe("observe");
+		expect(planned?.[1].mode_source).toBe("setting");
+		expect((summary?.workflow as { mode: string }).mode).toBe("observe");
+	});
+
+	test("the env var still overrides the persisted setting", async () => {
+		const { events, summary } = await runWith({ HUMAIN_ORCHESTRATOR_WORKFLOW_MODE: "off" }, "observe");
+		expect(events.map(([e]) => e)).not.toContain("workflow_level_planned");
+		expect(summary !== undefined && "workflow" in summary).toBe(false);
+	});
+
+	test("off mode emits no workflow event and no workflow summary key", async () => {
+		const { events, summary } = await runWith({});
+		expect(events.map(([e]) => e)).not.toContain("workflow_level_planned");
+		expect(summary !== undefined && "workflow" in summary).toBe(false);
+	});
+});
+
+describe("pipeline/run-orchestration.ts runOrchestration workflow enforce mode", () => {
+	const IMPL_REPORT = "done\n## Files Changed\n- src/util/format.ts\n\nSTATUS: completed";
+	// Real temp git repo + sync git calls: fresh-repo `git add -A` was measured stalling >5s on
+	// slow hosts, so these tests need an explicit timeout above bun's 5s default.
+	const GIT_IO_TIMEOUT_MS = 30_000;
+	let repo = "";
+	afterEach(() => { if (repo) rmSync(repo, { recursive: true, force: true }); repo = ""; });
+
+	function makeRepo(extra: Record<string, string> = {}): string {
+		const dir = mkdtempSync(join(tmpdir(), "wf-enforce-"));
+		try {
+		const files: Record<string, string> = {
+			"package.json": '{"scripts":{"test":"bun test"}}',
+			"bun.lock": "",
+			"src/util/format.ts": "export const f = 1;\n",
+			"src/util/format.test.ts": "export {};\n",
+			...extra,
+		};
+		for (const [rel, body] of Object.entries(files)) {
+			mkdirSync(join(dir, rel, ".."), { recursive: true });
+			writeFileSync(join(dir, rel), body);
+		}
+		const git = (...a: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...a], { cwd: dir, stdio: "ignore" });
+		git("init");
+		git("add", "-A");
+		git("commit", "-m", "init");
+		return dir;
+		} catch (err) {
+			rmSync(dir, { recursive: true, force: true });
+			throw err;
+		}
+	}
+
+	const passing = async () => [{ name: "test", argv: ["bun", "test"], status: "pass" as const, exitCode: 0, durationMs: 1, tail: "" }];
+	const failing = async () => [{ name: "test", argv: ["bun", "test"], status: "fail" as const, exitCode: 1, durationMs: 1, tail: "1 failed" }];
+
+	async function runWith(opts: {
+		args?: Partial<OrchestrateArgs>;
+		runChecks?: RunOrchestrationDeps["runChecks"];
+		extraFiles?: Record<string, string>;
+		onLead?: (repo: string) => void;
+		qaStdout?: string;
+	}) {
+		repo = makeRepo(opts.extraFiles);
+		const runId = "ht-orch-1700000000000-wf-e";
+		const session = fakeSession();
+		const { ctx } = fakeCtx({ confirm: () => Promise.resolve(true) });
+		const adapter = fakeAdapter();
+		const resolved = fakeResolution(adapter);
+		const events: Array<[string, Record<string, unknown>]> = [];
+		const dispatched: string[] = [];
+		const tasks: DispatchTask[] = [];
+		let summary: Record<string, unknown> | undefined;
+		let completes = 0;
+		let dispatchCostUsd = 0;
+		const deps = fakeDeps({
+			env: { HUMAIN_ORCHESTRATOR_WORKFLOW_MODE: "enforce" },
+			runChecks: opts.runChecks,
+			planRun: async () => ({
+				plan_id: "plan-123456789012", run_id: runId, task_class: "bugfix", complexity: 2, risk: "low",
+				topology: { depth: 1, leads: 1, workers: 0, shape: "flat" },
+				route: {
+					selected: { capability: "lead", effort: "medium", verification_depth: "standard" },
+					recommended: { capability: "lead", effort: "medium", verification_depth: "standard" },
+					mode: "auto", history_sufficient: true, explanation: {},
+				},
+				effective_quality_floor: 0.5,
+				cost_aggressiveness: 0.5,
+			}),
+			recordEvent: (e, p) => { events.push([e, p]); },
+			completeRun: async (_id, s) => { summary = s; completes++; return healthyTelemetry; },
+			dispatchParallel: async (_cwd, _r, ts) => ts.map((t) => {
+				dispatched.push(t.capability);
+				tasks.push(t);
+				const impl = t.capability === "implementation_strong";
+				if (t.capability.startsWith("lead")) opts.onLead?.(repo);
+				dispatchCostUsd += impl ? 0.25 : 0.01;
+				if (impl) appendFileSync(join(repo, "src/util/format.ts"), `export const g${dispatched.length} = 1;\n`);
+				return {
+					taskId: t.taskId, capability: t.capability, model: "p/x", exitCode: 0,
+					stdout: impl ? IMPL_REPORT : t.capability.startsWith("lead") ? "STATUS: completed\n\nFiles Changed: None" : (opts.qaStdout ?? "PASS"), stderr: "",
+					usage: { turns: 0, tool_calls: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens: 0 },
+					durationMs: 1, costUsd: impl ? 0.25 : 0.01, nestedCostUsd: 0, costReported: true, outcome: "completed" as const,
+					filesChanged: impl ? ["src/util/format.ts"] : [],
+				};
+			}),
+		});
+		const result = await runOrchestration(
+			runId, repo,
+			fakeArgs({ goal: "Fix src/util/format.ts", taskClass: "bugfix", complexity: 2, risk: "low", ...opts.args }),
+			adapter, resolved, ctx, session, { ...claimed, session }, deps,
+		);
+		return { events, dispatched, tasks, summary, completes, result, dispatchCostUsd };
+	}
+
+	test("enforce direct: implementer + passing checks completes without leads or QA agent", async () => {
+		const { dispatched, summary, events } = await runWith({ runChecks: passing });
+		expect(dispatched).toEqual(["implementation_strong"]);
+		expect((summary!.workflow as { final: string }).final).toBe("direct");
+		expect(summary!.verification_passed).toBe(true);
+		expect(events.map(([e]) => e)).not.toContain("workflow_level_escalated");
+	}, GIT_IO_TIMEOUT_MS);
+
+	test("enforce direct: persistent failure escalates to led, keeps QA scope and prior cost", async () => {
+		const { dispatched, tasks, summary, events, completes } = await runWith({ runChecks: failing });
+		expect(dispatched.slice(0, 2)).toEqual(["implementation_strong", "implementation_strong"]);
+		expect(dispatched).toContain("qa_agent");
+		const qa = tasks.find((t) => t.capability === "qa_agent");
+		expect(qa!.task).toContain("src/util/format.ts");
+		expect(events.map(([e]) => e)).toContain("workflow_level_escalated");
+		const wf = summary!.workflow as { planned: string; final: string; escalations: number };
+		expect([wf.planned, wf.final, wf.escalations]).toEqual(["direct", "led", 1]);
+		expect(summary!.total_cost_usd as number).toBeGreaterThanOrEqual(0.5);
+		expect(summary!.fix_rounds as number).toBeGreaterThanOrEqual(1);
+		expect(completes).toBe(1);
+	}, GIT_IO_TIMEOUT_MS);
+
+	test("escalated led run that reverts the flat changes is not reported as verified", async () => {
+		const { summary, result, dispatched } = await runWith({
+			runChecks: failing,
+			onLead: (r) => execFileSync("git", ["checkout", "--", "src/util/format.ts"], { cwd: r, stdio: "ignore" }),
+		});
+		expect(dispatched.some((c) => c.startsWith("lead"))).toBe(true);
+		expect(summary!.verification_passed).toBe(false);
+		expect(result.kind).toBe("completed");
+		const report = (result as { report: { passedVerification: boolean } }).report;
+		expect(report.passedVerification).toBe(false);
+	}, GIT_IO_TIMEOUT_MS);
+
+	test("escalated led retry rescope keeps the flat attempt's files when git observation is unavailable", async () => {
+		const { summary } = await runWith({
+			args: { maxRetries: 2 },
+			runChecks: failing,
+			qaStdout: "## Verdict\nFAIL\n- test",
+			// Destroying .git during the led phase makes every later git snapshot fail, so scope
+			// falls back to claimed file paths (flat attempt claims live in carry.priorResults).
+			onLead: (r) => rmSync(join(r, ".git"), { recursive: true, force: true }),
+		});
+		expect(summary!.fix_rounds as number).toBeGreaterThanOrEqual(2);
+		expect(summary!.files_changed as string[]).toContain("src/util/format.ts");
+	}, GIT_IO_TIMEOUT_MS);
+
+	test("escalated led QA that exits 0 with no check evidence is not reported as verified", async () => {
+		const { summary, result } = await runWith({ runChecks: failing, qaStdout: "all good" });
+		expect(summary!.verification_passed).toBe(false);
+		expect(result.kind).toBe("completed");
+		const report = (result as { report: { passedVerification: boolean } }).report;
+		expect(report.passedVerification).toBe(false);
+	}, GIT_IO_TIMEOUT_MS);
+
+	test("escalated run report.retries equals summary.fix_rounds and includes the prior round", async () => {
+		const { summary, result } = await runWith({ runChecks: failing });
+		const report = (result as { report: { retries: number } }).report;
+		expect(summary!.fix_rounds as number).toBeGreaterThanOrEqual(1);
+		expect(report.retries).toBe(summary!.fix_rounds as number);
+	}, GIT_IO_TIMEOUT_MS);
+
+	test("escalated run total cost equals the sum of every dispatch cost", async () => {
+		const { summary, dispatchCostUsd } = await runWith({ runChecks: failing });
+		expect(summary!.total_cost_usd as number).toBeCloseTo(dispatchCostUsd, 6);
+	}, GIT_IO_TIMEOUT_MS);
+
+	test("enforce never runs flat for excluded task classes", async () => {
+		const { dispatched } = await runWith({ args: { taskClass: "investigation" }, runChecks: passing });
+		expect(dispatched).not.toContain("implementation_strong");
+	}, GIT_IO_TIMEOUT_MS);
+
+	test("enforce never runs flat for a risk-path goal even with --workflow direct", async () => {
+		const { dispatched, summary } = await runWith({
+			args: { goal: "Fix src/auth/login.ts", workflowLevel: "direct" },
+			extraFiles: { "src/auth/login.ts": "export const a = 1;\n" },
+			runChecks: passing,
+		});
+		expect(dispatched[0]).not.toBe("implementation_strong");
+		const wf = summary!.workflow as { planned: string; final: string };
+		expect([wf.planned, wf.final]).toEqual(["full", "full"]);
+	}, GIT_IO_TIMEOUT_MS);
 });

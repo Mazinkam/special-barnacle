@@ -86,6 +86,26 @@ def _validate(m: dict[str, Any]) -> None:
     cap = m["rules"].get("dispatch_spend_cap")
     if cap and cap["mode"] not in ("off", "warn", "enforce"):
         raise ValueError(f"method.json: dispatch_spend_cap has unknown mode {cap['mode']!r}")
+    wf = m["rules"].get("workflow_policy")
+    if wf is not None:
+        if not isinstance(wf, dict):
+            raise ValueError("rules.workflow_policy must be a dict")
+        if wf.get("mode") not in ("off", "observe", "enforce"):
+            raise ValueError("rules.workflow_policy.mode must be off|observe|enforce")
+        if wf.get("levels") != ["direct", "checked", "led", "full"]:
+            raise ValueError("rules.workflow_policy.levels must be exactly direct, checked, led, full")
+        thresholds = wf.get("thresholds", {})
+        if not isinstance(thresholds, dict):
+            raise ValueError("rules.workflow_policy.thresholds must be a dict")
+        for key in ("led_min_files", "led_min_packages"):
+            _positive_int(thresholds.get(key), f"rules.workflow_policy.thresholds.{key}")
+        if isinstance(wf.get("fix_rounds_per_level"), bool) or not isinstance(wf.get("fix_rounds_per_level"), int) or wf["fix_rounds_per_level"] < 0:
+            raise ValueError("rules.workflow_policy.fix_rounds_per_level must be a non-negative integer")
+        for key in ("signal_timeout_ms", "check_timeout_ms"):
+            _positive_int(wf.get(key), f"rules.workflow_policy.{key}")
+        for key in ("excluded_task_classes", "risk_path_globs", "interface_globs"):
+            if not isinstance(wf.get(key), list) or not all(isinstance(x, str) and x for x in wf[key]):
+                raise ValueError(f"rules.workflow_policy.{key} must be a list of non-empty strings")
     _validate_model_rules(m)
     _validate_rule_efforts_and_tiers(m["rules"], efforts, tiers)
 

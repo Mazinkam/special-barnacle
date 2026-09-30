@@ -161,3 +161,11 @@ describe("/orchestrate argument parsing (parseArgs)", () => {
 		expect(tasks.length).toBe(4);
 	});
 });
+
+test("--workflow parses a level and rejects others", () => {
+	expect(parseArgs("--workflow direct fix x").workflowLevel).toBe("direct");
+	expect(parseArgs("--workflow direct fix x").goal).toBe("fix x");
+	const bad = parseArgs("--workflow tiny fix x");
+	expect(bad.workflowLevel).toBeUndefined();
+	expect(bad.unknownFlags).toContain("--workflow tiny");
+});

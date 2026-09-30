@@ -602,3 +602,23 @@ class LifecycleElapsedTests(unittest.TestCase):
         r=by_run(summarize_runs([],events,[]))['le3']
         self.assertEqual(r['elapsed_ms'],5000)
         self.assertEqual(r['elapsed_source'],'monotonic')
+
+
+class IterationCounterTests(unittest.TestCase):
+    def test_failover_is_provider_retry_not_fix_round(self):
+        events=[{'event':'dispatch_finished','run_id':'it1','task_id':'t','attempt':1,'superseded_by_fallback':True},
+                {'event':'dispatch_finished','run_id':'it1','task_id':'t','attempt':2}]
+        outcomes=[{'run_id':'it1','task_id':'run-complete','outcome':'verified','note':'{"fix_rounds": 0, "retries": 0}'}]
+        r=by_run(summarize_runs([],events,outcomes))['it1']
+        self.assertEqual(r['provider_retries'],1)
+        self.assertEqual(r['fix_rounds'],0)
+
+    def test_legacy_retries_note_becomes_fix_rounds(self):
+        outcomes=[{'run_id':'it2','task_id':'run-complete','outcome':'fail','note':'{"retries": 2}'}]
+        r=by_run(summarize_runs([],[],outcomes))['it2']
+        self.assertEqual(r['fix_rounds'],2)
+
+    def test_unknown_fix_rounds_is_none(self):
+        r=by_run(summarize_runs([call('it3','t',cost_usd=.01,cost_source='reported')],[],[]))['it3']
+        self.assertIsNone(r['fix_rounds'])
+        self.assertEqual(r['provider_retries'],0)

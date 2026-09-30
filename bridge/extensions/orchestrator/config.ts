@@ -118,7 +118,7 @@ function positiveIntEnv(env: BridgeEnv, name: string, fallback: number): number 
  * `HUMAIN_ORCHESTRATOR_STATE_ROOT`), else `contract.state_root.default`. See
  * `orchestrator/core/env.py`'s `default_state_root` for the Python-side mirror.
  */
-function resolveStateRoot(env: BridgeEnv): string {
+export function resolveStateRoot(env: BridgeEnv): string {
 	for (const name of [contract.state_root.env_vars.canonical, ...contract.state_root.env_vars.aliases]) {
 		const value = env[name];
 		if (value) return value;

@@ -60,6 +60,20 @@ export interface ModelFailoverRule {
 	real_work_min_tool_calls: number;
 }
 
+export type WorkflowLevel = "direct" | "checked" | "led" | "full";
+export type WorkflowMode = "off" | "observe" | "enforce";
+export interface WorkflowPolicy {
+	mode: WorkflowMode;
+	levels: WorkflowLevel[];
+	thresholds: { led_min_files: number; led_min_packages: number };
+	fix_rounds_per_level: number;
+	signal_timeout_ms: number;
+	check_timeout_ms: number;
+	excluded_task_classes: string[];
+	risk_path_globs: string[];
+	interface_globs: string[];
+}
+
 interface MethodFile {
 	schema_version: number;
 	tiers: Tier[];
@@ -97,6 +111,7 @@ interface MethodFile {
 		};
 		model_requirements: ModelRequirementsRule;
 		model_failover: ModelFailoverRule;
+		workflow_policy?: WorkflowPolicy;
 	};
 }
 
@@ -192,6 +207,12 @@ export interface ProfilesFile {
 	/** Providers to prefer, in order, when a bare alias exists on several. */
 	provider_preference?: string[];
 	profiles: Record<string, ProfileSpec>;
+	/**
+	 * Persisted workflow mode (`off|observe|enforce`), set with `/orchestrator-models workflow`.
+	 * Kept as the raw string: an invalid value is reported when a run resolves its mode
+	 * (workflow-mode.ts) and falls back to method.json, never blocking dispatch here.
+	 */
+	workflow_mode?: string;
 }
 
 export const DEFAULT_PROVIDER_PREFERENCE = ["openai-codex", "amazon-bedrock"];
@@ -219,6 +240,7 @@ export function parseProfilesFile(raw: unknown): { file: ProfilesFile; problems:
 	if (Array.isArray(r.provider_preference) && r.provider_preference.every((p) => typeof p === "string")) {
 		file.provider_preference = r.provider_preference as string[];
 	}
+	if (typeof r.workflow_mode === "string") file.workflow_mode = r.workflow_mode;
 	const profiles = r.profiles;
 	if (!profiles || typeof profiles !== "object") {
 		problems.push("missing \"profiles\" object");

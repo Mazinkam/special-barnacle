@@ -38,6 +38,20 @@ class CurrentBaselineTests(unittest.TestCase):
         self.assertIn('sonnet-5-5 (mid tier)', [label for label, _ in skill_vs_baseline.BRACKETS])
         self.assertEqual(skill_vs_baseline.COMMON_BASELINE_MODEL, 'claude-sonnet-5-5')
 
+    def test_route_events_are_not_work_and_missing_result_is_unknown(self):
+        rows = [
+            {'event': 'model_call', 'result': 'pass', 'cost_usd': .1, 'input_tokens': 10, 'output_tokens': 5, 'model': 'claude-sonnet-5-5'},
+            {'event': 'model_call', 'result': 'fail', 'cost_usd': .1, 'input_tokens': 10, 'output_tokens': 5, 'model': 'claude-sonnet-5-5'},
+            {'event': 'model_call', 'cost_usd': .1, 'input_tokens': 10, 'output_tokens': 5, 'model': 'claude-sonnet-5-5'},
+            {'event': 'route_executed', 'executed_model': 'x'},
+            {'event': 'adaptive_route_decision'},
+        ]
+        agg = skill_vs_baseline.aggregate(rows, {'enabled': False, 'models': {}})
+        self.assertEqual(agg['work_records'], 3)
+        self.assertEqual(agg['decision_records'], 2)
+        self.assertEqual((agg['pass_count'], agg['fail_count'], agg['unknown_result_count']), (1, 1, 1))
+        self.assertAlmostEqual(agg['success_rate'], .5)
+
 
 if __name__ == '__main__':
     unittest.main()

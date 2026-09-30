@@ -42,7 +42,10 @@ import { loadEfficiencyControls } from "../efficiency-flags.ts";
 import { pickModel } from "../core/routing.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 import { changedFilesSinceRunStart, gitDirtySnapshot, gitHead } from "../adapters/git-changes.ts";
-import { formatAdapterTable, shortName } from "../models.ts";
+import { formatAdapterTable, METHOD, shortName } from "../models.ts";
+import { resolveWorkflowMode } from "../workflow-mode.ts";
+import { collectWorkflowSignals, fsReader, listRepoFiles, type WorkflowSignals } from "../core/workflow-signals.ts";
+import { applyWorkflowOverride, atLeast, routeWorkflow, type WorkflowDecision } from "../core/workflow-router.ts";
 import { planEscalation, type EscalationLeadInput } from "../escalation.ts";
 import { leadSizeOf, sizeLead, type LeadSizeDecision } from "../lead-sizing.ts";
 import { classifyRunOutcome, externalChangeFiles, parseLeadStatus, qaScopeEvidenceFor } from "../run-outcome.ts";
@@ -51,10 +54,12 @@ import { confirmStep, safeUi } from "../run/ui-sink.ts";
 import { describeRunArtifact, type RunTiming } from "../run/session.ts";
 import type { RunContext, RunSessionLike, PendingCheckRow } from "../run/context.ts";
 import { telemetryWarning, type FlushReport, type QueueStats } from "../record-queue.ts";
-import { collectBilledResults, dispatchHierarchical, summarizeReconWorkers } from "./hierarchy.ts";
+import { collectBilledResults, dispatchHierarchical, summarizeReconWorkers, type HierarchyDeps } from "./hierarchy.ts";
 import { redactSecrets } from "../live-qa.ts";
 import { collectLeadAttempts, formatLeadAttemptLines } from "./lead-attempts.ts";
-import { runVerification, type VerificationResult } from "./verify-loop.ts";
+import { evidenceStatusFor, parseCheckResults, runVerification, type RunVerificationOptions, type VerificationResult } from "./verify-loop.ts";
+import { runChecks } from "./check-runner.ts";
+import { dispatchFlat, runFlatVerification } from "./flat-level.ts";
 import {
 	buildLiveQaSummaryField,
 	candidateOwnedFilesForLiveQa,
@@ -208,6 +213,8 @@ export interface RunOrchestrationDeps {
 	/** Records a single model-usage row (the Python-side economics ledger); used to record the
 	 *  live-QA stage's own cost rows, independent of `recordOutcome`'s outcome row. */
 	recordModelCall: (metric: Record<string, unknown>) => void;
+	/** Test seam for the deterministic check runner used by the flat (direct/checked) levels; production leaves it unset. */
+	runChecks?: typeof runChecks;
 	ciWait?: { now?: () => number; spawn?: CiPollSpawn; scheduleTick?: (delayMs: number, tick: () => void) => () => void };
 }
 
@@ -231,6 +238,18 @@ export interface RunAborted {
 }
 
 export type RunOrchestrationResult = RunCompleted | RunAborted;
+
+/** Work carried from a flat (direct/checked) attempt into the escalated re-run at a higher level. */
+export interface WorkflowCarry {
+	fromLevel: "direct" | "checked";
+	forceLevel: "led" | "full";
+	reason: string;
+	priorCostUsd: number;
+	priorFixRounds: number;
+	priorResults: DispatchResult[];
+	dirtyBefore: Map<string, string> | null;
+	headBefore: string | null;
+}
 
 /** Surface a failed terminal drain to the operator; silent on success. Exported so
  *  `commands/orchestrate.ts`'s cancellation/crash catch block (outside this function's
@@ -381,6 +400,7 @@ export async function runOrchestration(
 	session: RunSessionLike,
 	claimed: RunContext<RunSessionLike>,
 	deps: RunOrchestrationDeps,
+	carry?: WorkflowCarry,
 ): Promise<RunOrchestrationResult> {
 	// A6/N2: warn (never block) when this run's own repo contains the orchestrator extension
 	// currently executing it — before any cost is spent, alongside the other run-start setup below.
@@ -486,6 +506,42 @@ export async function runOrchestration(
 	});
 	session.log(`lead size: ${leadDecision.size} → ${leadDecision.capability} on ${leadModel} (source: ${leadDecision.source})`);
 
+	// Workflow level (spec §3). `off` does nothing at all; `observe` records the plan only.
+	// Signal collection is advisory: any failure is logged and leaves `workflow` null (never aborts the run).
+	const workflowPolicy = METHOD.rules.workflow_policy;
+	// Persisted `/orchestrator-models workflow` setting; `profiles.file` is absent in some test fakes.
+	const workflowMode = resolveWorkflowMode(workflowPolicy, deps.env, resolved.profiles?.file?.workflow_mode);
+	for (const p of workflowMode.problems) session.log(`workflow: ${p}`);
+	let workflow: WorkflowDecision | null = null;
+	let workflowSignalMs = 0;
+	let workflowSignals: WorkflowSignals | null = null;
+	if ((workflowMode.mode !== "off" || carry) && workflowPolicy) {
+		try {
+			const t0 = performance.now();
+			const root = resolve(cwd);
+			const files = listRepoFiles(root, workflowPolicy.signal_timeout_ms) ?? [];
+			const signals = collectWorkflowSignals({ goal: parsed.goal, files, reader: fsReader(root), triageRisk: effectiveRisk, taskClass: effectiveTaskClass, policy: workflowPolicy });
+			const routed = applyWorkflowOverride(routeWorkflow(signals, workflowPolicy), parsed.workflowLevel);
+			workflowSignalMs = Math.round(performance.now() - t0);
+			workflowSignals = signals;
+			const decision = carry
+				? { ...routed, level: atLeast(routed.level, carry.forceLevel), reasons: [...routed.reasons, `escalated from ${carry.fromLevel}: ${carry.reason}`] }
+				: routed;
+			deps.recordEvent("workflow_level_planned", {
+				run_id: runId, mode: workflowMode.mode, mode_source: workflowMode.source, level: decision.level, floor: decision.floor,
+				reasons: decision.reasons, uncertainty: decision.uncertainty, signal_ms: workflowSignalMs,
+				candidates: signals.candidates.length, packages: signals.packages, risk_path_hits: signals.riskPathHits,
+				checks: signals.checks.map((c) => c.name), override: decision.override ?? null,
+			});
+			workflow = decision;
+			session.log(`workflow: ${workflowMode.mode} (${workflowMode.source}) → ${decision.level} (floor ${decision.floor}; ${decision.reasons.join("; ")}; ${workflowSignalMs}ms)`);
+		} catch (err) {
+			workflow = null;
+			workflowSignals = null;
+			session.log(`workflow: signal collection failed (${err instanceof Error ? err.message : String(err)}); continuing without a workflow plan`);
+		}
+	}
+
 	const needsArchitect = plan.topology.depth >= 2 && complexityNeedsArchitect(plan.complexity);
 	const leadCount = Number.isFinite(plan.topology.leads)
 		? Math.min(deps.maxLeads, Math.max(1, Math.trunc(plan.topology.leads)))
@@ -553,22 +609,19 @@ export async function runOrchestration(
 		log_dir: session.dir,
 	});
 
-	const dirtyBefore = gitDirtySnapshot(cwd);
-	const headBefore = gitHead(cwd);
+	const dirtyBefore = carry ? carry.dirtyBefore : gitDirtySnapshot(cwd);
+	const headBefore = carry ? carry.headBefore : gitHead(cwd);
+	// Flat (direct/checked) path: enforce mode only, never on an escalated re-run, never for excluded
+	// task classes, and never when a hard floor (risk/protected path) already routed to led/full.
+	const flatLevel: "direct" | "checked" | null =
+		workflowMode.mode === "enforce" && !carry && workflow && workflowPolicy
+		&& !workflowPolicy.excluded_task_classes.includes(effectiveTaskClass)
+		&& (workflow.level === "direct" || workflow.level === "checked") ? workflow.level : null;
 	// `workerResults` carries the parent-owned recon dispatches; they must stay
 	// destructured here or the run stops billing them (plan Task 3).
 	const repoRoot = resolve(cwd);
 	const checkRows = new Map<string, PendingCheckRow>();
-	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks, resumedLeadTaskIds, retriedLeadTaskIds, resumedAttemptResults, pendingChecks } = await dispatchHierarchical(
-		runId,
-		plan.plan_id,
-		parsed.goal,
-		plan,
-		adapter,
-		ctx,
-		claimed,
-		leadDecision.capability,
-		{
+	const hierarchyDeps: HierarchyDeps = {
 			dispatch: (tasks) => deps.dispatchParallel(cwd, runId, tasks, adapter, ctx, claimed),
 			captureDispatchCost: deps.captureDispatchCost,
 			maxLeads: deps.maxLeads,
@@ -613,8 +666,14 @@ export async function runOrchestration(
 				const { head, dirty } = mark as { head: string | null; dirty: Map<string, string> | null };
 				return changedFilesSinceRunStart(cwd, head, dirty, claimedFiles).changed;
 			},
-		},
-	);
+	};
+	const dispatched = flatLevel
+		? await dispatchFlat(
+			{ runId, goal: parsed.goal, providedContext: deps.providedContext, level: flatLevel },
+			{ dispatch: hierarchyDeps.dispatch, captureDispatchCost: (r) => deps.captureDispatchCost(captureOpts, r, claimed) },
+		)
+		: await dispatchHierarchical(runId, plan.plan_id, parsed.goal, plan, adapter, ctx, claimed, leadDecision.capability, hierarchyDeps);
+	const { leadResults, workerResults, architectResult, skippedLeads, leadTasks, resumedLeadTaskIds, retriedLeadTaskIds, resumedAttemptResults, pendingChecks } = dispatched;
 	// dispatchHierarchical no longer hands back a mutable `escalationResults`
 	// sink to push into (B4.6); the retry loop below owns its own.
 	const escalationResults: DispatchResult[] = [];
@@ -671,7 +730,7 @@ export async function runOrchestration(
 		}
 		return changed;
 	};
-	let allFiles = changedSince("lead phase", leadResults);
+	let allFiles = changedSince("lead phase", leadResults, carry?.priorResults ?? []);
 
 	// A6/N2: compare claimed paths against git-observed paths, and inspect actual lead tool
 	// calls for a foreign cd. Warn-only: never alters `allFiles`/QA scope. When git observation
@@ -721,7 +780,7 @@ export async function runOrchestration(
 	// Only when EVERY lead exited 0 and says it changed nothing: a lead that
 	// failed, timed out or hit the spend cap may have edited files it never
 	// got to report, and those must still be verified.
-	const externalFiles = runOutcome === "blocked" ? [...allFiles] : externalChangeFiles(allFiles, qaScopeEvidenceFor(leadResults));
+	const externalFiles = runOutcome === "blocked" ? [...allFiles] : externalChangeFiles(allFiles, qaScopeEvidenceFor([...(carry?.priorResults ?? []), ...leadResults]));
 	if (externalFiles.length > 0) {
 		session.log(
 			`${externalFiles.length} file(s) changed during the run but no lead reported changing them (likely a concurrent session); excluded from QA: ${externalFiles.join(", ")}`,
@@ -745,28 +804,29 @@ export async function runOrchestration(
 	// later QA dispatch (after an escalation retry) that also times out does not get a second
 	// re-run — it just ends the run with the TIMED OUT verdict, same as the first re-run failing.
 	let qaRerunUsed = false;
-	while (runOutcome !== "blocked" && dispatchOk && retries <= parsed.maxRetries) {
+	const retryBudget = flatLevel && workflowPolicy ? workflowPolicy.fix_rounds_per_level : parsed.maxRetries;
+	const verify = (options?: RunVerificationOptions): Promise<VerificationResult> => {
+		const verifyDeps = {
+			dispatch: (tasks: DispatchTask[]) => deps.dispatchParallel(cwd, runId, tasks, adapter, ctx, claimed),
+			captureDispatchCost: deps.captureDispatchCost,
+			recordOutcome: deps.recordOutcome,
+		};
+		return flatLevel && workflowPolicy
+			? runFlatVerification(
+				{ runId, level: flatLevel, files: allFiles, checks: workflowSignals?.checks ?? [], repoRoot, checkTimeoutMs: workflowPolicy.check_timeout_ms, goal: parsed.goal },
+				{ dispatch: verifyDeps.dispatch, captureDispatchCost: (r) => deps.captureDispatchCost(captureOpts, r, claimed), recordOutcome: deps.recordOutcome, runChecks: deps.runChecks },
+			)
+			: runVerification(runId, plan.plan_id, allFiles, ctx, claimed, captureOpts, verifyDeps, repoRoot, options);
+	};
+	while (runOutcome !== "blocked" && dispatchOk && retries <= retryBudget) {
 		if (allFiles.length > 0) {
 			session.setPhase(
 				retries === 0
 					? `QA on ${allFiles.length} changed file(s) via ${shortName(adapter.qa_agent?.model ?? "?")}`
-					: `QA retry ${retries + 1}/${parsed.maxRetries + 1} on ${allFiles.length} changed file(s)`,
+					: `QA retry ${retries + 1}/${retryBudget + 1} on ${allFiles.length} changed file(s)`,
 			);
 		}
-		lastVerification = await runVerification(
-			runId,
-			plan.plan_id,
-			allFiles,
-			ctx,
-			claimed,
-			captureOpts,
-			{
-				dispatch: (tasks) => deps.dispatchParallel(cwd, runId, tasks, adapter, ctx, claimed),
-				captureDispatchCost: deps.captureDispatchCost,
-				recordOutcome: deps.recordOutcome,
-			},
-			repoRoot,
-		);
+		lastVerification = await verify();
 		session.cancellation.throwIfCancelled();
 		if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
 		if (lastVerification.passed) break;
@@ -782,21 +842,7 @@ export async function runOrchestration(
 			session.log(`QA dispatch ${qaFailure}; re-running QA once with scoped-test-command guidance`);
 			deps.recordEvent(qaFailure === "timeout" ? "qa_timed_out_rerun" : "qa_provider_stall_rerun", { run_id: runId, attempt: 1 });
 			session.setPhase(`QA re-run (attempt 1) on ${allFiles.length} changed file(s) after ${qaFailure}`);
-			lastVerification = await runVerification(
-				runId,
-				plan.plan_id,
-				allFiles,
-				ctx,
-				claimed,
-				captureOpts,
-				{
-					dispatch: (tasks) => deps.dispatchParallel(cwd, runId, tasks, adapter, ctx, claimed),
-					captureDispatchCost: deps.captureDispatchCost,
-					recordOutcome: deps.recordOutcome,
-				},
-				repoRoot,
-				{ attempt: 1, reason: lastVerification.providerStall ? "provider_stall" : "timeout" },
-			);
+			lastVerification = await verify({ attempt: 1, reason: lastVerification.providerStall ? "provider_stall" : "timeout" });
 			session.cancellation.throwIfCancelled();
 			if (lastVerification.dispatch) verificationResults.push(lastVerification.dispatch);
 			if (lastVerification.passed) break;
@@ -834,7 +880,7 @@ export async function runOrchestration(
 			plan.complexity,
 			plan.risk,
 			retries,
-			parsed.maxRetries,
+			retryBudget,
 		);
 		if (escalationTasks.length === 0) break;
 
@@ -901,6 +947,7 @@ export async function runOrchestration(
 		// post-escalation tree is the state worth reporting.
 		const thisRound = escalationResults.slice(roundStart);
 		allFiles = changedSince(`escalation retry ${retries}`, thisRound, [
+			...(carry?.priorResults ?? []),
 			...leadResults,
 			...escalationResults.slice(0, roundStart),
 		]).filter((f) => !externalFiles.includes(f));
@@ -913,6 +960,30 @@ export async function runOrchestration(
 			);
 			break;
 		}
+	}
+
+	// Flat level could not produce a passing verdict: escalate upward, carrying the work forward.
+	if (flatLevel && runOutcome !== "blocked" && !(lastVerification?.passed && !lastVerification.skipped)) {
+		const prior = [...leadResults, ...escalationResults, ...verificationResults];
+		const priorCostUsd = triageCost.usd + prior.reduce((s, r) => s + r.costUsd + (r.nestedCostUsd ?? 0), 0) + (carry?.priorCostUsd ?? 0);
+		const reason = lastVerification?.failedChecks.join(", ") || (dispatchOk ? "verification failed" : "implementer failed");
+		session.cancellation.throwIfCancelled();
+		deps.recordEvent("workflow_level_escalated", { run_id: runId, from: flatLevel, to: "led", reason, failed_checks: lastVerification?.failedChecks ?? [], prior_cost_usd: priorCostUsd });
+		session.log(`workflow: escalating ${flatLevel} → led (${reason})`);
+		const feedback = [
+			`## Prior ${flatLevel} attempt (escalated)`,
+			`Failed: ${reason}`,
+			"Files it changed are still in the working tree; build on them or revert them deliberately.",
+			...(lastVerification?.summary ? [`Verification: ${lastVerification.summary}`] : []),
+			"Last implementer report (tail):",
+			(escalationResults.at(-1) ?? leadResults.at(-1))?.stdout.slice(-4000) ?? "(none)",
+		].join("\n");
+		return runOrchestration(
+			runId, cwd, { ...parsed, taskClass: effectiveTaskClass, complexity: effectiveComplexity, risk: effectiveRisk },
+			adapter, resolved, ctx, session, claimed,
+			{ ...deps, providedContext: [deps.providedContext, feedback].filter(Boolean).join("\n\n") },
+			{ fromLevel: flatLevel, forceLevel: "led", reason, priorCostUsd, priorFixRounds: retries + (carry?.priorFixRounds ?? 0), priorResults: [...(carry?.priorResults ?? []), ...prior], dirtyBefore, headBefore },
+		);
 	}
 
 	// A lead that failed and was later retried (C3's transient resume, or an escalation retry after
@@ -950,13 +1021,26 @@ export async function runOrchestration(
 	// (ht-orch-1790256789245-1a3fms: $13.22 nested vs $1.56 reported).
 	const nestedCost = billedResults.reduce((s, r) => s + (r.nestedCostUsd ?? 0), 0);
 	let totalCost =
-		triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0) + nestedCost;
+		triageCost.usd + billedResults.reduce((s, r) => s + r.costUsd, 0) + nestedCost + (carry?.priorCostUsd ?? 0);
 	// `passedVerification` accepts EITHER `dispatchOk` (the pre-retry-loop gate QA actually ran
 	// under) or `finalDispatchOk` (a lead that failed initially but succeeded on a later retry): a
 	// lead-attempts accounting quirk in either direction must never make an otherwise-passing QA
 	// verdict read as unverified.
-	const verificationSkipped = lastVerification?.skipped ?? false;
-	const passedVerification = (lastVerification?.passed ?? false) && (dispatchOk || finalDispatchOk);
+	// On an escalated re-run (`carry`), a skipped verification (nothing left to verify, e.g. the led
+	// lead reverted the flat changes) is vacuous and must not launder the prior flat failure into a
+	// pass: treat it as unverified (FAIL), never as skipped/passed.
+	// The same holds for a QA that exited 0 but reported no check that actually ran to pass/fail
+	// (empty output, all skipped/unavailable): non-carry runs keep the T8 behaviour (passes, with
+	// evidence_status recorded), but after an escalation it is not evidence the flat failure is fixed.
+	const carryNoEvidence =
+		carry !== undefined &&
+		(lastVerification?.passed ?? false) &&
+		!(lastVerification?.skipped ?? false) &&
+		evidenceStatusFor(parseCheckResults(lastVerification?.dispatch?.stdout ?? "")) === "unverified_checks_unavailable";
+	const carrySkipped = carry !== undefined && (lastVerification?.skipped ?? false);
+	const carryUnverified = carrySkipped || carryNoEvidence;
+	const verificationSkipped = (lastVerification?.skipped ?? false) && !carrySkipped;
+	const passedVerification = (lastVerification?.passed ?? false) && !carryUnverified && (dispatchOk || finalDispatchOk);
 	// The QA dispatch itself timing out (inactivity/absolute ceiling) is a distinct state from QA
 	// completing and reporting failing checks — the summary must say so instead of folding both
 	// into a plain FAIL (docs/architecture-review.md C5).
@@ -964,7 +1048,11 @@ export async function runOrchestration(
 	// their distinct causes in the report instead of labeling a provider error a timeout.
 	const verificationTimedOut = lastVerification?.dispatch?.outcome === "timed_out";
 	const verificationProviderStall = lastVerification?.providerStall === true && !verificationTimedOut;
-	const failedChecks = lastVerification?.failedChecks ?? [];
+	const failedChecks = carry && carrySkipped
+		? [`unverified after escalation from ${carry.fromLevel}: ${carry.reason}`]
+		: carry && carryNoEvidence
+			? [`unverified after escalation from ${carry.fromLevel}: no check evidence`]
+			: (lastVerification?.failedChecks ?? []);
 
 	// -----------------------------------------------------------------
 	// Step 3.5: Phase 3 opt-in Forge live-QA stage. Runs at most once, only when explicitly
@@ -1028,6 +1116,16 @@ export async function runOrchestration(
 	}
 	if (finalChecks.length) session.setPendingChecks?.(finalChecks.map(({ check, outcome }) => ({ provider: check.provider, id: check.id, outcome: outcome === "cancelled" ? "unverified" : outcome, ...(check.mr ? { mr: check.mr } : {}) })));
 	const telemetry = await deps.completeRun(runId, {
+		...(workflow || carry
+			? { workflow: {
+				mode: workflowMode.mode,
+				planned: carry?.fromLevel ?? workflow?.level ?? "led",
+				final: flatLevel ?? workflow?.level ?? carry?.forceLevel ?? "led",
+				escalations: carry ? 1 : 0,
+				reasons: workflow?.reasons ?? (carry ? [`escalated from ${carry.fromLevel}: ${carry.reason}`, "signal collection failed on escalated run"] : []),
+				signal_ms: workflowSignalMs,
+			} }
+			: {}),
 		success_rate: finalSucceededLeads / Math.max(1, leadAttempts.length),
 		verification_passed: passedVerification,
 		external_checks: finalChecks.map(({ check, outcome, reason, jobId }) => ({ provider: check.provider, id: check.id, outcome, reason, job_id: jobId })),
@@ -1036,10 +1134,10 @@ export async function runOrchestration(
 		external_changes: externalFiles.length,
 		total_cost_usd: totalCost,
 		files_changed: allFiles,
-		retries,
+		retries: retries + (carry?.priorFixRounds ?? 0),
 		// Quality repair rounds (QA/escalation loop iterations). `retries` is kept for existing
-		// readers; `fix_rounds` is the explicit name the evaluation reads (spec §1.3).
-		fix_rounds: retries,
+		// readers. `fix_rounds` is the explicit name the evaluation reads (spec §1.3).
+		fix_rounds: retries + (carry?.priorFixRounds ?? 0),
 		models: Object.fromEntries(Object.entries(adapter).map(([k, v]) => [k, v.model])),
 		log_dir: session.dir,
 		// Phase 3 opt-in Forge live-QA stage (T1): the `live_qa` key itself is present ONLY when
@@ -1105,7 +1203,7 @@ export async function runOrchestration(
 		succeededLeads: finalSucceededLeads,
 		totalLeads: leadResults.length,
 		skippedLeads,
-		retries,
+		retries: retries + (carry?.priorFixRounds ?? 0),
 		leadAttemptLines,
 		leadStatuses: finalLeadStatuses,
 		resumedLeadIds: resumedLeadTaskIds.map((id) => id.replace(`${runId}-`, "")),
@@ -1119,7 +1217,7 @@ export async function runOrchestration(
 		failedChecks,
 		externalChecks: finalChecks.map(({ check, outcome }) => ({ provider: check.provider, id: check.id, outcome: outcome === "cancelled" ? "unverified" as const : outcome })),
 		totalCostUsd: totalCost,
-		dispatchCount: billedResults.length + (triageCost.usd > 0 ? 1 : 0),
+		dispatchCount: billedResults.length + (triageCost.usd > 0 ? 1 : 0) + (carry?.priorResults.length ?? 0),
 		nestedCostUsd: nestedCost,
 		firstFailureLine,
 		reportLines,

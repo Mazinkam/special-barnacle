@@ -170,6 +170,8 @@ def build_route_stats(metrics:list[dict], outcomes:list[dict]|None=None, width:i
         # here. It is NOT a verification rate and must not be read as one — compare `verified_tasks`
         # for that.
         successes=sum(w for x,w in weighted if x.get('result') in {'pass','verified','success'})
+        result_weight=sum(w for x,w in weighted if x.get('result') is not None)
+        result_samples=sum(1 for x,_ in weighted if x.get('result') is not None)
         quality_num=sum(float(x['quality_evidence_score'])*w for x,w in weighted if x.get('quality_evidence_score') is not None)
         quality_den=sum(w for x,w in weighted if x.get('quality_evidence_score') is not None)
         # `records.metric` wants the population size, not the decayed weight sum: with decay on, a
@@ -200,7 +202,8 @@ def build_route_stats(metrics:list[dict], outcomes:list[dict]|None=None, width:i
             # cost-per-verified-task label.
             'verified_tasks':len(verified),'verified_runs':len(verified_runs),'verified_cost_usd':total/verified_weight if verified_weight and priced and not unpriced else None,
             # Dispatch-level success rate (see `successes` above), not a verification rate.
-            'pass_rate':successes/eff if eff else None,
+            'pass_rate':successes/result_weight if result_weight else None,
+            'result_samples':result_samples,
             # `quality_evidence_score` is written only by Engine.verify_task, never by a live run
             # (0 of 410 rows) — NO_DATA distinguishes "no producer yet" from "measured zero".
             'avg_quality_evidence':records.metric(quality_num/quality_den if quality_den else None,quality_samples),

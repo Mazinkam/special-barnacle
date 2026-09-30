@@ -752,6 +752,11 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 			runPromise.catch((err) => {
 				console.error(`[orchestrator] run ${runId} background task rejected unexpectedly: ${(err as Error)?.stack ?? err}`);
 			});
+			// Headless callers (benchmark runner, CI) opt in to waiting for the run so print mode
+			// does not dispose the runtime — and cancel the run via session_shutdown — mid-flight.
+			if (deps.env.HUMAIN_ORCHESTRATOR_FOREGROUND === "1") {
+				await runPromise.catch(() => undefined);
+			}
 		},
 	});
 

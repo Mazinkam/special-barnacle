@@ -334,6 +334,8 @@ describe("session ingest hook wiring", () => {
 	test("runModule forwards STATE_ROOT as CODING_AGENT_ORCHESTRATOR_HOME", async () => {
 		const customRoot = mkdtempSync(join(tmpdir(), "orch-runmodule-state-"));
 		const previousState = process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT;
+		const previousCanonicalState = process.env.CODING_AGENT_ORCHESTRATOR_HOME;
+		delete process.env.CODING_AGENT_ORCHESTRATOR_HOME;
 		process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = customRoot;
 		try {
 			// Re-import the module so STATE_ROOT (read at module load time) reflects
@@ -356,6 +358,8 @@ describe("session ingest hook wiring", () => {
 		} finally {
 			if (previousState === undefined) delete process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT;
 			else process.env.HUMAIN_ORCHESTRATOR_STATE_ROOT = previousState;
+			if (previousCanonicalState === undefined) delete process.env.CODING_AGENT_ORCHESTRATOR_HOME;
+			else process.env.CODING_AGENT_ORCHESTRATOR_HOME = previousCanonicalState;
 			rmSync(customRoot, { recursive: true, force: true });
 		}
 	});

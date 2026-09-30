@@ -228,6 +228,31 @@ profile was retired); run `install.sh` to install the shipped profiles.
   (`<profile>-<hash of resolved bindings>`) and `lead_size`; the dashboard's **Lead sizing**
   table groups lead cost and verified outcomes by size.
 
+### Workflow levels (Phase 2)
+
+- `/orchestrator-models workflow off|observe|enforce` persists the mode as `workflow_mode` in
+  `orchestrator-profiles.json`; `workflow default` removes it and `workflow` shows the effective
+  mode and its source. Precedence: `HUMAIN_ORCHESTRATOR_WORKFLOW_MODE` env (one-off override,
+  e.g. benchmarks/CI) > saved setting > `method.json` `rules.workflow_policy.mode` (default
+  `off`). Invalid values at any layer are logged and skipped; they never block dispatch.
+- `--workflow direct|checked|led|full` may raise the selected level, never lower it below
+  the hard floor. Rejected overrides are recorded with their reason.
+- `workflow_level_planned` records `run_id`, `mode`, `mode_source` (`env|setting|method`),
+  `level`, `floor`, `reasons`,
+  `uncertainty`, `signal_ms`, `candidates`, `packages`, `risk_path_hits`, `checks`, and
+  `override`. `workflow_level_escalated` records `run_id`, `from`, `to`, `reason`,
+  `failed_checks`, and `prior_cost_usd`.
+- The run summary's `workflow` key contains `{mode, planned, final, escalations, reasons,
+  signal_ms}` and is absent in `off` mode.
+- High/critical risk or any `risk_path_globs` hit sets the hard floor to `full`; so does an
+  interface change across packages. Unresolved scope sets the floor to `led`. Investigation
+  and `qa_verification` task classes are excluded from flat execution. `led` and `full` both
+  run the coordinated pipeline in this phase; a direct/checked attempt that escalates retains
+  the pre-run git snapshot so QA still covers its files. A repository with no discovered checks
+  is never routed `direct`: its floor rises to `checked` and `--workflow direct` is rejected.
+- Deterministic checks run with `shell: false` and a timeout of `check_timeout_ms`; timeout
+  handling kills the process group.
+
 ```
 /orchestrator-models                       resolved table for the active profile, with sources
 /orchestrator-models list                  every alias you can use + the full catalog

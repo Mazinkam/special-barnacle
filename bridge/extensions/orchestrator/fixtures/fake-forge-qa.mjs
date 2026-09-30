@@ -46,7 +46,8 @@
 //
 // FAKE_FORGE_PIDFILE, if set, receives this process's pid (as plain text) before any mode logic
 // runs, so a test can poll for it and later confirm (via `process.kill(pid, 0)`) that the child
-// has actually exited once the adapter's returned promise settles.
+// has actually exited once the adapter's returned promise settles. For SIGINT-handling modes,
+// the pid is written once the handler is installed, so readiness implies the handler exists.
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -55,8 +56,14 @@ const mode = process.env.FAKE_FORGE_MODE ?? "pass";
 const repoRoot = process.cwd();
 const argv = process.argv.slice(2);
 
-if (process.env.FAKE_FORGE_PIDFILE) {
-	writeFileSync(process.env.FAKE_FORGE_PIDFILE, String(process.pid));
+function writePidFile() {
+	if (process.env.FAKE_FORGE_PIDFILE) {
+		writeFileSync(process.env.FAKE_FORGE_PIDFILE, String(process.pid));
+	}
+}
+
+if (mode !== "hang" && mode !== "cancel_writes_pass") {
+	writePidFile();
 }
 
 if (process.env.FAKE_FORGE_ARGV_LOG) {
@@ -247,6 +254,7 @@ switch (mode) {
 			log("received SIGINT; exiting 130 (no cleanup performed by this fake)");
 			process.exit(130);
 		});
+		writePidFile();
 		setInterval(() => {}, 1 << 30); // keep the event loop alive
 		break;
 	}
@@ -260,6 +268,7 @@ switch (mode) {
 			finish(0, reportPath);
 			process.exit(0);
 		});
+		writePidFile();
 		break;
 	}
 	case "no_usage": {

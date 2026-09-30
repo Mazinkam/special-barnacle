@@ -15,6 +15,7 @@ import { emptyOverrides, type ModelOverrides, parseArgs } from "../core/args.ts"
 import type { FullResolution } from "../adapters/adapter-resolver.ts";
 import { formatCandidateGroups } from "../adapters/model-router.ts";
 import type { LoadedProfiles } from "../adapters/profiles-store.ts";
+import { isWorkflowMode, resolveWorkflowMode, WORKFLOW_MODE_ENV, WORKFLOW_MODES, type WorkflowModeSource } from "../workflow-mode.ts";
 import {
 	ALL_CAPABILITIES,
 	type AvailableModel,
@@ -24,6 +25,7 @@ import {
 	isThinkingLevel,
 	isTier,
 	listShortcuts,
+	METHOD,
 	PROFILE_NAME_RE,
 	type ProfileSpec,
 	type ProfilesFile,
@@ -45,6 +47,8 @@ export interface OrchestratorModelsDeps {
 	checkModels(ctx: ExtensionContext, resolved: ResolvedAdapter): Promise<boolean>;
 	/** Where `orchestrator-profiles.json` lives; shown in usage/error text. */
 	profilesPath: string;
+	/** Environment used to report an overriding HUMAIN_ORCHESTRATOR_WORKFLOW_MODE; defaults to process.env. */
+	env?: Record<string, string | undefined>;
 }
 
 function buildModelsUsage(profilesPath: string): string {
@@ -58,6 +62,7 @@ function buildModelsUsage(profilesPath: string): string {
 		"  /orchestrator-models set <capability|tier> <ALIAS> [--profile P]",
 		"  /orchestrator-models effort <capability> <level|none> [--profile P]",
 		"  /orchestrator-models use <PROFILE>         switch active profile",
+		"  /orchestrator-models workflow [off|observe|enforce|default]   show or persist the workflow mode",
 		"  /orchestrator-models new <PROFILE> [--from P]",
 		"  /orchestrator-models pick [PROFILE]        interactive: tiers first, then capability overrides",
 		`file: ${profilesPath}`,
@@ -249,6 +254,43 @@ const pick: SubcommandHandler = async ({ ctx, positional, deps, showResolved }) 
 	else if (await ctx.ui.confirm("Validation OK", "Run a live probe on each configured model now? (a few cents)")) await deps.checkModels(ctx, resolved);
 };
 
+const WORKFLOW_SOURCE_LABEL: Record<WorkflowModeSource, string> = {
+	env: `${WORKFLOW_MODE_ENV} env var`,
+	setting: "orchestrator-profiles.json",
+	method: "method.json default",
+	absent: "workflow_policy missing from method.json",
+};
+
+/** `workflow` shows the effective mode; `workflow <mode>` persists it; `workflow default` removes the key. */
+const workflow: SubcommandHandler = async ({ ctx, positional, deps }) => {
+	const env = deps.env ?? process.env;
+	const arg = positional[0];
+	const profiles = deps.loadProfiles();
+	if (arg !== undefined) {
+		if (arg === "default") delete profiles.file.workflow_mode;
+		else if (isWorkflowMode(arg)) profiles.file.workflow_mode = arg;
+		else {
+			ctx.ui.notify(`Unknown workflow mode "${arg}". Use one of: ${WORKFLOW_MODES.join(", ")}, default.`, "error");
+			return;
+		}
+		deps.writeProfilesFile(profiles.file);
+	}
+	const policy = METHOD.rules.workflow_policy;
+	const effective = resolveWorkflowMode(policy, env, profiles.file.workflow_mode);
+	if (arg !== undefined && effective.source === "env") {
+		ctx.ui.notify(`Saved, but ${WORKFLOW_MODE_ENV}=${env[WORKFLOW_MODE_ENV]} overrides it until you unset that variable.`, "warning");
+	}
+	ctx.ui.notify(
+		[
+			`workflow mode: ${effective.mode} (source: ${WORKFLOW_SOURCE_LABEL[effective.source]})`,
+			`saved setting: ${profiles.file.workflow_mode ?? "(none; method.json default applies)"}   method.json default: ${policy?.mode ?? "n/a"}`,
+			...effective.problems.map((p) => `note: ${p}`),
+			"off = no signals; observe = record the planned level only; enforce = run direct/checked flat and escalate on failure",
+		].join("\n"),
+		"info",
+	);
+};
+
 /** Keyed by subcommand name; `orchestrator-models <goal-that-isn't-a-flag>` with no match falls through to `default`. */
 const SUBCOMMANDS: Record<string, SubcommandHandler> = {
 	show,
@@ -260,13 +302,14 @@ const SUBCOMMANDS: Record<string, SubcommandHandler> = {
 	set,
 	effort,
 	pick,
+	workflow,
 };
 
 export function registerOrchestratorModelsCommand(pi: ExtensionAPI, deps: OrchestratorModelsDeps): void {
 	const modelsUsage = buildModelsUsage(deps.profilesPath);
 	pi.registerCommand("orchestrator-models", {
 		description:
-			"Manage which models /orchestrate uses. Subcommands: show|list|validate [--live]|check|set|effort|use|new|pick. " +
+			"Manage which models /orchestrate uses. Subcommands: show|list|validate [--live]|check|set|effort|use|new|pick|workflow. " +
 			"Aliases like fable-5-1, opus-5-5, sonnet-5, gpt-6-sol, gpt-6-luna, astra resolve against your configured models.",
 		handler: async (args, ctx) => {
 			const tokens = args.trim().split(/\s+/).filter(Boolean);
@@ -291,7 +334,11 @@ export function registerOrchestratorModelsCommand(pi: ExtensionAPI, deps: Orches
 					...(p.notes.length > 0 ? ["", ...p.notes.map((n) => `  ${n}`)] : []),
 					"",
 					`profiles: ${Object.keys(p.file.profiles).map((n) => (n === p.file.active_profile ? `*${n}` : n)).join(", ")}  file: ${deps.profilesPath}${p.present ? "" : " (not created yet)"}`,
-					"commands: /orchestrator-models list | set <cap|tier> <alias> | use <profile> | pick | validate --live",
+					(() => {
+						const wf = resolveWorkflowMode(METHOD.rules.workflow_policy, deps.env ?? process.env, p.file.workflow_mode);
+						return `workflow mode: ${wf.mode} (source: ${WORKFLOW_SOURCE_LABEL[wf.source]})`;
+					})(),
+					"commands: /orchestrator-models list | set <cap|tier> <alias> | use <profile> | pick | validate --live | workflow <mode>",
 				];
 				ctx.ui.notify(lines.join("\n"), resolved.warnings.length > 0 ? "warning" : "info");
 				return resolved;

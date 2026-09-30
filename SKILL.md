@@ -139,6 +139,21 @@ The highest-capability lead receives those compact evidence packets and owns syn
 
 Skip reconnaissance for a low-risk, well-localized change. Use only the workers needed to remove a specific uncertainty; they do not make implementation decisions.
 
+### Rule 6: Workflow levels
+
+`method.json` `rules.workflow_policy` picks a workflow level from observable repository evidence, not from the triage complexity score. Levels: `direct` (one implementer + deterministic checks), `checked` (direct + one independent review), `led` and `full` (the coordinated pipeline; `full` is a floor nothing can lower). A repo with no discovered checks is never routed `direct`; its floor is raised to `checked`, so `--workflow direct` is rejected there.
+
+| Evidence | Level |
+|---|---|
+| explicit high/critical risk, or any `risk_path_globs` hit | full (hard floor) |
+| interface change across packages | full (hard floor) |
+| unresolved scope (no candidate files) | led (hard floor) |
+| 4 or more candidate files or 3 or more packages | led |
+| exactly one low-risk file with adjacent tests and discovered checks, no interface change | direct |
+| anything else | checked |
+
+`mode` is `off` by default. Persist a per-user mode with `/orchestrator-models workflow off|observe|enforce` (stored as `workflow_mode` in `~/.humain-terminal/agent/orchestrator-profiles.json`; `workflow default` removes it; `workflow` alone shows the effective mode and its source). Precedence: `HUMAIN_ORCHESTRATOR_WORKFLOW_MODE` env (one-off override) > saved setting > `method.json`. `observe` records `workflow_level_planned` and runs today's pipeline. `enforce` runs `direct`/`checked` with `fix_rounds_per_level` repair rounds, then escalates to `led` carrying the working tree, prior cost and feedback (`workflow_level_escalated`). `led` and `full` both run the coordinated pipeline in this phase. A direct/checked attempt that escalates keeps the pre-run git snapshot so QA still covers its files. `--workflow <level>` may raise the level, never lower it below the floor. `investigation` and `qa_verification` tasks are never run flat.
+
 ## Toggle classes
 
 Use consistent state types:
@@ -209,7 +224,7 @@ Regenerate `~/.local/state/coding-agent-orchestrator/dashboard.html` after use. 
 
 ### Performance evidence
 
-To evaluate whether the orchestrator is earning its keep, run `scripts/skill_vs_baseline.py`. It reads `metrics.jsonl`, partitions orchestrated work from session-log ingests, reprices orchestrated records at flat single-model baselines, and reports cost, success rate, cost-per-success, retry rate, and waste — for the orchestrator and each bracket. The script is observational: it writes nothing to the stream and does not change the dashboard.
+To evaluate whether the orchestrator is earning its keep, follow `docs/EVAL_BASELINE.md`: freeze a snapshot, then run `scripts/skill_vs_baseline.py --state-dir <snapshot>`. It excludes decision/route events from work, reports missing results as `unknown` (never `fail`), and prints one task outcome per run by complexity band with time/cost coverage. Flat-model repricing remains a cost sensitivity analysis, not a no-orchestration experiment; matched comparisons come from the benchmark in the tiered-workflows spec.
 
 The most recent calibrated numbers come from re-running `scripts/skill_vs_baseline.py` against the current `metrics.jsonl`; there is no separate calibrated-numbers file to refresh. The durable finding as of the first measurement: the orchestrator's routing savings came from reviews routed to cheaper tiers paying for stronger implementers. That measurement predates the 2026-09-24 finding that a frontier lead doing its own implementation was 49% of orchestrated spend; treat any prior ROI figure as historical until it is re-measured on matched cohorts (plan Phase E).
 
