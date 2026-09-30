@@ -1,6 +1,11 @@
 import json, shlex, subprocess, sys
 from pathlib import Path
+import os
 import pytest
+
+# Post-write dashboard refresh is async by default (app.refresh); existing tests read the page right after a write
+# (and delete their tmp dirs), so they run synchronous. tests/test_async_dashboard.py opts back in explicitly.
+os.environ.setdefault('ORCHESTRATOR_DASHBOARD_SYNC', '1')
 
 FAKE = Path(__file__).resolve().parents[1] / 'bench' / 'fake_agent.py'
 
