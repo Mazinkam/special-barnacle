@@ -25,6 +25,7 @@ import { gitHead } from "../adapters/git-changes.ts";
 import { summarizeStderr } from "../dispatch/stderr-sink.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import { isTransientProviderError } from "../core/transient-error.ts";
+import { resolveVerificationPlan } from "../core/verification-commands.ts";
 import {
 	architectPrompt,
 	complexityNeedsArchitect,
@@ -327,9 +328,10 @@ export async function dispatchReconAndLeads(
 			}
 		}
 	}
+	const verification = resolveVerificationPlan(repoRoot);
 	const leadTaskFor = (i: number): DispatchTask => ({
 		capability: leadCapability,
-		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter, repoRoot, assignments?.[i], providedContext),
+		task: leadPrompt(goal, plan, architectResult, reconEvidence, i, leadCount, adapter, repoRoot, assignments?.[i], providedContext, verification),
 		taskId: `${runId}-lead-${i}`,
 	});
 

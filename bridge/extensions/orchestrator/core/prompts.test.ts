@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { architectPrompt, effectiveLeadCount, formatTaskPrompt, leadPrompt, NO_BLOCKING_WAITS_RULE, parsePlanResponse, repoRootGuardrail, resumeLeadPrompt, retryLeadPrompt, RESUME_REPORT_MAX_CHARS, VERIFICATION_COMMANDS, type PlanResponse } from "./prompts.ts";
+import { architectPrompt, effectiveLeadCount, formatTaskPrompt, leadPrompt, NO_BLOCKING_WAITS_RULE, parsePlanResponse, repoRootGuardrail, resumeLeadPrompt, retryLeadPrompt, RESUME_REPORT_MAX_CHARS, type PlanResponse } from "./prompts.ts";
+import { ORCHESTRATOR_VERIFICATION_COMMANDS } from "./verification-commands.ts";
 import planFixture from "../fixtures/orchestrator-cli-plan-response.json";
 
 function plan(leads: number): PlanResponse {
@@ -64,9 +65,15 @@ describe("core/prompts.ts repoRootGuardrail", () => {
 		expect(lines.join("\n")).toContain("The repo root is /abs/repo/root (your cwd). Never search outside it; never run `find /`.");
 	});
 
-	test("names the repo's verification commands", () => {
-		const lines = repoRootGuardrail("/abs/repo/root");
-		for (const cmd of VERIFICATION_COMMANDS) expect(lines.join("\n")).toContain(cmd);
+	test("names the resolved verification commands", () => {
+		const lines = repoRootGuardrail("/abs/repo/root", { source: "orchestrator-repo", commands: ORCHESTRATOR_VERIFICATION_COMMANDS, guidanceFile: null });
+		for (const cmd of ORCHESTRATOR_VERIFICATION_COMMANDS) expect(lines.join("\n")).toContain(cmd);
+	});
+
+	test("does not tell an unknown repo to run the orchestrator's own suites", () => {
+		const text = repoRootGuardrail("/abs/repo/root").join("\n");
+		expect(text).toContain("Verification commands:");
+		expect(text).not.toContain("python3 -B -m pytest");
 	});
 });
 

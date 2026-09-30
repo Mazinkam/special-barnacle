@@ -8,6 +8,7 @@ import type { Binding } from "../models.ts";
 import { METHOD } from "../models.ts";
 import type { LeadAssignment } from "../lead-plan.ts";
 import { sanitizeControlChars } from "./text-safety.ts";
+import { DOCUMENTED_VERIFICATION, type VerificationPlan, verificationLines } from "./verification-commands.ts";
 
 type Adapter = Record<string, Binding>;
 
@@ -213,24 +214,17 @@ export const QA_SCOPE_RULES = [
 	"Environment: use the project's documented test commands. If they cannot run after 2 attempts (missing interpreter, dependency, or service), stop and report FAIL with check name `environment` and the exact error; do not try alternative interpreters or install anything.",
 ];
 
-/** The repo's own canonical verification commands (README.md "Verify" section). */
-export const VERIFICATION_COMMANDS = [
-	"python3 -B -m pytest -p no:cacheprovider -q",
-	"bun test ./bridge",
-	"./scripts/typecheck-bridge.sh --all",
-];
-
 /**
  * Grounds a QA/lead prompt in the repo it is actually running against (docs/architecture-review.md
  * C4): the old QA prompt didn't name the repo root, so the agent decided it was in the wrong
- * directory, ran `find / -iname ...`, and hung until the 20-minute timeout. `repoRoot` must be the
- * run's cwd, resolved absolute, and threaded in explicitly by the caller — this stays a pure
- * string formatter, never reading `process.cwd()` itself.
+ * directory, ran `find /`, and hung until the 20-minute timeout. `repoRoot` must be the
+ * run's cwd, resolved absolute, and threaded in explicitly by the caller. The verification plan is
+ * resolved by the caller (`resolveVerificationPlan`) so this stays a pure string formatter.
  */
-export function repoRootGuardrail(repoRoot: string): string[] {
+export function repoRootGuardrail(repoRoot: string, verification: VerificationPlan = DOCUMENTED_VERIFICATION): string[] {
 	return [
 		`The repo root is ${repoRoot} (your cwd). Never search outside it; never run \`find /\`.`,
-		`Verification commands: ${VERIFICATION_COMMANDS.join(" · ")}`,
+		...verificationLines(verification),
 	];
 }
 
@@ -272,6 +266,8 @@ export function leadPrompt(
 	 *  (docs/architecture-review.md C6); `""` (default) when neither flag was given — in that case the
 	 *  prompt is byte-identical to its pre-C6 output. */
 	providedContext = "",
+	/** How to verify work in this repo; resolved by the caller with `resolveVerificationPlan(repoRoot)`. */
+	verification: VerificationPlan = DOCUMENTED_VERIFICATION,
 ): string {
 	// Only forward a plan the architect actually produced. A failed architect
 	// dispatch used to be pasted in as an empty "Architect's plan:" section,
@@ -306,7 +302,7 @@ export function leadPrompt(
 	return [
 		`You are the orchestrator lead for the following goal. Drive it to completion.`,
 		"",
-		...repoRootGuardrail(repoRoot),
+		...repoRootGuardrail(repoRoot, verification),
 		"",
 		`Goal: ${goal}`,
 		`Task class: ${plan.task_class} | Complexity: ${plan.complexity} | Risk: ${plan.risk}`,

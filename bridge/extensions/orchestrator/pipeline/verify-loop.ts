@@ -21,6 +21,7 @@ import { testedRevisionFor } from "../adapters/git-changes.ts";
 import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import { isTransientProviderError } from "../core/transient-error.ts";
 import { QA_SCOPE_RULES, repoRootGuardrail, type DispatchTask } from "../core/prompts.ts";
+import { resolveVerificationPlan } from "../core/verification-commands.ts";
 import type { RunContext, RunSessionLike } from "../run/context.ts";
 
 export type CheckOutcome = "pass" | "fail" | "skipped" | "unavailable";
@@ -391,7 +392,7 @@ export async function runVerification(
 		"",
 		...filesChanged.map((f) => `- \`${f}\``),
 		"",
-		...repoRootGuardrail(repoRoot),
+		...repoRootGuardrail(repoRoot, resolveVerificationPlan(repoRoot)),
 		"",
 		"Run typecheck, unit tests, integration tests, lint as applicable.",
 		...QA_SCOPE_RULES,
