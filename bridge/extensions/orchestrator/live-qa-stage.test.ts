@@ -544,6 +544,33 @@ function reportWithLiveQa(stage: RunReport["liveQa"]): RunReport {
 }
 
 describe("live-QA final report", () => {
+	// Passing the multiline runner tail through unchanged hides Docker's failure from
+	// consumers that extract only the first `verification:` line. Truncating the head
+	// instead of retaining the end also loses that failure behind a long scope banner.
+	for (const scope of ["verify login", `${"startup context ".repeat(25)} API_TOKEN=private-value`]) {
+		test(`preflight diagnostic stays bounded and on the final verification line (scope length ${scope.length})`, async () => {
+			const cwd = initRepo();
+			commitFile(cwd, "a.txt", "base");
+			process.env.FAKE_FORGE_MODE = "preflight_fail";
+			const configPath = writeConfig(validAdapterConfig(cwd, { required: true }));
+			const result = await runLiveQaStage(baseOptions({
+				cwd, env: { HUMAIN_ORCHESTRATOR_LIVE_QA_CONFIG: configPath }, request: { requested: true, scope },
+			}));
+			expect(result.verdict).toBe("unavailable");
+			expect(result.reasons[0]).not.toMatch(/[\r\n]/);
+			expect(result.reasons[0].length).toBeLessThanOrEqual(300);
+			expect(result.reasons[0]).toContain("docker not running");
+			expect(result.reasons.join(" ")).not.toContain("private-value");
+			expect(result.outcomeRow?.reasons).toEqual(result.reasons);
+			const summary = buildRunSummary(reportWithLiveQa({ stage: result, notRunReason: null, hasUnknownCost: false }));
+			const verificationLine = summary.text.split("\n").find((line) => line.startsWith("verification:"));
+			expect(summary.succeeded).toBe(false);
+			expect(verificationLine).toContain("UNVERIFIED (required live QA unavailable:");
+			expect(verificationLine).toContain("docker not running");
+			expect(verificationLine).toEndWith(")");
+		});
+	}
+
 	test("confirmed finding and required unavailable override generic PASS; optional unavailable does not", () => {
 		for (const { verdict, required, reason, expected, succeeded } of [
 			{ verdict: "fail", required: true, reason: "broken login", expected: "FAIL (live QA: broken login)", succeeded: false },

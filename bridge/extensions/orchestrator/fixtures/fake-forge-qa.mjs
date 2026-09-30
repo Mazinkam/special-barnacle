@@ -51,6 +51,7 @@
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import net from "node:net";
 
 const mode = process.env.FAKE_FORGE_MODE ?? "pass";
 const repoRoot = process.cwd();
@@ -128,6 +129,21 @@ const runId = newRunId();
 log(`focused: scope=${argv[2] ?? ""} | ref=${argv[argv.indexOf("--ref") + 1] ?? "HEAD"} | slot=${slot}`);
 log("QA session starting");
 
+// Exercise Forge's atomic reservation boundary using an isolated test port.
+if (mode === "slot_contention") {
+	const port = Number(process.env.FAKE_FORGE_SLOT_PORT);
+	const reservation = net.createServer();
+	const busy = await new Promise((resolve) => {
+		reservation.once("error", () => resolve(true));
+		reservation.listen(port, "127.0.0.1", () => resolve(false));
+	});
+	if (busy) {
+		console.error(`[${nowIso()}] [qa cli] slot ${slot} is reserved by another QA run (port ${port} in use)`);
+		process.exit(1);
+	}
+	await new Promise((resolve) => reservation.close(resolve));
+}
+
 // Realistic results.md content mirroring Forge's own prompt contract (scripts/qa/prompts/
 // common.md item 3): a Markdown table with a `Result` column of exactly PASS|FAIL|BLOCKED.
 const RESULTS_MD_PASS = "| Step | Result |\n| --- | --- |\n| login flow | PASS |\n";
@@ -189,6 +205,7 @@ function finish(exitCode, reportPath) {
 }
 
 switch (mode) {
+	case "slot_contention":
 	case "pass": {
 		const reportPath = writeSession({ findings: [], usage: baseUsage() });
 		finish(0, reportPath);

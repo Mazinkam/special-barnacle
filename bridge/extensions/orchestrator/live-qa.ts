@@ -964,6 +964,8 @@ export interface RunLiveQaResult {
 	/** Set only when `spawn` itself failed (e.g. ENOENT). Never confuse this with a runner exit
 	 *  code — downstream parsing must treat it (like any missing report) as UNAVAILABLE, never PASS. */
 	spawnError?: string;
+	/** Admission refusal, including why waiting stopped, when no session was started. */
+	failureReason?: string;
 }
 
 // Forge's progress logger (scripts/qa/progress.ts createLogger) always prefixes every line with
@@ -1202,6 +1204,47 @@ export function sanitizeForPersistence<T>(value: T, env: NodeJS.ProcessEnv, key?
 }
 
 /**
+ * Await Forge's existing atomic admission check, not a duplicate port probe or cleanup command.
+ * Only explicit capacity refusals before a report are safe to re-attempt. All attempts and
+ * waits share the configured QA budget; admission waiting never gets a separate timeout or
+ * retry count, and the admitted runner receives only the remaining budget.
+ */
+export async function runLiveQa(opts: Parameters<typeof runLiveQaAttempt>[0]): Promise<RunLiveQaResult> {
+	const deadline = Date.now() + opts.adapter.budget_minutes * 60_000;
+	let argv = opts.argv;
+	while (true) {
+		const result = await runLiveQaAttempt({ ...opts, argv });
+		const refusal = /(?:^|\n)(?:\[[^\]\r\n]+\] )?\[qa cli\] (slot [01] (?:is reserved by another QA run \(port \d+ in use\)|ports in use: [\d, ]+\. Not touching them\.))(?:\r?\n|$)/.exec(result.tail)?.[1];
+		if (result.cancelled || result.spawnError || result.exitCode === 0 || result.reportPath || !refusal) return result;
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) {
+			const failureReason = `${refusal}; QA budget deadline expired while waiting for slot`;
+			return { ...result, failureReason, tail: `${result.tail}\n${failureReason}`.slice(-TAIL_MAX_BYTES) };
+		}
+		opts.onLine(`[live-qa] waiting for capacity: ${refusal}`);
+		let cancelled = opts.signal.isCancelled === true;
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(done, Math.min(1000, remaining));
+			let unsubscribe = () => {};
+			function done() { clearTimeout(timer); unsubscribe(); resolve(); }
+			unsubscribe = opts.signal.onCancel(() => { cancelled = true; done(); });
+		});
+		if (cancelled) {
+			return { ...result, cancelled: true, failureReason: `${refusal}; run cancelled while waiting for slot` };
+		}
+		if (Date.now() >= deadline) {
+			const failureReason = `${refusal}; QA budget deadline expired while waiting for slot`;
+			return { ...result, failureReason, tail: `${result.tail}\n${failureReason}`.slice(-TAIL_MAX_BYTES) };
+		}
+		// Forge accepts a positive numeric --budget (minutes), including fractions. Do not reset
+		// its execution allowance after spending time waiting for somebody else's reservation.
+		argv = [...opts.argv];
+		const budgetIndex = argv.indexOf("--budget");
+		if (budgetIndex >= 0) argv[budgetIndex + 1] = String((deadline - Date.now()) / 60_000);
+	}
+}
+
+/**
  * Spawns the runner's argv directly (shell: false), inherits process.env (the runner needs it —
  * never logs or records env values), and streams lines to `onLine` so the caller can write them
  * to the session log. There is NO timeout of our own — the runner owns its own budget/deadline.
@@ -1210,7 +1253,7 @@ export function sanitizeForPersistence<T>(value: T, env: NodeJS.ProcessEnv, key?
  * it never sends SIGKILL and never runs `bun qa clean`. If `signal.isCancelled` is already
  * `true` before this call, the child is never spawned at all.
  */
-export function runLiveQa(opts: {
+function runLiveQaAttempt(opts: {
 	adapter: LiveQaAdapterConfig;
 	argv: string[];
 	signal: LiveQaCancellationSignal;
@@ -1979,6 +2022,8 @@ export function parseLiveQaSession(opts: {
 	exitCode: number | null;
 	/** Epoch ms captured before this invocation was spawned; session artifacts must not predate it. */
 	startedAtMs: number;
+	/** Redacted spawn/admission diagnostic from this invocation, never a foreign session. */
+	runnerFailure?: string;
 }): LiveQaVerdict {
 	const unavailable = (reason: string, extra: Partial<LiveQaVerdict> = {}): LiveQaVerdict => redactVerdict({
 		verdict: "unavailable",
@@ -1994,8 +2039,15 @@ export function parseLiveQaSession(opts: {
 	});
 
 	if (!opts.reportPath) {
+		// Final verification summaries are consumed one line at a time. Redact before
+		// flattening/truncating so neither multiline credentials nor cut values leak.
+		// Keep the end of a long tail: startup/scope banners precede the real failure.
+		const diagnostic = redactSecrets(opts.runnerFailure ?? "", process.env).replace(/\s+/g, " ").trim();
+		const boundedDiagnostic = diagnostic.length > 256 ? `…${diagnostic.slice(-255)}` : diagnostic;
 		return unavailable(
-			"no session report produced (preflight failure: docker, version mismatch, busy slot, bad environment, or a usage error before a session directory existed)",
+			boundedDiagnostic
+				? `no session report produced: ${boundedDiagnostic}`
+				: "no session report produced (runner supplied no failure diagnostic)",
 		);
 	}
 	if (!opts.runnerRunId) {

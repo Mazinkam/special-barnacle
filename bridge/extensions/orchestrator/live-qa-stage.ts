@@ -301,6 +301,7 @@ async function runLiveQaStageUnsanitized(opts: RunLiveQaStageOptions): Promise<R
 		runnerRunId: runResult.runnerRunId,
 		exitCode: runResult.exitCode,
 		startedAtMs,
+		runnerFailure: runResult.failureReason ?? runResult.spawnError ?? runResult.tail,
 	});
 	// A runner that receives SIGINT (because THIS run's own cancellation fired) but keeps running
 	// long enough to write out fully valid, pass-shaped artifacts and exit 0 anyway did not run to
