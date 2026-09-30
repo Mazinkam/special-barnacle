@@ -137,7 +137,7 @@
     },
     "workflow_policy": {
       "summary": "Observable repository evidence picks the lightest workflow level; hard floors cannot be lowered; failures escalate upward with work carried forward.",
-      "mode": "off",
+      "mode": "observe",
       "levels": ["direct", "checked", "led", "full"],
       "thresholds": { "led_min_files": 4, "led_min_packages": 3 },
       "fix_rounds_per_level": 1,

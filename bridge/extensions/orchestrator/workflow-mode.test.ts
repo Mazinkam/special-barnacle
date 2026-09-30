@@ -5,15 +5,15 @@ import { METHOD } from "./models.ts";
 const policy = METHOD.rules.workflow_policy!;
 
 describe("resolveWorkflowMode", () => {
-	test("method default is off", () => {
-		expect(resolveWorkflowMode(policy, {})).toEqual({ mode: "off", source: "method", problems: [] });
+	test("method default is observe", () => {
+		expect(resolveWorkflowMode(policy, {})).toEqual({ mode: "observe", source: "method", problems: [] });
 	});
 	test("env overrides", () => {
 		expect(resolveWorkflowMode(policy, { HUMAIN_ORCHESTRATOR_WORKFLOW_MODE: "observe" }).mode).toBe("observe");
 	});
 	test("invalid env keeps method value and reports", () => {
 		const r = resolveWorkflowMode(policy, { HUMAIN_ORCHESTRATOR_WORKFLOW_MODE: "yes" });
-		expect(r.mode).toBe("off");
+		expect(r.mode).toBe("observe");
 		expect(r.problems[0]).toContain("HUMAIN_ORCHESTRATOR_WORKFLOW_MODE");
 	});
 	test("absent policy is off", () => {
@@ -27,7 +27,7 @@ describe("resolveWorkflowMode", () => {
 	});
 	test("invalid persisted setting falls back to method default and reports", () => {
 		const r = resolveWorkflowMode(policy, {}, "sometimes");
-		expect([r.mode, r.source]).toEqual(["off", "method"]);
+		expect([r.mode, r.source]).toEqual(["observe", "method"]);
 		expect(r.problems[0]).toContain("workflow_mode");
 	});
 	test("invalid env falls through to a valid persisted setting", () => {

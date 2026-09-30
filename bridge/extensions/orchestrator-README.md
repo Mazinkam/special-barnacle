@@ -234,7 +234,7 @@ profile was retired); run `install.sh` to install the shipped profiles.
   `orchestrator-profiles.json`; `workflow default` removes it and `workflow` shows the effective
   mode and its source. Precedence: `HUMAIN_ORCHESTRATOR_WORKFLOW_MODE` env (one-off override,
   e.g. benchmarks/CI) > saved setting > `method.json` `rules.workflow_policy.mode` (default
-  `off`). Invalid values at any layer are logged and skipped; they never block dispatch.
+  `observe`: records `workflow_level_planned`, runs the usual pipeline). Invalid values at any layer are logged and skipped; they never block dispatch.
 - `--workflow direct|checked|led|full` may raise the selected level, never lower it below
   the hard floor. Rejected overrides are recorded with their reason.
 - `workflow_level_planned` records `run_id`, `mode`, `mode_source` (`env|setting|method`),
