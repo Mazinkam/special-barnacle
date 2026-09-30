@@ -25,7 +25,7 @@ def _spawn_renderer(root: Path, config: dict | None) -> None:
     """Start a detached one-shot renderer unless one already owns the slot (it re-checks after it releases)."""
     if not render_slot_free(root):
         return
-    p = subprocess.Popen([sys.executable, '-m', 'orchestrator.presentation.publish', str(root)], stdin=subprocess.PIPE,
+    p = subprocess.Popen([sys.executable, '-m', 'orchestrator.presentation.publish', str(root.resolve())], stdin=subprocess.PIPE,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                          cwd=str(Path(__file__).resolve().parents[2]))
     p.stdin.write(json.dumps(config).encode()); p.stdin.close()

@@ -176,3 +176,10 @@ def test_write_landing_after_in_lock_check_is_not_lost(tmp_path):
         publish.render_until_current(tmp_path, {})
     assert publish.dashboard_is_current(tmp_path)
 
+
+def test_relative_state_root_renders_the_callers_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    rel = Path('state')
+    assert refresh_after_write(rel, _write(rel, 0), config={})['ok']
+    _wait(lambda: publish.dashboard_is_current(tmp_path / 'state') and publish.render_slot_free(tmp_path / 'state'), 20)
+
