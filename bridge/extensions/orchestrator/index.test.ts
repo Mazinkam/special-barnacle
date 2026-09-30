@@ -3840,8 +3840,11 @@ describe("final triage and shutdown integration", () => {
 			expect(outcome).toMatchObject({ outcome: "cancelled", note: "session_shutdown" });
 			expect(readRows("events.jsonl").some(row => row.run_id === runId && row.event === "run_cancelled")).toBe(true);
 			expect(JSON.parse(readFileSync(join(pythonStateRoot, "ledger.json"), "utf8")).runs[runId].status).toBe("cancelled");
-			// A shutdown-initiated cancel has no live session to post into; the chat must stay silent for this run.
-			expect(sent.some((s) => s.message.details?.runId === runId)).toBe(false);
+			// A shutdown-initiated cancel posts its result best-effort (RunResultV1) before the notify.
+			await session?.runPromise;
+			const posted = sent.filter((s) => s.message.customType === "orchestrator-run" && s.message.details?.runId === runId);
+			expect(posted).toHaveLength(1);
+			expect((posted[0]!.message.details as { result?: { causes?: string[] } } | undefined)?.result?.causes).toEqual(["cancelled_shutdown"]);
 		} finally {
 			session?.cancel();
 			await session?.runPromise;

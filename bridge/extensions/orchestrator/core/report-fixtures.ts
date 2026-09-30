@@ -1,0 +1,41 @@
+import type { RunReport } from "./report.ts";
+
+/** An all-pass `RunReport` for tests; override only the fields a test is about. */
+export function minimalReport(overrides: Partial<RunReport> = {}): RunReport {
+	return {
+		runId: "ht-orch-1700000000000-abcdef",
+		elapsedMs: 65_000,
+		blocked: false,
+		dispatchOk: true,
+		verificationDispatchOk: true,
+		succeededLeads: 1,
+		totalLeads: 1,
+		skippedLeads: 0,
+		retries: 0,
+		resumedLeadIds: [],
+		leadAttemptLines: [],
+		leadStatuses: ["completed"],
+		filesChangedCount: 1,
+		externalFilesCount: 0,
+		outOfTreeChangesLine: null,
+		reconWorkersLine: "recon: 0 workers dispatched",
+		verificationSkipped: false,
+		passedVerification: true,
+		verificationTimedOut: false,
+		failedChecks: [],
+		externalChecks: [],
+		totalCostUsd: 0.5,
+		dispatchCount: 1,
+		nestedCostUsd: 0,
+		firstFailureLine: "",
+		reportLines: [],
+		showFullReport: false,
+		reportTruncated: false,
+		hasLeadReports: false,
+		leadReportPath: "",
+		runLogPath: "/l/run.log",
+		stateRoot: "/tmp/state",
+		telemetryReport: { ok: true, batches: 1, acknowledged: 1, failed: 0, derivedStale: 0 },
+		...overrides,
+	};
+}

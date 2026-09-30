@@ -17,6 +17,7 @@
  */
 import { telemetryHealthy, telemetryWarning, type FlushReport } from "../record-queue.ts";
 import { composeVerificationVerdict, liveQaSummaryLines, type RunLiveQaStageResult } from "../live-qa-stage.ts";
+import type { AcceptanceResult } from "./run-result.ts";
 import { fmtElapsed } from "../run-ui.ts";
 
 export interface VerificationVerdictInput {
@@ -113,7 +114,9 @@ export interface RunReport {
 	 *  recognizing any specific check (`FAIL (unparsed)`). */
 	failedChecks: string[];
 	/** Parent-owned external CI results; unverified/failure never implies PASS. */
-	externalChecks?: Array<{ provider: "gitlab" | "github"; id: string; outcome: "pending" | "success" | "failure" | "unverified" }>;
+	externalChecks?: Array<{ provider: "gitlab" | "github"; id: string; outcome: "pending" | "success" | "failure" | "unverified"; reason?: string }>;
+	/** Acceptance verdict (populated by a later task); absent unless requested. */
+	acceptance?: AcceptanceResult;
 	totalCostUsd: number;
 	/** Number of billed dispatches (architect/workers/leads/verification/escalation + triage, when triage spent anything). */
 	dispatchCount: number;
@@ -122,6 +125,8 @@ export interface RunReport {
 	firstFailureLine: string;
 	/** Excerpt lines from the first successful lead's report (full report, or just its Open items). */
 	reportLines: string[];
+	/** Untruncated bullet items from the `## Open items` section of each lead's final successful attempt (deduped, "None"/"N/A" excluded). Feeds RunResultV1; `reportLines` is display-capped. */
+	openItems?: string[];
 	/** True when `reportLines` is the full report (no files changed) rather than just Open items. */
 	showFullReport: boolean;
 	/** True when the full report shown was truncated to 40 lines. */
@@ -219,7 +224,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 			"- See 'open items from lead' below for the specific follow-up work.",
 			...(actionLines.length > 0 ? ["what still needs action:", ...actionLines] : []),
 		] : []),
-		...externalChecks.map((check) => `external check: ${check.provider} ${check.id} ${check.outcome}`),
+		...externalChecks.map((check) => `external check: ${check.provider} ${check.id} ${check.outcome}${check.reason ? ` (${check.reason})` : ""}`),
 		`total cost: $${report.totalCostUsd.toFixed(4)} (${report.dispatchCount} dispatches${report.nestedCostUsd > 0 ? `; $${report.nestedCostUsd.toFixed(4)} of it in lead subagents` : ""})`,
 		...(report.dispatchOk ? [] : [`first failure: ${report.firstFailureLine}`]),
 		...(report.liveQa ? liveQaSummaryLines(report.liveQa.stage, report.liveQa.notRunReason, report.liveQa.hasUnknownCost) : []),
@@ -230,6 +235,7 @@ export function buildRunSummary(report: RunReport): { text: string; succeeded: b
 				: []),
 		`run log: ${report.runLogPath}`,
 		`ledger: ${report.stateRoot}/metrics.jsonl`,
+		"result_contract: v1",
 		...telemetryWarning(report.telemetryReport),
 	];
 	const text = summary.join("\n");

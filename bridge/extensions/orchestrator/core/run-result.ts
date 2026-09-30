@@ -1,3 +1,5 @@
+import type { RunReport } from "./report.ts";
+
 export const RUN_RESULT_SCHEMA = "orchestration-result";
 export const RUN_RESULT_VERSION = 1;
 export const RUN_RESULT_LIMITS = { payloadBytes: 65536, stringChars: 2048, openItems: 50, criteria: 20, artifacts: 50 } as const;
@@ -108,4 +110,76 @@ export function enforceRunResultBounds(result: RunResultV1): RunResultV1 {
 		cost: result.cost,
 		runLog: result.runLog.slice(0, 1024),
 	};
+}
+
+export function buildCompletedRunResult(report: RunReport): RunResultV1 {
+	const statuses = report.leadStatuses ?? [];
+	const external = report.externalChecks ?? [];
+	const causes: RunCause[] = [];
+	if (statuses.includes("partial")) causes.push("lead_partial");
+	if (report.blocked || statuses.includes("blocked")) causes.push("lead_blocked");
+	if (external.some((c) => c.outcome !== "success")) causes.push("external_check");
+	if (!report.dispatchOk || statuses.includes("failed")) causes.push("dispatch_failed");
+	const stage = report.liveQa?.stage ?? null;
+	const row = stage?.outcomeRow ?? null;
+	return enforceRunResultBounds({
+		schema: RUN_RESULT_SCHEMA,
+		version: 1,
+		runId: report.runId,
+		outcome: outcomeFromCauses(causes),
+		causes,
+		codeVerification: report.verificationSkipped ? "skipped"
+			: !report.verificationDispatchOk ? "not_run"
+			: report.passedVerification ? "pass" : "fail",
+		liveQa: {
+			verdict: stage?.verdict ?? "not_requested",
+			...(typeof row?.session_id === "string" ? { sessionId: row.session_id } : {}),
+			...(typeof row?.tested_revision === "string" ? { testedCommit: row.tested_revision } : {}),
+			reasons: stage?.reasons ?? (report.liveQa?.notRunReason ? [report.liveQa.notRunReason] : []),
+		},
+		...(report.acceptance ? { acceptance: report.acceptance } : {}),
+		externalChecks: external.map((c) => ({ provider: c.provider, id: c.id, outcome: c.outcome, ...(c.reason ? { reason: c.reason } : {}) })),
+		// report.openItems is the untruncated list; reportLines is display-capped and may hold the whole report.
+		openItems: report.openItems
+			?? report.reportLines.filter((l) => /^\s*[-*]\s+/.test(l)).map((l) => l.replace(/^\s*[-*]\s+/, "")),
+		diagnostics: report.dispatchOk ? [] : [report.firstFailureLine],
+		cost: { usd: report.totalCostUsd, complete: !(report.liveQa?.hasUnknownCost ?? false) },
+		runLog: report.runLogPath,
+	});
+}
+
+/** Explicit, marked truncation (never silent): result is <= max chars and ends with the marker. */
+function truncateMarked(text: string, max: number): string {
+	if (text.length <= max) return text;
+	let dropped = text.length - max;
+	for (;;) {
+		const marker = `…[truncated ${dropped} chars]`;
+		const next = text.length - (max - marker.length);
+		if (next === dropped) return text.slice(0, max - marker.length) + marker;
+		dropped = next;
+	}
+}
+
+export function buildTerminalRunResult(input: {
+	runId: string;
+	causes: RunCause[];
+	diagnostic: string;
+	costUsd: number;
+	costComplete: boolean;
+	runLog: string;
+}): RunResultV1 {
+	return enforceRunResultBounds({
+		schema: RUN_RESULT_SCHEMA,
+		version: 1,
+		runId: input.runId,
+		outcome: outcomeFromCauses(input.causes),
+		causes: input.causes,
+		codeVerification: "not_run",
+		liveQa: { verdict: "not_requested", reasons: [] },
+		externalChecks: [],
+		openItems: [],
+		diagnostics: [truncateMarked(input.diagnostic, RUN_RESULT_LIMITS.stringChars)],
+		cost: { usd: input.costUsd, complete: input.costComplete },
+		runLog: input.runLog,
+	});
 }

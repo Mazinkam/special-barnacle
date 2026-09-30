@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildRunSummary, verificationVerdictFor, type RunReport } from "./report.ts";
+import { minimalReport } from "./report-fixtures.ts";
 import type { FlushReport } from "../record-queue.ts";
 
 const base = { blocked: false, dispatchOk: true, verificationSkipped: false, filesChangedCount: 3, passedVerification: true };
@@ -133,6 +134,7 @@ describe("core/report.ts buildRunSummary", () => {
 				"total cost: $1.2345 (3 dispatches)",
 				"run log: /tmp/run.log",
 				"ledger: /tmp/state/metrics.jsonl",
+				"result_contract: v1",
 			].join("\n"),
 		);
 		expect(succeeded).toBe(true);
@@ -160,6 +162,7 @@ describe("core/report.ts buildRunSummary", () => {
 				"first failure: ht-orch-1700000000000-abcdef-lead-0 exit 1: boom",
 				"run log: /tmp/run.log",
 				"ledger: /tmp/state/metrics.jsonl",
+				"result_contract: v1",
 			].join("\n"),
 		);
 		expect(succeeded).toBe(false);
@@ -184,6 +187,7 @@ describe("core/report.ts buildRunSummary", () => {
 				"total cost: $1.2345 (3 dispatches)",
 				"run log: /tmp/run.log",
 				"ledger: /tmp/state/metrics.jsonl",
+				"result_contract: v1",
 			].join("\n"),
 		);
 		expect(succeeded).toBe(false);
@@ -262,6 +266,7 @@ describe("core/report.ts buildRunSummary", () => {
 				"did the thing.",
 				"run log: /tmp/run.log",
 				"ledger: /tmp/state/metrics.jsonl",
+				"result_contract: v1",
 			].join("\n"),
 		);
 	});
@@ -398,6 +403,7 @@ describe("core/report.ts buildRunSummary", () => {
 				"total cost: $1.2345 (3 dispatches)",
 				"run log: /tmp/run.log",
 				"ledger: /tmp/state/metrics.jsonl",
+				"result_contract: v1",
 				"telemetry: 1 record(s) could not be written to the ledger — ledger write failed",
 			].join("\n"),
 		);
@@ -415,6 +421,7 @@ describe("core/report.ts buildRunSummary", () => {
 			"total cost: $1.2345 (3 dispatches)",
 			"run log: /tmp/run.log",
 			"ledger: /tmp/state/metrics.jsonl",
+				"result_contract: v1",
 		].join("\n"));
 		expect(succeeded).toBe(false);
 	});
@@ -452,5 +459,13 @@ describe("core/report.ts buildRunSummary", () => {
 		const { text } = buildRunSummary(report);
 		expect(text).toContain("verification: PASS");
 		expect(text).not.toContain("NOT RUN");
+	});
+});
+
+describe("core/report.ts result contract lines", () => {
+	test("summary carries result_contract and the external-check reason", () => {
+		const { text } = buildRunSummary(minimalReport({ externalChecks: [{ provider: "github", id: "unknown", outcome: "unverified", reason: "unparsed_checks" }] }));
+		expect(text).toContain("result_contract: v1");
+		expect(text).toContain("external check: github unknown unverified (unparsed_checks)");
 	});
 });

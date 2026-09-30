@@ -28,6 +28,7 @@ import type { CaptureOpts, DispatchResult } from "../core/records.ts";
 import { ModelHealth } from "../run/model-health.ts";
 import type { DispatchTask, PlanResponse } from "../core/prompts.ts";
 import { buildRunSummary } from "../core/report.ts";
+import { buildCompletedRunResult, buildTerminalRunResult, type RunResultV1 } from "../core/run-result.ts";
 import type { TriageResult } from "../core/triage.ts";
 import type { Adapter, FullResolution } from "../adapters/adapter-resolver.ts";
 import { policyIdFor } from "../adapters/adapter-resolver.ts";
@@ -549,10 +550,11 @@ function postRunMessage(
 	outcome: "completed" | "failed" | "cancelled",
 	content: string,
 	costUsd: number,
+	result: RunResultV1,
 ): void {
 	try {
 		pi.sendMessage(
-			{ customType: "orchestrator-run", content, display: true, details: { runId, outcome, costUsd } },
+			{ customType: "orchestrator-run", content, display: true, details: { runId, outcome, costUsd, result } },
 			{ triggerTurn: false },
 		);
 	} catch (err) {
@@ -708,31 +710,45 @@ export function registerOrchestrateCommand(pi: ExtensionAPI, deps: OrchestrateDe
 				if (result.kind === "completed") {
 					const { text: summaryText, succeeded } = buildRunSummary(result.report);
 					session.log(summaryText);
+					postRunMessage(pi, runId, succeeded ? "completed" : "failed", summaryText, result.report.totalCostUsd, buildCompletedRunResult(result.report));
 					safeUi(() => ctx.ui.notify(summaryText, succeeded ? "info" : "warning"));
-					postRunMessage(pi, runId, succeeded ? "completed" : "failed", summaryText, result.report.totalCostUsd);
+				} else {
+					const terminal = buildTerminalRunResult({ runId, causes: [result.cause], diagnostic: result.notifyText,
+						costUsd: session.totalCost(), costComplete: true, runLog: session.file("run.log") });
+					postRunMessage(pi, runId, "failed", result.notifyText, session.totalCost(), terminal);
+					safeUi(() => ctx.ui.notify(result.notifyText, result.notifyType));
 				}
 			} catch (err) {
 				if (session.cancellation.isCancelled) {
 					const stopped = session.cancelledDispatches();
 					session.log(`run cancelled by user; stopped dispatches: ${stopped.join(", ") || "none active"}`);
 					const cancelReason = session.cancelReason;
-					warnTelemetry(ctx, await deps.cancelRun(runId, deps.cancelReasonLabel(cancelReason), session.terminalTiming(), session.telemetryBaseline));
-					const cancelText = `Orchestration cancelled. ${stopped.length ? `Stopped: ${stopped.join(", ")}. ` : "No child dispatch was active. "}See ${session.file("run.log")}`;
-					safeUi(() => ctx.ui.notify(cancelText, "info"));
-					// Only a user-initiated cancel (/orchestrate-cancel) has a live session to post
-					// into; a shutdown or signal cancel means the session itself is going away.
-					if (cancelReason === "user") {
-						postRunMessage(pi, runId, "cancelled", cancelText, session.totalCost());
+					// Best effort: a rejecting terminal-telemetry flush must not skip the result post or the notify.
+					try {
+						warnTelemetry(ctx, await deps.cancelRun(runId, deps.cancelReasonLabel(cancelReason), session.terminalTiming(), session.telemetryBaseline));
+					} catch (telemetryErr) {
+						session.log(`terminal telemetry failed: ${(telemetryErr as Error)?.message ?? String(telemetryErr)}`);
 					}
+					const cancelText = `Orchestration cancelled. ${stopped.length ? `Stopped: ${stopped.join(", ")}. ` : "No child dispatch was active. "}See ${session.file("run.log")}`;
+					// Best effort for every cancel reason; postRunMessage swallows a dead session's throw.
+					postRunMessage(pi, runId, "cancelled", cancelText, session.totalCost(), buildTerminalRunResult({ runId,
+						causes: [cancelReason === "user" ? "cancelled_user" : "cancelled_shutdown"], diagnostic: cancelText,
+						costUsd: session.totalCost(), costComplete: true, runLog: session.file("run.log") }));
+					safeUi(() => ctx.ui.notify(cancelText, "info"));
 				} else {
 					// Any uncaught throw used to leave the run half-recorded (no outcome
 					// row) and the UI stuck on the last notify. Record + surface it.
 					const message = (err as Error).stack ?? String(err);
 					session.log(`run crashed: ${message}`);
-					warnTelemetry(ctx, await deps.failRun(runId, `crashed: ${(err as Error).message}`, session.terminalTiming(), session.telemetryBaseline));
+					try {
+						warnTelemetry(ctx, await deps.failRun(runId, `crashed: ${(err as Error).message}`, session.terminalTiming(), session.telemetryBaseline));
+					} catch (telemetryErr) {
+						session.log(`terminal telemetry failed: ${(telemetryErr as Error)?.message ?? String(telemetryErr)}`);
+					}
 					const crashText = `Orchestration crashed: ${(err as Error).message}\nSee ${session.file("run.log")}`;
+					postRunMessage(pi, runId, "failed", crashText, session.totalCost(), buildTerminalRunResult({ runId,
+						causes: ["crashed"], diagnostic: crashText, costUsd: session.totalCost(), costComplete: true, runLog: session.file("run.log") }));
 					safeUi(() => ctx.ui.notify(crashText, "error"));
-					postRunMessage(pi, runId, "failed", crashText, session.totalCost());
 				}
 			} finally {
 				try {

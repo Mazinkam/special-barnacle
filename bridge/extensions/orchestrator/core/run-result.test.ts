@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { enforceRunResultBounds, outcomeFromCauses, RUN_RESULT_LIMITS, type RunResultV1 } from "./run-result.ts";
+import { buildCompletedRunResult, buildTerminalRunResult, enforceRunResultBounds, outcomeFromCauses, RUN_RESULT_LIMITS, type RunResultV1 } from "./run-result.ts";
+import { minimalReport } from "./report-fixtures.ts";
 
 const base: RunResultV1 = {
 	schema: "orchestration-result", version: 1, runId: "ht-orch-1",
@@ -150,4 +151,68 @@ describe("fixtures", () => {
 			expect(fixture.outcome).toBe(outcomeFromCauses(fixture.causes));
 		});
 	}
+});
+
+describe("buildTerminalRunResult diagnostic truncation", () => {
+	const input = { runId: "r", causes: ["crashed" as const], costUsd: 0, costComplete: true, runLog: "/l" };
+	test("a 5000-char diagnostic is explicitly marked and within 2048 chars, unchanged by bounds", () => {
+		const result = buildTerminalRunResult({ ...input, diagnostic: "d".repeat(5000) });
+		const d = result.diagnostics[0]!;
+		const marker = `…[truncated ${5000 - (2048 - `…[truncated ${5000} chars]`.length)} chars]`;
+		expect(d.length).toBeLessThanOrEqual(2048);
+		expect(d.endsWith(marker)).toBe(true);
+		expect(d.startsWith("d".repeat(100))).toBe(true);
+		expect(result.diagnostics[0]).not.toContain("result exceeded bounds");
+		expect(enforceRunResultBounds(result)).toEqual(result);
+	});
+	test("a diagnostic of exactly 2048 chars is untouched", () => {
+		expect(buildTerminalRunResult({ ...input, diagnostic: "d".repeat(2048) }).diagnostics[0]).toBe("d".repeat(2048));
+	});
+});
+
+describe("run result builders", () => {
+	test("#144 shape: partial lead + unparsed external check => blocked with both causes", () => {
+		const result = buildCompletedRunResult(minimalReport({
+			leadStatuses: ["partial"],
+			externalChecks: [{ provider: "github", id: "unknown", outcome: "unverified", reason: "unparsed_checks" }],
+		}));
+		expect(result.causes).toEqual(["lead_partial", "external_check"]);
+		expect(result.outcome).toBe("blocked");
+		expect(result.externalChecks[0]?.reason).toBe("unparsed_checks");
+	});
+
+	test("openItems come from report.openItems when defined, not from reportLines", () => {
+		const result = buildCompletedRunResult(minimalReport({ reportLines: ["- Files Changed bullet"], showFullReport: true, openItems: ["real item"] }));
+		expect(result.openItems).toEqual(["real item"]);
+	});
+	test("openItems fall back to reportLines bullets when report.openItems is undefined", () => {
+		const result = buildCompletedRunResult(minimalReport({ reportLines: ["- a", "prose", "* b"] }));
+		expect(result.openItems).toEqual(["a", "b"]);
+	});
+	test("51 report.openItems reach the bounds check unchanged and are rejected explicitly", () => {
+		const result = buildCompletedRunResult(minimalReport({ openItems: Array.from({ length: 51 }, (_, i) => `i${i}`) }));
+		expect(result.diagnostics).toEqual(["result exceeded bounds: openItems 51 > 50"]);
+	});
+
+	test("code verification is the pre-live-QA verdict; live Qa reported separately", () => {
+		const result = buildCompletedRunResult(minimalReport({
+			passedVerification: true,
+			liveQa: {
+				stage: { verdict: "fail", required: true, reasons: ["confirmed finding"], costRows: [],
+					outcomeRow: { session_id: "run-x", tested_revision: "8a3817feef" }, stage: null, cancelled: false },
+				notRunReason: null,
+				hasUnknownCost: true,
+			},
+		}));
+		expect(result.codeVerification).toBe("pass");
+		expect(result.liveQa).toEqual({ verdict: "fail", sessionId: "run-x", testedCommit: "8a3817feef", reasons: ["confirmed finding"] });
+		expect(result.cost.complete).toBe(false);
+	});
+
+	test("terminal result for plan failure", () => {
+		const result = buildTerminalRunResult({ runId: "r", causes: ["plan_failed"], diagnostic: "TypeError",
+			costUsd: 0.0005, costComplete: true, runLog: "/l/run.log" });
+		expect(result).toMatchObject({ outcome: "failed", codeVerification: "not_run", liveQa: { verdict: "not_requested" },
+			diagnostics: ["TypeError"] });
+	});
 });
