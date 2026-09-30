@@ -233,7 +233,8 @@ def test_cli_write_with_captured_pipes_returns_before_slow_render(tmp_path):
     _wait(lambda: publish.dashboard_is_current(state) and publish.render_slot_free(state), 30)
     assert time.monotonic() - t0 >= 4  # the page really came from the slow detached child
     page = (state / 'dashboard.html').read_text()
-    publish.generate_dashboard(state, config=json.loads((REPO / 'orchestrator' / 'config.json').read_text()))
+    from orchestrator import cli
+    publish.generate_dashboard(state, config=cli.cfg())  # the config the CLI handed the child
     assert _strip((state / 'dashboard.html').read_text()) == _strip(page)  # child env/cwd == in-call render
 
 
