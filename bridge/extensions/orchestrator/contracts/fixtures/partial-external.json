@@ -1,0 +1,52 @@
+{
+  "schema": "orchestration-result",
+  "version": 1,
+  "runId": "ht-orch-partial-external",
+  "outcome": "blocked",
+  "causes": [
+    "lead_partial",
+    "external_check"
+  ],
+  "codeVerification": "pass",
+  "liveQa": {
+    "verdict": "pass",
+    "sessionId": "run-20260930-095418-ba63",
+    "testedCommit": "abc1234",
+    "reasons": []
+  },
+  "externalChecks": [
+    {
+      "provider": "github",
+      "id": "ci/build",
+      "outcome": "pending",
+      "reason": "required check not yet reported"
+    }
+  ],
+  "openItems": [
+    "Follow-up: remaining work not completed"
+  ],
+  "diagnostics": [],
+  "cost": {
+    "usd": 0.5,
+    "complete": true
+  },
+  "runLog": "/state/runs/ht-orch-partial-external/run.log",
+  "acceptance": {
+    "overall": "pass",
+    "criteria": [
+      {
+        "id": "ac-1",
+        "result": "pass",
+        "expected": {
+          "status": 200
+        },
+        "observed": {
+          "status": 200
+        },
+        "artifacts": [
+          "artifacts/ac-1.png"
+        ]
+      }
+    ]
+  }
+}

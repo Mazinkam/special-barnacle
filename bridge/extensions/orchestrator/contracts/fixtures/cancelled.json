@@ -1,0 +1,22 @@
+{
+  "schema": "orchestration-result",
+  "version": 1,
+  "runId": "ht-orch-cancelled",
+  "outcome": "cancelled",
+  "causes": [
+    "cancelled_user"
+  ],
+  "codeVerification": "not_run",
+  "liveQa": {
+    "verdict": "not_requested",
+    "reasons": []
+  },
+  "externalChecks": [],
+  "openItems": [],
+  "diagnostics": [],
+  "cost": {
+    "usd": 0.5,
+    "complete": true
+  },
+  "runLog": "/state/runs/ht-orch-cancelled/run.log"
+}

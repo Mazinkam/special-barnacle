@@ -1,0 +1,24 @@
+{
+  "schema": "orchestration-result",
+  "version": 1,
+  "runId": "ht-orch-plan-failed",
+  "outcome": "failed",
+  "causes": [
+    "plan_failed"
+  ],
+  "codeVerification": "not_run",
+  "liveQa": {
+    "verdict": "not_requested",
+    "reasons": []
+  },
+  "externalChecks": [],
+  "openItems": [],
+  "diagnostics": [
+    "lead plan failed validation"
+  ],
+  "cost": {
+    "usd": 0.5,
+    "complete": true
+  },
+  "runLog": "/state/runs/ht-orch-plan-failed/run.log"
+}
