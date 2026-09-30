@@ -14,6 +14,7 @@ sys.path.insert(0, str(HERE.parent))
 from bench.arms import ARMS, ExperimentConfig, config_fingerprint  # noqa: E402
 from bench.manifest import load_suite  # noqa: E402
 from bench.runner import plan_attempts, run_experiment  # noqa: E402
+from bench.tools import preflight_tool_isolation  # noqa: E402
 
 
 def _tiered_supported() -> bool:
@@ -82,6 +83,10 @@ def main(argv=None) -> int:
     from bench.runner import is_live_root
     if is_live_root(args.experiment_root):
         print('error: refusing to use the live state root as an experiment root', file=sys.stderr)
+        return 2
+    problems = preflight_tool_isolation(cfg, tasks, args.experiment_root)
+    if problems:
+        print('error: tool isolation preflight failed:\n  ' + '\n  '.join(problems), file=sys.stderr)
         return 2
     try:
         # run_experiment validates the root (live state) and budget before creating anything

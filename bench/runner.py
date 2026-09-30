@@ -14,8 +14,9 @@ from pathlib import Path
 
 from bench.arms import arm_invocation, config_fingerprint
 from bench.grade import grade
-from bench.sandbox import default_deny_roots, sandbox_argv
+from bench.sandbox import sandbox_argv
 from bench.snapshot import make_snapshot
+from bench.tools import preflight_tool_isolation, task_deny_roots
 from orchestrator.core.env import default_state_root
 
 
@@ -103,6 +104,9 @@ def run_experiment(tasks, cfg, arms, experiment_root: Path, *, approve_usd: floa
     cap = cfg.per_run_usd_cap if cfg else 0.0
     if cfg is None or approve_usd < len(attempts) * cap:
         raise ValueError(f'approve at least ${len(attempts) * cap:.2f} (--approve-usd) for {len(attempts)} attempts')
+    problems = preflight_tool_isolation(cfg, list(by_id.values()), root)
+    if problems:
+        raise ValueError('tool isolation preflight failed:\n  ' + '\n  '.join(problems))
     root.mkdir(parents=True, exist_ok=True)
     fingerprint = config_fingerprint(cfg)
     journal, done, orphaned = _journal(root)
@@ -149,16 +153,14 @@ def _run_one(task, a: Attempt, cfg, root: Path, fingerprint: str, journal: Path,
     for setup_argv in task.setup:
         cmd = list(setup_argv)
         if sandbox:   # network stays open for installs; only grading is offline
-            cmd = sandbox_argv(cmd, deny_read=default_deny_roots([Path(task.repo), task.source.parent, root / 'journal.jsonl']),
-                               allow_network=True)
+            cmd = sandbox_argv(cmd, deny_read=task_deny_roots(task, root), allow_network=True)
         try:
             subprocess.run(cmd, cwd=snap.path, env={**os.environ, **env}, check=False, timeout=task.timeout_s)
         except (subprocess.TimeoutExpired, OSError):
             return _infra_row(a, None)
     argv = shlex.split(argv[0]) + argv[1:]           # allows "python fake_agent.py" style binaries
     if sandbox:
-        argv = sandbox_argv(argv, deny_read=default_deny_roots([Path(task.repo), task.source.parent, root / 'journal.jsonl']),
-                            allow_network=True)
+        argv = sandbox_argv(argv, deny_read=task_deny_roots(task, root), allow_network=True)
     state = root / 'state'
     known = {r['run_id'] for r in _outcome_rows(state)}
     _append(journal, {'event': 'started', 'attempt_id': a.attempt_id})
