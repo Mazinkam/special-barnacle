@@ -183,3 +183,42 @@ def test_relative_state_root_renders_the_callers_directory(tmp_path, monkeypatch
     assert refresh_after_write(rel, _write(rel, 0), config={})['ok']
     _wait(lambda: publish.dashboard_is_current(tmp_path / 'state') and publish.render_slot_free(tmp_path / 'state'), 20)
 
+
+def test_cli_write_with_captured_pipes_returns_before_slow_render(tmp_path):
+    """A hook/CI caller using capture_output must not wait for the detached renderer (no inherited pipes)."""
+    site = tmp_path / 'site'; site.mkdir()
+    (site / 'sitecustomize.py').write_text(  # inherited by the detached child through PYTHONPATH
+        f"import sys, time\nsys.path.insert(0, {str(REPO)!r})\n"
+        "from orchestrator.presentation import dashboard_data as d\n_real = d.build_data\n"
+        "def slow(root, config): time.sleep(4); return _real(root, config)\nd.build_data = slow\n")
+    state = tmp_path / 'state'
+    env = {k: v for k, v in os.environ.items() if k != SYNC_ENV}
+    env.update(PYTHONPATH=str(site), CODING_AGENT_ORCHESTRATOR_HOME=str(state))
+    t0 = time.monotonic()
+    out = subprocess.run([sys.executable, '-m', 'orchestrator.cli', 'event', 'note', '{"record_id":"r1"}'],
+                         cwd=REPO, env=env, capture_output=True, text=True, timeout=30)
+    elapsed = time.monotonic() - t0
+    assert out.returncode == 0, out.stderr
+    body = json.loads(out.stdout)
+    assert body['ok'] and body['dashboard_updated'] is False
+    assert elapsed < 3, elapsed  # the detached render alone sleeps 4s
+    _wait(lambda: publish.dashboard_is_current(state) and publish.render_slot_free(state), 30)
+    assert time.monotonic() - t0 >= 4  # the page really came from the slow detached child
+    page = (state / 'dashboard.html').read_text()
+    publish.generate_dashboard(state, config=json.loads((REPO / 'orchestrator' / 'config.json').read_text()))
+    assert _strip((state / 'dashboard.html').read_text()) == _strip(page)  # child env/cwd == in-call render
+
+
+def test_death_between_page_and_receipt_leaves_page_stale_not_claimed_current(tmp_path):
+    _write(tmp_path, 0)
+    publish.generate_dashboard(tmp_path, {})
+    old_receipt = (tmp_path / 'dashboard.version.json').read_bytes()
+    _write(tmp_path, 1)
+
+    def die(*a, **k): raise SystemExit('killed after page replace')
+
+    with patch.object(publish, 'write_json', die), pytest.raises(SystemExit):
+        publish.render_until_current(tmp_path, {})
+    assert (tmp_path / 'dashboard.version.json').read_bytes() == old_receipt  # receipt never runs ahead
+    assert not publish.dashboard_is_current(tmp_path) and publish.render_slot_free(tmp_path)
+    assert publish.render_until_current(tmp_path, {}) == 1 and publish.dashboard_is_current(tmp_path)
