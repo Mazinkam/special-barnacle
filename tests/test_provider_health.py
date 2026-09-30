@@ -204,7 +204,9 @@ def test_backfill_bedrock_host_and_undated_evidence_never_create_precise_windows
     assert rows[0]['endpoint_host'] == 'bedrock-runtime.eu-west-2.amazonaws.com'
     assert rows[0]['first_ts'] == '2026-09-26T10:00:00Z'
     assert rows[1]['provider'] == rows[2]['provider'] == 'unknown'
-    assert all('private' not in str(row) and 'secret' not in str(row) and 'evil.test' not in str(row) for row in rows)
+    # 'repository' is the checkout path (may legitimately contain e.g. /private/tmp), not log content.
+    leaks = [str({k: v for k, v in row.items() if k != 'repository'}) for row in rows]
+    assert all('private' not in r and 'secret' not in r and 'evil.test' not in r for r in leaks)
     panel = provider_health(rows, now=datetime(2026, 9, 27, tzinfo=timezone.utc))
     assert panel['outage_windows'] == [{
         'provider': 'amazon-bedrock', 'error_code': 'fetch_failed',
