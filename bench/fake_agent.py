@@ -14,6 +14,9 @@ with (state / 'events.jsonl').open('a') as fh:
     fh.write(json.dumps({'event': 'run_started', 'run_id': run_id, 'started_at': now, 'ts': now}) + '\n')
 if behaviour.startswith('sleep:'):
     time.sleep(float(behaviour.split(':', 1)[1]))
+elif behaviour.startswith('toolcall:'):   # a bash tool call reading the given path, as --mode json records it
+    print(json.dumps({'type': 'tool_execution_start', 'toolCallId': 'c1', 'toolName': 'bash',
+                      'args': {'command': f"cat {behaviour.split(':', 1)[1]}"}}))
 elif behaviour.startswith('apply:'):
     subprocess.run(['git', 'apply', behaviour.split(':', 1)[1]], check=True)
 with (state / 'outcomes.jsonl').open('a') as fh:
