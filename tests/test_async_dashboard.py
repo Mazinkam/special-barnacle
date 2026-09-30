@@ -184,6 +184,34 @@ def test_relative_state_root_renders_the_callers_directory(tmp_path, monkeypatch
     _wait(lambda: publish.dashboard_is_current(tmp_path / 'state') and publish.render_slot_free(tmp_path / 'state'), 20)
 
 
+def test_detached_render_failure_is_reported_by_the_next_write_until_a_render_succeeds(tmp_path):
+    """Sync mode reports a failed render as refresh_failed (exit 3); async must not hide it forever."""
+    site = tmp_path / 'site'; site.mkdir(); flag = tmp_path / 'fail'; flag.touch()
+    (site / 'sitecustomize.py').write_text(
+        f"import os, sys\nsys.path.insert(0, {str(REPO)!r})\n"
+        "from orchestrator.presentation import dashboard_data as d\n_real = d.build_data\n"
+        f"def boom(root, config):\n    if os.path.exists({str(flag)!r}): raise RuntimeError('render exploded')\n"
+        "    return _real(root, config)\nd.build_data = boom\n")
+    state = tmp_path / 'state'; err = state / publish.RENDER_ERROR
+    env = {k: v for k, v in os.environ.items() if k != SYNC_ENV}
+    env.update(PYTHONPATH=str(site), CODING_AGENT_ORCHESTRATOR_HOME=str(state))
+
+    def event(i):
+        out = subprocess.run([sys.executable, '-m', 'orchestrator.cli', 'event', 'note', json.dumps({'record_id': f'r{i}'})],
+                             cwd=REPO, env=env, capture_output=True, text=True, timeout=30)
+        return out.returncode, json.loads(out.stdout)
+
+    assert event(0)[0] == 0  # the failure happens later, in the child
+    _wait(lambda: err.exists(), 20)
+    code, body = event(1)
+    assert code == 3 and body['status'] == 'refresh_failed' and 'render exploded' in body['error']
+    assert body['retry'] == 'same_ids' and body['persisted']['event'] == 1  # records are still durable
+    flag.unlink()  # the cause goes away; any successful render (here in-process, or a retried child) clears it
+    _wait(lambda: publish.render_until_current(state, {}) >= 0 and publish.render_slot_free(state)
+          and publish.dashboard_is_current(state) and not err.exists(), 30)
+    assert event(2)[0] == 0
+
+
 def test_cli_write_with_captured_pipes_returns_before_slow_render(tmp_path):
     """A hook/CI caller using capture_output must not wait for the detached renderer (no inherited pipes)."""
     site = tmp_path / 'site'; site.mkdir()
