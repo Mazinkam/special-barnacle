@@ -11,7 +11,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from bench.arms import ARMS, ExperimentConfig, config_fingerprint  # noqa: E402
+from bench.arms import ARMS, ExperimentConfig, config_fingerprint, provenance  # noqa: E402
 from bench.manifest import load_suite  # noqa: E402
 from bench.runner import plan_attempts, run_experiment  # noqa: E402
 from bench.tools import preflight_tool_isolation  # noqa: E402
@@ -108,7 +108,7 @@ def _guard_then_write_meta(args, cfg, tasks, arms, fingerprint, ext_dir, meta_pa
     args.experiment_root.mkdir(parents=True, exist_ok=True)
     meta = {'config': {**cfg.__dict__, 'skill_root': str(cfg.skill_root), 'profiles_file': str(cfg.profiles_file),
                        'orchestrate_flags': list(cfg.orchestrate_flags)},
-            'config_fingerprint': fingerprint, 'suite_ids': sorted(t.id for t in tasks), 'arms': list(arms),
+            'config_fingerprint': fingerprint, 'provenance': provenance(cfg), 'suite_ids': sorted(t.id for t in tasks), 'arms': list(arms),
             'installed_extension_revision': _extension_revision(ext_dir)}
     meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True))
 
