@@ -241,17 +241,20 @@ array on stdin (or as one argument), with **1–500** records of the form
 records also need `event`; reuse the original IDs on retry. IDs must not identify different
 payloads: an already recorded ID is treated as a duplicate, not an update. The HT bridge
 coalesces related records and awaits terminal flushes; every successful batch invocation
-publishes the dashboard. Validation precedes append, but a multi-stream I/O failure can leave a
+schedules a dashboard publish (eventually consistent, see below). Validation precedes append, but a multi-stream I/O failure can leave a
 durable prefix: this is recoverable, **not** an atomic transaction across three JSONL files.
 
 The write-command JSON response includes `persisted`, `duplicates`, `ledger_updated`,
 `dashboard_updated`, and `retry`. Exit codes:
 
-- **0:** durable records (including duplicate retries), dashboard refreshed.
+- **0:** durable records (including duplicate retries). The dashboard is rendered by a detached
+  background process, so `dashboard_updated` is `false` while that render is pending and the page
+  catches up shortly after; set `ORCHESTRATOR_DASHBOARD_SYNC=1` to render inside the call
+  (`docs/TELEMETRY.md`, State and dashboard).
 - **1 + `status: invalid`:** validation failed; no records appended.
 - **2:** append interrupted; retry the **whole original batch with the same IDs**.
-- **3:** durable records, but checkpoint/ledger/dashboard refresh failed; same-ID replay
-  catches up derived views without charging twice.
+- **3:** durable records, but checkpoint/ledger/dashboard refresh failed (including a failed
+  earlier background render); same-ID replay catches up derived views without charging twice.
 - A missing response, spawn failure, or other ambiguous exit is **not** proof that nothing
   persisted. Preserve the payload/IDs and replay them; do not manufacture new IDs.
 

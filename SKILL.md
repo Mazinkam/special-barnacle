@@ -17,7 +17,7 @@ Execute coding work through a dynamic, model-agnostic hierarchy while minimizing
 4. Orchestration logic requests capabilities, never concrete model names.
 5. If the harness supports effort/reasoning levels, resolve abstract effort through the adapter.
 6. Structured state outside model context is authoritative.
-7. Every invocation creates/updates persistent state and regenerates the dashboard.
+7. Every invocation creates/updates persistent state and regenerates the dashboard (in the background after writes; `ORCHESTRATOR_DASHBOARD_SYNC=1` or the `dashboard` command renders in-call).
 8. Run deterministic validation before expensive semantic review when applicable.
 9. Escalate the smallest failing subproblem.
 10. Cost optimization must never bypass hard quality/safety gates.

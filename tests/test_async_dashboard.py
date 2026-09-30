@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import signal
 import subprocess
@@ -153,3 +154,100 @@ def test_sync_env_renders_inside_write_and_dashboard_command_always_renders(tmp_
     with patch.object(publish, 'render', lambda d: renders.append(1) or real(d)):
         publish.generate_dashboard(tmp_path, config={})
     assert renders == [1]
+
+
+def test_write_landing_after_in_lock_check_is_not_lost(tmp_path):
+    """Lost wakeup: the renderer finds the page current *under* the slot lock, then a write lands and its
+    writer probes the (still held) slot and skips spawning. The renderer must re-check after release."""
+    _write(tmp_path, 0)
+    real, calls = publish.dashboard_is_current, []
+
+    def racing(root):
+        calls.append(1)
+        if len(calls) == 2:  # the in-lock check: another renderer just published, then a write lands
+            publish.generate_dashboard(tmp_path, {})
+            current = real(root)
+            _write(tmp_path, 1)
+            assert not publish.render_slot_free(tmp_path)  # so that writer's refresh spawns nothing
+            return current
+        return real(root)
+
+    with patch.object(publish, 'dashboard_is_current', racing):
+        publish.render_until_current(tmp_path, {})
+    assert publish.dashboard_is_current(tmp_path)
+
+
+def test_relative_state_root_renders_the_callers_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    rel = Path('state')
+    assert refresh_after_write(rel, _write(rel, 0), config={})['ok']
+    _wait(lambda: publish.dashboard_is_current(tmp_path / 'state') and publish.render_slot_free(tmp_path / 'state'), 20)
+
+
+def test_detached_render_failure_is_reported_by_the_next_write_until_a_render_succeeds(tmp_path):
+    """Sync mode reports a failed render as refresh_failed (exit 3); async must not hide it forever."""
+    site = tmp_path / 'site'; site.mkdir(); flag = tmp_path / 'fail'; flag.touch()
+    (site / 'sitecustomize.py').write_text(
+        f"import os, sys\nsys.path.insert(0, {str(REPO)!r})\n"
+        "from orchestrator.presentation import dashboard_data as d\n_real = d.build_data\n"
+        f"def boom(root, config):\n    if os.path.exists({str(flag)!r}): raise RuntimeError('render exploded')\n"
+        "    return _real(root, config)\nd.build_data = boom\n")
+    state = tmp_path / 'state'; err = state / publish.RENDER_ERROR
+    env = {k: v for k, v in os.environ.items() if k != SYNC_ENV}
+    env.update(PYTHONPATH=str(site), CODING_AGENT_ORCHESTRATOR_HOME=str(state))
+
+    def event(i):
+        out = subprocess.run([sys.executable, '-m', 'orchestrator.cli', 'event', 'note', json.dumps({'record_id': f'r{i}'})],
+                             cwd=REPO, env=env, capture_output=True, text=True, timeout=30)
+        return out.returncode, json.loads(out.stdout)
+
+    assert event(0)[0] == 0  # the failure happens later, in the child
+    _wait(lambda: err.exists(), 20)
+    code, body = event(1)
+    assert code == 3 and body['status'] == 'refresh_failed' and 'render exploded' in body['error']
+    assert body['retry'] == 'same_ids' and body['persisted']['event'] == 1  # records are still durable
+    flag.unlink()  # the cause goes away; any successful render (here in-process, or a retried child) clears it
+    _wait(lambda: publish.render_until_current(state, {}) >= 0 and publish.render_slot_free(state)
+          and publish.dashboard_is_current(state) and not err.exists(), 30)
+    assert event(2)[0] == 0
+
+
+def test_cli_write_with_captured_pipes_returns_before_slow_render(tmp_path):
+    """A hook/CI caller using capture_output must not wait for the detached renderer (no inherited pipes)."""
+    site = tmp_path / 'site'; site.mkdir()
+    (site / 'sitecustomize.py').write_text(  # inherited by the detached child through PYTHONPATH
+        f"import sys, time\nsys.path.insert(0, {str(REPO)!r})\n"
+        "from orchestrator.presentation import dashboard_data as d\n_real = d.build_data\n"
+        "def slow(root, config): time.sleep(4); return _real(root, config)\nd.build_data = slow\n")
+    state = tmp_path / 'state'
+    env = {k: v for k, v in os.environ.items() if k != SYNC_ENV}
+    env.update(PYTHONPATH=str(site), CODING_AGENT_ORCHESTRATOR_HOME=str(state))
+    t0 = time.monotonic()
+    out = subprocess.run([sys.executable, '-m', 'orchestrator.cli', 'event', 'note', '{"record_id":"r1"}'],
+                         cwd=REPO, env=env, capture_output=True, text=True, timeout=30)
+    elapsed = time.monotonic() - t0
+    assert out.returncode == 0, out.stderr
+    body = json.loads(out.stdout)
+    assert body['ok'] and body['dashboard_updated'] is False
+    assert elapsed < 3, elapsed  # the detached render alone sleeps 4s
+    _wait(lambda: publish.dashboard_is_current(state) and publish.render_slot_free(state), 30)
+    assert time.monotonic() - t0 >= 4  # the page really came from the slow detached child
+    page = (state / 'dashboard.html').read_text()
+    from orchestrator import cli
+    publish.generate_dashboard(state, config=cli.cfg())  # the config the CLI handed the child
+    assert _strip((state / 'dashboard.html').read_text()) == _strip(page)  # child env/cwd == in-call render
+
+
+def test_death_between_page_and_receipt_leaves_page_stale_not_claimed_current(tmp_path):
+    _write(tmp_path, 0)
+    publish.generate_dashboard(tmp_path, {})
+    old_receipt = (tmp_path / 'dashboard.version.json').read_bytes()
+    _write(tmp_path, 1)
+
+    def die(*a, **k): raise SystemExit('killed after page replace')
+
+    with patch.object(publish, 'write_json', die), pytest.raises(SystemExit):
+        publish.render_until_current(tmp_path, {})
+    assert (tmp_path / 'dashboard.version.json').read_bytes() == old_receipt  # receipt never runs ahead
+    assert not publish.dashboard_is_current(tmp_path) and publish.render_slot_free(tmp_path)
+    assert publish.render_until_current(tmp_path, {}) == 1 and publish.dashboard_is_current(tmp_path)

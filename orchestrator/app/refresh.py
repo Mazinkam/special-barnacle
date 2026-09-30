@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from ..contract import RETRY_SAME_IDS, STATUS_REFRESH_FAILED
-from ..presentation.publish import dashboard_is_current, generate_dashboard, render_slot_free
+from ..presentation.publish import dashboard_is_current, generate_dashboard, render_error, render_slot_free
 
 SYNC_ENV = 'ORCHESTRATOR_DASHBOARD_SYNC'  # set to 1 to render inside the write call (deterministic readers/tests)
 
@@ -25,7 +25,7 @@ def _spawn_renderer(root: Path, config: dict | None) -> None:
     """Start a detached one-shot renderer unless one already owns the slot (it re-checks after it releases)."""
     if not render_slot_free(root):
         return
-    p = subprocess.Popen([sys.executable, '-m', 'orchestrator.presentation.publish', str(root)], stdin=subprocess.PIPE,
+    p = subprocess.Popen([sys.executable, '-m', 'orchestrator.presentation.publish', str(root.resolve())], stdin=subprocess.PIPE,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                          cwd=str(Path(__file__).resolve().parents[2]))
     p.stdin.write(json.dumps(config).encode()); p.stdin.close()
@@ -50,7 +50,9 @@ def refresh_after_write(root: str | Path, result: dict[str, Any], *, config: dic
         else:  # eventually consistent: the page lags until the background renderer catches up
             current = dashboard_is_current(root)
             if not current:
-                _spawn_renderer(Path(root), config)
+                _spawn_renderer(Path(root), config)  # also the retry after a failed detached render
+                failed = render_error(root)
+                if failed: raise RuntimeError(f'last background render failed: {failed}')
             result['dashboard_updated'] = current
     except Exception as exc:  # noqa: BLE001 - records (and any ledger catch-up) are already durable
         result['ok'] = False

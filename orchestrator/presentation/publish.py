@@ -67,10 +67,24 @@ def generate_dashboard(state_dir=None, config: dict | None = None, *,
         out = root / 'dashboard.html'
         if skip_if_current and out.exists() and read_json(root / 'dashboard.version.json', None) == version:
             return out
-        data = build(root, config)
-        write_text_atomic(out, render(data))
-        write_json(root / 'dashboard.version.json', version)
+        try:
+            data = build(root, config)
+            write_text_atomic(out, render(data))
+            write_json(root / 'dashboard.version.json', version)
+        except Exception as exc:  # recorded under the lock, so it always describes the latest attempt
+            try: write_text_atomic(root / RENDER_ERROR, [f'{type(exc).__name__}: {exc}'])
+            except OSError: pass
+            raise
+        (root / RENDER_ERROR).unlink(missing_ok=True)
         return out
+
+
+RENDER_ERROR = 'dashboard.render.error'  # last render attempt failed; a detached renderer's only way to report
+
+
+def render_error(root) -> str | None:
+    try: return (Path(root) / RENDER_ERROR).read_text(encoding='utf-8')
+    except FileNotFoundError: return None
 
 
 RENDER_LOCK = 'dashboard.render.lock'  # flock: held only by the one background renderer; the OS frees it on death
@@ -97,7 +111,7 @@ def render_until_current(root, config: dict | None = None, *, build_data=None) -
         with (root / RENDER_LOCK).open('a') as f:
             try: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError: return renders
-            if dashboard_is_current(root): break
+            if dashboard_is_current(root): continue  # not break: a write probing the held slot now must be seen after release
             generate_dashboard(root, config, build_data=build_data, skip_if_current=True)
             renders += 1
     return renders
