@@ -27,6 +27,13 @@ if not _LOGGER.handlers:
 _LOGGER.setLevel(logging.WARNING)
 
 
+def config_path() -> Path:
+    """The one place that decides which config.json every reader uses: `ORCHESTRATOR_CONFIG_PATH`
+    (test/operator override, read on each call, never falling back to the real file) else the
+    packaged `orchestrator/config.json`. Resolves lazily so importing opens nothing."""
+    return Path(os.environ.get('ORCHESTRATOR_CONFIG_PATH') or Path(__file__).resolve().parent.parent / 'config.json')
+
+
 def read_json(path: Path, default):
     if not path.exists(): return default
     try: return json.loads(path.read_text(encoding='utf-8'))

@@ -43,15 +43,11 @@ from ..features import feature_inventory
 from ..history import build_route_stats
 from ..outcomes import outcome_summary
 from ..records import NO_DATA
-from ..core.fs import read_json
+from ..core.fs import config_path, read_json
 from ..core.jsonl import iter_jsonl
 from ..run_evidence import SPEND_CAP_EVENT, evidence_coverage, spend_cap_breach, summarize_runs
 from ..analytics import flaky_stats
 from ..contract import INGEST_STATUS_FILE, STREAMS
-
-#: `orchestrator/config.json`, read relative to the `orchestrator` package root, not this
-#: submodule's own directory (`presentation/`).
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'config.json'
 
 # Display tails only; every aggregate still covers the complete deduplicated history.
 RECENT_EVENTS = 500
@@ -709,7 +705,7 @@ def build_data(root: Path, config: dict | None = None):
     Orchestrated metrics, run events, outcomes, and exact-ID sets still scale with history.
     All metric definitions and verification joins use the full retained cohorts, not the tails.
     """
-    config = config or read_json(_CONFIG_PATH, {})
+    config = config or read_json(config_path(), {})
     event_count = 0
     last_event_ts = ''
     conflict_rows = 0

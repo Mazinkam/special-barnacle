@@ -7,19 +7,18 @@ labels it as estimated. Rates live in `config.json` under `pricing`, never in co
 because they change without notice. No rate configured means no estimate: the record
 stays `unmetered` rather than silently reporting a fabricated number.
 """
-from pathlib import Path
 from typing import Any, Optional
 
 # core.fs, not runtime: runtime.meter re-exports through records.metering, which imports this
 # module top-level; importing runtime here would cycle (see docs/architecture-review.md B2.2/B2.3).
-from .core.fs import read_json
+from .core.fs import config_path, read_json
 
 _MTOK = 1_000_000
 
 
 def load_pricing(config: dict[str, Any] | None = None) -> dict[str, Any]:
     if config is None:
-        config = read_json(Path(__file__).with_name('config.json'), {})
+        config = read_json(config_path(), {})
     pricing = config.get('pricing') or {}
     return pricing if isinstance(pricing, dict) else {}
 

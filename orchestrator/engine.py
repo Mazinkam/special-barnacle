@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from .core.fs import config_path as default_config_path
 from .runtime import EventStore, Policy, QualityEvidence, default_state_root, read_json, stable_hash
 from .state import refresh_ledger
 from .history import load_stats
@@ -31,7 +32,7 @@ class OrchestrationEngine:
                  on_change: Callable[[], None] | None = None):
         self.state_root = Path(state_root) if state_root is not None else default_state_root()
         self.store = EventStore(self.state_root)
-        self.config_path = Path(config_path) if config_path else Path(__file__).with_name("config.json")
+        self.config_path = Path(config_path) if config_path else default_config_path()
         self.config = read_json(self.config_path, {})
         self.feature_policy = FeaturePolicy(self.config.get('features', {}))
         # The engine never imports the presentation layer (`dashboard.py`); publishing it after a

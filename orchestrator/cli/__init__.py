@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse,json,os,sys
 from pathlib import Path
 from typing import Any, Callable
+from ..core.fs import config_path
 from ..runtime import EventStore,QualityEvidence,default_state_root,read_json
 from ..state import rebuild,refresh_ledger,load_or_rebuild
 from ..dashboard import generate_dashboard
@@ -57,12 +58,7 @@ def _root() -> Path:
     environment right now (once per call, never cached at import time)."""
     return ROOT if ROOT is not None else default_state_root()
 
-#: `orchestrator/config.json` lives one directory up from this package (`orchestrator/cli/`), same
-#: file `engine.py`/`pricing.py`/`presentation/dashboard_data.py` read; resolved relative to this
-#: file so cfg() doesn't care what the caller's cwd is. `ORCHESTRATOR_CONFIG_PATH` overrides it
-#: (tests point it at a temp copy instead of mutating the tracked file).
-_CONFIG_PATH = Path(os.environ.get('ORCHESTRATOR_CONFIG_PATH') or Path(__file__).resolve().parent.parent / 'config.json')
-def cfg(): return read_json(_CONFIG_PATH,{})
+def cfg(): return read_json(config_path(),{})  # same file engine/pricing/dashboard_data read; see core.fs.config_path
 def refresh(state_root: Path | None = None) -> Path:
     """Catch the ledger up from its durable checkpoint and republish the dashboard; return its path.
 
