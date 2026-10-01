@@ -170,3 +170,18 @@ the hidden content), validation result, smoke-run result and cost.
   tolerated and one of its overlaid test files is not run (needs networked model data); `syn-003`
   leaves closing-marker behaviour for `----`/`---x` unspecified; `syn-004` exercises only
   `failoverConfig()` with no explicit rule.
+
+### Suite revision 2 (2026-10-01)
+
+- humain-terminal tasks now hydrate the provider model catalog during setup (`npm run hydrate:model-data`),
+  so the prepared tree resembles a real dev checkout: typecheck errors at ht-001's base drop from 833 to
+  ~40 (the rest are old tests naming models today's live catalog no longer lists).
+- `ht-003` and `ht-005`: hydration fails at their base commits (the live catalog lacks a provider those
+  commits expect, `kimi-coding`), so their setup tries and continues without it. Each arm still gets the
+  identical prepared tree; these two tasks keep the noisier typecheck.
+- All 20 tasks re-validated (humain-terminal 6/6 after the change). New file-hash manifest sha256:
+  `1e56bc8728ae08d0ea92f71a1a96f25870f35f28f648cf40a46e6c1c101b97e8`.
+- Known benchmark-environment noise (affects every arm equally): `test_allowed_path_is_readable` fails
+  on this repo's tasks because `sandbox-exec` cannot nest; humain-terminal typecheck drift above; some
+  base commits contain genuinely failing tests (e.g. `test_cli_rejects_tiered` at orch-001's base).
+
