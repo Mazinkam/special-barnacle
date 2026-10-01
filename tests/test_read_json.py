@@ -15,7 +15,6 @@ from pathlib import Path
 from orchestrator.runtime import read_json
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = REPO_ROOT / 'orchestrator' / 'config.json'
 
 
 def test_missing_file_returns_default_with_no_warning(tmp_path, caplog):
@@ -70,22 +69,29 @@ def test_unreadable_directory_instead_of_file_returns_default_and_warns(tmp_path
 def test_cli_plan_with_corrupt_config_still_exits_zero_with_stderr_warning(tmp_path):
     """End-to-end: a corrupt orchestrator/config.json must not break `plan`/`route`; the CLI
     falls back to defaults and warns on stderr, with stdout still clean JSON for the bridge."""
-    original = CONFIG_PATH.read_text(encoding='utf-8')
-    try:
-        CONFIG_PATH.write_text('{this is not valid json', encoding='utf-8')
-        state = tmp_path / 'state'
-        env = {
-            **os.environ,
-            'CODING_AGENT_ORCHESTRATOR_HOME': str(state),
-            'PYTHONPATH': str(REPO_ROOT),
-        }
-        command = [sys.executable, '-m', 'orchestrator.cli', 'plan', 'run-1', 'coding', '0.6', 'medium']
-        result = subprocess.run(command, env=env, capture_output=True, text=True, check=False)
-        assert result.returncode == 0, result.stderr
-        assert result.stderr.strip() != ''
-        assert 'config.json' in result.stderr
-        # stdout must be exactly the JSON plan the bridge parses with `.trim()` — no warning text mixed in.
-        body = json.loads(result.stdout)
-        assert body['task_class'] == 'coding'
-    finally:
-        CONFIG_PATH.write_text(original, encoding='utf-8')
+    bad_config = tmp_path / 'config.json'
+    bad_config.write_text('{this is not valid json', encoding='utf-8')
+    state = tmp_path / 'state'
+    env = {
+        **os.environ,
+        'CODING_AGENT_ORCHESTRATOR_HOME': str(state),
+        'PYTHONPATH': str(REPO_ROOT),
+        'ORCHESTRATOR_CONFIG_PATH': str(bad_config),
+    }
+    command = [sys.executable, '-m', 'orchestrator.cli', 'plan', 'run-1', 'coding', '0.6', 'medium']
+    result = subprocess.run(command, env=env, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stderr.strip() != ''
+    assert 'config.json' in result.stderr
+    # stdout must be exactly the JSON plan the bridge parses with `.trim()` — no warning text mixed in.
+    body = json.loads(result.stdout)
+    assert body['task_class'] == 'coding'
+
+
+def test_config_path_override_is_honored(tmp_path):
+    alt = tmp_path / 'alt.json'
+    alt.write_text('{"marker": 42}', encoding='utf-8')
+    env = {**os.environ, 'PYTHONPATH': str(REPO_ROOT), 'ORCHESTRATOR_CONFIG_PATH': str(alt)}
+    out = subprocess.run([sys.executable, '-c', 'from orchestrator.cli import cfg; print(cfg()["marker"])'],
+                         env=env, capture_output=True, text=True, check=True).stdout
+    assert out.strip() == '42'
