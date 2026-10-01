@@ -53,7 +53,36 @@ def _packaging_tools_available() -> tuple[bool, str]:
             metadata.version(dist)
         except metadata.PackageNotFoundError:
             return False, f"{dist} is not installed in this interpreter"
+    need = _required_setuptools()
+    have = metadata.version("setuptools")
+    if need and _vtuple(have) < _vtuple(need):
+        return False, (
+            f"setuptools {have} is older than pyproject.toml's build-system "
+            f"requirement setuptools>={need}; it would build an empty UNKNOWN-0.0.0 wheel"
+        )
     return True, ""
+
+
+def _vtuple(v: str) -> tuple[int, ...]:
+    # No `packaging` dependency (py3.9 CI has only pip + pytest): leading ints only.
+    return tuple(int(n) for n in re.findall(r"\d+", v)[:3])
+
+
+def _required_setuptools() -> str:
+    """Minimum setuptools from [build-system].requires (regex; tomllib is 3.11+)."""
+    block = re.search(
+        r"\[build-system\].*?requires\s*=\s*\[(.*?)\]", PYPROJECT.read_text(), re.DOTALL
+    )
+    m = re.search(r"setuptools\s*>=\s*([\d.]+)", block.group(1)) if block else None
+    return m.group(1) if m else ""
+
+
+def _skip_or_fail_unavailable(reason: str) -> None:
+    # Skip locally, but fail under CI so packaging tests cannot be silently skipped.
+    msg = f"packaging tools unavailable: {reason}"
+    if os.environ.get("CI"):
+        pytest.fail(msg)
+    pytest.skip(msg)
 
 
 def _build_wheel(dest_dir: Path) -> Path:
@@ -103,7 +132,7 @@ def _build_wheel(dest_dir: Path) -> Path:
 def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
     available, reason = _packaging_tools_available()
     if not available:
-        pytest.skip(f"packaging tools unavailable: {reason}")
+        _skip_or_fail_unavailable(reason)
     return _build_wheel(tmp_path_factory.mktemp("wheel-out"))
 
 
@@ -217,3 +246,27 @@ def test_pyproject_package_data_has_no_parent_relative_entries() -> None:
     assert entries, "expected at least one package-data entry"
     escaping = [e for e in entries if e.startswith("..")]
     assert not escaping, f"package-data entries must not escape the package: {escaping}"
+
+
+def test_packaging_tools_available_checks_setuptools_version(monkeypatch) -> None:
+    from importlib import metadata
+
+    need = _required_setuptools()
+    assert need, "could not parse setuptools requirement from pyproject.toml"
+
+    def fake(setuptools_version: str):
+        return lambda d: setuptools_version if d == "setuptools" else "1.0"
+
+    monkeypatch.setattr(metadata, "version", fake("1.0"))
+    ok, reason = _packaging_tools_available()
+    assert not ok and "older than" in reason and f">={need}" in reason
+
+    monkeypatch.setattr(metadata, "version", fake(need))
+    assert _packaging_tools_available() == (True, "")
+
+    monkeypatch.delenv("CI", raising=False)
+    with pytest.raises(pytest.skip.Exception):
+        _skip_or_fail_unavailable(reason)
+    monkeypatch.setenv("CI", "1")
+    with pytest.raises(pytest.fail.Exception):
+        _skip_or_fail_unavailable(reason)
