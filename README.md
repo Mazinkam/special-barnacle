@@ -286,6 +286,7 @@ metrics, and checkpoint for reconciliation. Do not use `--discover` for benchmar
 
 The skill-root override chooses **code**, not state. Set both Python and HT state-root variables
 as well; merely running inside a worktree does not redirect the installed bridge or shared state.
+`ORCHESTRATOR_CONFIG_PATH` is a test and operator override: every Python `config.json` reader (CLI `cfg()`, `OrchestrationEngine`, `pricing`, dashboard data) reads that file instead of `orchestrator/config.json`; a missing or corrupt file yields defaults with a warning, never the real config. `method.json` is unaffected.
 This example creates a deterministic frozen fixture and benchmarks **copies** of it at 1x/2x/4x;
 it never opens the live state root, installs an extension, or launches agents:
 
