@@ -33,13 +33,22 @@ def cache_key(task: TaskManifest) -> str:
 
 
 def clone_tree(src: Path, dst: Path) -> None:
-    """Full independent copy of `src` (including .git), as an APFS clone when possible."""
+    """Full independent copy of `src` (including .git), as an APFS clone when possible.
+
+    A clone has new inodes, so git's first `status` re-hashes every tracked file (13 s on humain-terminal,
+    35 s on forge). That exceeded the bridge's 10 s git-snapshot timeout, which then reported "git snapshot
+    unavailable" and skipped QA for the orchestrated arm. The index is refreshed here, before any agent
+    starts and outside its clock; refreshing only rewrites stat data, never content.
+    """
     src, dst = Path(src), Path(dst)
     if dst.exists():
         shutil.rmtree(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
     if not _clone(src, dst):
         shutil.copytree(src, dst, symlinks=True)
+    if (dst / '.git').is_dir():
+        subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', str(dst),
+                        'update-index', '-q', '--refresh'], capture_output=True, check=False)
 
 
 def _run_setup(task: TaskManifest, tree: Path, *, sandbox: bool, deny_roots: list[Path] | None, env: dict | None) -> None:
@@ -58,6 +67,17 @@ def _run_setup(task: TaskManifest, tree: Path, *, sandbox: bool, deny_roots: lis
             raise SetupError(f'setup {" ".join(argv)} exited {p.returncode}: {tail}')
 
 
+def _tune_git(tree: Path) -> None:
+    """Make clones of `tree` git-ready instantly: compare only mtime and size (clones keep mtimes but not
+    inodes or ctimes), then record that stat data once. Idempotent and content-neutral."""
+    if not (tree / '.git').is_dir():
+        return
+    git = ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', str(tree)]
+    for key, value in (('core.checkStat', 'minimal'), ('core.trustctime', 'false')):
+        subprocess.run([*git, 'config', key, value], capture_output=True, check=False)
+    subprocess.run([*git, 'update-index', '-q', '--refresh'], capture_output=True, check=False)
+
+
 def prepared_tree(task: TaskManifest, cache_root: Path, *, sandbox: bool, deny_roots: list[Path] | None = None,
                   env: dict | None = None) -> Path:
     """Path of the READY prepared tree for `task`, building it (snapshot + setup) on first use.
@@ -72,6 +92,7 @@ def prepared_tree(task: TaskManifest, cache_root: Path, *, sandbox: bool, deny_r
     with open(cache_root / f'{key}.lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if (final / 'READY.json').is_file():
+            _tune_git(final / 'tree')            # also upgrades caches built before tuning existed
             return final / 'tree'
         if final.exists():                       # a previous build died before READY: never reuse it
             shutil.rmtree(final)
@@ -81,6 +102,7 @@ def prepared_tree(task: TaskManifest, cache_root: Path, *, sandbox: bool, deny_r
         try:
             snap = make_snapshot(Path(task.repo), task.base_commit, building / 'tree')
             _run_setup(task, snap.path, sandbox=sandbox, deny_roots=deny_roots, env=env)
+            _tune_git(snap.path)
             (building / 'READY.json').write_text(json.dumps({'task': task.id, 'repo': task.repo,
                                                              'base_commit': task.base_commit,
                                                              'setup': [list(a) for a in task.setup]}, indent=2))

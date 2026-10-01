@@ -12,7 +12,17 @@ with (state / 'metrics.jsonl').open('a') as fh:
                          'cost_source': 'reported', 'input_tokens': 10, 'output_tokens': 5, 'complexity': 2, 'risk': 'low'}) + '\n')
 with (state / 'events.jsonl').open('a') as fh:
     fh.write(json.dumps({'event': 'run_started', 'run_id': run_id, 'started_at': now, 'ts': now}) + '\n')
-if behaviour.startswith('sleep:'):
+# like humain-terminal, each finished turn's usage is streamed immediately (a killed run still shows it)
+print(json.dumps({'type': 'message_end', 'message': {'role': 'assistant', 'usage': {'cost': {'total': 0.01}}}}), flush=True)
+if behaviour == 'envdump':
+    Path('env.json').write_text(json.dumps(dict(os.environ)))
+elif behaviour.startswith('orphan:') or behaviour.startswith('orphansleep:'):   # a detached grandchild (own session) that outlives the agent, like a bridge child
+    pid_file = behaviour.split(':', 1)[1]
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'], start_new_session=True)
+    Path(pid_file).write_text(str(child.pid))
+    if behaviour.startswith('orphansleep:'):
+        time.sleep(60)
+elif behaviour.startswith('sleep:'):
     time.sleep(float(behaviour.split(':', 1)[1]))
 elif behaviour.startswith('toolcall:'):   # a bash tool call reading the given path, as --mode json records it
     print(json.dumps({'type': 'tool_execution_start', 'toolCallId': 'c1', 'toolName': 'bash',

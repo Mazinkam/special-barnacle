@@ -107,12 +107,16 @@ def _unlink_symlinks_under_overlay(hidden: Path, work: Path) -> None:
 
 def grade(task: TaskManifest, submitted: Path, base: Path, work: Path, *, sandbox: bool = True) -> GradeResult:
     digest = worktree_digest(submitted)
+    hidden = task.source.parent / task.hidden_files
+    # A protected path the overlay supplies is restored before checks run, so editing it cannot affect
+    # grading; adding tests to that same file is ordinary work, not tampering. Only protected paths the
+    # overlay does NOT supply (e.g. configs the hidden tests read) are compared.
     tampered = [p for p in task.protected_paths
-                if _unsafe(p) or _protected_fingerprint(submitted, p) != _protected_fingerprint(base, p)]
+                if _unsafe(p) or (not os.path.lexists(hidden / p)
+                                  and _protected_fingerprint(submitted, p) != _protected_fingerprint(base, p))]
     if work.exists():
         shutil.rmtree(work)
     copy_tree(submitted, work)
-    hidden = task.source.parent / task.hidden_files
     _unlink_symlinks_under_overlay(hidden, work)
     shutil.copytree(hidden, work, symlinks=True, dirs_exist_ok=True)
     checks = []

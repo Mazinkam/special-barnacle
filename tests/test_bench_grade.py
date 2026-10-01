@@ -153,3 +153,23 @@ def test_clone_path_is_used_on_macos(tmp_path, monkeypatch):
     grade_mod.copy_tree(src, tmp_path / 'dst')
     assert sorted(cloned) == ['a.txt', 'abs-link', 'link.txt', 'pkg']      # every entry except .git
     assert (tmp_path / 'dst' / 'pkg' / 'node_modules' / 'dep' / 'index.js').exists()
+
+
+def test_editing_an_overlaid_hidden_test_file_is_not_tampering(tmp_path):
+    # The overlay replaces the file before checks run, so the agent's edit cannot influence grading.
+    # Adding tests to the same test file is normal work (ht-001 smoke: a correct fix was failed for it).
+    t = task(tmp_path, "import pathlib,sys; sys.exit(0 if pathlib.Path('a.txt').read_text()=='fixed' else 1)",
+             protected=('check.py', 'keep.txt'))
+    base = tree(tmp_path / 'base', a__txt='bug', keep__txt='k', check__py='old tests')
+    sub = tree(tmp_path / 'sub', a__txt='fixed', keep__txt='k', check__py='agent added tests')
+    r = grade(t, sub, base, tmp_path / 'work', sandbox=False)
+    assert r.verdict == 'pass' and r.tampered == []
+    assert (tmp_path / 'work' / 'check.py').read_text() != 'agent added tests'   # the hidden version ran
+
+
+def test_non_overlaid_protected_path_still_counts_as_tampering(tmp_path):
+    t = task(tmp_path, 'import sys; sys.exit(0)', protected=('check.py', 'keep.txt'))
+    base = tree(tmp_path / 'base', keep__txt='k', check__py='x')
+    sub = tree(tmp_path / 'sub', keep__txt='edited', check__py='y')
+    r = grade(t, sub, base, tmp_path / 'work', sandbox=False)
+    assert r.verdict == 'fail' and r.tampered == ['keep.txt']

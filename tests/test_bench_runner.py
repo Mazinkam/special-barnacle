@@ -203,3 +203,92 @@ def test_refuses_attempts_symlink_outside_root(tmp_path, tiny_suite, fake_cfg):
     with pytest.raises(ValueError):
         run_experiment(tiny_suite, fake_cfg, ('direct',), root, approve_usd=100, sandbox=False)
     assert list(outside.iterdir()) == []
+
+
+def _alive(pid):
+    import os
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # a zombie still answers kill(0); ps shows its state
+    import subprocess
+    state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith('Z')
+
+
+def test_detached_descendants_are_killed_after_the_attempt(tmp_path, tiny_suite, fake_cfg, monkeypatch):
+    # Bridge children run detached in their own sessions, so killing the agent's process group misses them;
+    # the first smoke run left a QA pytest running after the attempt ended.
+    import time
+    pid_file = tmp_path / 'orphan.pid'
+    monkeypatch.setenv('BENCH_FAKE_BEHAVIOUR', f'orphan:{pid_file}')
+    run_experiment(tiny_suite, fake_cfg, ('direct',), tmp_path / 'exp', approve_usd=100, sandbox=False)
+    pid = int(pid_file.read_text())
+    deadline = time.time() + 5
+    while _alive(pid) and time.time() < deadline:
+        time.sleep(0.1)
+    assert not _alive(pid)
+
+
+def test_attempt_marker_reaches_the_agent_but_not_the_arm_env(tmp_path, fake_cfg):
+    from bench.arms import arm_invocation, injected_env_keys
+    from bench.runner import ATTEMPT_ENV
+    _, env = arm_invocation('direct', 'g', fake_cfg, tmp_path)
+    assert ATTEMPT_ENV not in env and ATTEMPT_ENV not in injected_env_keys()   # the scrubbing shell keeps it
+
+
+from pathlib import Path
+
+
+def test_killing_the_runner_mid_attempt_kills_detached_descendants(tmp_path, tiny_suite, fake_cfg):
+    import os, signal, subprocess, sys, time, pickle
+    pid_file = tmp_path / 'orphan.pid'
+    (tmp_path / 'args.pkl').write_bytes(pickle.dumps((tiny_suite, fake_cfg)))
+    script = (
+        "import pickle, sys; sys.path.insert(0, %r); sys.path.insert(0, %r)\n"
+        "from bench.runner import run_experiment\n"
+        "suite, cfg = pickle.loads(open(%r, 'rb').read())\n"
+        "try:\n    run_experiment(suite, cfg, ('direct',), %r, approve_usd=100, sandbox=False)\n"
+        "except KeyboardInterrupt:\n    sys.exit(130)\n"
+    ) % (str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent),
+         str(tmp_path / 'args.pkl'), str(tmp_path / 'exp'))
+    env = {**os.environ, 'BENCH_FAKE_BEHAVIOUR': f'orphansleep:{pid_file}'}
+    runner = subprocess.Popen([sys.executable, '-c', script], env=env)
+    deadline = time.time() + 20
+    while not pid_file.exists() and time.time() < deadline:
+        time.sleep(0.1)
+    assert pid_file.exists()
+    orphan = int(pid_file.read_text())
+    runner.send_signal(signal.SIGTERM)
+    assert runner.wait(30) == 130
+    deadline = time.time() + 5
+    while _alive(orphan) and time.time() < deadline:
+        time.sleep(0.1)
+    assert not _alive(orphan)
+
+
+def test_attempt_env_drops_the_launching_humain_terminal_session(monkeypatch):
+    # Launched from inside a humain-terminal session, the runner inherited PI_PACKAGE_DIR (pointing at the real
+    # HT checkout: the task's tests then tried to read it and hit the sandbox) plus the session id/file/model.
+    from bench.runner import attempt_base_env
+    monkeypatch.setenv('PI_PACKAGE_DIR', '/real/humain-terminal/packages/coding-agent')
+    monkeypatch.setenv('PI_SESSION_FILE', '/home/.humain-terminal/agent/sessions/x.jsonl')
+    monkeypatch.setenv('HUMAIN_TERMINAL_SESSION_ID', 'abc')
+    monkeypatch.setenv('HUMAIN_TERMINAL_MODEL', 'm')
+    monkeypatch.setenv('PI_CODING_AGENT', 'true')
+    monkeypatch.setenv('HOME_LIKE_KEEP', 'yes')
+    env = attempt_base_env()
+    assert not [k for k in env if k.startswith('PI_') or k.startswith('HUMAIN_TERMINAL_')]
+    assert env['HOME_LIKE_KEEP'] == 'yes' and 'PATH' in env
+
+
+def test_launching_session_env_never_reaches_the_agent(tmp_path, tiny_suite, fake_cfg, monkeypatch):
+    import json
+    monkeypatch.setenv('PI_PACKAGE_DIR', '/real/humain-terminal')
+    monkeypatch.setenv('HUMAIN_TERMINAL_SESSION_FILE', '/sessions/x.jsonl')
+    monkeypatch.setenv('BENCH_FAKE_BEHAVIOUR', 'envdump')
+    run_experiment(tiny_suite, fake_cfg, ('direct',), tmp_path / 'exp', approve_usd=100, sandbox=False)
+    dump = json.loads(next((tmp_path / 'exp' / 'attempts').glob('*/tree/env.json')).read_text())
+    assert 'PI_PACKAGE_DIR' not in dump and 'HUMAIN_TERMINAL_SESSION_FILE' not in dump
+    assert dump['HUMAIN_TERMINAL_CODING_AGENT_DIR'].endswith('ht-agent')      # the one HT variable we set

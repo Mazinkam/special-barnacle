@@ -73,3 +73,45 @@ def test_runner_reports_setup_failure_as_infra_error(tmp_path, tiny_suite, fake_
     assert [r['execution_status'] for r in rows] == ['infra_error']
     assert 'exited 5' in rows[0]['infra_reason']
     assert not os.path.exists(tmp_path / 'exp' / 'attempts' / rows[0]['attempt_id'] / 'agent.jsonl')   # agent never ran
+
+
+def test_attempt_clone_has_a_fresh_git_index(tmp_path, tiny_suite, monkeypatch):
+    # A clone has new inodes, so git's first status re-hashes every tracked file (35 s on forge), which
+    # exceeded the bridge's 10 s git-snapshot timeout and made it skip QA. The clone must be refreshed.
+    import subprocess
+    from bench import prepared as prep
+    calls = []
+    real_run = subprocess.run
+    def spy(cmd, *a, **k):
+        if isinstance(cmd, list) and cmd[:1] == ['git'] and 'update-index' in cmd:
+            calls.append(cmd)
+        return real_run(cmd, *a, **k)
+    monkeypatch.setattr(prep.subprocess, 'run', spy)
+    src = prepared_tree(tiny_suite[0], tmp_path / 'cache', sandbox=False)
+    dst = tmp_path / 'attempt-tree'
+    clone_tree(src, dst)
+    assert calls and calls[-1][-2:] == ['-q', '--refresh'] and str(dst) in calls[-1]
+    status = real_run(['git', '-C', str(dst), 'status', '--porcelain'], capture_output=True, text=True).stdout
+    assert status == ''                                     # refreshing never changes content
+
+
+def test_clone_without_git_skips_the_refresh(tmp_path):
+    src = tmp_path / 'plain'; src.mkdir(); (src / 'x').write_text('1')
+    clone_tree(src, tmp_path / 'dst')
+    assert (tmp_path / 'dst' / 'x').read_text() == '1'
+
+
+def test_prepared_tree_git_compares_only_mtime_and_size(tmp_path, tiny_suite):
+    import subprocess
+    tree = prepared_tree(tiny_suite[0], tmp_path / 'cache', sandbox=False)
+    get = lambda k: subprocess.run(['git', '-C', str(tree), 'config', '--get', k], capture_output=True, text=True).stdout.strip()
+    assert get('core.checkStat') == 'minimal' and get('core.trustctime') == 'false'
+
+
+def test_existing_ready_trees_are_tuned_on_reuse(tmp_path, tiny_suite):
+    import subprocess
+    tree = prepared_tree(tiny_suite[0], tmp_path / 'cache', sandbox=False)
+    subprocess.run(['git', '-C', str(tree), 'config', '--unset', 'core.checkStat'], check=True)   # a pre-fix cache
+    prepared_tree(tiny_suite[0], tmp_path / 'cache', sandbox=False)
+    assert subprocess.run(['git', '-C', str(tree), 'config', '--get', 'core.checkStat'], capture_output=True,
+                          text=True).stdout.strip() == 'minimal'
