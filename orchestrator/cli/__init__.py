@@ -59,8 +59,9 @@ def _root() -> Path:
 
 #: `orchestrator/config.json` lives one directory up from this package (`orchestrator/cli/`), same
 #: file `engine.py`/`pricing.py`/`presentation/dashboard_data.py` read; resolved relative to this
-#: file so cfg() doesn't care what the caller's cwd is.
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'config.json'
+#: file so cfg() doesn't care what the caller's cwd is. `ORCHESTRATOR_CONFIG_PATH` overrides it
+#: (tests point it at a temp copy instead of mutating the tracked file).
+_CONFIG_PATH = Path(os.environ.get('ORCHESTRATOR_CONFIG_PATH') or Path(__file__).resolve().parent.parent / 'config.json')
 def cfg(): return read_json(_CONFIG_PATH,{})
 def refresh(state_root: Path | None = None) -> Path:
     """Catch the ledger up from its durable checkpoint and republish the dashboard; return its path.

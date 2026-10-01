@@ -46,3 +46,26 @@ def fake_cfg(tmp_path):
     skill_root = Path(__file__).resolve().parents[1]
     return ExperimentConfig('exp-test', 1, 1, f'{shlex.quote(sys.executable)} {shlex.quote(str(FAKE))}', skill_root,
                             tmp_path / 'profiles.json', 'fake/m', 'low', (), 1.0, 60)
+
+
+def _tree_state(root):
+    """(porcelain of orchestrator/, sha256 of config.json), or None when not in a git checkout."""
+    import hashlib
+    try:
+        status = subprocess.run(['git', '-C', str(root), 'status', '--porcelain', 'orchestrator/'],
+                                check=True, capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    cfg = root / 'orchestrator' / 'config.json'
+    return status, hashlib.sha256(cfg.read_bytes()).hexdigest() if cfg.exists() else None
+
+@pytest.fixture(scope='session', autouse=True)
+def _tracked_files_untouched():
+    """Fail if the run changed orchestrator/ (git porcelain) or config.json's hash vs. session start.
+    Compares before/after so a tree that was already dirty does not false-fail. Per-worker under xdist."""
+    root = Path(__file__).resolve().parents[1]
+    before = _tree_state(root)
+    yield
+    if before is not None:
+        after = _tree_state(root)
+        assert after == before, f'tests modified tracked files under orchestrator/: before={before} after={after}'
